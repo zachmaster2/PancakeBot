@@ -1,0 +1,120 @@
+# PancakeBot configuration (sane defaults).
+#
+# This file is intentionally verbose: every field includes:
+#   - description
+#   - example
+#   - behavior / constraints
+#
+# NOTE: The README summarizes what belongs in this file, but this file is the
+# source of truth for details.
+
+[paths]
+# Path to the closed-round JSONL store (epoch-ascending; written by the sync logic).
+# Example: "var/closed_rounds.jsonl"
+# Behavior: created if missing. Must remain epoch-ascending forever.
+closed_rounds_path = "var/closed_rounds.jsonl"
+
+[graph]
+# ABI JSON filepath (must be a JSON LIST, i.e. the ABI array; NOT {"abi":[...]}).
+# Example: "abi/prediction_v2_abi.json"
+# Behavior: loaded at startup; any parse failure is fatal.
+abi_json_path = "abi/prediction_v2_abi.json"
+
+[runtime]
+# Cutoff seconds before lock time for "current" (open) round feature snapshot.
+# Example: 20
+# Behavior: at runtime, bot sleeps until (lock_ts - cutoff_seconds), then snapshots.
+cutoff_seconds = 20
+
+# Number of most-recent usable closed rounds used for training (not including warmup).
+# Example: 500
+# Behavior:
+#   - Required and must be > 0.
+#   - The sync logic ensures enough usable closed rounds exist on disk.
+train_size = 30000
+
+# Retrain models every N decision steps in all modes (live/dry/backtest).
+# Example: 100
+# Behavior:
+#   - step counter advances once per evaluated epoch/round.
+#   - retrain triggers when steps_since_train >= retrain_interval.
+retrain_interval = 100
+
+# Number of most-recent closed target rounds used to fit the sigmoid calibrator.
+# Example: 2000
+# Behavior:
+#   - Required and must be > 0.
+#   - Calibrator is fit on a disjoint calibration window (no overlap with train targets).
+calibrate_size = 30000
+
+# Recalibrate every N decision steps.
+# Example: 100
+# Behavior:
+#   - If 0: recalibrate only immediately after retrain.
+#   - If >0: recalibrate triggers when steps_since_calibrate >= recalibrate_interval.
+#   - After any retrain, calibration runs immediately (if enabled) and resets the calibrate counter.
+recalibrate_interval = 100
+
+# Deterministic recency weighting for train/calibration rows.
+# Example: 0.10
+# Behavior:
+#   - Must be in (0, 1].
+#   - Weight of oldest row in each walk-forward slice.
+recency_weight_floor = 0.10
+
+# Curvature for deterministic recency weighting.
+# Example: 2.0
+# Behavior:
+#   - Must be > 0.
+#   - Larger values emphasize more recent rows more aggressively.
+recency_weight_power = 2.0
+
+# Global random seed for deterministic model training/backtests.
+# Example: 1337
+# Behavior: must be >= 0.
+random_seed = 1337
+
+[models]
+# Ridge regression alpha for the price-return model.
+# Example: 1.0
+# Behavior: must be > 0.
+price_alpha = 1.0
+
+# Ridge regression alpha for the pool inflow total model (log1p target).
+# Example: 1.0
+# Behavior: must be > 0.
+pool_alpha_total = 1.0
+
+# Ridge regression alpha for the pool inflow bull ratio model.
+# Example: 1.0
+# Behavior: must be > 0.
+pool_alpha_ratio = 1.0
+
+[policy]
+# Fractional Kelly multiplier (spec v1.0).
+# Example: 0.5
+# Behavior: f = kelly_multiplier * f_full.
+kelly_multiplier = 0.9
+
+# Cap bet size to a fraction of bankroll.
+# Example: 0.10
+# Behavior: bet_size <= bankroll_cap_fraction * bankroll_bnb.
+bankroll_cap_fraction = 0.20
+
+# Cap bet size to a fraction of the predicted final side pool.
+# Example: 0.10
+# Behavior: bet_size <= pool_cap_fraction * final_side_bnb.
+pool_cap_fraction = 0.15
+
+# Absolute cap on bet size (BNB).
+# Example: 0.25
+# Behavior: bet_size <= max_bet_bnb.
+max_bet_bnb = 0.50
+
+[backtest]
+# Number of most-recent closed rounds to simulate.
+# Example: 5000
+simulation_size = 200
+
+# Starting bankroll for deterministic backtests (BNB).
+initial_bankroll_bnb = 0.5
