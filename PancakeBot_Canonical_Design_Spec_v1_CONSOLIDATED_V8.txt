@@ -1,0 +1,761 @@
+PANCAKEBOT -- CANONICAL DESIGN SPEC (v1.0 FROZEN)
+
+============================================================
+A) ROUND STATES & SOURCES OF TRUTH
+============================================================
+
+Graph (round state inputs)
+- open_round
+- locked_round
+- closed_rounds
+
+RPC (alignment input)
+- current_epoch
+
+Alignment invariant (hard)
+- open_round.epoch MUST equal current_epoch.
+- Violation => invariant failure; no inference or betting may proceed.
+- current_epoch is NEVER used as a feature input.
+
+Locked terminology
+- target_round
+- prior_context_rounds
+
+Feature code MUST reason ONLY in terms of:
+- target_round
+- prior_context_rounds
+
+Removed terms
+- lookback
+- history_rounds
+- locked_round as feature role
+
+============================================================
+B) FEATURE CONTEXT MODEL
+============================================================
+
+Exactly one round-context concept:
+- prior_context_rounds
+
+Ordered oldest -> newest.
+Tail = most recent prior round.
+
+Outcome eligibility rule (hard)
+- prior_context_rounds[-1] is NOT outcome-eligible.
+
+============================================================
+C) CONTEXT SIZING -- ROUNDS
+============================================================
+
+Per-feature declaration
+- required_prior_context_rounds_size
+
+Global
+- max_required_prior_context_rounds_size()
+
+Exact invariant (hard)
+- len(prior_context_rounds) == max_required_prior_context_rounds_size()
+
+Ordering invariant (hard)
+- strictly increasing epochs
+
+============================================================
+D) BACKTEST CONTEXT CONSTRUCTION
+============================================================
+
+For target_round at epoch t:
+- prior_context_rounds :=
+  K most recent rounds with epoch < t
+  where K = max_required_prior_context_rounds_size()
+
+============================================================
+E) NAMING GRAMMAR
+============================================================
+
+Tokens
+- underscore-delimited
+- no leading/trailing underscores
+- atomic tokens contain no underscore
+
+Atomic blocks
+- w_p_<x>_to_p_<y>
+- r_<n>
+- k_<n>
+
+Domain reservation (hard)
+- r_<n> -> prior_context_rounds only
+- k_<n> -> context_klines only
+
+============================================================
+F) GLOBAL HOUSE SEMANTICS
+============================================================
+
+Outcomes in {Bull, Bear, House}
+House is neutral.
+
+Fixed-length outcome features:
+- House contributes 0 to Bull and Bear counts.
+
+Transition features:
+- House ignored in adjacency logic.
+
+============================================================
+G) CALIBRATION FOUNDATION
+============================================================
+
+Calibration is required.
+
+- Calibration is trained only on out-of-sample walk-forward predictions.
+- Calibration mapping must be monotonic.
+- House outcomes excluded for directional probability target.
+
+All probabilities used downstream MUST be calibrated.
+
+============================================================
+H) PROBABILITY SEMANTICS
+============================================================
+
+- p_bull = calibrated probability that outcome in {Bull, Bear} is Bull
+- p_bear = 1 - p_bull
+- Raw probabilities are never exposed to strategy.
+
+============================================================
+I) CUTOFF TIMESTAMP
+============================================================
+
+cutoff_ts = target_round.lock_ts - cutoff_seconds
+
+All pool features and pool forecasts MUST use data <= cutoff_ts.
+
+============================================================
+J) POOL FORECAST FOUNDATION
+============================================================
+
+Observed at cutoff:
+- cutoff_total_bnb
+- cutoff_bull_bnb
+- cutoff_bear_bnb
+
+Model primitives:
+- late_inflow_total_bnb (>= 0)
+- late_inflow_bull_frac (in [0,1])
+
+Derived:
+- final_total_bnb = cutoff_total_bnb + late_inflow_total_bnb
+- final_bull_bnb = cutoff_bull_bnb + late_inflow_total_bnb * late_inflow_bull_frac
+- final_bear_bnb = cutoff_bear_bnb + late_inflow_total_bnb * (1 - late_inflow_bull_frac)
+
+Invariants:
+- final_total_bnb = final_bull_bnb + final_bear_bnb
+- finals >= cutoff values
+
+============================================================
+K) GAS COST FOUNDATION
+============================================================
+
+gas_price_wei   = 5_000_000_000
+gas_limit_bet   = 200_000
+gas_limit_claim = 250_000
+
+Derived:
+- gas_cost_bet_bnb   = 0.0010
+- gas_cost_claim_bnb = 0.00125
+
+Deterministic across dry/live/backtest.
+
+============================================================
+L) IMPACT-AWARE PAYOUT MODEL
+============================================================
+
+For Bull bet of size s:
+
+adj_final_total_bnb = final_total_bnb + s
+adj_final_bull_bnb  = final_bull_bnb + s
+adj_final_bear_bnb  = final_bear_bnb
+
+effective_pool_bnb = adj_final_total_bnb * (1 - treasury_fee_fraction)
+
+If Bull wins:
+gross_payout = s * (effective_pool_bnb / adj_final_bull_bnb)
+profit_win = gross_payout - s - gas_cost_bet_bnb
+
+If Bear wins:
+profit_loss = -s - gas_cost_bet_bnb
+
+Expected value:
+EV = p_bull * profit_win + (1 - p_bull) * profit_loss
+
+All EV must use impact-adjusted pools.
+
+============================================================
+M) SIZING RULE -- FRACTIONAL KELLY WITH CAPS
+============================================================
+
+Kelly core:
+b = (effective_pool_bnb / adj_final_side_bnb) - 1
+f_full = (p * b - (1 - p)) / b
+
+Fractional Kelly:
+kelly_multiplier = 0.5
+f = 0.5 * f_full
+
+If f <= 0 -> no bet
+
+kelly_bet = f * current_bankroll_bnb
+
+Caps:
+- 10% bankroll
+- 10% final_side_bnb
+- 0.25 BNB absolute
+
+bet_size = min(
+    kelly_bet,
+    0.10 * current_bankroll_bnb,
+    0.10 * final_side_bnb,
+    0.25
+)
+
+============================================================
+END SPEC -- PANCAKEBOT v1.0
+============================================================
+
+================================
+O) REGIME FEATURES
+================================
+
+Operate on:
+W := prior_context_rounds[:-1]
+
+required_prior_context_rounds_size = n + 1
+
+Features:
+- regime_bull_frac_r_20
+- regime_bull_frac_r_60
+- regime_bear_frac_r_20
+- regime_bear_frac_r_60
+- regime_flip_rate_r_20
+- regime_flip_rate_r_60
+- regime_streak_len
+
+
+================================
+T) CONTIGUITY -- ROUND ELIGIBILITY
+================================
+
+Adjacency link contiguous iff:
+- epoch difference == 1
+- abs((lock_ts delta - 300)) <= buffer_seconds
+
+All links in:
+prior_context_rounds[-K] -> ... -> target_round
+must be contiguous.
+
+Else target_round skipped.
+
+
+================================
+U) EXTERNAL PRICE FEED -- BINANCE US 1m
+================================
+
+Source:
+- Binance US Spot 1m BNBUSDT
+
+Leakage rule:
+- Only klines with close_time_ms <= cutoff_ts
+
+Minimum window:
+- >= 15 minutes
+
+--------------------------------
+U1) Storage & Cache
+--------------------------------
+
+Disk:
+- var/klines.jsonl
+- append-only
+- fully CLOSED klines only
+
+Schema:
+- open_time_ms
+- close_time_ms
+- open_price
+- high_price
+- low_price
+- close_price
+- volume
+- quote_asset_volume
+- number_of_trades
+- taker_buy_base_volume
+- taker_buy_quote_volume
+
+Invariants:
+- strictly ordered by open_time_ms
+- no duplicates
+
+Cache:
+- RollingKlinesCache
+
+Dry/Live:
+- ONLY mode allowed to query Binance US
+- fetch newly CLOSED klines once per loop
+- append only
+
+Backtest:
+- MUST NOT query Binance US
+- read-only
+- missing coverage => InvariantError
+
+--------------------------------
+U2) context_klines
+--------------------------------
+
+Ordered oldest -> newest.
+Anchored to cutoff_ts.
+
+Exact sizing (hard):
+- len(context_klines) ==
+  max_required_context_klines_size()
+
+Contiguity (hard):
+- open_time_ms[i] ==
+  open_time_ms[i-1] + 60_000
+
+Failure => target_round skipped.
+
+--------------------------------
+U3) Schema Mechanics
+--------------------------------
+
+Each feature defines:
+(feature_name, required_context_klines_size)
+
+Global:
+- max_required_context_klines_size()
+
+--------------------------------
+U4) External Price Feature Set
+--------------------------------
+
+Windows:
+- 15
+- 30
+- 60
+- 120
+
+Return:
+log_return_t = log(close_t / close_{t-1})
+
+Features (per n):
+- price_log_return_mean_k_n
+- price_log_return_std_k_n
+- price_log_return_abs_mean_k_n
+- price_log_return_abs_max_k_n
+- price_range_mean_k_n
+- price_range_max_k_n
+- price_volume_mean_k_n
+- price_volume_std_k_n
+- price_volume_max_k_n
+- price_trade_count_mean_k_n
+- price_trade_count_std_k_n
+- price_trade_count_max_k_n
+
+
+================================
+R) DECISION-LAYER INTERFACE
+================================
+
+Inputs:
+- target_epoch
+- p_bull
+- final_bull_bnb
+- final_bear_bnb
+- bankroll_bnb
+- treasury_fee_fraction
+- gas_cost_bet_bnb
+- min_bet_amount_bnb
+- kelly_multiplier
+- bankroll_cap_fraction
+- pool_cap_fraction
+- max_bet_bnb
+
+Derived:
+- p_bear = 1 - p_bull
+- final_total_bnb = final_bull_bnb + final_bear_bnb
+
+No raw probabilities allowed.
+
+
+================================
+S) MODEL OUTPUT CONTRACT
+================================
+
+Target domain:
+- {Bull, Bear}
+
+p_bull = calibrated probability
+p_bear = 1 - p_bull
+
+================================
+UNCHANGED DECISIONS (STILL IN FORCE)
+================================
+
+This spec is self-contained. All foundational decisions referenced as "unchanged" are defined
+in full elsewhere in this same document. This section is only an index to those canonical
+definitions (so no information is duplicated or abbreviated here).
+
+- Round states + alignment invariant: see section A) ROUND STATES & SOURCES OF TRUTH
+- Feature roles + prior context semantics: see section B) FEATURE CONTEXT MODEL
+- Context sizing + ordering invariants: see section C) CONTEXT SIZING & INVARIANTS
+- Backtest context construction: see section D) BACKTEST CONTEXT CONSTRUCTION
+- Naming grammar: see section E) NAMING GRAMMAR
+- Window/operator set: see section F) WINDOW & OPERATOR SET
+- Feature groups: see section G) FEATURE GROUPS
+- Imbalance sign convention: see section H) IMBALANCE SIGN CONVENTION
+- Schema mechanics / requirements source-of-truth: see section I) FEATURE REQUIREMENTS MECHANICS
+- Feature unavailability / NaN rules: see section J) FEATURE UNAVAILABILITY
+- Single ownership / separation of responsibilities: see section K) SINGLE OWNERSHIP
+- Logging template: see section L) LOGGING CONTRACT
+- Workflow constraints: see section M) WORKFLOW CONSTRAINTS
+- Do-not-repeat list: see section P) DO-NOT-REPEAT
+
+================================
+L) LOGGING CONTRACT (LOCKED)
+================================
+
+Startup-only, deterministic, human-auditable.
+
+CANONICAL TEMPLATE (must match exactly):
+
+BACKTEST RUN SETUP
+
+Context
+  max_required_prior_context_rounds_size : <int>
+  context_mode                    : target_only | target_plus_prior_context
+
+Features
+  price_features                  : <int>
+  pool_features                   : <int>
+
+Feature requirements
+  required_prior_context_rounds_size     : <int>
+    [<group_name>]
+      <feature_a>                      <feature_d>
+      <feature_b>                      <feature_e>
+      <feature_c>                      <feature_f>
+
+  (repeat blocks for each distinct size, ordered descending)
+
+Training / calibration
+  train_size                      : <int>
+  calibrate_size                  : <int>
+  retrain_interval                : <int>
+  recalibrate_interval            : <int>
+
+Feature listing layout rules
+- Alphabetical sort within group.
+- Split list into two halves.
+- LEFT column fills top->bottom, then RIGHT column top->bottom.
+- Column-major ordering; rows are visual only.
+
+================================
+STRATEGY / EV / SIZING (LATEST FROZEN)
+================================
+
+CUTOFF TIMESTAMP (FROZEN v1.0)
+
+Definition (hard)
+- cutoff_ts = target_round.lock_ts - cutoff_seconds
+
+Where:
+- cutoff_seconds is a fixed configuration parameter.
+
+Semantics (hard)
+- cutoff_ts represents the last timestamp at which the strategy is allowed
+  to observe and act on information for the target_round.
+- All pool features and pool-final forecasts MUST use only data available
+  at or before cutoff_ts.
+
+
+CUTOFF TIMESTAMP (FROZEN v1.0)
+
+Definition (hard)
+- cutoff_ts = target_round.lock_ts - cutoff_seconds
+- cutoff_seconds is a fixed configuration parameter.
+
+Semantics (hard)
+- cutoff_ts is the decision boundary for the target_round.
+- Pool features and pool-final forecasts MUST use only data available at or before cutoff_ts.
+
+POOL FORECAST FOUNDATION -- OUTPUT CONTRACT (FROZEN v1.0)
+
+Purpose
+- Provide strategy with predicted final pools for target_round to enable impact-aware EV sizing.
+
+Leakage boundary (hard)
+- Pool-final forecasts MUST be computed using only information available at or before cutoff_ts.
+
+Preferred parameterization (hard)
+- The pool forecast is expressed in terms of:
+    - delta_total_bnb_hat          (>= 0)
+    - bull_frac_final_hat          (in [0, 1])
+  where:
+    - total_final_bnb_hat = total_at_cutoff_bnb + delta_total_bnb_hat
+    - bull_final_bnb_hat  = total_final_bnb_hat * bull_frac_final_hat
+    - bear_final_bnb_hat  = total_final_bnb_hat - bull_final_bnb_hat
+
+Validity constraints (hard)
+- delta_total_bnb_hat >= 0
+- bull_frac_final_hat in [0, 1]
+- total_final_bnb_hat >= total_at_cutoff_bnb
+- bull_final_bnb_hat  >= bull_at_cutoff_bnb
+- bear_final_bnb_hat  >= bear_at_cutoff_bnb
+
+Ownership rule (hard)
+- Strategy MUST consume only validated pool forecasts satisfying the above constraints.
+- Enforcing these constraints is the responsibility of the single owner that constructs
+  strategy inputs (not the strategy itself).
+
+Not yet frozen
+- Model family, loss function, training cadence details, and evaluation metrics.
+
+
+POOL FORECAST FOUNDATION -- OUTPUT CONTRACT (FROZEN v1.0)
+
+Purpose
+- Provide strategy with predicted final pools for target_round
+  to enable impact-aware EV sizing.
+
+Leakage boundary (hard)
+- Pool forecasts MUST use only information available
+  at or before cutoff_ts.
+
+Observed at decision time (hard)
+- cutoff_total_bnb
+- cutoff_bull_bnb
+- cutoff_bear_bnb
+
+Model-predicted primitives (hard)
+- late_inflow_total_bnb      (>= 0)
+- late_inflow_bull_frac      (in [0, 1])
+
+Derived canonical outputs (hard)
+- final_total_bnb =
+      cutoff_total_bnb + late_inflow_total_bnb
+
+- final_bull_bnb =
+      cutoff_bull_bnb +
+      late_inflow_total_bnb * late_inflow_bull_frac
+
+- final_bear_bnb =
+      cutoff_bear_bnb +
+      late_inflow_total_bnb * (1 - late_inflow_bull_frac)
+
+Validity invariants (hard)
+- late_inflow_total_bnb >= 0
+- 0 <= late_inflow_bull_frac <= 1
+- final_total_bnb >= cutoff_total_bnb
+- final_bull_bnb  >= cutoff_bull_bnb
+- final_bear_bnb  >= cutoff_bear_bnb
+- final_bull_bnb + final_bear_bnb == final_total_bnb
+
+Ownership rule (hard)
+- Strategy MUST consume only validated pool forecasts
+  satisfying all invariants.
+- Enforcing validity is the responsibility of the
+  single owner constructing strategy inputs.
+
+Not yet frozen
+- Model family
+- Loss functions
+- Training cadence
+
+GAS COST FOUNDATION (FROZEN v1.0)
+
+Determinism rule (hard)
+- Gas costs used in EV calculations MUST be deterministic and identical
+  across dry, live, and backtest modes.
+
+Gas pricing constants (hard)
+- gas_price_wei      = 5_000_000_000        (5 gwei)
+- gas_limit_bet      = 200_000
+- gas_limit_claim    = 250_000
+
+Conservative cost model (hard)
+- gas_cost_bet_bnb =
+      gas_price_wei * gas_limit_bet / 1e18
+
+- gas_cost_claim_bnb =
+      gas_price_wei * gas_limit_claim / 1e18
+
+Numerical values (derived)
+- gas_cost_bet_bnb   = 0.0010 BNB
+- gas_cost_claim_bnb = 0.00125 BNB
+
+Usage rule (hard)
+- Any non-None bet MUST subtract gas_cost_bet_bnb from EV.
+- Claim modeling MUST subtract gas_cost_claim_bnb when a claim action
+  is included in the EV model.
+
+No dynamic estimation (hard)
+- Strategy MUST NOT use on-chain gas estimation.
+- Gas costs are fixed constants at the specification layer.
+
+Not yet frozen
+- Exact modeling of claim cadence in EV.
+
+IMPACT-AWARE PAYOUT MODEL & EV DEFINITION (FROZEN v1.0)
+
+Purpose
+- Define how expected value (EV) is computed using calibrated probability
+  and predicted final pools.
+
+--------------------------------
+Payout Mechanics (hard)
+--------------------------------
+
+If betting on Bull with bet_size_bnb:
+
+Adjusted final pools:
+- adj_final_total_bnb = final_total_bnb + bet_size_bnb
+- adj_final_bull_bnb  = final_bull_bnb + bet_size_bnb
+- adj_final_bear_bnb  = final_bear_bnb
+
+Treasury fee:
+- effective_pool_bnb =
+      adj_final_total_bnb * (1 - treasury_fee_fraction)
+
+If Bull wins:
+- gross_payout_bnb =
+      bet_size_bnb *
+      (effective_pool_bnb / adj_final_bull_bnb)
+
+Net profit if Bull wins:
+- profit_win_bnb =
+      gross_payout_bnb - bet_size_bnb - gas_cost_bet_bnb
+
+Net loss if Bear wins:
+- profit_loss_bnb =
+      - bet_size_bnb - gas_cost_bet_bnb
+
+(Claim gas cost may be included separately depending on cadence modeling.)
+
+--------------------------------
+Expected Value (EV)
+--------------------------------
+
+EV_bull(bet_size_bnb) =
+    p_bull * profit_win_bnb +
+    (1 - p_bull) * profit_loss_bnb
+
+Analogous symmetric formula applies for Bear.
+
+--------------------------------
+No-impact model forbidden (hard)
+--------------------------------
+
+EV calculations MUST use adj_final_* pools.
+Using final_* pools without adjusting for bet_size_bnb is forbidden.
+
+--------------------------------
+Monotonicity (implicit)
+--------------------------------
+
+- Increasing bet_size_bnb reduces payout ratio via adj_final_bull_bnb.
+- Impact-aware sizing is therefore self-consistent.
+
+--------------------------------
+Strategy decision rule (not yet frozen)
+--------------------------------
+
+- Exact sizing function (Kelly, fractional Kelly, capped Kelly, etc.)
+  is NOT yet frozen.
+
+END BLOCK
+
+SIZING RULE -- FRACTIONAL KELLY WITH CAPS (FROZEN v1.0)
+
+Purpose
+- Define the deterministic bet sizing rule using impact-aware EV.
+
+--------------------------------
+Kelly Core (hard)
+--------------------------------
+
+Let:
+- p = p_bull (or p_bear for Bear bet)
+- b = net odds after impact
+
+Net odds definition:
+- b =
+    ( effective_pool_bnb / adj_final_side_bnb ) - 1
+
+Kelly fraction:
+- f_full = (p * b - (1 - p)) / b
+
+Fractional Kelly:
+- kelly_multiplier = 0.5
+- f = kelly_multiplier * f_full
+
+If f <= 0:
+- No bet (bet_direction = None, bet_size_bnb = 0)
+
+Raw Kelly bet size:
+- kelly_bet_bnb = f * current_bankroll_bnb
+
+--------------------------------
+Hard Caps (hard)
+--------------------------------
+
+1) Bankroll cap
+- max_bankroll_fraction_per_bet = 0.10
+- bankroll_cap_bnb =
+      0.10 * current_bankroll_bnb
+
+2) Pool impact cap
+- max_pool_fraction_per_bet = 0.10
+- pool_cap_bnb =
+      0.10 * final_side_bnb
+
+3) Absolute cap
+- max_bet_bnb = 0.25
+
+--------------------------------
+Final Bet Size (hard)
+--------------------------------
+
+bet_size_bnb =
+    min(
+        kelly_bet_bnb,
+        bankroll_cap_bnb,
+        pool_cap_bnb,
+        max_bet_bnb
+    )
+
+If bet_size_bnb <= 0:
+- bet_direction = None
+- bet_size_bnb = 0
+
+--------------------------------
+Impact Awareness (hard)
+--------------------------------
+
+- All odds and EV calculations MUST use adj_final_* pools
+  that include bet_size_bnb.
+
+--------------------------------
+Gas Treatment (hard)
+--------------------------------
+
+- gas_cost_bet_bnb MUST be subtracted in EV before
+  determining f_full.
+
+--------------------------------
+Determinism (hard)
+--------------------------------
+
+- No randomness.
+- No dynamic parameter tuning.
+- Pure function of strategy inputs.
+
+END BLOCK
+

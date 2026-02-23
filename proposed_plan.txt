@@ -1,0 +1,83 @@
+Proposed Plan V2: Direction Gate Stabilization and Profit Validation
+
+Objective
+- Improve safe profit reliability by stabilizing directional gating first, then tuning sizing.
+- Avoid overfitting to a single window or a single threshold style.
+
+Scope
+- This phase is probe-focused and fast-iteration oriented.
+- Keep runs short by default and escalate to larger sims only after passing stability checks.
+
+1) Data and Encoding Hygiene
+- Keep this file and all exported summaries ASCII/UTF-8 clean.
+- Remove any mojibake or mixed-encoding artifacts from plan/report text.
+
+2) Direction Gating Redesign (Primary)
+- Use distribution-aware thresholds, not fixed 0.5 +/- x gates in compressed regimes.
+- Preferred mode: quantile thresholds around a rolling center.
+- Keep center configurable (fixed 0.5 or rolling mean/median).
+- Keep edge floor configurable in two ways:
+  - absolute floor (percentage points)
+  - relative floor (ratio of observed spread)
+
+3) Viability Checks (Before Interpreting PnL)
+- Fail fast when gate has little usable signal.
+- Log and enforce:
+  - p_spread (for |p-center| distribution)
+  - expected signal count at current thresholds
+  - realized signal count in simulation
+- If signal count is too low, mark run as non-actionable and skip sizing conclusions.
+
+4) Diagnostics Expansion
+- Keep per-run skip counts by reason and make them first-class in summary.
+- Add/ensure explicit counts for:
+  - no_positive_ev
+  - direction_filter_no_signal
+  - direction_filter_side_mismatch
+  - pool_imbalance (if enabled)
+  - insufficient_edge
+- Add directional participation summary:
+  - bull_signals
+  - bear_signals
+  - both_side_coverage flag
+
+5) Correlation and Stats Safety
+- Do not compute or interpret correlations below minimum sample sizes.
+- Add min-sample guardrails for:
+  - EV-to-PnL correlation
+  - edge-to-winrate relation
+- Emit "insufficient_sample" instead of unstable numeric correlations.
+
+6) Experiment Sequence
+- Phase A (Gate Stability):
+  - lock sizing to a simple baseline
+  - sweep threshold mode, center mode, and edge floor style
+  - pick setups with sufficient signals and balanced side coverage
+- Phase B (Sizing A/B):
+  - only after Phase A passes viability/stability
+  - compare 1-2 sizing variants under the same gate
+- Phase C (Longer Validation):
+  - run chunked larger simulations and require consistency
+
+7) Stability Checks (Chunked)
+- For long sims, split into chunks and track variance across chunks.
+- Require no single chunk to dominate total profit.
+- Promote a setup only if performance is directionally consistent across chunks.
+
+8) Promotion Criteria
+- A candidate can be marked "current best" only if all are true:
+  - positive net profit
+  - sufficient signal count
+  - acceptable win rate and drawdown profile
+  - no critical skip bottleneck dominating by accident
+  - stable chunk behavior
+
+9) Deferred Until Gate Is Stable
+- Deep EV-gating redesign
+- Aggressive pool-imbalance experimentation
+- Broad feature set expansion
+
+Immediate Next Probe Pack
+- Run a compact Phase A sweep with gate viability metrics enabled.
+- Keep calibration and window ordering fixed while isolating gate behavior.
+- Promote only setups that pass viability + chunk consistency, then start sizing A/B.

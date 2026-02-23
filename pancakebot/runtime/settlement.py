@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from pancakebot.core.constants import BNB_WEI, GAS_COST_CLAIM_BNB
+from pancakebot.domain.types import Round
+from pancakebot.domain.features.pool_amounts import compute_pool_amounts_wei_at_or_before
+from pancakebot.core.errors import InvariantError
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementResult:
+    outcome: str  # "win" | "loss" | "refund"
+    credit_bnb: float  # amount credited to bankroll AFTER close (net of claim gas)
+    payout_multiple_after_fee: float  # 0 for loss/refund
+
+
+def settle_bet_against_closed_round(
+    *,
+    bet_bnb: float,
+    bet_side: str,
+    round_closed: Round,
+    treasury_fee_fraction: float,
+) -> SettlementResult:
+    """Compute the settlement credit for a bet, using only the closed round data.
+
+    This is used by:
+      - dry mode: simulating claim settlement
+      - backtest: deterministic replay (no RPC calls)
+
+    Convention:
+      - Bet principal and bet gas are paid at bet-time (outside this function).
+      - This function returns the net credit applied at claim-time:
+          - WIN: bet_bnb * payout_multiple_after_fee - GAS_COST_CLAIM_BNB
+          - REFUND (failed): bet_bnb - GAS_COST_CLAIM_BNB
+          - LOSS: 0.0
+
+    Important (impact-aware):
+      - Historical closed-round pools do NOT include our simulated bet.
+      - To match live execution, settlement payout math MUST include the bet's impact
+        on the final pools (total and winner-side denominator).
+    """
+    if bet_bnb < 0.0:
+        raise InvariantError("settle_bet_bnb_negative")
+    if round_closed.lock_at is None or round_closed.position is None:
+        raise InvariantError("settle_round_not_closed")
+    if not (0.0 <= float(treasury_fee_fraction) < 1.0):
+        raise InvariantError("settle_treasury_fee_fraction_out_of_range")
+
+    bet_side_u = str(bet_side).upper()
+    if bet_side_u not in ("BULL", "BEAR"):
+        raise InvariantError("settle_bet_side_invalid")
+
+    winner_u = str(round_closed.position).upper()
+
+    # Final pools at lock time (all bets are in by lock_at).
+    pools_wei = compute_pool_amounts_wei_at_or_before(bets=round_closed.bets, cutoff_ts=int(round_closed.lock_at))
+    bull_pool_bnb = float(pools_wei.bull_wei) / float(BNB_WEI)
+    bear_pool_bnb = float(pools_wei.bear_wei) / float(BNB_WEI)
+
+    if bool(round_closed.failed):
+        return SettlementResult(outcome="refund", credit_bnb=float(bet_bnb) - float(GAS_COST_CLAIM_BNB), payout_multiple_after_fee=0.0)
+
+    if winner_u not in ("BULL", "BEAR", "HOUSE"):
+        raise InvariantError("settle_winner_invalid")
+
+    if winner_u != bet_side_u:
+        return SettlementResult(outcome="loss", credit_bnb=0.0, payout_multiple_after_fee=0.0)
+
+    # Apply our simulated bet impact to pools (live-consistent settlement math).
+    bull_after = float(bull_pool_bnb) + (float(bet_bnb) if bet_side_u == "BULL" else 0.0)
+    bear_after = float(bear_pool_bnb) + (float(bet_bnb) if bet_side_u == "BEAR" else 0.0)
+    total_after = float(bull_after) + float(bear_after)
+
+    denom = float(bull_after) if bet_side_u == "BULL" else float(bear_after)
+    if denom <= 0.0 or total_after <= 0.0:
+        # Degenerate pools; still paid claim gas.
+        return SettlementResult(outcome="win", credit_bnb=-float(GAS_COST_CLAIM_BNB), payout_multiple_after_fee=0.0)
+
+    mult = (float(total_after) * (1.0 - float(treasury_fee_fraction))) / float(denom)
+    credit = float(bet_bnb) * float(mult) - float(GAS_COST_CLAIM_BNB)
+    return SettlementResult(outcome="win", credit_bnb=float(credit), payout_multiple_after_fee=float(mult))
