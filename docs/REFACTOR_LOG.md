@@ -35,6 +35,10 @@ Chronological decision record for long-running cleanup/refactor work.
     - removed redundant constants persistence in `runtime_loop` startup
 14. Updated runtime and strategy config docs/comments to dislocation-only
     terminology and revalidated continuous/chunk-reset smoke runs.
+15. Removed duplicate candidate defaults from code:
+    - `strategy.dislocation.candidates` is now required in config
+    - deleted large in-code `_default_candidates()` block from
+      `pancakebot/config/strategy_config.py`.
 
 ## Open Follow-Ups
 
