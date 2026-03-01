@@ -20,7 +20,6 @@ class AppConfig:
     random_seed: int
     use_onchain_event_bets: bool
     event_lookback_blocks: int
-    event_freshness_slack_seconds: int
     latency_log_path: str
     wait_for_bet_receipt: bool
     bet_receipt_timeout_seconds: int

@@ -5,8 +5,8 @@ Hard rules (project-level):
   - No disk reads in the main live loop: closed rounds are loaded once at startup
     and then maintained via an in-memory rolling cache.
 
-This module orchestrates I/O (Graph, on-chain) and pure logic
-(feature building, training, inference, policy).
+This module orchestrates I/O (Graph, on-chain) and strategy execution for the
+single production dislocation pipeline.
 """
 
 from __future__ import annotations
@@ -43,7 +43,6 @@ from pancakebot.domain.strategy.dislocation_engine import (
     build_dislocation_engine_from_config,
 )
 from pancakebot.runtime.claim_manager import claim_scan_cursor
-from pancakebot.runtime.contract_constants_cache import ContractConstants, save_contract_constants
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 from pancakebot.runtime.sleep import sleep_seconds
 from pancakebot.core.errors import InvariantError, TransientGraphError, TransientRpcError
@@ -91,12 +90,10 @@ class RuntimeConfig:
     # Protocol constants (cached at startup)
     treasury_fee_fraction: float
     buffer_seconds: int
-    min_bet_amount_bnb: float
 
     # Optional on-chain bet-event replacement for target-round bets at cutoff.
     use_onchain_event_bets: bool
     event_lookback_blocks: int
-    event_freshness_slack_seconds: int
 
     # Runtime latency telemetry.
     latency_log_path: str
@@ -272,9 +269,6 @@ def _replace_open_round_bets_from_events(
         )
         for ev in events
     )
-
-    if int(cfg.event_freshness_slack_seconds) < 0:
-        raise InvariantError("event_freshness_slack_seconds_negative")
 
     out = Round(
         epoch=int(open_round.epoch),
@@ -612,15 +606,6 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
         raise InvariantError("insufficient_closed_rounds_for_dislocation_strategy")
 
     disk_latest_epoch = int(cache.rounds[-1].epoch)
-
-    # Persist contract constants after startup sync so backtests can run without any RPC.
-    save_contract_constants(
-        constants=ContractConstants(
-            min_bet_amount_bnb=float(cfg.min_bet_amount_bnb),
-            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-            buffer_seconds=int(cfg.buffer_seconds),
-        )
-    )
 
     klines_cache = _init_klines_cache(cfg=cfg, closed_cache=cache)
     dislocation_engine = build_dislocation_engine_from_config(

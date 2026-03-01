@@ -308,7 +308,7 @@ def _default_candidates() -> tuple[DislocationCandidateConfig, ...]:
 
 @dataclass(frozen=True, slots=True)
 class DislocationStrategyConfig:
-    """Top-level config for the dislocation cell-mean strategy."""
+    """Top-level config for the production dislocation strategy."""
 
     selector: DislocationSelectorConfig = DislocationSelectorConfig()
     candidates: tuple[DislocationCandidateConfig, ...] = _default_candidates()

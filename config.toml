@@ -29,9 +29,6 @@ use_onchain_event_bets = false
 # Block lookback for event reconstruction when use_onchain_event_bets=true.
 event_lookback_blocks = 600
 
-# Freshness slack in seconds for event checks.
-event_freshness_slack_seconds = 2
-
 # Path for live latency telemetry JSONL.
 latency_log_path = "var/live_latency.jsonl"
 
