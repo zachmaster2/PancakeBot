@@ -8,7 +8,7 @@ from pancakebot.domain.types import Kline, Round
 from pancakebot.domain.features.feature_builder import build_features, vectorize
 from pancakebot.domain.features.pool_amounts import compute_pool_amounts_wei_at_or_before
 from pancakebot.domain.features.schema import FEATURE_SCHEMA, max_required_context_klines_size, max_required_prior_context_rounds_size
-from pancakebot.domain.models.walk_forward import WalkForwardState, predict_probabilities
+from pancakebot.domain.models.walk_forward import WalkForwardState, predict_probabilities, predict_tradeable_probability
 from pancakebot.domain.strategy.ev_math import ChainPolicyParams
 from pancakebot.domain.strategy.policy import PolicyDecision, decide
 from pancakebot.core.errors import InvariantError
@@ -37,7 +37,9 @@ class PredictionBundle:
 
     # Probabilities:
     # - p_final: calibrated probability used for EV/sizing
+    # - p_tradeable: predictability gate score
     p_final: float
+    p_tradeable: float
 
     # Observed pools at cutoff.
     cutoff_total_bnb: float
@@ -147,6 +149,7 @@ def predict(*, state: WalkForwardState, feats: FeatureBundle) -> PredictionBundl
 
     mu = float(state.models.price_model.predict(feats.x_price)[0])
     p_final = predict_probabilities(state=state, mu=float(mu))
+    p_tradeable = predict_tradeable_probability(state=state, x_row=list(feats.x_price[0]))
 
     late_total_pred, late_bull_frac_pred = state.models.pool_model.predict(feats.x_pool)[0]
 
@@ -188,6 +191,7 @@ def predict(*, state: WalkForwardState, feats: FeatureBundle) -> PredictionBundl
     return PredictionBundle(
         epoch=int(feats.epoch),
         p_final=float(p_final),
+        p_tradeable=float(p_tradeable),
         cutoff_total_bnb=float(feats.cutoff_total_bnb),
         cutoff_bull_bnb=float(feats.cutoff_bull_bnb),
         cutoff_bear_bnb=float(feats.cutoff_bear_bnb),

@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import warnings
 from lightgbm import LGBMClassifier, early_stopping
 
 from pancakebot.core.errors import InvariantError
+
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"X does not have valid feature names, but LGBM(Classifier|Regressor) was fitted with feature names",
+    category=UserWarning,
+)
 
 
 _DIRECTION_PARAMS = {
@@ -50,7 +57,7 @@ class PriceReturnModel:
             n_estimators=int(_TRAINING["num_boost_round"]),
             **params,
         )
-        self._feature_names: list[str] | None = None
+        self._n_features: int | None = None
 
     @staticmethod
     def _to_2d_array(x) -> np.ndarray:
@@ -59,18 +66,10 @@ class PriceReturnModel:
             raise InvariantError("direction_x_not_2d")
         return arr
 
-    @staticmethod
-    def _make_feature_names(n_features: int) -> list[str]:
-        if int(n_features) <= 0:
-            raise InvariantError("direction_feature_count_nonpositive")
-        return [f"f{idx}" for idx in range(int(n_features))]
-
     def fit(self, x, y_up, *, x_eval=None, y_eval=None, sample_weight=None) -> None:
         x_arr = self._to_2d_array(x)
         if x_arr.ndim != 2 or x_arr.shape[0] <= 1 or x_arr.shape[1] <= 0:
             raise InvariantError("direction_fit_x_shape_invalid")
-        feature_names = self._make_feature_names(int(x_arr.shape[1]))
-        x_df = pd.DataFrame(x_arr, columns=feature_names)
 
         y_arr = np.asarray(list(y_up), dtype=int)
         if y_arr.ndim != 1:
@@ -101,14 +100,13 @@ class PriceReturnModel:
             x_eval_arr = self._to_2d_array(x_eval)
             if x_eval_arr.ndim != 2 or x_eval_arr.shape[0] <= 0 or x_eval_arr.shape[1] != x_arr.shape[1]:
                 raise InvariantError("direction_eval_x_shape_invalid")
-            x_eval_df = pd.DataFrame(x_eval_arr, columns=feature_names)
             y_eval_arr = np.asarray(list(y_eval), dtype=int)
             if y_eval_arr.ndim != 1:
                 raise InvariantError("direction_eval_y_not_1d")
             if len(y_eval_arr) != int(x_eval_arr.shape[0]):
                 raise InvariantError("direction_eval_len_mismatch")
             if len(y_eval_arr) > 1 and np.all((y_eval_arr == 0) | (y_eval_arr == 1)):
-                fit_kwargs["eval_set"] = [(x_eval_df, y_eval_arr)]
+                fit_kwargs["eval_set"] = [(x_eval_arr, y_eval_arr)]
                 fit_kwargs["eval_metric"] = "binary_logloss"
                 callbacks.append(
                     early_stopping(
@@ -123,21 +121,20 @@ class PriceReturnModel:
         if sample_weight_arr is not None:
             fit_kwargs["sample_weight"] = sample_weight_arr
 
-        self._m.fit(x_df, y_arr, **fit_kwargs)
-        self._feature_names = feature_names
+        self._m.fit(x_arr, y_arr, **fit_kwargs)
+        self._n_features = int(x_arr.shape[1])
 
     def predict(self, x):
-        if self._feature_names is None:
+        if self._n_features is None:
             raise InvariantError("direction_predict_without_fit")
 
         x_arr = self._to_2d_array(x)
         if x_arr.ndim != 2 or x_arr.shape[0] <= 0:
             raise InvariantError("direction_predict_x_shape_invalid")
-        if int(x_arr.shape[1]) != int(len(self._feature_names)):
+        if int(x_arr.shape[1]) != int(self._n_features):
             raise InvariantError("direction_predict_feature_count_mismatch")
 
-        x_df = pd.DataFrame(x_arr, columns=self._feature_names)
-        proba = self._m.predict_proba(x_df)
+        proba = self._m.predict_proba(x_arr)
         arr = np.asarray(proba, dtype=float)
         if arr.ndim != 2 or arr.shape[1] < 2:
             raise InvariantError("direction_predict_proba_shape_invalid")

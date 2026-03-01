@@ -1,120 +1,358 @@
-# PancakeBot configuration (sane defaults).
+# PancakeBot configuration
 #
-# This file is intentionally verbose: every field includes:
-#   - description
-#   - example
-#   - behavior / constraints
+# This file defines the single production pipeline used by live, dry, and
+# backtest modes.
 #
-# NOTE: The README summarizes what belongs in this file, but this file is the
-# source of truth for details.
+# No backward compatibility is supported: unknown keys are treated as errors.
 
 [paths]
-# Path to the closed-round JSONL store (epoch-ascending; written by the sync logic).
-# Example: "var/closed_rounds.jsonl"
-# Behavior: created if missing. Must remain epoch-ascending forever.
+# Path to closed-round history JSONL (epoch-ascending).
 closed_rounds_path = "var/closed_rounds.jsonl"
 
+# Path to minute kline history JSONL.
+klines_path = "var/klines.jsonl"
+
 [graph]
-# ABI JSON filepath (must be a JSON LIST, i.e. the ABI array; NOT {"abi":[...]}).
-# Example: "abi/prediction_v2_abi.json"
-# Behavior: loaded at startup; any parse failure is fatal.
+# ABI filepath (must contain ABI array JSON).
 abi_json_path = "abi/prediction_v2_abi.json"
 
 [runtime]
-# Cutoff seconds before lock time for "current" (open) round feature snapshot.
-# Example: 20
-# Behavior: at runtime, bot sleeps until (lock_ts - cutoff_seconds), then snapshots.
-cutoff_seconds = 20
+# Seconds before round lock for cutoff-time snapshotting.
+cutoff_seconds = 17
 
-# Number of most-recent usable closed rounds used for training (not including warmup).
-# Example: 500
-# Behavior:
-#   - Required and must be > 0.
-#   - The sync logic ensures enough usable closed rounds exist on disk.
-train_size = 30000
-
-# Retrain models every N decision steps in all modes (live/dry/backtest).
-# Example: 100
-# Behavior:
-#   - step counter advances once per evaluated epoch/round.
-#   - retrain triggers when steps_since_train >= retrain_interval.
-retrain_interval = 100
-
-# Number of most-recent closed target rounds used to fit the sigmoid calibrator.
-# Example: 2000
-# Behavior:
-#   - Required and must be > 0.
-#   - Calibrator is fit on a disjoint calibration window (no overlap with train targets).
-calibrate_size = 30000
-
-# Recalibrate every N decision steps.
-# Example: 100
-# Behavior:
-#   - If 0: recalibrate only immediately after retrain.
-#   - If >0: recalibrate triggers when steps_since_calibrate >= recalibrate_interval.
-#   - After any retrain, calibration runs immediately (if enabled) and resets the calibrate counter.
-recalibrate_interval = 100
-
-# Deterministic recency weighting for train/calibration rows.
-# Example: 0.10
-# Behavior:
-#   - Must be in (0, 1].
-#   - Weight of oldest row in each walk-forward slice.
-recency_weight_floor = 0.10
-
-# Curvature for deterministic recency weighting.
-# Example: 2.0
-# Behavior:
-#   - Must be > 0.
-#   - Larger values emphasize more recent rows more aggressively.
-recency_weight_power = 2.0
-
-# Global random seed for deterministic model training/backtests.
-# Example: 1337
-# Behavior: must be >= 0.
+# Deterministic seed used for all reproducible operations.
 random_seed = 1337
 
-[models]
-# Ridge regression alpha for the price-return model.
-# Example: 1.0
-# Behavior: must be > 0.
-price_alpha = 1.0
+# If true, replace Graph target-round bets with on-chain bet events.
+use_onchain_event_bets = false
 
-# Ridge regression alpha for the pool inflow total model (log1p target).
-# Example: 1.0
-# Behavior: must be > 0.
-pool_alpha_total = 1.0
+# Block lookback for event reconstruction when use_onchain_event_bets=true.
+event_lookback_blocks = 600
 
-# Ridge regression alpha for the pool inflow bull ratio model.
-# Example: 1.0
-# Behavior: must be > 0.
-pool_alpha_ratio = 1.0
+# Freshness slack in seconds for event checks.
+event_freshness_slack_seconds = 2
 
-[policy]
-# Fractional Kelly multiplier (spec v1.0).
-# Example: 0.5
-# Behavior: f = kelly_multiplier * f_full.
-kelly_multiplier = 0.9
+# Path for live latency telemetry JSONL.
+latency_log_path = "var/live_latency.jsonl"
 
-# Cap bet size to a fraction of bankroll.
-# Example: 0.10
-# Behavior: bet_size <= bankroll_cap_fraction * bankroll_bnb.
-bankroll_cap_fraction = 0.20
+# If true, wait for bet receipt confirmation in live mode.
+wait_for_bet_receipt = true
 
-# Cap bet size to a fraction of the predicted final side pool.
-# Example: 0.10
-# Behavior: bet_size <= pool_cap_fraction * final_side_bnb.
-pool_cap_fraction = 0.15
+# Receipt timeout in seconds when wait_for_bet_receipt=true.
+bet_receipt_timeout_seconds = 45
 
-# Absolute cap on bet size (BNB).
-# Example: 0.25
-# Behavior: bet_size <= max_bet_bnb.
-max_bet_bnb = 0.50
+[strategy]
+# Single production strategy namespace.
+
+[strategy.dislocation.selector]
+# Settled rounds required before selector can choose a candidate.
+warmup_rounds = 50000
+
+# Quantile bins for selector celling on EV and absolute dislocation.
+num_quantile_bins = 12
+
+# Minimum observations required for a selector cell.
+min_cell_obs = 5
+
+# Minimum selector cell mean-profit score (BNB) to allow picks.
+score_threshold = -0.01
+
+# If true, selector cells are split by side (bull/bear).
+use_direction_split = true
+
+# Initial per-candidate shadow bankroll used by selector internals.
+shadow_initial_bankroll_bnb = 0.5
+
+# Candidate table schema
+# Required keys per candidate:
+#   name
+#   lookback1_seconds
+#   lookback2_seconds
+#   lookback3_seconds
+#   weight1
+#   weight2
+#   weight3
+#   temperature_bps
+#   fixed_bet_bnb
+#   dislocation_threshold_pp
+#   nowcast_confidence_min
+#   cutoff_pool_total_min_bnb
+#   expected_net_min_bnb
+#   side_selection_mode
+#   market_extreme_min
+#   flow_window_seconds
+#   flow_min_imbalance
+#   flow_gate_mode
+#   adaptive_candidate_modes
+#   adaptive_window
+#   adaptive_min_history
+#   adaptive_score
+#   adaptive_fallback_mode
+#   stake_mode
+#   stake_min_bnb
+#   stake_max_bnb
+#   stake_ev_ref_bnb
+#   stake_max_side_pool_frac
+#   perf_adapt_mode
+#   perf_gate_window
+#   perf_gate_min_history
+#   perf_gate_min_win_rate
+#   perf_gate_min_mean_profit_bnb
+
+[[strategy.dislocation.candidates]]
+name = "disloc_best_20260227_x80"
+lookback1_seconds = 26
+lookback2_seconds = 150
+lookback3_seconds = 300
+weight1 = 1.0
+weight2 = 0.0
+weight3 = 0.0
+temperature_bps = 3.0
+fixed_bet_bnb = 0.3
+dislocation_threshold_pp = 0.15
+nowcast_confidence_min = 0.0
+cutoff_pool_total_min_bnb = 1.2
+expected_net_min_bnb = 0.18
+side_selection_mode = "nowcast_when_market_disagree"
+market_extreme_min = 0.0
+flow_window_seconds = 30
+flow_min_imbalance = 0.1
+flow_gate_mode = "against_side"
+adaptive_candidate_modes = []
+adaptive_window = 200
+adaptive_min_history = 100
+adaptive_score = "mean_profit_per_round"
+adaptive_fallback_mode = "nowcast_when_market_disagree"
+stake_mode = "ev_optimal"
+stake_min_bnb = 0.05
+stake_max_bnb = 0.35
+stake_ev_ref_bnb = 0.1
+stake_max_side_pool_frac = 1000000.0
+perf_adapt_mode = "skip"
+perf_gate_window = 120
+perf_gate_min_history = 60
+perf_gate_min_win_rate = 0.55
+perf_gate_min_mean_profit_bnb = 0.001
+
+[[strategy.dislocation.candidates]]
+name = "disloc_altA_20260227_x80"
+lookback1_seconds = 26
+lookback2_seconds = 150
+lookback3_seconds = 300
+weight1 = 1.4
+weight2 = 0.0
+weight3 = 0.0
+temperature_bps = 2.5
+fixed_bet_bnb = 0.3
+dislocation_threshold_pp = 0.15
+nowcast_confidence_min = 0.0
+cutoff_pool_total_min_bnb = 1.2
+expected_net_min_bnb = 0.18
+side_selection_mode = "nowcast_when_market_disagree"
+market_extreme_min = 0.0
+flow_window_seconds = 30
+flow_min_imbalance = 0.1
+flow_gate_mode = "against_side"
+adaptive_candidate_modes = []
+adaptive_window = 200
+adaptive_min_history = 100
+adaptive_score = "mean_profit_per_round"
+adaptive_fallback_mode = "nowcast_when_market_disagree"
+stake_mode = "fixed"
+stake_min_bnb = 0.05
+stake_max_bnb = 0.3
+stake_ev_ref_bnb = 0.1
+stake_max_side_pool_frac = 1000000.0
+perf_adapt_mode = "skip"
+perf_gate_window = 80
+perf_gate_min_history = 40
+perf_gate_min_win_rate = 0.52
+perf_gate_min_mean_profit_bnb = 0.0
+
+[[strategy.dislocation.candidates]]
+name = "disloc_altB_20260227_x80"
+lookback1_seconds = 26
+lookback2_seconds = 150
+lookback3_seconds = 300
+weight1 = 1.4
+weight2 = 0.0
+weight3 = 0.0
+temperature_bps = 2.5
+fixed_bet_bnb = 0.3
+dislocation_threshold_pp = 0.15
+nowcast_confidence_min = 0.0
+cutoff_pool_total_min_bnb = 1.2
+expected_net_min_bnb = 0.18
+side_selection_mode = "nowcast_when_market_disagree"
+market_extreme_min = 0.0
+flow_window_seconds = 30
+flow_min_imbalance = 0.1
+flow_gate_mode = "off"
+adaptive_candidate_modes = []
+adaptive_window = 200
+adaptive_min_history = 100
+adaptive_score = "mean_profit_per_round"
+adaptive_fallback_mode = "nowcast_when_market_disagree"
+stake_mode = "fixed"
+stake_min_bnb = 0.05
+stake_max_bnb = 0.3
+stake_ev_ref_bnb = 0.1
+stake_max_side_pool_frac = 1000000.0
+perf_adapt_mode = "skip"
+perf_gate_window = 80
+perf_gate_min_history = 40
+perf_gate_min_win_rate = 0.52
+perf_gate_min_mean_profit_bnb = 0.0
+
+[[strategy.dislocation.candidates]]
+name = "disloc_cons_20260227_x80"
+lookback1_seconds = 26
+lookback2_seconds = 150
+lookback3_seconds = 300
+weight1 = 1.0
+weight2 = 0.0
+weight3 = 0.0
+temperature_bps = 3.0
+fixed_bet_bnb = 0.3
+dislocation_threshold_pp = 0.1
+nowcast_confidence_min = 0.0
+cutoff_pool_total_min_bnb = 2.0
+expected_net_min_bnb = 0.18
+side_selection_mode = "nowcast_when_market_disagree"
+market_extreme_min = 0.0
+flow_window_seconds = 30
+flow_min_imbalance = 0.1
+flow_gate_mode = "against_side"
+adaptive_candidate_modes = []
+adaptive_window = 200
+adaptive_min_history = 100
+adaptive_score = "mean_profit_per_round"
+adaptive_fallback_mode = "nowcast_when_market_disagree"
+stake_mode = "ev_optimal"
+stake_min_bnb = 0.05
+stake_max_bnb = 0.35
+stake_ev_ref_bnb = 0.1
+stake_max_side_pool_frac = 1000000.0
+perf_adapt_mode = "skip"
+perf_gate_window = 120
+perf_gate_min_history = 60
+perf_gate_min_win_rate = 0.55
+perf_gate_min_mean_profit_bnb = 0.001
+
+[[strategy.dislocation.candidates]]
+name = "disloc_stageG2_r37_x80"
+lookback1_seconds = 30
+lookback2_seconds = 150
+lookback3_seconds = 300
+weight1 = 1.4
+weight2 = 0.0
+weight3 = 0.0
+temperature_bps = 6.0
+fixed_bet_bnb = 0.4
+dislocation_threshold_pp = 0.5
+nowcast_confidence_min = 0.0
+cutoff_pool_total_min_bnb = 2.0
+expected_net_min_bnb = 0.146
+side_selection_mode = "market_contra"
+market_extreme_min = 0.0
+flow_window_seconds = 0
+flow_min_imbalance = 0.0
+flow_gate_mode = "off"
+adaptive_candidate_modes = []
+adaptive_window = 200
+adaptive_min_history = 100
+adaptive_score = "mean_profit_per_round"
+adaptive_fallback_mode = "nowcast_when_market_disagree"
+stake_mode = "fixed"
+stake_min_bnb = 0.05
+stake_max_bnb = 0.4
+stake_ev_ref_bnb = 0.1
+stake_max_side_pool_frac = 1000000.0
+perf_adapt_mode = "off"
+perf_gate_window = 0
+perf_gate_min_history = 0
+perf_gate_min_win_rate = 0.0
+perf_gate_min_mean_profit_bnb = 0.0
+
+[[strategy.dislocation.candidates]]
+name = "disloc_stageH_sidenowcast_when_market_disagree_perfflip_w80_h40_wr0p5_mnm0p001_x80"
+lookback1_seconds = 26
+lookback2_seconds = 150
+lookback3_seconds = 300
+weight1 = 1.4
+weight2 = 0.0
+weight3 = 0.0
+temperature_bps = 2.5
+fixed_bet_bnb = 0.3
+dislocation_threshold_pp = 0.15
+nowcast_confidence_min = 0.0
+cutoff_pool_total_min_bnb = 1.2
+expected_net_min_bnb = 0.18
+side_selection_mode = "nowcast_when_market_disagree"
+market_extreme_min = 0.0
+flow_window_seconds = 30
+flow_min_imbalance = 0.1
+flow_gate_mode = "against_side"
+adaptive_candidate_modes = []
+adaptive_window = 200
+adaptive_min_history = 100
+adaptive_score = "mean_profit_per_round"
+adaptive_fallback_mode = "nowcast_when_market_disagree"
+stake_mode = "fixed"
+stake_min_bnb = 0.05
+stake_max_bnb = 0.3
+stake_ev_ref_bnb = 0.1
+stake_max_side_pool_frac = 1000000.0
+perf_adapt_mode = "flip"
+perf_gate_window = 80
+perf_gate_min_history = 40
+perf_gate_min_win_rate = 0.5
+perf_gate_min_mean_profit_bnb = -0.001
+
+[[strategy.dislocation.candidates]]
+name = "disloc_stageB_side_adaptive_shadow_ev0p146_skip_w80_h40_wr0p52_mn0p0_x80"
+lookback1_seconds = 18
+lookback2_seconds = 150
+lookback3_seconds = 300
+weight1 = 2.2
+weight2 = 0.0
+weight3 = 0.0
+temperature_bps = 5.0
+fixed_bet_bnb = 0.2
+dislocation_threshold_pp = 0.35
+nowcast_confidence_min = 0.0
+cutoff_pool_total_min_bnb = 1.2
+expected_net_min_bnb = 0.146
+side_selection_mode = "adaptive_shadow"
+market_extreme_min = 0.0
+flow_window_seconds = 0
+flow_min_imbalance = 0.0
+flow_gate_mode = "off"
+adaptive_candidate_modes = ["nowcast_when_market_disagree", "ev_max", "nowcast_contra"]
+adaptive_window = 200
+adaptive_min_history = 100
+adaptive_score = "mean_profit_per_round"
+adaptive_fallback_mode = "nowcast_when_market_disagree"
+stake_mode = "fixed"
+stake_min_bnb = 0.05
+stake_max_bnb = 0.2
+stake_ev_ref_bnb = 0.1
+stake_max_side_pool_frac = 1000000.0
+perf_adapt_mode = "skip"
+perf_gate_window = 80
+perf_gate_min_history = 40
+perf_gate_min_win_rate = 0.52
+perf_gate_min_mean_profit_bnb = 0.0
 
 [backtest]
-# Number of most-recent closed rounds to simulate.
-# Example: 5000
-simulation_size = 200
+# Number of most-recent closed rounds to replay.
+simulation_size = 20000
 
-# Starting bankroll for deterministic backtests (BNB).
-initial_bankroll_bnb = 0.5
+# Starting bankroll for backtest replay.
+initial_bankroll_bnb = 50.0
+
+# Backtest reset mode: continuous | chunk_reset
+reset_mode = "continuous"
+
+# Reset interval in rounds when reset_mode="chunk_reset".
+reset_every_rounds = 0

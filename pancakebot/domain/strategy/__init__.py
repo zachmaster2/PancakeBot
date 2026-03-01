@@ -1,9 +1,10 @@
-"""Planning / decision pipeline.
+"""Production strategy package.
 
-This package holds the shared per-epoch planning code used by:
-  - live runtime
-  - dry runtime
-  - backtest
+This package holds the single production strategy engine used by:
+  - live mode
+  - dry mode
+  - backtest mode
 
-Import from pancakebot.domain.strategy.planner explicitly.
+Use `pancakebot.domain.strategy.dislocation_cellmean_engine` as the canonical
+entrypoint until the next strategy-module rename pass.
 """

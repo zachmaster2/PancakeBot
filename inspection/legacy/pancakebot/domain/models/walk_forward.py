@@ -31,21 +31,25 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from pancakebot.core.constants import GAS_COST_BET_BNB
 from pancakebot.domain.types import Round
 from pancakebot.domain.features.feature_builder import build_features, vectorize
 from pancakebot.domain.features.schema import FEATURE_SCHEMA, max_required_context_klines_size, max_required_prior_context_rounds_size
 from pancakebot.domain.features.targets import compute_pool_forecast_targets, compute_price_targets
 from pancakebot.domain.models.calibration import IsotonicCalibrator
 from pancakebot.domain.models.final_pool_model import FinalPoolModel
+from pancakebot.domain.models.predictability_model import PredictabilityModel
 from pancakebot.domain.models.price_return_model import PriceReturnModel
 from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
+from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
 
 @dataclass(frozen=True, slots=True)
 class WalkForwardModels:
     price_model: PriceReturnModel
     pool_model: FinalPoolModel
+    predictability_model: PredictabilityModel
 
 
 @dataclass(slots=True)
@@ -203,6 +207,17 @@ def predict_probabilities(*, state: WalkForwardState, mu: float) -> float:
     return float(p_final)
 
 
+def predict_tradeable_probability(*, state: WalkForwardState, x_row: list[float]) -> float:
+    if state.models is None:
+        raise InvariantError("predict_tradeable_without_models")
+    p = float(state.models.predictability_model.predict_proba([list(x_row)])[0])
+    if not math.isfinite(p):
+        raise InvariantError("predict_tradeable_non_finite")
+    if p < 0.0 or p > 1.0:
+        raise InvariantError("predict_tradeable_out_of_range")
+    return float(p)
+
+
 def _train_and_maybe_calibrate(
     *,
     cfg: Any,
@@ -234,6 +249,8 @@ def _train_and_maybe_calibrate(
         x_pool_train,
         y_late_inflow_total,
         y_late_inflow_bull_frac,
+        x_gate_train,
+        y_tradeable_train,
     ) = _build_training_rows(
         cfg=cfg,
         rounds=tail,
@@ -265,7 +282,17 @@ def _train_and_maybe_calibrate(
             y_late_inflow_bull_frac,
             sample_weight=train_sample_weight,
         )
-        models = WalkForwardModels(price_model=price_model, pool_model=pool_model)
+        predictability_model = PredictabilityModel(seed=int(cfg.random_seed))
+        predictability_model.fit(
+            x_gate_train,
+            y_tradeable_train,
+            sample_weight=train_sample_weight,
+        )
+        models = WalkForwardModels(
+            price_model=price_model,
+            pool_model=pool_model,
+            predictability_model=predictability_model,
+        )
 
         calibrator_final = _fit_final_calibrator(
             mu_cal=[0.0, 1.0],
@@ -281,6 +308,8 @@ def _train_and_maybe_calibrate(
         x_pool_cal,
         y_late_inflow_total_cal,
         y_late_inflow_bull_frac_cal,
+        x_gate_cal,
+        y_tradeable_cal,
     ) = _build_training_rows(
         cfg=cfg,
         rounds=tail,
@@ -321,8 +350,20 @@ def _train_and_maybe_calibrate(
         y_frac_eval=y_late_inflow_bull_frac_cal,
         sample_weight=train_sample_weight,
     )
+    predictability_model = PredictabilityModel(seed=int(cfg.random_seed))
+    predictability_model.fit(
+        x_gate_train,
+        y_tradeable_train,
+        x_eval=x_gate_cal,
+        y_eval=y_tradeable_cal,
+        sample_weight=train_sample_weight,
+    )
 
-    models = WalkForwardModels(price_model=price_model, pool_model=pool_model)
+    models = WalkForwardModels(
+        price_model=price_model,
+        pool_model=pool_model,
+        predictability_model=predictability_model,
+    )
 
     mu_cal = list(models.price_model.predict(x_price_cal))
     calibrator_final = _fit_final_calibrator(
@@ -359,12 +400,29 @@ def _build_calibration_rows(
     cal_begin = k
     cal_end = cal_begin + int(calibrate_size)
 
-    return _build_training_rows(
+    (
+        x_price_cal,
+        y_ret_cal,
+        y_up_cal,
+        x_pool_cal,
+        y_late_inflow_total_cal,
+        y_late_inflow_bull_frac_cal,
+        _x_gate_cal,
+        _y_tradeable_cal,
+    ) = _build_training_rows(
         cfg=cfg,
         rounds=tail,
         target_begin=int(cal_begin),
         target_end=int(cal_end),
         prior_context_rounds_required=int(k),
+    )
+    return (
+        x_price_cal,
+        y_ret_cal,
+        y_up_cal,
+        x_pool_cal,
+        y_late_inflow_total_cal,
+        y_late_inflow_bull_frac_cal,
     )
 
 
@@ -573,6 +631,24 @@ def _context_klines_for_round(*, cfg, round_t: Round) -> list:
     return cfg.klines_store.get_context_klines(anchor_close_time_ms=int(anchor_ms), size=int(kk))
 
 
+def _tradeable_label(*, cfg: Any, round_t: Round, feats: dict[str, float]) -> int:
+    baseline_bet = float(getattr(cfg, "predictability_baseline_bet_bnb", 0.05))
+    if not math.isfinite(float(baseline_bet)) or float(baseline_bet) <= 0.0:
+        raise InvariantError("predictability_baseline_bet_bnb_invalid")
+
+    log_imb = float(feats.get("log_imb_w_p_80_to_p_100", float("nan")))
+    side = "Bull" if (not math.isfinite(float(log_imb)) or float(log_imb) >= 0.0) else "Bear"
+
+    settled = settle_bet_against_closed_round(
+        bet_bnb=float(baseline_bet),
+        bet_side=str(side),
+        round_closed=round_t,
+        treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+    )
+    pnl = float(settled.credit_bnb) - float(baseline_bet) - float(GAS_COST_BET_BNB)
+    return 1 if float(pnl) > 0.0 else 0
+
+
 def _build_training_rows(
     *,
     cfg: Any,
@@ -598,6 +674,8 @@ def _build_training_rows(
     x_pool: list[list[float]] = []
     y_late_inflow_total: list[float] = []
     y_late_inflow_bull_frac: list[float] = []
+    x_gate: list[list[float]] = []
+    y_tradeable: list[int] = []
 
     used = 0
     for i in range(int(target_begin), int(target_end)):
@@ -624,6 +702,7 @@ def _build_training_rows(
 
         x_price.append(vectorize(features=feats, schema=FEATURE_SCHEMA))
         x_pool.append(vectorize(features=feats, schema=FEATURE_SCHEMA))
+        x_gate.append(vectorize(features=feats, schema=FEATURE_SCHEMA))
 
         price_targets = compute_price_targets(round_t=r_t)
         ret_open = float(price_targets.ret_open)
@@ -645,10 +724,12 @@ def _build_training_rows(
         y_late_inflow_total.append(float(late_total))
         y_late_inflow_bull_frac.append(float(late_frac))
 
+        y_tradeable.append(int(_tradeable_label(cfg=cfg, round_t=r_t, feats=feats)))
+
         used += 1
 
     if used <= 0:
         raise InvariantError("train_insufficient_history")
 
-    return x_price, y_ret, y_up, x_pool, y_late_inflow_total, y_late_inflow_bull_frac
+    return x_price, y_ret, y_up, x_pool, y_late_inflow_total, y_late_inflow_bull_frac, x_gate, y_tradeable
 

@@ -9,12 +9,25 @@ Chronological decision record for long-running cleanup/refactor work.
 3. Set explicit rule: no backward compatibility layers during restructure.
 4. Set explicit rule: move legacy probe code to `inspection/legacy` for one
    transition cycle.
+5. Replaced hardcoded dislocation candidate family with config-driven builder
+   in production strategy engine wiring.
+6. Refactored runtime/backtest strategy config path to
+   `strategy.dislocation.{selector,candidates}`.
+7. Removed legacy runtime/model/policy knobs from active `AppConfig`,
+   `RuntimeConfig`, and `load_config.py`.
+8. Rewrote `config.toml` to lean production schema with explicit dislocation
+   candidate tables.
+9. Archived dead production model/planner/policy modules under
+   `inspection/legacy/pancakebot/` and removed them from active production
+   tree.
+10. Smoke-validated canonical probe path with
+    `python -m inspection.run_backtest_scenario --name smoke_refactor_sync --sim-size 200`.
 
 ## Open Follow-Ups
 
-1. Finalize the lean production runtime config surface.
-2. Remove legacy production pipeline modules from `pancakebot/` after probe
-   migration and compile checks.
-3. Move old inspection scripts into `inspection/legacy`.
-4. Rebuild `inspection/run_backtest_scenario.py` as a thin canonical runner.
-5. Push tunable dislocation candidate knobs into `config.toml` and schema.
+1. Rename `dislocation_cellmean_engine.py` to a cleaner strategy-module name
+   now that legacy path dependencies are removed.
+2. Continue reducing redundant feature fields/constants that are no longer
+   needed by the dislocation-only pipeline.
+3. Run broader scenario matrix and compare against pre-refactor baselines for
+   behavior parity.

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pancakebot.backtest.config import BacktestConfig
-from pancakebot.config.policy_config import PolicyConfig
+from pancakebot.config.strategy_config import StrategyConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,21 +17,16 @@ class AppConfig:
 
     # Runtime
     cutoff_seconds: int
-    train_size: int
-    retrain_interval: int
-    calibrate_size: int
-    recalibrate_interval: int
-    recency_weight_floor: float
-    recency_weight_power: float
     random_seed: int
+    use_onchain_event_bets: bool
+    event_lookback_blocks: int
+    event_freshness_slack_seconds: int
+    latency_log_path: str
+    wait_for_bet_receipt: bool
+    bet_receipt_timeout_seconds: int
 
-    # Model hyperparameters
-    price_alpha: float
-    pool_alpha_total: float
-    pool_alpha_ratio: float
-
-    # Policy
-    policy: PolicyConfig
+    # Strategy
+    strategy: StrategyConfig
 
     # Backtest options. Live and dry ignore these.
     backtest: BacktestConfig
