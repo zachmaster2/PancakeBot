@@ -13,12 +13,19 @@ Modeling details:
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
-import pandas as pd
 from lightgbm import LGBMRegressor, early_stopping
 
 from pancakebot.core.errors import InvariantError
+
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"X does not have valid feature names, but LGBM(Classifier|Regressor) was fitted with feature names",
+    category=UserWarning,
+)
 
 
 _LGBM_LATE_TOTAL = {
@@ -93,7 +100,7 @@ class FinalPoolModel:
             n_estimators=int(_TRAINING["num_boost_round"]),
             **frac_params,
         )
-        self._feature_names: list[str] | None = None
+        self._n_features: int | None = None
 
     @staticmethod
     def _to_2d_array(x) -> np.ndarray:
@@ -101,12 +108,6 @@ class FinalPoolModel:
         if arr.ndim != 2:
             raise InvariantError("pool_x_not_2d")
         return arr
-
-    @staticmethod
-    def _make_feature_names(n_features: int) -> list[str]:
-        if int(n_features) <= 0:
-            raise InvariantError("pool_feature_count_nonpositive")
-        return [f"f{idx}" for idx in range(int(n_features))]
 
     @staticmethod
     def _logit(p: float) -> float:
@@ -176,8 +177,6 @@ class FinalPoolModel:
         x_arr = self._to_2d_array(x)
         if x_arr.ndim != 2 or x_arr.shape[0] <= 1 or x_arr.shape[1] <= 0:
             raise InvariantError("pool_fit_x_shape_invalid")
-        feature_names = self._make_feature_names(int(x_arr.shape[1]))
-        x_df = pd.DataFrame(x_arr, columns=feature_names)
 
         raw_total = np.asarray(list(y_late_inflow_total_bnb), dtype=float)
         if raw_total.ndim != 1 or len(raw_total) <= 1:
@@ -217,7 +216,6 @@ class FinalPoolModel:
             x_eval_arr = self._to_2d_array(x_eval)
             if x_eval_arr.ndim != 2 or x_eval_arr.shape[0] <= 0 or x_eval_arr.shape[1] != x_arr.shape[1]:
                 raise InvariantError("pool_eval_x_shape_invalid")
-            x_eval_df = pd.DataFrame(x_eval_arr, columns=feature_names)
             y_total_eval_log = self._transform_total_targets(y_total_eval, winsor_cap=float(winsor_cap))
             y_frac_eval_logit = self._transform_frac_targets(y_frac_eval)
             if len(y_total_eval_log) != int(x_eval_arr.shape[0]):
@@ -226,7 +224,7 @@ class FinalPoolModel:
                 raise InvariantError("late_inflow_frac_eval_len_mismatch")
 
             if len(y_total_eval_log) > 1:
-                fit_total_kwargs["eval_set"] = [(x_eval_df, y_total_eval_log)]
+                fit_total_kwargs["eval_set"] = [(x_eval_arr, y_total_eval_log)]
                 fit_total_kwargs["eval_metric"] = "l2"
                 fit_total_kwargs["callbacks"] = [
                     early_stopping(
@@ -237,7 +235,7 @@ class FinalPoolModel:
                 ]
 
             if len(y_frac_eval_logit) > 1:
-                fit_frac_kwargs["eval_set"] = [(x_eval_df, y_frac_eval_logit)]
+                fit_frac_kwargs["eval_set"] = [(x_eval_arr, y_frac_eval_logit)]
                 fit_frac_kwargs["eval_metric"] = "l2"
                 fit_frac_kwargs["callbacks"] = [
                     early_stopping(
@@ -251,24 +249,22 @@ class FinalPoolModel:
             fit_total_kwargs["sample_weight"] = sample_weight_arr
             fit_frac_kwargs["sample_weight"] = sample_weight_arr
 
-        self._m_total_log1p.fit(x_df, y_total_log, **fit_total_kwargs)
-        self._m_frac_logit.fit(x_df, y_frac_logit, **fit_frac_kwargs)
-        self._feature_names = feature_names
+        self._m_total_log1p.fit(x_arr, y_total_log, **fit_total_kwargs)
+        self._m_frac_logit.fit(x_arr, y_frac_logit, **fit_frac_kwargs)
+        self._n_features = int(x_arr.shape[1])
 
     def predict(self, x):
-        if self._feature_names is None:
+        if self._n_features is None:
             raise InvariantError("pool_predict_without_fit")
 
         x_arr = self._to_2d_array(x)
         if x_arr.ndim != 2 or x_arr.shape[0] <= 0:
             raise InvariantError("pool_predict_x_shape_invalid")
-        if int(x_arr.shape[1]) != int(len(self._feature_names)):
+        if int(x_arr.shape[1]) != int(self._n_features):
             raise InvariantError("pool_predict_feature_count_mismatch")
 
-        x_df = pd.DataFrame(x_arr, columns=self._feature_names)
-
-        total_log = np.asarray(self._m_total_log1p.predict(x_df), dtype=float)
-        frac_logit = np.asarray(self._m_frac_logit.predict(x_df), dtype=float)
+        total_log = np.asarray(self._m_total_log1p.predict(x_arr), dtype=float)
+        frac_logit = np.asarray(self._m_frac_logit.predict(x_arr), dtype=float)
         if total_log.shape != frac_logit.shape:
             raise InvariantError("pool_predict_head_shape_mismatch")
         if not np.all(np.isfinite(total_log)):

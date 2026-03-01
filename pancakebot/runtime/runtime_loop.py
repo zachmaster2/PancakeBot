@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-from pancakebot.config.policy_config import PolicyConfig
+from pancakebot.config.strategy_config import StrategyConfig
 from pancakebot.core.constants import (
     BNB_WEI,
     GAS_LIMIT_BET,
@@ -26,20 +27,22 @@ from pancakebot.core.constants import (
 )
 from pancakebot.domain.closed_rounds_cache import RollingClosedRoundsCache
 from pancakebot.infra.closed_rounds_sync import sync_closed_rounds
-from pancakebot.runtime.cache_policy import compute_required_cache_size
 from pancakebot.infra.graph_client import GraphClient
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
 from pancakebot.infra.klines_store import KlinesStore
 from pancakebot.infra.binance_us_client import BinanceUsClient
 from pancakebot.infra.klines_sync import ensure_klines_coverage
 from pancakebot.domain.klines_cache import RollingKlinesCache
-from pancakebot.domain.types import Kline, Round
+from pancakebot.domain.types import Bet, Kline, Round
 from pancakebot.domain.features.schema import max_required_context_klines_size, max_required_prior_context_rounds_size
 from pancakebot.domain.contiguity import check_klines_contiguous, check_rounds_contiguous
 from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionContract
-from pancakebot.domain.strategy.planner import build_inputs, predict, size_bet
+from pancakebot.domain.strategy.dislocation_cellmean_engine import (
+    DislocationCellMeanEngine,
+    LiveStrategyDecision,
+    build_dislocation_cellmean_engine_from_config,
+)
 from pancakebot.runtime.claim_manager import claim_scan_cursor
-from pancakebot.runtime.model_manager import ModelManager
 from pancakebot.runtime.contract_constants_cache import ContractConstants, save_contract_constants
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 from pancakebot.runtime.sleep import sleep_seconds
@@ -82,35 +85,23 @@ class RuntimeConfig:
     # Feature cutoff
     cutoff_seconds: int
 
-    # Policy config
-    policy_cfg: PolicyConfig
+    # Strategy config
+    strategy_cfg: StrategyConfig
 
     # Protocol constants (cached at startup)
     treasury_fee_fraction: float
     buffer_seconds: int
     min_bet_amount_bnb: float
 
-    # Training window sizing
-    train_size: int
+    # Optional on-chain bet-event replacement for target-round bets at cutoff.
+    use_onchain_event_bets: bool
+    event_lookback_blocks: int
+    event_freshness_slack_seconds: int
 
-    # Retrain cadence
-    retrain_interval: int
-
-    # Calibration window sizing (Step 2+). Step 1 wiring only.
-    calibrate_size: int
-
-    # Recalibrate cadence (Step 2+). Step 1 wiring only.
-    recalibrate_interval: int
-
-    # Deterministic recency weighting for walk-forward train/calibration rows.
-    recency_weight_floor: float
-    recency_weight_power: float
-
-    # Model hyperparameters
-    price_alpha: float
-    pool_alpha_total: float
-    pool_alpha_ratio: float
-    random_seed: int
+    # Runtime latency telemetry.
+    latency_log_path: str
+    wait_for_bet_receipt: bool
+    bet_receipt_timeout_seconds: int
 
     # Execution
     dry: bool
@@ -121,7 +112,7 @@ class _ClosedState:
     cache: RollingClosedRoundsCache
     disk_latest_epoch: int
     klines_cache: RollingKlinesCache
-    model_manager: ModelManager
+    dislocation_engine: DislocationCellMeanEngine | None = None
     claim_scan_initialized: bool = False
     simulated_bankroll_bnb: float | None = None
     dry_bets_by_epoch: dict[int, dict[str, object]] | None = None
@@ -238,6 +229,79 @@ def _append_jsonl(path: str, record: dict[str, object]) -> None:
     with open(path, "a") as f:
         f.write(json.dumps(record, separators=(",", ":"), sort_keys=True))
         f.write("\n")
+
+
+def _mono_ms() -> float:
+    return float(time.perf_counter() * 1000.0)
+
+
+def _replace_open_round_bets_from_events(
+    *,
+    cfg: RuntimeConfig,
+    open_round: Round,
+    cutoff_ts: int,
+) -> tuple[Round | None, str | None]:
+    if not bool(cfg.use_onchain_event_bets):
+        return open_round, None
+
+    head_block = int(cfg.contract.latest_block_number())
+    head_ts = int(cfg.contract.block_timestamp(int(head_block)))
+    if int(head_ts) < int(cutoff_ts):
+        return None, "event_chain_head_behind_cutoff"
+
+    lookback_blocks = int(cfg.event_lookback_blocks)
+    if lookback_blocks <= 0:
+        raise InvariantError("event_lookback_blocks_nonpositive")
+
+    from_block = int(max(1, int(head_block) - int(lookback_blocks)))
+    from_block_ts = int(cfg.contract.block_timestamp(int(from_block)))
+    if int(from_block_ts) > int(open_round.start_at):
+        return None, "event_lookback_insufficient_for_round_start"
+
+    events = cfg.contract.fetch_bet_events_for_epoch(
+        epoch=int(open_round.epoch),
+        from_block=int(from_block),
+        to_block=int(head_block),
+    )
+    event_bets = tuple(
+        Bet(
+            wallet_address=str(ev.wallet_address),
+            amount_wei=int(ev.amount_wei),
+            position=str(ev.position),
+            created_at=int(ev.block_timestamp),
+        )
+        for ev in events
+    )
+
+    if int(cfg.event_freshness_slack_seconds) < 0:
+        raise InvariantError("event_freshness_slack_seconds_negative")
+
+    out = Round(
+        epoch=int(open_round.epoch),
+        start_at=int(open_round.start_at),
+        lock_at=open_round.lock_at,
+        close_at=open_round.close_at,
+        lock_price=open_round.lock_price,
+        close_price=open_round.close_price,
+        position=open_round.position,
+        failed=open_round.failed,
+        bets=event_bets,
+    )
+
+    info(
+        "RUN",
+        "DATA",
+        "EVENTBETS",
+        msg=(
+            f"epoch={int(open_round.epoch)} "
+            f"events={int(len(event_bets))} "
+            f"from_block={int(from_block)} "
+            f"to_block={int(head_block)} "
+            f"head_ts={int(head_ts)} "
+            f"cutoff_ts={int(cutoff_ts)}"
+        ),
+    )
+    return out, None
 
 
 def _load_dry_bets(path: str) -> dict[int, dict[str, object]]:
@@ -471,17 +535,16 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
 def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     """Startup-only closed rounds sync + in-memory cache load."""
     k = int(max_required_prior_context_rounds_size())
-    train_size = int(cfg.train_size)
-    calibrate_size = int(cfg.calibrate_size)
-    retrain_interval = int(cfg.retrain_interval)
-    recalibrate_interval = int(cfg.recalibrate_interval)
+    warmup_rounds = int(cfg.strategy_cfg.dislocation.selector.warmup_rounds)
+    if warmup_rounds <= 0:
+        raise InvariantError("dislocation_warmup_rounds_nonpositive")
 
     if k <= 0:
         context_desc = "target_only"
     else:
         context_desc = f"prior_context_rounds[{int(k)}]"
 
-    inference_closed_cache_needed = int(k) + int(train_size) + int(calibrate_size)
+    cache_n = max(2, int(warmup_rounds))
 
     info(
         "CORE",
@@ -489,19 +552,9 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
         "SETUP",
         msg=(
             f"Core setup: prior_context_rounds_required={int(k)} context={context_desc} "
-            f"train_size={int(train_size)} calibrate_size={int(calibrate_size)} "
-            f"retrain_interval={int(retrain_interval)} recalibrate_interval={int(recalibrate_interval)}"
-            + (
-                f" inference_closed_cache_needed={int(inference_closed_cache_needed)}"
-                if inference_closed_cache_needed is not None
-                else ""
-            )
+            f"strategy=dislocation warmup_rounds={int(warmup_rounds)} "
+            f"inference_closed_cache_needed={int(cache_n)}"
         ),
-    )
-
-    cache_n = compute_required_cache_size(
-        train_size=train_size,
-        calibrate_size=calibrate_size,
     )
 
     info(
@@ -555,12 +608,8 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
         msg=f"Closed rounds sync complete: stored_n={int(stored_n)} cache_epochs=[{int(cache_lo)}..{int(cache_hi)}]",
     )
 
-    required = compute_required_cache_size(
-        train_size=train_size,
-        calibrate_size=calibrate_size,
-    )
-    if len(cache.rounds) < required:
-        raise InvariantError("insufficient_closed_rounds_for_training")
+    if len(cache.rounds) < 2:
+        raise InvariantError("insufficient_closed_rounds_for_dislocation_strategy")
 
     disk_latest_epoch = int(cache.rounds[-1].epoch)
 
@@ -574,11 +623,20 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     )
 
     klines_cache = _init_klines_cache(cfg=cfg, closed_cache=cache)
+    dislocation_engine = build_dislocation_cellmean_engine_from_config(
+        selector_cfg=cfg.strategy_cfg.dislocation.selector,
+        candidate_cfgs=cfg.strategy_cfg.dislocation.candidates,
+        treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+        cutoff_seconds=int(cfg.cutoff_seconds),
+    )
+    dislocation_engine.refresh_klines(list(klines_cache.klines))
+    dislocation_engine.bootstrap_from_closed_rounds(list(cache.rounds))
+
     closed = _ClosedState(
         cache=cache,
         disk_latest_epoch=disk_latest_epoch,
         klines_cache=klines_cache,
-        model_manager=ModelManager(),
+        dislocation_engine=dislocation_engine,
     )
 
     if cfg.dry:
@@ -623,8 +681,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _dry_settle_available_bets(cfg, closed)
             closed.claim_scan_initialized = True
 
-        # Step 3: Train models and regime thresholds using the in-memory closed-rounds cache.
-        wf_state = closed.model_manager.step(cfg=cfg, closed_rounds=closed.cache.rounds, current_epoch=int(current_epoch))
+        # Step 3: Update strategy owner state from newly-closed rounds.
+        if closed.dislocation_engine is None:
+            raise InvariantError("dislocation_engine_missing")
+        closed.dislocation_engine.refresh_klines(list(closed.klines_cache.klines))
+        closed.dislocation_engine.settle_closed_rounds(list(closed.cache.rounds))
 
         # Step 4: Fetch lock_ts(t) (RPC) for open epoch.
         lock_ts_t = int(cfg.contract.lock_ts(int(current_epoch)))
@@ -698,7 +759,19 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             # Alignment moved; restart anchoring.
             continue
 
-        # Step 8-10: Plan (build feats -> predict -> size) using the shared planner API.
+        open_round, event_skip = _replace_open_round_bets_from_events(
+            cfg=cfg,
+            open_round=open_round,
+            cutoff_ts=int(cutoff_ts_t),
+        )
+        if event_skip is not None:
+            info("RUN", "ACT", "SKIP", msg=f"Skip epoch {int(current_epoch)}: {str(event_skip)}")
+            _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
+            return
+        if open_round is None:
+            raise InvariantError("event_bets_open_round_missing")
+
+        # Step 8: Build context guards before deciding.
         k = int(max_required_prior_context_rounds_size())
         if int(k) <= 0:
             prior_context_rounds: list[Round] = []
@@ -739,15 +812,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
-        feats = build_inputs(
-            cfg=cfg,
-            prior_context_rounds=prior_context_rounds,
-            context_klines=context_klines,
-            target_round=open_round,
-        )
-
-        pred = predict(state=wf_state, feats=feats)
-
+        t_features_start_ms = _mono_ms()
+        pred_p_final = 0.5
         if cfg.dry:
             if closed.simulated_bankroll_bnb is None:
                 raise InvariantError("dry_bankroll_uninitialized")
@@ -755,19 +821,20 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         else:
             bankroll_bnb = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
 
-        decision = size_bet(cfg=cfg, pred=pred, bankroll_bnb=bankroll_bnb)
+        if closed.dislocation_engine is None:
+            raise InvariantError("dislocation_engine_missing")
+        decision = closed.dislocation_engine.decide_open_round(
+            round_t=open_round,
+            bankroll_bnb=float(bankroll_bnb),
+        )
+        if decision.p_bull is not None:
+            pred_p_final = float(decision.p_bull)
+        t_decision_ready_ms = _mono_ms()
 
         if decision.action != "BET":
             reason = str(decision.skip_reason or "")
             if reason == "":
                 raise InvariantError("policy_skip_missing_reason")
-
-            allowed = {
-                "no_positive_ev",
-                "insufficient_bankroll_for_gas",
-            }
-            if reason not in allowed:
-                raise InvariantError(f"unexpected_policy_skip_reason: {reason}")
 
             info("RUN", "ACT", "SKIP", msg=f"Skip epoch {int(current_epoch)}: {reason}")
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
@@ -789,21 +856,26 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if amount_wei <= 0:
             raise InvariantError("bet_amount_wei_nonpositive")
 
+        tx_submit = None
         if not cfg.dry:
             gas_price_wei = cfg.contract.suggest_gas_price_wei()
             if decision.bet_side == "Bull":
-                cfg.contract.bet_bull(
+                tx_submit = cfg.contract.bet_bull_timed(
                     epoch=int(current_epoch),
                     amount_wei=int(amount_wei),
                     gas_limit=int(GAS_LIMIT_BET),
                     gas_price_wei=int(gas_price_wei),
+                    wait_receipt=bool(cfg.wait_for_bet_receipt),
+                    receipt_timeout_seconds=int(cfg.bet_receipt_timeout_seconds),
                 )
             elif decision.bet_side == "Bear":
-                cfg.contract.bet_bear(
+                tx_submit = cfg.contract.bet_bear_timed(
                     epoch=int(current_epoch),
                     amount_wei=int(amount_wei),
                     gas_limit=int(GAS_LIMIT_BET),
                     gas_price_wei=int(gas_price_wei),
+                    wait_receipt=bool(cfg.wait_for_bet_receipt),
+                    receipt_timeout_seconds=int(cfg.bet_receipt_timeout_seconds),
                 )
             else:
                 raise InvariantError(f"unexpected_bet_side: {decision.bet_side}")
@@ -824,6 +896,43 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     + bankroll_suffix(bankroll_bnb=bankroll_after_live, bnbusd_price=bnbusd_price)
                 ),
             )
+            if tx_submit is None:
+                raise InvariantError("live_bet_submit_missing")
+            receipt_confirmed_ms = (
+                float(tx_submit.t_receipt_confirmed_mono_ms)
+                if tx_submit.t_receipt_confirmed_mono_ms is not None
+                else None
+            )
+            latency_record = {
+                "epoch": int(current_epoch),
+                "cutoff_ts": int(cutoff_ts_t),
+                "t_features_start_mono_ms": float(t_features_start_ms),
+                "t_decision_ready_mono_ms": float(t_decision_ready_ms),
+                "t_tx_signed_mono_ms": float(tx_submit.t_tx_signed_mono_ms),
+                "t_tx_hash_received_mono_ms": float(tx_submit.t_tx_hash_received_mono_ms),
+                "t_receipt_confirmed_mono_ms": receipt_confirmed_ms,
+                "tx_hash": str(tx_submit.tx_hash),
+                "tx_included_block_number": int(tx_submit.included_block_number)
+                if tx_submit.included_block_number is not None
+                else None,
+                "tx_included_block_timestamp": int(tx_submit.included_block_timestamp)
+                if tx_submit.included_block_timestamp is not None
+                else None,
+                "latency_features_ms": float(t_decision_ready_ms) - float(t_features_start_ms),
+                "latency_sign_ms": float(tx_submit.t_tx_signed_mono_ms) - float(t_decision_ready_ms),
+                "latency_broadcast_ms": float(tx_submit.t_tx_hash_received_mono_ms) - float(tx_submit.t_tx_signed_mono_ms),
+                "latency_mempool_ms": (
+                    float(receipt_confirmed_ms) - float(tx_submit.t_tx_hash_received_mono_ms)
+                    if receipt_confirmed_ms is not None
+                    else None
+                ),
+                "latency_e2e_ms": (
+                    float(receipt_confirmed_ms) - float(t_features_start_ms)
+                    if receipt_confirmed_ms is not None
+                    else None
+                ),
+            }
+            _append_jsonl(str(cfg.latency_log_path), latency_record)
         else:
             # Step 14: Dry bookkeeping (including gas proxy) + record.
             if closed.simulated_bankroll_bnb is None:
@@ -849,7 +958,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 epoch=int(current_epoch),
                 side=str(decision.bet_side),
                 amount_bnb=float(amount_bnb),
-                p_final=float(pred.p_final),
+                p_final=float(pred_p_final),
                 expected_profit_bnb=float(decision.expected_profit_bnb),
                 bankroll_before_bet_bnb=float(bankroll_before_bet),
                 bankroll_after_bet_bnb=float(bankroll_after_bet),
