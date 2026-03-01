@@ -16,6 +16,9 @@ class CandidateSpec:
     columns_csv: str
 
 
+_FULL_FEATURES_TOKEN = "__FULL__"
+
+
 def _parse_candidate(spec: str) -> CandidateSpec:
     raw = str(spec).strip()
     if "=" not in raw:
@@ -47,16 +50,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--block-size", type=int, default=2000)
     p.add_argument("--num-blocks", type=int, default=5)
     p.add_argument("--skip-most-recent-blocks", type=int, default=0)
+    p.add_argument("--direction-model-type", type=str, choices=("lgbm", "logistic"), default="lgbm")
     p.add_argument("--calibration-mode", type=str, choices=("isotonic", "raw", "platt"), default="raw")
     p.add_argument("--window-order", type=str, choices=("cal_train", "train_cal", "train_in_sample"), default="cal_train")
     p.add_argument("--direction-filter-mode", type=str, choices=("none", "bull_only", "bear_only", "both_sides"), default="both_sides")
     p.add_argument("--direction-threshold-mode", type=str, choices=("fixed", "quantile"), default="quantile")
+    p.add_argument("--direction-threshold-bull", type=float, default=0.5)
+    p.add_argument("--direction-threshold-bear", type=float, default=0.5)
     p.add_argument("--direction-target-bull-rate", type=float, default=0.04)
     p.add_argument("--direction-target-bear-rate", type=float, default=0.01)
     p.add_argument("--direction-threshold-window", type=int, default=300)
     p.add_argument("--direction-center-mode", type=str, choices=("fixed_0p5", "rolling_median", "rolling_mean"), default="rolling_median")
     p.add_argument("--direction-center-window", type=int, default=300)
     p.add_argument("--direction-edge-floor-pp", type=float, default=0.001)
+    p.add_argument("--force-no-positive-ev", action="store_true", default=False)
+    p.add_argument("--no-positive-ev-floor-bnb", type=float, default=None)
+    p.add_argument("--ev-reliability-window", type=int, default=0)
+    p.add_argument("--ev-reliability-min-bets", type=int, default=20)
+    p.add_argument("--ev-reliability-quantile", type=float, default=0.70)
+    p.add_argument("--ev-reliability-min-mean-profit", type=float, default=0.0)
+    p.add_argument("--regime-filter", type=str, choices=("none", "pool_imbalance"), default="none")
+    p.add_argument("--regime-min-imbalance", type=float, default=0.12)
     p.add_argument("--direction-viability-hard-fail", action="store_true", default=False)
     p.add_argument("--fixed-bet-bnb", type=float, default=None)
     p.add_argument("--winrate-only", action="store_true", default=False)
@@ -85,16 +99,20 @@ def _run_one(*, args, scenario_name: str, columns_csv: str, sim_offset_rounds: i
         str(int(args.block_size)),
         "--sim-offset-rounds",
         str(int(sim_offset_rounds)),
+        "--direction-model-type",
+        str(args.direction_model_type),
         "--calibration-mode",
         str(args.calibration_mode),
         "--window-order",
         str(args.window_order),
-        "--sparse-probe-columns",
-        str(columns_csv),
         "--direction-filter-mode",
         str(args.direction_filter_mode),
         "--direction-threshold-mode",
         str(args.direction_threshold_mode),
+        "--direction-threshold-bull",
+        str(float(args.direction_threshold_bull)),
+        "--direction-threshold-bear",
+        str(float(args.direction_threshold_bear)),
         "--direction-target-bull-rate",
         str(float(args.direction_target_bull_rate)),
         "--direction-target-bear-rate",
@@ -107,9 +125,27 @@ def _run_one(*, args, scenario_name: str, columns_csv: str, sim_offset_rounds: i
         str(int(args.direction_center_window)),
         "--direction-edge-floor-pp",
         str(float(args.direction_edge_floor_pp)),
+        "--ev-reliability-window",
+        str(int(args.ev_reliability_window)),
+        "--ev-reliability-min-bets",
+        str(int(args.ev_reliability_min_bets)),
+        "--ev-reliability-quantile",
+        str(float(args.ev_reliability_quantile)),
+        "--ev-reliability-min-mean-profit",
+        str(float(args.ev_reliability_min_mean_profit)),
+        "--regime-filter",
+        str(args.regime_filter),
+        "--regime-min-imbalance",
+        str(float(args.regime_min_imbalance)),
     ]
+    if bool(args.force_no_positive_ev):
+        cmd.append("--force-no-positive-ev")
+    if args.no_positive_ev_floor_bnb is not None:
+        cmd.extend(["--no-positive-ev-floor-bnb", str(float(args.no_positive_ev_floor_bnb))])
     if bool(args.direction_viability_hard_fail):
         cmd.append("--direction-viability-hard-fail")
+    if str(columns_csv).strip() != _FULL_FEATURES_TOKEN:
+        cmd.extend(["--sparse-probe-columns", str(columns_csv)])
     if args.fixed_bet_bnb is not None:
         cmd.extend(["--fixed-bet-bnb", str(float(args.fixed_bet_bnb))])
     if bool(args.winrate_only):
@@ -216,7 +252,11 @@ def main() -> None:
                 sim_offset_rounds=int(offset),
             )
             row["candidate"] = str(cand.name)
-            row["features"] = str(cand.columns_csv)
+            row["features"] = (
+                "(full_feature_schema)"
+                if str(cand.columns_csv).strip() == _FULL_FEATURES_TOKEN
+                else str(cand.columns_csv)
+            )
             row["block_index"] = int(block_idx)
             cand_rows.append(row)
             all_block_rows.append(dict(row))
@@ -228,7 +268,11 @@ def main() -> None:
 
         agg = _aggregate(rows=cand_rows)
         agg["candidate"] = str(cand.name)
-        agg["features"] = str(cand.columns_csv)
+        agg["features"] = (
+            "(full_feature_schema)"
+            if str(cand.columns_csv).strip() == _FULL_FEATURES_TOKEN
+            else str(cand.columns_csv)
+        )
         agg_rows.append(agg)
 
     agg_rows_sorted = sorted(
