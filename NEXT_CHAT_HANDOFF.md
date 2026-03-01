@@ -33,6 +33,7 @@ Unify production around a single dislocation strategy pipeline, eliminate legacy
    - Moved to `inspection/legacy/pancakebot/...`:
      - `config/policy_config.py`
      - `domain/models/{final_pool_model,price_return_model,predictability_model,walk_forward}.py`
+     - `domain/models/{artifacts,calibration,dataset_builder,__init__}.py`
      - `domain/strategy/{planner,policy,ev_math,sizing}.py`
      - `runtime/{model_manager,cache_policy}.py`
    - Updated package docs:

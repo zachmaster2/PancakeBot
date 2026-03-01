@@ -26,6 +26,9 @@ Chronological decision record for long-running cleanup/refactor work.
     - file: `dislocation_engine.py`
     - class: `DislocationEngine`
     - builder: `build_dislocation_engine_from_config(...)`
+12. Archived remaining dead `pancakebot/domain/models/*` placeholder modules
+    under `inspection/legacy/pancakebot/domain/models/` and removed active
+    references from production tree.
 
 ## Open Follow-Ups
 
