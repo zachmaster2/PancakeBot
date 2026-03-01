@@ -22,12 +22,14 @@ Chronological decision record for long-running cleanup/refactor work.
    tree.
 10. Smoke-validated canonical probe path with
     `python -m inspection.run_backtest_scenario --name smoke_refactor_sync --sim-size 200`.
+11. Renamed strategy module interface to clean terminology:
+    - file: `dislocation_engine.py`
+    - class: `DislocationEngine`
+    - builder: `build_dislocation_engine_from_config(...)`
 
 ## Open Follow-Ups
 
-1. Rename `dislocation_cellmean_engine.py` to a cleaner strategy-module name
-   now that legacy path dependencies are removed.
-2. Continue reducing redundant feature fields/constants that are no longer
+1. Continue reducing redundant feature fields/constants that are no longer
    needed by the dislocation-only pipeline.
-3. Run broader scenario matrix and compare against pre-refactor baselines for
+2. Run broader scenario matrix and compare against pre-refactor baselines for
    behavior parity.

@@ -11,8 +11,8 @@ from pancakebot.backtest.config import BacktestConfig
 from pancakebot.core.constants import GAS_COST_BET_BNB
 from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
-from pancakebot.domain.strategy.dislocation_cellmean_engine import (
-    build_dislocation_cellmean_engine_from_config,
+from pancakebot.domain.strategy.dislocation_engine import (
+    build_dislocation_engine_from_config,
 )
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
@@ -49,7 +49,7 @@ def _all_klines_from_store(klines_store) -> list[Kline]:
 
 
 def _build_dislocation_engine(*, runtime_cfg, all_klines: list[Kline]):
-    engine = build_dislocation_cellmean_engine_from_config(
+    engine = build_dislocation_engine_from_config(
         selector_cfg=runtime_cfg.strategy_cfg.dislocation.selector,
         candidate_cfgs=runtime_cfg.strategy_cfg.dislocation.candidates,
         treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
