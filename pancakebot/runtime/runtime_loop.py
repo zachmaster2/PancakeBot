@@ -37,10 +37,10 @@ from pancakebot.domain.types import Bet, Kline, Round
 from pancakebot.domain.features.schema import max_required_context_klines_size, max_required_prior_context_rounds_size
 from pancakebot.domain.contiguity import check_klines_contiguous, check_rounds_contiguous
 from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionContract
-from pancakebot.domain.strategy.dislocation_cellmean_engine import (
-    DislocationCellMeanEngine,
+from pancakebot.domain.strategy.dislocation_engine import (
+    DislocationEngine,
     LiveStrategyDecision,
-    build_dislocation_cellmean_engine_from_config,
+    build_dislocation_engine_from_config,
 )
 from pancakebot.runtime.claim_manager import claim_scan_cursor
 from pancakebot.runtime.contract_constants_cache import ContractConstants, save_contract_constants
@@ -112,7 +112,7 @@ class _ClosedState:
     cache: RollingClosedRoundsCache
     disk_latest_epoch: int
     klines_cache: RollingKlinesCache
-    dislocation_engine: DislocationCellMeanEngine | None = None
+    dislocation_engine: DislocationEngine | None = None
     claim_scan_initialized: bool = False
     simulated_bankroll_bnb: float | None = None
     dry_bets_by_epoch: dict[int, dict[str, object]] | None = None
@@ -623,7 +623,7 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     )
 
     klines_cache = _init_klines_cache(cfg=cfg, closed_cache=cache)
-    dislocation_engine = build_dislocation_cellmean_engine_from_config(
+    dislocation_engine = build_dislocation_engine_from_config(
         selector_cfg=cfg.strategy_cfg.dislocation.selector,
         candidate_cfgs=cfg.strategy_cfg.dislocation.candidates,
         treasury_fee_fraction=float(cfg.treasury_fee_fraction),

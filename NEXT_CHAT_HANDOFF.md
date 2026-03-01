@@ -7,8 +7,8 @@ Unify production around a single dislocation strategy pipeline, eliminate legacy
 
 1. Strategy engine is now config-driven:
    - Removed hardcoded promoted candidate family from
-     `pancakebot/domain/strategy/dislocation_cellmean_engine.py`.
-   - Added `build_dislocation_cellmean_engine_from_config(...)`.
+     `pancakebot/domain/strategy/dislocation_engine.py`.
+   - Added `build_dislocation_engine_from_config(...)`.
    - Runtime/backtest now pass `strategy.dislocation.selector` and
      `strategy.dislocation.candidates` directly.
 
@@ -49,15 +49,10 @@ Unify production around a single dislocation strategy pipeline, eliminate legacy
 
 1. `load_config.py` is strict and intentionally rejects old keys/sections.
 2. `config.toml` must stay on new schema; legacy keys will now fail startup.
-3. `dislocation_cellmean_engine.py` name is still legacy wording; behavior is
-   current production logic, but module rename is still pending.
-
 ## Recommended Next Steps
 
-1. Commit current refactor chunk (small rollback unit).
-2. Perform module rename pass:
-   - `dislocation_cellmean_engine.py` -> clean final strategy module name.
-3. Sweep for dead feature fields/constants no longer used in dislocation-only
+1. Commit current rename/terminology cleanup chunk (small rollback unit).
+2. Sweep for dead feature fields/constants no longer used in dislocation-only
    path and prune.
-4. Run larger backtest parity matrix against previous known scenarios and log
+3. Run larger backtest parity matrix against previous known scenarios and log
    drift summary.

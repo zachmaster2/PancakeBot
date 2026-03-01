@@ -5,6 +5,6 @@ This package holds the single production strategy engine used by:
   - dry mode
   - backtest mode
 
-Use `pancakebot.domain.strategy.dislocation_cellmean_engine` as the canonical
-entrypoint until the next strategy-module rename pass.
+Use `pancakebot.domain.strategy.dislocation_engine` as the canonical
+entrypoint.
 """

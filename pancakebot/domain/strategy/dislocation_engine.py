@@ -763,7 +763,7 @@ def _shadow_profit_for_decision(
     return float(profit), True, bool(is_win)
 
 
-class DislocationCellMeanEngine:
+class DislocationEngine:
     def __init__(
         self,
         *,
@@ -1464,13 +1464,13 @@ def _to_candidate_config(
     )
 
 
-def build_dislocation_cellmean_engine_from_config(
+def build_dislocation_engine_from_config(
     *,
     selector_cfg: DislocationSelectorConfig,
     candidate_cfgs: tuple[DislocationCandidateConfig, ...],
     cutoff_seconds: int,
     treasury_fee_fraction: float,
-) -> DislocationCellMeanEngine:
+) -> DislocationEngine:
     """Build the production dislocation engine from app config."""
 
     if int(cutoff_seconds) <= 0:
@@ -1483,7 +1483,7 @@ def build_dislocation_cellmean_engine_from_config(
         _to_candidate_config(cfg=cfg, cutoff_seconds=int(cutoff_seconds))
         for cfg in candidate_cfgs
     ]
-    return DislocationCellMeanEngine(
+    return DislocationEngine(
         selector_cfg=selector,
         candidate_cfgs=candidates,
         treasury_fee_fraction=float(treasury_fee_fraction),
