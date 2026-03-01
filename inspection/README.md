@@ -17,6 +17,10 @@ Additional inspection probes for strategy-routing experiments:
    router-ready dataset with feature columns and labels.
 2. `inspection/run_strategy_router_probe.py`:
    runs walk-forward router policy probes against that dataset.
+3. `inspection/run_ml_strategy_blocks.py`:
+   generates block artifacts for a walk-forward ML strategy using the active
+   model stack (`pancakebot/domain/models/*`), writing
+   `var/exp/<name>_bXofY_offZ/dislocation_trades.csv`.
 
 Quick usage (do not execute automatically in agent workflows):
 
