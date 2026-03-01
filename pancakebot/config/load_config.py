@@ -410,7 +410,6 @@ def load_app_config(path: str) -> AppConfig:
         "random_seed",
         "use_onchain_event_bets",
         "event_lookback_blocks",
-        "event_freshness_slack_seconds",
         "latency_log_path",
         "wait_for_bet_receipt",
         "bet_receipt_timeout_seconds",
@@ -430,10 +429,6 @@ def load_app_config(path: str) -> AppConfig:
     event_lookback_blocks = _opt_int(runtime, "event_lookback_blocks", 600)
     if event_lookback_blocks <= 0:
         raise InvariantError("event_lookback_blocks_must_be_positive")
-
-    event_freshness_slack_seconds = _opt_int(runtime, "event_freshness_slack_seconds", 2)
-    if event_freshness_slack_seconds < 0:
-        raise InvariantError("event_freshness_slack_seconds_must_be_nonnegative")
 
     latency_log_path = _opt_str(runtime, "latency_log_path", "var/live_latency.jsonl")
 
@@ -485,7 +480,6 @@ def load_app_config(path: str) -> AppConfig:
         random_seed=int(random_seed),
         use_onchain_event_bets=bool(use_onchain_event_bets),
         event_lookback_blocks=int(event_lookback_blocks),
-        event_freshness_slack_seconds=int(event_freshness_slack_seconds),
         latency_log_path=str(latency_log_path),
         wait_for_bet_receipt=bool(wait_for_bet_receipt),
         bet_receipt_timeout_seconds=int(bet_receipt_timeout_seconds),

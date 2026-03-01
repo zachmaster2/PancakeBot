@@ -29,6 +29,12 @@ Chronological decision record for long-running cleanup/refactor work.
 12. Archived remaining dead `pancakebot/domain/models/*` placeholder modules
     under `inspection/legacy/pancakebot/domain/models/` and removed active
     references from production tree.
+13. Removed non-functional runtime/config leftovers:
+    - dropped `event_freshness_slack_seconds` from active config/runtime path
+    - dropped `min_bet_amount_bnb` from `RuntimeConfig`
+    - removed redundant constants persistence in `runtime_loop` startup
+14. Updated runtime and strategy config docs/comments to dislocation-only
+    terminology and revalidated continuous/chunk-reset smoke runs.
 
 ## Open Follow-Ups
 

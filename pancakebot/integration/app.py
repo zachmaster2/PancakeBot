@@ -48,7 +48,6 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
             cutoff_seconds=cfg.cutoff_seconds,
             use_onchain_event_bets=False,
             event_lookback_blocks=cfg.event_lookback_blocks,
-            event_freshness_slack_seconds=cfg.event_freshness_slack_seconds,
             latency_log_path=cfg.latency_log_path,
             wait_for_bet_receipt=False,
             bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
@@ -56,7 +55,6 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
             dry=dry,
             treasury_fee_fraction=float(constants.treasury_fee_fraction),
             buffer_seconds=int(constants.buffer_seconds),
-            min_bet_amount_bnb=float(constants.min_bet_amount_bnb),
         )
         run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var"))
         return
@@ -101,7 +99,6 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
         cutoff_seconds=cfg.cutoff_seconds,
         use_onchain_event_bets=cfg.use_onchain_event_bets,
         event_lookback_blocks=cfg.event_lookback_blocks,
-        event_freshness_slack_seconds=cfg.event_freshness_slack_seconds,
         latency_log_path=cfg.latency_log_path,
         wait_for_bet_receipt=cfg.wait_for_bet_receipt,
         bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
@@ -109,7 +106,6 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
         dry=dry,
         treasury_fee_fraction=treasury_fee_fraction,
         buffer_seconds=buffer_seconds,
-        min_bet_amount_bnb=float(min_bet_amount_bnb),
     )
 
     run_live_loop(runtime_cfg)

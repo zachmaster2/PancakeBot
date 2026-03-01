@@ -43,8 +43,17 @@ Unify production around a single dislocation strategy pipeline, eliminate legacy
 
 5. Validation:
    - `python -m compileall pancakebot inspection/run_backtest_scenario.py` passed.
-   - Smoke scenario passed:
+   - Smoke scenarios passed:
      - `python -m inspection.run_backtest_scenario --name smoke_refactor_sync --sim-size 200`
+     - `python -m inspection.run_backtest_scenario --name smoke_refactor_trim_fields --sim-size 120`
+     - `python -m inspection.run_backtest_scenario --name smoke_refactor_trim_fields_chunk --sim-size 120 --reset-mode chunk_reset --reset-every-rounds 40`
+
+6. Additional cleanup completed:
+   - Removed `event_freshness_slack_seconds` from active runtime/config path.
+   - Removed `min_bet_amount_bnb` from `RuntimeConfig`.
+   - Removed redundant `save_contract_constants(...)` call from runtime-loop
+     startup path.
+   - Updated dislocation terminology comments/docstrings.
 
 ## Critical Notes
 
@@ -52,8 +61,8 @@ Unify production around a single dislocation strategy pipeline, eliminate legacy
 2. `config.toml` must stay on new schema; legacy keys will now fail startup.
 ## Recommended Next Steps
 
-1. Commit current rename/terminology cleanup chunk (small rollback unit).
-2. Sweep for dead feature fields/constants no longer used in dislocation-only
-   path and prune.
+1. Commit current runtime-field trim chunk (small rollback unit).
+2. Sweep remaining active files (`domain/features/*`, `runtime/*`) for stale
+   nomenclature/comments inherited from legacy model pipeline.
 3. Run larger backtest parity matrix against previous known scenarios and log
    drift summary.
