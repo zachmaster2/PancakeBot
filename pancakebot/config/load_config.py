@@ -335,29 +335,24 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
         raise InvariantError("config_section_not_dict: strategy.dislocation.selector")
     selector_cfg = _parse_dislocation_selector(selector_obj)
 
-    default_dislocation = DislocationStrategyConfig()
-    candidates_obj = dislocation.get("candidates", None)
-    candidate_cfgs: tuple[DislocationCandidateConfig, ...]
-    if candidates_obj is None:
-        candidate_cfgs = tuple(default_dislocation.candidates)
-    else:
-        if not isinstance(candidates_obj, list):
-            raise InvariantError("config_section_not_list: strategy.dislocation.candidates")
-        if not candidates_obj:
-            raise InvariantError("dislocation_candidates_empty")
+    candidates_obj = _req(dislocation, "candidates")
+    if not isinstance(candidates_obj, list):
+        raise InvariantError("config_section_not_list: strategy.dislocation.candidates")
+    if not candidates_obj:
+        raise InvariantError("dislocation_candidates_empty")
 
-        parsed: list[DislocationCandidateConfig] = []
-        seen_names: set[str] = set()
-        for i, item in enumerate(candidates_obj):
-            if not isinstance(item, dict):
-                raise InvariantError(f"dislocation_candidate_not_dict: idx={i}")
-            cfg = _parse_dislocation_candidate(item, idx=i)
-            key = str(cfg.name)
-            if key in seen_names:
-                raise InvariantError(f"dislocation_candidate_name_duplicate: {key}")
-            seen_names.add(key)
-            parsed.append(cfg)
-        candidate_cfgs = tuple(parsed)
+    parsed: list[DislocationCandidateConfig] = []
+    seen_names: set[str] = set()
+    for i, item in enumerate(candidates_obj):
+        if not isinstance(item, dict):
+            raise InvariantError(f"dislocation_candidate_not_dict: idx={i}")
+        cfg = _parse_dislocation_candidate(item, idx=i)
+        key = str(cfg.name)
+        if key in seen_names:
+            raise InvariantError(f"dislocation_candidate_name_duplicate: {key}")
+        seen_names.add(key)
+        parsed.append(cfg)
+    candidate_cfgs = tuple(parsed)
 
     return StrategyConfig(
         dislocation=DislocationStrategyConfig(

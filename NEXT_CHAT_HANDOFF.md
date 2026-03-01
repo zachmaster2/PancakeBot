@@ -54,11 +54,14 @@ Unify production around a single dislocation strategy pipeline, eliminate legacy
    - Removed redundant `save_contract_constants(...)` call from runtime-loop
      startup path.
    - Updated dislocation terminology comments/docstrings.
+   - Removed in-code candidate defaults; candidates are now required in
+     `config.toml` under `[[strategy.dislocation.candidates]]`.
 
 ## Critical Notes
 
 1. `load_config.py` is strict and intentionally rejects old keys/sections.
 2. `config.toml` must stay on new schema; legacy keys will now fail startup.
+3. `strategy.dislocation.candidates` is required; no code fallback exists.
 ## Recommended Next Steps
 
 1. Commit current runtime-field trim chunk (small rollback unit).
