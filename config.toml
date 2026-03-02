@@ -357,23 +357,24 @@ online_score_threshold_bnb = 0.0
 online_use_direction_split = true
 
 [strategy.ml_candidate]
-# Optional ML walk-forward candidate routed alongside dislocation candidates.
+# Locked ML walk-forward preset.
+# This is the single production ML knob set used by shared pipeline modes.
 enabled = false
-name = "ml_walkforward_v1"
+name = "mlwf_bestset_adapt_v1"
 fixed_bet_bnb = 0.2
-min_tradeable_prob = 0.55
-min_prob_edge = 0.02
+min_tradeable_prob = 0.51
+min_prob_edge = 0.0015
 cutoff_pool_total_min_bnb = 1.2
 expected_net_min_bnb = 0.0
-train_size = 20000
-calibrate_size = 2000
+train_size = 8000
+calibrate_size = 4000
 retrain_interval = 500
 recalibrate_interval = 250
 price_alpha = 1.0
 pool_alpha_total = 1.0
 pool_alpha_ratio = 1.0
-recency_weight_floor = 0.7
-recency_weight_power = 1.0
+recency_weight_floor = 0.1
+recency_weight_power = 2.0
 predictability_baseline_bet_bnb = 0.05
 random_seed = 1337
 

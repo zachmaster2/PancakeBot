@@ -85,6 +85,13 @@ def _opt_bool(obj: dict[str, Any], key: str, default: bool) -> bool:
     return bool(v)
 
 
+def _req_bool(obj: dict[str, Any], key: str) -> bool:
+    v = _req(obj, key)
+    if not isinstance(v, bool):
+        raise InvariantError(f"config_key_not_bool: {key}")
+    return bool(v)
+
+
 def _req_list_str(obj: dict[str, Any], key: str) -> tuple[str, ...]:
     raw = _req(obj, key)
     if not isinstance(raw, list):
@@ -219,7 +226,6 @@ def _parse_strategy_router(router: dict[str, Any]) -> StrategyRouterConfig:
 
 
 def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
-    defaults = MlCandidateConfig()
     allowed = {
         "enabled",
         "name",
@@ -242,76 +248,52 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
     }
     _validate_unknown_keys("strategy_ml_candidate", candidate, allowed)
 
-    enabled = _opt_bool(candidate, "enabled", bool(defaults.enabled))
-    name = _opt_str(candidate, "name", str(defaults.name))
-    fixed_bet_bnb = _opt_float(candidate, "fixed_bet_bnb", float(defaults.fixed_bet_bnb))
+    enabled = _req_bool(candidate, "enabled")
+    name = _req_str(candidate, "name")
+    fixed_bet_bnb = _req_float(candidate, "fixed_bet_bnb")
     if float(fixed_bet_bnb) <= 0.0:
         raise InvariantError("strategy_ml_candidate_fixed_bet_bnb_must_be_positive")
 
-    min_tradeable_prob = _opt_float(
-        candidate,
-        "min_tradeable_prob",
-        float(defaults.min_tradeable_prob),
-    )
+    min_tradeable_prob = _req_float(candidate, "min_tradeable_prob")
     if not (0.0 <= float(min_tradeable_prob) <= 1.0):
         raise InvariantError("strategy_ml_candidate_min_tradeable_prob_out_of_range")
 
-    min_prob_edge = _opt_float(candidate, "min_prob_edge", float(defaults.min_prob_edge))
+    min_prob_edge = _req_float(candidate, "min_prob_edge")
     if float(min_prob_edge) < 0.0:
         raise InvariantError("strategy_ml_candidate_min_prob_edge_negative")
 
-    cutoff_pool_total_min_bnb = _opt_float(
-        candidate,
-        "cutoff_pool_total_min_bnb",
-        float(defaults.cutoff_pool_total_min_bnb),
-    )
+    cutoff_pool_total_min_bnb = _req_float(candidate, "cutoff_pool_total_min_bnb")
     if float(cutoff_pool_total_min_bnb) < 0.0:
         raise InvariantError("strategy_ml_candidate_cutoff_pool_total_min_bnb_negative")
 
-    expected_net_min_bnb = _opt_float(
-        candidate,
-        "expected_net_min_bnb",
-        float(defaults.expected_net_min_bnb),
-    )
-    train_size = _opt_int(candidate, "train_size", int(defaults.train_size))
-    calibrate_size = _opt_int(candidate, "calibrate_size", int(defaults.calibrate_size))
-    retrain_interval = _opt_int(candidate, "retrain_interval", int(defaults.retrain_interval))
-    recalibrate_interval = _opt_int(candidate, "recalibrate_interval", int(defaults.recalibrate_interval))
+    expected_net_min_bnb = _req_float(candidate, "expected_net_min_bnb")
+    train_size = _req_int(candidate, "train_size")
+    calibrate_size = _req_int(candidate, "calibrate_size")
+    retrain_interval = _req_int(candidate, "retrain_interval")
+    recalibrate_interval = _req_int(candidate, "recalibrate_interval")
     if int(train_size) <= 0 or int(calibrate_size) < 0:
         raise InvariantError("strategy_ml_candidate_train_or_calibrate_size_invalid")
     if int(retrain_interval) <= 0 or int(recalibrate_interval) < 0:
         raise InvariantError("strategy_ml_candidate_retrain_or_recalibrate_interval_invalid")
 
-    price_alpha = _opt_float(candidate, "price_alpha", float(defaults.price_alpha))
-    pool_alpha_total = _opt_float(candidate, "pool_alpha_total", float(defaults.pool_alpha_total))
-    pool_alpha_ratio = _opt_float(candidate, "pool_alpha_ratio", float(defaults.pool_alpha_ratio))
+    price_alpha = _req_float(candidate, "price_alpha")
+    pool_alpha_total = _req_float(candidate, "pool_alpha_total")
+    pool_alpha_ratio = _req_float(candidate, "pool_alpha_ratio")
     if float(price_alpha) <= 0.0 or float(pool_alpha_total) <= 0.0 or float(pool_alpha_ratio) <= 0.0:
         raise InvariantError("strategy_ml_candidate_alpha_must_be_positive")
 
-    recency_weight_floor = _opt_float(
-        candidate,
-        "recency_weight_floor",
-        float(defaults.recency_weight_floor),
-    )
-    recency_weight_power = _opt_float(
-        candidate,
-        "recency_weight_power",
-        float(defaults.recency_weight_power),
-    )
+    recency_weight_floor = _req_float(candidate, "recency_weight_floor")
+    recency_weight_power = _req_float(candidate, "recency_weight_power")
     if not (0.0 < float(recency_weight_floor) <= 1.0):
         raise InvariantError("strategy_ml_candidate_recency_weight_floor_out_of_range")
     if float(recency_weight_power) <= 0.0:
         raise InvariantError("strategy_ml_candidate_recency_weight_power_must_be_positive")
 
-    predictability_baseline_bet_bnb = _opt_float(
-        candidate,
-        "predictability_baseline_bet_bnb",
-        float(defaults.predictability_baseline_bet_bnb),
-    )
+    predictability_baseline_bet_bnb = _req_float(candidate, "predictability_baseline_bet_bnb")
     if float(predictability_baseline_bet_bnb) <= 0.0:
         raise InvariantError("strategy_ml_candidate_predictability_baseline_bet_bnb_must_be_positive")
 
-    random_seed = _opt_int(candidate, "random_seed", int(defaults.random_seed))
+    random_seed = _req_int(candidate, "random_seed")
     if int(random_seed) < 0:
         raise InvariantError("strategy_ml_candidate_random_seed_negative")
 
@@ -525,9 +507,7 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
         raise InvariantError("config_section_not_dict: strategy.router")
     router_cfg = _parse_strategy_router(router_obj)
 
-    ml_candidate_obj = strategy.get("ml_candidate", {})
-    if ml_candidate_obj is None:
-        ml_candidate_obj = {}
+    ml_candidate_obj = _req(strategy, "ml_candidate")
     if not isinstance(ml_candidate_obj, dict):
         raise InvariantError("config_section_not_dict: strategy.ml_candidate")
     ml_candidate_cfg = _parse_ml_candidate(ml_candidate_obj)

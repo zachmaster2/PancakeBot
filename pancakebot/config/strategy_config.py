@@ -79,24 +79,24 @@ class DislocationStrategyConfig:
 class MlCandidateConfig:
     """ML walk-forward candidate configuration used by the shared router."""
 
-    enabled: bool = False
-    name: str = "ml_walkforward_v1"
-    fixed_bet_bnb: float = 0.2
-    min_tradeable_prob: float = 0.55
-    min_prob_edge: float = 0.02
-    cutoff_pool_total_min_bnb: float = 1.2
-    expected_net_min_bnb: float = 0.0
-    train_size: int = 20_000
-    calibrate_size: int = 2_000
-    retrain_interval: int = 500
-    recalibrate_interval: int = 250
-    price_alpha: float = 1.0
-    pool_alpha_total: float = 1.0
-    pool_alpha_ratio: float = 1.0
-    recency_weight_floor: float = 0.7
-    recency_weight_power: float = 1.0
-    predictability_baseline_bet_bnb: float = 0.05
-    random_seed: int = 1337
+    enabled: bool
+    name: str
+    fixed_bet_bnb: float
+    min_tradeable_prob: float
+    min_prob_edge: float
+    cutoff_pool_total_min_bnb: float
+    expected_net_min_bnb: float
+    train_size: int
+    calibrate_size: int
+    retrain_interval: int
+    recalibrate_interval: int
+    price_alpha: float
+    pool_alpha_total: float
+    pool_alpha_ratio: float
+    recency_weight_floor: float
+    recency_weight_power: float
+    predictability_baseline_bet_bnb: float
+    random_seed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,5 +104,5 @@ class StrategyConfig:
     """Top-level strategy configuration root."""
 
     dislocation: DislocationStrategyConfig
+    ml_candidate: MlCandidateConfig
     router: StrategyRouterConfig = StrategyRouterConfig()
-    ml_candidate: MlCandidateConfig = MlCandidateConfig()
