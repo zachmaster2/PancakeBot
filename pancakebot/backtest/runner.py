@@ -11,10 +11,11 @@ from pancakebot.backtest.config import BacktestConfig
 from pancakebot.core.constants import GAS_COST_BET_BNB
 from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
-from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 from pancakebot.domain.strategy.dislocation_engine import (
     build_dislocation_engine_from_config,
 )
+from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
+from pancakebot.domain.strategy.pipeline import StrategyPipeline
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterConfig
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
@@ -61,42 +62,49 @@ def _build_dislocation_engine(*, runtime_cfg, all_klines: list[Kline]):
     return engine
 
 
-def _build_router(*, backtest_cfg: BacktestConfig) -> StrategyRouter:
-    """Build backtest router from backtest config knobs."""
+def _build_router(*, runtime_cfg) -> StrategyRouter:
+    """Build shared router from strategy config."""
 
     router_cfg = StrategyRouterConfig(
-        mode=str(backtest_cfg.router_mode),
-        score_threshold_bnb=float(backtest_cfg.router_score_threshold_bnb),
+        mode=str(runtime_cfg.strategy_cfg.router.mode),
+        score_threshold_bnb=float(runtime_cfg.strategy_cfg.router.score_threshold_bnb),
+        online_warmup_rounds=int(runtime_cfg.strategy_cfg.router.online_warmup_rounds),
+        online_num_quantile_bins=int(runtime_cfg.strategy_cfg.router.online_num_quantile_bins),
+        online_min_cell_obs=int(runtime_cfg.strategy_cfg.router.online_min_cell_obs),
+        online_score_threshold_bnb=float(runtime_cfg.strategy_cfg.router.online_score_threshold_bnb),
+        online_use_direction_split=bool(runtime_cfg.strategy_cfg.router.online_use_direction_split),
     )
     return StrategyRouter(config=router_cfg)
 
 
-def _oracle_realized_profit_by_candidate(
-    *,
-    candidate_signals: dict[str, StrategyCandidateSignal],
-    round_closed: Round,
-    treasury_fee_fraction: float,
-) -> dict[str, float]:
-    """Compute hindsight per-candidate realized profit for one closed round."""
+def _build_ml_candidate_adapter(*, runtime_cfg) -> MlCandidateAdapter | None:
+    """Build optional ML candidate adapter from shared strategy config."""
 
-    out: dict[str, float] = {}
-    for candidate_name, signal in candidate_signals.items():
-        profit = 0.0
-        if (
-            str(signal.action) == "BET"
-            and str(signal.bet_side) in ("Bull", "Bear")
-            and float(signal.bet_size_bnb) > 0.0
-        ):
-            outcome = settle_bet_against_closed_round(
-                bet_bnb=float(signal.bet_size_bnb),
-                bet_side=str(signal.bet_side),
-                round_closed=round_closed,
-                treasury_fee_fraction=float(treasury_fee_fraction),
-            )
-            credit_bnb = float(outcome.credit_bnb)
-            profit = float(credit_bnb) - float(signal.bet_size_bnb) - float(GAS_COST_BET_BNB)
-        out[str(candidate_name)] = float(profit)
-    return out
+    ml_cfg = runtime_cfg.strategy_cfg.ml_candidate
+    if not bool(ml_cfg.enabled):
+        return None
+    return MlCandidateAdapter(
+        config=ml_cfg,
+        cutoff_seconds=int(runtime_cfg.cutoff_seconds),
+        treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
+        klines_store_like=runtime_cfg.klines_store,
+    )
+
+
+def _build_strategy_pipeline(*, runtime_cfg, all_klines: list[Kline]) -> StrategyPipeline:
+    """Build shared strategy pipeline for backtest replay."""
+
+    dislocation_engine = _build_dislocation_engine(runtime_cfg=runtime_cfg, all_klines=all_klines)
+    router = _build_router(runtime_cfg=runtime_cfg)
+    ml_adapter = _build_ml_candidate_adapter(runtime_cfg=runtime_cfg)
+    pipeline = StrategyPipeline(
+        dislocation_engine=dislocation_engine,
+        router=router,
+        treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
+        ml_candidate_adapter=ml_adapter,
+    )
+    pipeline.refresh_klines(klines=list(all_klines))
+    return pipeline
 
 
 def _chunk_bootstrap_rounds(
@@ -134,8 +142,7 @@ class _BacktestStats:
 
 def _simulate_rounds(
     *,
-    engine,
-    router: StrategyRouter,
+    pipeline: StrategyPipeline,
     rounds: list[Round],
     runtime_cfg,
     trades_w,
@@ -146,21 +153,10 @@ def _simulate_rounds(
 ) -> tuple[float, int]:
     rounds_done = int(rounds_done_before_chunk)
     for round_t in rounds:
-        candidate_signals = engine.candidate_signals_for_open_round(round_t=round_t)
-        oracle_profit_by_candidate: dict[str, float] | None = None
-        if str(router.mode) == "oracle_skip":
-            oracle_profit_by_candidate = _oracle_realized_profit_by_candidate(
-                candidate_signals=candidate_signals,
-                round_closed=round_t,
-                treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
-            )
-
-        decision = router.route_round(
-            candidate_signals=candidate_signals,
+        decision = pipeline.decide_open_round(
+            round_t=round_t,
             bankroll_bnb=float(bankroll),
-            bet_gas_cost_bnb=float(GAS_COST_BET_BNB),
-            selector_ready=bool(engine.selector_ready()),
-            realized_profit_by_candidate=oracle_profit_by_candidate,
+            allow_oracle_mode=True,
         )
 
         ev = float(decision.expected_profit_bnb)
@@ -218,7 +214,7 @@ def _simulate_rounds(
                 float(profit),
                 float(bankroll),
                 str(decision.selected_strategy or ""),
-                str(router.mode),
+                str(pipeline.router_mode),
                 (
                     float(decision.selector_score_bnb)
                     if decision.selector_score_bnb is not None
@@ -227,7 +223,7 @@ def _simulate_rounds(
             ]
         )
 
-        engine.settle_closed_rounds([round_t])
+        pipeline.settle_closed_rounds(rounds=[round_t])
         rounds_done += 1
 
         if int(rounds_done) % 250 == 0:
@@ -273,7 +269,7 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
         raise InvariantError("backtest_dislocation_sim_rounds_len_mismatch")
 
     all_klines = _all_klines_from_store(runtime_cfg.klines_store)
-    router = _build_router(backtest_cfg=backtest_cfg)
+    router_cfg = runtime_cfg.strategy_cfg.router
 
     out_dir.mkdir(parents=True, exist_ok=True)
     trades_path = out_dir / "backtest_trades.csv"
@@ -308,8 +304,8 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
         rounds_done = 0
 
         if reset_mode == "continuous":
-            engine = _build_dislocation_engine(runtime_cfg=runtime_cfg, all_klines=all_klines)
-            engine.bootstrap_from_closed_rounds(list(warmup))
+            pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=all_klines)
+            pipeline.bootstrap_from_closed_rounds(rounds=list(warmup))
             info(
                 "BACK",
                 "INIT",
@@ -317,13 +313,14 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 msg=(
                     f"mode={str(reset_mode)} warmup_n={len(warmup)} sim_n={len(sim_rounds)} "
                     f"selector_warmup={int(runtime_cfg.strategy_cfg.dislocation.selector.warmup_rounds)} "
-                    f"router_mode={str(router.mode)} "
-                    f"router_score_threshold_bnb={float(backtest_cfg.router_score_threshold_bnb):.6f}"
+                    f"router_mode={str(router_cfg.mode)} "
+                    f"router_score_threshold_bnb={float(router_cfg.score_threshold_bnb):.6f} "
+                    f"router_online_warmup_rounds={int(router_cfg.online_warmup_rounds)} "
+                    f"ml_candidate_enabled={bool(runtime_cfg.strategy_cfg.ml_candidate.enabled)}"
                 ),
             )
             bankroll, rounds_done = _simulate_rounds(
-                engine=engine,
-                router=router,
+                pipeline=pipeline,
                 rounds=sim_rounds,
                 runtime_cfg=runtime_cfg,
                 trades_w=trades_w,
@@ -342,8 +339,10 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 msg=(
                     f"mode={str(reset_mode)} reset_every_rounds={int(interval)} "
                     f"warmup_n={len(warmup)} sim_n={len(sim_rounds)} chunks={int(chunk_count)} "
-                    f"router_mode={str(router.mode)} "
-                    f"router_score_threshold_bnb={float(backtest_cfg.router_score_threshold_bnb):.6f}"
+                    f"router_mode={str(router_cfg.mode)} "
+                    f"router_score_threshold_bnb={float(router_cfg.score_threshold_bnb):.6f} "
+                    f"router_online_warmup_rounds={int(router_cfg.online_warmup_rounds)} "
+                    f"ml_candidate_enabled={bool(runtime_cfg.strategy_cfg.ml_candidate.enabled)}"
                 ),
             )
             for chunk_index, chunk_start in enumerate(range(0, len(sim_rounds), interval), start=1):
@@ -365,11 +364,10 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                     ),
                 )
 
-                chunk_engine = _build_dislocation_engine(runtime_cfg=runtime_cfg, all_klines=all_klines)
-                chunk_engine.bootstrap_from_closed_rounds(list(chunk_warmup))
+                chunk_pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=all_klines)
+                chunk_pipeline.bootstrap_from_closed_rounds(rounds=list(chunk_warmup))
                 bankroll, rounds_done = _simulate_rounds(
-                    engine=chunk_engine,
-                    router=router,
+                    pipeline=chunk_pipeline,
                     rounds=list(chunk_rounds),
                     runtime_cfg=runtime_cfg,
                     trades_w=trades_w,
@@ -391,8 +389,10 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
         summary = {
             "reset_mode": str(reset_mode),
             "reset_every_rounds": int(reset_every_rounds),
-            "router_mode": str(router.mode),
-            "router_score_threshold_bnb": float(backtest_cfg.router_score_threshold_bnb),
+            "router_mode": str(router_cfg.mode),
+            "router_score_threshold_bnb": float(router_cfg.score_threshold_bnb),
+            "router_online_warmup_rounds": int(router_cfg.online_warmup_rounds),
+            "ml_candidate_enabled": bool(runtime_cfg.strategy_cfg.ml_candidate.enabled),
             "num_rounds": int(num_rounds),
             "num_bets": int(stats.num_bets),
             "num_skips": int(num_skips),

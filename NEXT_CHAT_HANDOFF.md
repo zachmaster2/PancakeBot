@@ -1,5 +1,79 @@
 # PancakeBot Handoff: Refactor Iteration Status (2026-03-01)
 
+## Update (2026-03-02): Shared Pipeline + Online Router + ML Candidate Adapter
+
+1. Shared strategy pipeline module added:
+   - `pancakebot/domain/strategy/pipeline.py`
+   - Combines dislocation candidates + optional ML candidate + shared router.
+   - Used by both backtest and runtime (single execution pipeline path).
+
+2. Router upgraded for online adaptation:
+   - `pancakebot/domain/strategy/router.py`
+   - Added `online_cellmean` mode with:
+     - warmup rounds,
+     - per-candidate quantile celling on expected profit and absolute dislocation,
+     - optional bull/bear direction split,
+     - per-cell realized-profit mean routing.
+   - Added `observe_settlement(...)` state updates.
+
+3. ML candidate adapter restored into active tree:
+   - `pancakebot/domain/strategy/ml_candidate_adapter.py`
+   - Reuses current feature builder + walk-forward stack to emit router-compatible
+     `StrategyCandidateSignal`.
+   - Produces `SKIP` with explicit reasons until readiness gates are satisfied.
+
+4. Strategy config surface extended (shared across live/dry/backtest):
+   - `pancakebot/config/strategy_config.py`
+   - Added:
+     - `StrategyRouterConfig`
+     - `MlCandidateConfig`
+   - `StrategyConfig` now owns:
+     - `dislocation`
+     - `router`
+     - `ml_candidate`
+
+5. Config parser updated for new strategy namespaces:
+   - `pancakebot/config/load_config.py`
+   - Added strict parsers:
+     - `strategy.router`
+     - `strategy.ml_candidate`
+   - Removed router knobs from `backtest` section (router is now strategy-owned).
+
+6. Backtest runner switched to shared pipeline:
+   - `pancakebot/backtest/runner.py`
+   - No direct dislocation decision path in backtest loop anymore.
+   - Summary now records router/ML flags from `strategy_cfg`.
+
+7. Runtime loop switched to shared pipeline:
+   - `pancakebot/runtime/runtime_loop.py`
+   - Replaced direct dislocation-engine decisions with:
+     - `StrategyPipeline.decide_open_round(...)`
+     - `StrategyPipeline.settle_closed_rounds(...)`
+   - Keeps live/dry behavior unchanged except for routing source unification.
+
+8. Inspection backtest probe aligned:
+   - `inspection/run_backtest_scenario.py`
+   - Router CLI overrides now target `strategy_cfg.router`.
+   - Supports `--router-mode online_cellmean`.
+
+9. Config TOML updated:
+   - `config.toml`
+   - Added:
+     - `[strategy.router]`
+     - `[strategy.ml_candidate]`
+   - `backtest` now only owns simulation/reset knobs.
+
+10. Tests:
+   - Updated `tests/test_strategy_router.py` with `online_cellmean` coverage.
+   - Added `tests/test_ml_candidate_adapter.py` (disabled-path deterministic test).
+
+11. Validation (using `.\.venv\Scripts\python.exe`):
+   - `python -m compileall` on touched files passed.
+   - `python -m unittest tests.test_strategy_router tests.test_ml_candidate_adapter -v` passed.
+   - Smoke scenarios passed:
+     - `python -m inspection.run_backtest_scenario --name smoke_shared_pipeline --sim-size 300 --reset-mode continuous`
+     - `python -m inspection.run_backtest_scenario --name smoke_online_cellmean --sim-size 300 --reset-mode continuous --router-mode online_cellmean`
+
 ## Update (2026-03-02): Shared Router Groundwork (Backtest-Only Integration)
 
 1. Added shared router module:
