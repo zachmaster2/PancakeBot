@@ -140,7 +140,7 @@ def _simulate_block(
     eta_dislocation_abs_b: float,
     score_bias_a: float,
     score_bias_b: float,
-    cash_score_threshold: float,
+    skip_score_threshold: float,
     write_trades_path: Path | None,
 ) -> dict[str, Any]:
     epochs = sorted(set(a_rows.keys()) | set(b_rows.keys()))
@@ -157,7 +157,7 @@ def _simulate_block(
     num_wins = 0
     num_pick_a = 0
     num_pick_b = 0
-    num_cash = 0
+    num_skip = 0
 
     trades_rows: list[list[Any]] = []
     if write_trades_path is not None:
@@ -205,23 +205,23 @@ def _simulate_block(
             min_history=int(min_history),
         )
 
-        pick = "CASH"
+        pick = "SKIP"
         profit = 0.0
         pick_score = float("-inf")
         if float(score_a) >= float(score_b):
             pick = "A"
             pick_score = float(score_a)
-            if pick_score >= float(cash_score_threshold) and a_row is not None and str(a_row.action) == "BET":
+            if pick_score >= float(skip_score_threshold) and a_row is not None and str(a_row.action) == "BET":
                 profit = float(a_row.profit_bnb)
             else:
-                pick = "CASH"
+                pick = "SKIP"
         else:
             pick = "B"
             pick_score = float(score_b)
-            if pick_score >= float(cash_score_threshold) and b_row is not None and str(b_row.action) == "BET":
+            if pick_score >= float(skip_score_threshold) and b_row is not None and str(b_row.action) == "BET":
                 profit = float(b_row.profit_bnb)
             else:
-                pick = "CASH"
+                pick = "SKIP"
 
         if pick == "A":
             num_pick_a += 1
@@ -234,7 +234,7 @@ def _simulate_block(
             if profit > 0.0:
                 num_wins += 1
         else:
-            num_cash += 1
+            num_skip += 1
 
         net_profit += float(profit)
 
@@ -277,7 +277,7 @@ def _simulate_block(
         "num_wins": int(num_wins),
         "num_pick_a": int(num_pick_a),
         "num_pick_b": int(num_pick_b),
-        "num_cash": int(num_cash),
+        "num_skip": int(num_skip),
         "bet_rate": float(_safe_rate(int(num_bets), int(n_rounds))),
         "win_rate": float(_safe_rate(int(num_wins), int(num_bets))),
         "net_profit_bnb": float(net_profit),
@@ -305,7 +305,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eta-dislocation-abs-b", type=float, default=None)
     p.add_argument("--score-bias-a", type=float, default=0.0)
     p.add_argument("--score-bias-b", type=float, default=0.0)
-    p.add_argument("--cash-score-threshold", type=float, default=0.0)
+    p.add_argument("--skip-score-threshold", type=float, default=0.0)
     p.add_argument("--write-trades", action="store_true", default=False)
     return p
 
@@ -397,7 +397,7 @@ def main() -> None:
             eta_dislocation_abs_b=float(eta_dislocation_abs_b),
             score_bias_a=float(args.score_bias_a),
             score_bias_b=float(args.score_bias_b),
-            cash_score_threshold=float(args.cash_score_threshold),
+            skip_score_threshold=float(args.skip_score_threshold),
             write_trades_path=write_trades_path,
         )
 
@@ -412,7 +412,7 @@ def main() -> None:
             "win_rate": float(summary["win_rate"]),
             "pick_a": int(summary["num_pick_a"]),
             "pick_b": int(summary["num_pick_b"]),
-            "pick_cash": int(summary["num_cash"]),
+            "pick_skip": int(summary["num_skip"]),
         }
         block_rows.append(row)
 
@@ -441,7 +441,7 @@ def main() -> None:
                         "eta_dislocation_abs_b": float(eta_dislocation_abs_b),
                         "score_bias_a": float(args.score_bias_a),
                         "score_bias_b": float(args.score_bias_b),
-                        "cash_score_threshold": float(args.cash_score_threshold),
+                        "skip_score_threshold": float(args.skip_score_threshold),
                         "block_size": int(args.block_size),
                         "sim_offset_rounds": int(offset),
                     },
@@ -487,7 +487,7 @@ def main() -> None:
         "eta_dislocation_abs_b": float(eta_dislocation_abs_b),
         "score_bias_a": float(args.score_bias_a),
         "score_bias_b": float(args.score_bias_b),
-        "cash_score_threshold": float(args.cash_score_threshold),
+        "skip_score_threshold": float(args.skip_score_threshold),
     }
 
     blocks_csv = out_dir / f"{args.name_prefix}_blocks.csv"
@@ -508,7 +508,7 @@ def main() -> None:
                 "win_rate",
                 "pick_a",
                 "pick_b",
-                "pick_cash",
+                "pick_skip",
             ],
         )
         w.writeheader()
@@ -533,7 +533,7 @@ def main() -> None:
                 "eta_dislocation_abs_b",
                 "score_bias_a",
                 "score_bias_b",
-                "cash_score_threshold",
+                "skip_score_threshold",
                 "blocks",
                 "net_total",
                 "net_mean",
@@ -568,3 +568,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

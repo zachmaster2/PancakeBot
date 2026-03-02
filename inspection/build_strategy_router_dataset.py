@@ -21,7 +21,7 @@ from typing import Any
 from inspection.strategy_router_common import (
     direction_to_idx,
     load_block_round_snapshots,
-    oracle_cash_pick,
+    oracle_skip_pick,
     parse_strategy_prefixes,
     to_column_key_map,
 )
@@ -81,7 +81,7 @@ def _build_columns(strategy_prefixes: list[str], key_map: dict[str, str]) -> tup
 
     label_columns.extend(
         [
-            "label_best_strategy_or_cash",
+            "label_best_strategy_or_skip",
             "label_best_action",
             "label_oracle_profit_bnb",
         ]
@@ -136,9 +136,9 @@ def main() -> None:
             "epoch": int(snapshot.epoch),
         }
 
-        best_strategy_or_cash, oracle_profit_bnb = oracle_cash_pick(snapshot.rows_by_strategy)
-        row["label_best_strategy_or_cash"] = str(best_strategy_or_cash)
-        row["label_best_action"] = "BET" if str(best_strategy_or_cash) != "CASH" else "SKIP"
+        best_strategy_or_skip, oracle_profit_bnb = oracle_skip_pick(snapshot.rows_by_strategy)
+        row["label_best_strategy_or_skip"] = str(best_strategy_or_skip)
+        row["label_best_action"] = "BET" if str(best_strategy_or_skip) != "SKIP" else "SKIP"
         row["label_oracle_profit_bnb"] = float(oracle_profit_bnb)
 
         oracle_net_total_bnb += float(oracle_profit_bnb)
@@ -255,4 +255,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

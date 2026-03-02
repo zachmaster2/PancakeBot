@@ -131,7 +131,7 @@ def _simulate_block(
     gamma_win_rate: float,
     eta_dislocation_abs: float,
     score_biases: dict[str, float],
-    cash_score_threshold: float,
+    skip_score_threshold: float,
     write_trades_path: Path | None,
 ) -> dict[str, Any]:
     epochs_all: set[int] = set()
@@ -151,7 +151,7 @@ def _simulate_block(
     net_profit = 0.0
     num_bets = 0
     num_wins = 0
-    num_cash = 0
+    num_skip = 0
     picks_by_strategy: dict[str, int] = {s: 0 for s in strategy_order}
 
     trades_rows: list[list[Any]] = []
@@ -179,7 +179,7 @@ def _simulate_block(
                 min_history=int(min_history),
             )
 
-        pick = "CASH"
+        pick = "SKIP"
         pick_score = float("-inf")
         profit = 0.0
         for s in strategy_order:
@@ -187,13 +187,13 @@ def _simulate_block(
             if float(sc) > float(pick_score):
                 pick_score = float(sc)
                 pick = str(s)
-        if not math.isfinite(float(pick_score)) or float(pick_score) < float(cash_score_threshold):
-            pick = "CASH"
+        if not math.isfinite(float(pick_score)) or float(pick_score) < float(skip_score_threshold):
+            pick = "SKIP"
             pick_score = float("-inf")
-        if pick != "CASH":
+        if pick != "SKIP":
             row_pick = strategy_rows[pick].get(int(ep))
             if row_pick is None or str(row_pick.action) != "BET":
-                pick = "CASH"
+                pick = "SKIP"
                 pick_score = float("-inf")
             else:
                 profit = float(row_pick.profit_bnb)
@@ -201,15 +201,15 @@ def _simulate_block(
                 if profit > 0.0:
                     num_wins += 1
                 picks_by_strategy[pick] += 1
-        if pick == "CASH":
-            num_cash += 1
+        if pick == "SKIP":
+            num_skip += 1
 
         net_profit += float(profit)
 
         if trades_rows:
             out = [
                 int(ep),
-                "BET" if pick != "CASH" else "SKIP",
+                "BET" if pick != "SKIP" else "SKIP",
                 str(pick),
                 float(pick_score) if math.isfinite(float(pick_score)) else "",
                 float(profit),
@@ -241,7 +241,7 @@ def _simulate_block(
         "num_rounds": int(n_rounds),
         "num_bets": int(num_bets),
         "num_wins": int(num_wins),
-        "num_cash": int(num_cash),
+        "num_skip": int(num_skip),
         "bet_rate": float(_safe_rate(int(num_bets), int(n_rounds))),
         "win_rate": float(_safe_rate(int(num_wins), int(num_bets))),
         "net_profit_bnb": float(net_profit),
@@ -279,7 +279,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gamma-win-rate", type=float, default=0.5)
     p.add_argument("--eta-dislocation-abs", type=float, default=0.0)
     p.add_argument("--score-biases", type=str, default="")
-    p.add_argument("--cash-score-threshold", type=float, default=0.0)
+    p.add_argument("--skip-score-threshold", type=float, default=0.0)
     p.add_argument("--write-trades", action="store_true", default=False)
     return p
 
@@ -319,7 +319,7 @@ def main() -> None:
     bets_total = 0
     wins_total = 0
     picks_totals: dict[str, int] = {s: 0 for s in strategy_order}
-    cash_total = 0
+    skip_total = 0
 
     for block_idx, offset in enumerate(offsets, start=1):
         strategy_rows: dict[str, dict[int, TradeRow]] = {}
@@ -351,7 +351,7 @@ def main() -> None:
             gamma_win_rate=float(args.gamma_win_rate),
             eta_dislocation_abs=float(args.eta_dislocation_abs),
             score_biases=score_biases,
-            cash_score_threshold=float(args.cash_score_threshold),
+            skip_score_threshold=float(args.skip_score_threshold),
             write_trades_path=write_trades_path,
         )
 
@@ -364,7 +364,7 @@ def main() -> None:
             "wins": int(summary["num_wins"]),
             "bet_rate": float(summary["bet_rate"]),
             "win_rate": float(summary["win_rate"]),
-            "pick_cash": int(summary["num_cash"]),
+            "pick_skip": int(summary["num_skip"]),
         }
         for s in strategy_order:
             row[f"pick_{s}"] = int(summary["picks_by_strategy"].get(s, 0))
@@ -373,7 +373,7 @@ def main() -> None:
         nets.append(float(summary["net_profit_bnb"]))
         bets_total += int(summary["num_bets"])
         wins_total += int(summary["num_wins"])
-        cash_total += int(summary["num_cash"])
+        skip_total += int(summary["num_skip"])
         for s in strategy_order:
             picks_totals[s] += int(summary["picks_by_strategy"].get(s, 0))
 
@@ -392,7 +392,7 @@ def main() -> None:
                         "gamma_win_rate": float(args.gamma_win_rate),
                         "eta_dislocation_abs": float(args.eta_dislocation_abs),
                         "score_biases": {str(k): float(v) for k, v in score_biases.items()},
-                        "cash_score_threshold": float(args.cash_score_threshold),
+                        "skip_score_threshold": float(args.skip_score_threshold),
                         "block_size": int(args.block_size),
                         "sim_offset_rounds": int(offset),
                     },
@@ -421,7 +421,7 @@ def main() -> None:
         "positive_block_frac": float(sum(1 for x in nets if float(x) > 0.0) / len(nets)),
         "bets_total": int(bets_total),
         "wins_total": int(wins_total),
-        "cash_total": int(cash_total),
+        "skip_total": int(skip_total),
         "win_rate_weighted": float(_safe_rate(int(wins_total), int(bets_total))),
         "bet_rate_mean": float(sum(float(r["bet_rate"]) for r in block_rows) / len(block_rows)),
         "net_per_500_rounds": float((sum(nets) / (int(args.block_size) * len(block_rows))) * 500.0),
@@ -432,7 +432,7 @@ def main() -> None:
         "beta_profit_mean": float(args.beta_profit_mean),
         "gamma_win_rate": float(args.gamma_win_rate),
         "eta_dislocation_abs": float(args.eta_dislocation_abs),
-        "cash_score_threshold": float(args.cash_score_threshold),
+        "skip_score_threshold": float(args.skip_score_threshold),
     }
     for s in strategy_order:
         agg[f"picks_total_{s}"] = int(picks_totals[s])
@@ -452,7 +452,7 @@ def main() -> None:
         "wins",
         "bet_rate",
         "win_rate",
-        "pick_cash",
+        "pick_skip",
     ] + [f"pick_{s}" for s in strategy_order]
     with blocks_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=block_fields)
@@ -468,7 +468,7 @@ def main() -> None:
         "beta_profit_mean",
         "gamma_win_rate",
         "eta_dislocation_abs",
-        "cash_score_threshold",
+        "skip_score_threshold",
         "blocks",
         "net_total",
         "net_mean",
@@ -479,7 +479,7 @@ def main() -> None:
         "positive_block_frac",
         "bets_total",
         "wins_total",
-        "cash_total",
+        "skip_total",
         "win_rate_weighted",
         "bet_rate_mean",
         "net_per_500_rounds",
@@ -505,4 +505,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

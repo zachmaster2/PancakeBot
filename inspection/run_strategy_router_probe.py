@@ -16,7 +16,7 @@ from typing import Any
 
 from inspection.strategy_router_common import parse_strategy_prefixes
 
-_ROUTER_MODES = ("cash_only", "oracle_cash", "expected_net_max", "online_cellmean")
+_ROUTER_MODES = ("skip_only", "oracle_skip", "expected_net_max", "online_cellmean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,7 +160,7 @@ def _pick_expected_net_max(
     strategies: list[str],
     expected_net_threshold_bnb: float,
 ) -> str:
-    best_strategy = "CASH"
+    best_strategy = "SKIP"
     best_expected = float("-inf")
     for strategy in strategies:
         candidate = round_row.candidates[str(strategy)]
@@ -253,10 +253,10 @@ def _run_probe(
     max_drawdown_bnb = 0.0
     num_bets = 0
     num_wins = 0
-    num_cash = 0
+    num_skip = 0
     oracle_total_bnb = 0.0
     picks_by_strategy: dict[str, int] = {str(strategy): 0 for strategy in strategies}
-    picks_by_strategy["CASH"] = 0
+    picks_by_strategy["SKIP"] = 0
     trade_rows: list[dict[str, Any]] = []
 
     sum_profit_by_cell: dict[str, dict[tuple[int, int, int], float]] = {
@@ -297,17 +297,17 @@ def _run_probe(
 
     for idx, round_row in enumerate(rounds):
         oracle_total_bnb += float(round_row.oracle_profit_bnb)
-        chosen = "CASH"
+        chosen = "SKIP"
         chosen_profit_bnb = 0.0
         chosen_score = ""
 
         is_warmup = str(router_mode) == "online_cellmean" and int(idx) < int(warmup_rounds)
 
-        if str(router_mode) == "cash_only":
-            chosen = "CASH"
-        elif str(router_mode) == "oracle_cash":
+        if str(router_mode) == "skip_only":
+            chosen = "SKIP"
+        elif str(router_mode) == "oracle_skip":
             best_profit = 0.0
-            best_strategy = "CASH"
+            best_strategy = "SKIP"
             for strategy in strategies:
                 candidate = round_row.candidates[str(strategy)]
                 if not bool(candidate.bet_available):
@@ -323,13 +323,13 @@ def _run_probe(
                 strategies=strategies,
                 expected_net_threshold_bnb=float(expected_net_threshold_bnb),
             )
-            if str(chosen) != "CASH":
+            if str(chosen) != "SKIP":
                 chosen_profit_bnb = float(round_row.candidates[str(chosen)].profit_bnb)
                 chosen_score = round_row.candidates[str(chosen)].expected_net_selected_bnb
         elif str(router_mode) == "online_cellmean":
             if not bool(is_warmup):
                 best_estimated = float("-inf")
-                best_strategy = "CASH"
+                best_strategy = "SKIP"
                 for strategy in strategies:
                     candidate = round_row.candidates[str(strategy)]
                     if not bool(candidate.bet_available):
@@ -353,7 +353,7 @@ def _run_probe(
                         best_estimated = float(estimated)
                         best_strategy = str(strategy)
                 chosen = str(best_strategy)
-                if str(chosen) != "CASH":
+                if str(chosen) != "SKIP":
                     chosen_profit_bnb = float(round_row.candidates[str(chosen)].profit_bnb)
                     chosen_score = float(best_estimated)
         else:
@@ -380,9 +380,9 @@ def _run_probe(
                 )
                 count_by_cell[str(strategy)][key] = int(count_by_cell[str(strategy)].get(key, 0) + 1)
 
-        if str(chosen) == "CASH":
-            num_cash += 1
-            picks_by_strategy["CASH"] += 1
+        if str(chosen) == "SKIP":
+            num_skip += 1
+            picks_by_strategy["SKIP"] += 1
             chosen_profit_bnb = 0.0
         else:
             num_bets += 1
@@ -415,7 +415,7 @@ def _run_probe(
     summary = {
         "num_rounds": int(rounds_total),
         "num_bets": int(num_bets),
-        "num_cash": int(num_cash),
+        "num_skip": int(num_skip),
         "num_wins": int(num_wins),
         "bet_rate": float(_safe_rate(num_bets, rounds_total)),
         "win_rate_on_bets": float(_safe_rate(num_wins, num_bets)),

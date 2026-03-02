@@ -9,6 +9,7 @@ from pancakebot.config.strategy_config import DislocationCandidateConfig, Disloc
 from pancakebot.core.constants import BNB_WEI, GAS_COST_BET_BNB, GAS_COST_CLAIM_BNB
 from pancakebot.core.errors import InvariantError
 from pancakebot.domain.features.pool_amounts import compute_pool_amounts_wei_at_or_before
+from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
@@ -953,6 +954,69 @@ class DislocationEngine:
             skip_reason=None,
             p_bull=float(chosen.p_nowcast_bull) if chosen.p_nowcast_bull is not None else None,
             selected_strategy=str(best_name),
+        )
+
+    def candidate_signals_for_open_round(self, *, round_t: Round) -> dict[str, StrategyCandidateSignal]:
+        """Return per-candidate routing signals for the target open round."""
+
+        decisions = self._compute_decisions_for_round(round_t=round_t)
+        return self._candidate_signals_from_decisions(decisions=decisions)
+
+    def _candidate_signals_from_decisions(
+        self,
+        *,
+        decisions: dict[str, _CandidateRoundDecision],
+    ) -> dict[str, StrategyCandidateSignal]:
+        """Convert internal candidate decisions to a shared signal contract."""
+
+        out: dict[str, StrategyCandidateSignal] = {}
+        for name in self._candidate_order:
+            dec = decisions[str(name)]
+            selector_score = None
+            if bool(self._selector_ready) and str(dec.action) == "BET":
+                selector_score = self._selector_score_for_decision(
+                    candidate=str(name),
+                    dec=dec,
+                )
+            out[str(name)] = self._candidate_signal_from_decision(
+                candidate_name=str(name),
+                dec=dec,
+                selector_score_bnb=selector_score,
+            )
+        return out
+
+    @staticmethod
+    def _candidate_signal_from_decision(
+        *,
+        candidate_name: str,
+        dec: _CandidateRoundDecision,
+        selector_score_bnb: float | None,
+    ) -> StrategyCandidateSignal:
+        """Map one dislocation candidate decision to a strategy-agnostic signal."""
+
+        is_bet = str(dec.action) == "BET" and dec.side is not None and float(dec.bet_bnb) > 0.0
+        bet_side = None
+        if bool(is_bet):
+            bet_side = "Bull" if str(dec.side).upper() == "BULL" else "Bear"
+        skip_reason = None if bool(is_bet) else str(dec.skip_reason or "unknown_skip_reason")
+        return StrategyCandidateSignal(
+            candidate_name=str(candidate_name),
+            action="BET" if bool(is_bet) else "SKIP",
+            bet_side=bet_side,
+            bet_size_bnb=float(dec.bet_bnb) if bool(is_bet) else 0.0,
+            expected_profit_bnb=(
+                float(dec.expected_net_selected)
+                if dec.expected_net_selected is not None
+                else None
+            ),
+            selector_score_bnb=(
+                float(selector_score_bnb) if selector_score_bnb is not None else None
+            ),
+            skip_reason=skip_reason,
+            p_bull=float(dec.p_nowcast_bull) if dec.p_nowcast_bull is not None else None,
+            dislocation_bull=(
+                float(dec.dislocation_bull) if dec.dislocation_bull is not None else None
+            ),
         )
 
     def _compute_decisions_for_round(self, *, round_t: Round) -> dict[str, _CandidateRoundDecision]:
