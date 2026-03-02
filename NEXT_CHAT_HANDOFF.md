@@ -1,4 +1,78 @@
-# PancakeBot Handoff: Refactor Iteration Status (2026-03-01)
+# PancakeBot Handoff: Refactor Iteration Status (2026-03-02)
+
+## Update (2026-03-02): Backtest Warmup Snapshot Caching (Committed)
+
+1. Commit completed:
+   - `dc1b842`
+   - Message: `Backtest: cache warmup bootstrap state for second-pass speed`
+
+2. Scope:
+   - Backtest-only acceleration changes.
+   - Live/dry behavior unchanged.
+
+3. Key implementation:
+   - Added backtest state cache module:
+     - `pancakebot/backtest/state_cache.py`
+   - Added bootstrap state export/import hooks:
+     - `pancakebot/domain/strategy/pipeline.py`
+     - `pancakebot/domain/strategy/dislocation_engine.py`
+     - `pancakebot/domain/strategy/router.py`
+     - `pancakebot/domain/strategy/ml_candidate_adapter.py`
+   - Wired cache load/save in backtest runner for:
+     - `continuous`
+     - `chunk_reset`
+     - file: `pancakebot/backtest/runner.py`
+   - Added batched feature-cache commits and explicit flush/close:
+     - `pancakebot/infra/feature_cache_store.py`
+
+4. Timing proof with full ML + all candidates + router:
+   - Continuous cold (`sim=10`): `432.292s` (cache miss)
+   - Continuous warm (`sim=10`): `27.854s` (cache hit)
+   - Chunk-reset cold (`sim=20`, `reset=20`): `489.763s` (cache miss)
+   - Chunk-reset warm (`sim=20`, `reset=20`): `27.472s` (cache hit)
+   - Continuous warm (`sim=500`): `33.410s` (cache hit)
+   - Warm runs now in seconds (tens of seconds), versus minutes on cold start.
+
+5. Artifact state observed:
+   - Backtest state snapshots written under:
+     - `var/backtest_state_cache/pipeline_bootstrap/*.pkl.gz`
+   - Feature cache used:
+     - `var/feature_cache_v8.sqlite`
+     - table: `feature_vectors` (observed count: `50380`)
+
+6. Validation:
+   - `.\.venv\Scripts\python.exe -m compileall ...` on touched modules: passed.
+   - `.\.venv\Scripts\python.exe -m unittest tests.test_strategy_router tests.test_ml_candidate_adapter -v`: passed.
+
+## User-Approved Next Tasks (Execute Automatically In Next Chat)
+
+1. Move backtest state-cache path out of repo and make it explicit in config.
+   - Keep experiment outputs under `../PancakeBot_var_exp`.
+   - Align state-cache path with that external location (not under project `var/`).
+
+2. Add a one-command performance harness:
+   - Runs `cold -> warm` for both `continuous` and `chunk_reset`.
+   - Prints concise timing deltas and cache hit/miss confirmation.
+
+3. Run full matrix with warm cache and output one consolidated table:
+   - mode
+   - reset interval
+   - net profit BNB
+   - profit per 500 rounds
+   - max drawdown BNB
+   - num bets
+   - top skip reasons
+
+4. Post-matrix speed pass targeting sub-10s warm runs:
+   - cache ML retrain/calibration checkpoint state across simulation intervals.
+   - preserve deterministic behavior.
+
+## Anchors / Non-Negotiables
+
+1. Always use `.\.venv\Scripts\python.exe` for runs.
+2. Keep `good-results-codebase` off-limits.
+3. Do not revert unrelated dirty files.
+4. Continue frequent small commits for rollback safety.
 
 ## Update (2026-03-02): Shared Pipeline + Online Router + ML Candidate Adapter
 
