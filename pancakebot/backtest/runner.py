@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,9 @@ from pancakebot.domain.strategy.pipeline import StrategyPipeline
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterConfig
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
+
+_BOOTSTRAP_BATCH_ROUNDS = 1000
+_BOOTSTRAP_LOG_EVERY_ROUNDS = 5000
 
 
 def _tail_rounds(store, *, n: int) -> list[Round]:
@@ -250,6 +254,52 @@ def _resolve_reset_settings(backtest_cfg: BacktestConfig) -> tuple[str, int]:
     return str(mode), int(interval)
 
 
+def _bootstrap_pipeline_with_progress(
+    *,
+    pipeline: StrategyPipeline,
+    warmup_rounds: list[Round],
+    phase: str,
+) -> None:
+    total = int(len(warmup_rounds))
+    if int(total) <= 0:
+        return
+    if int(_BOOTSTRAP_BATCH_ROUNDS) <= 0:
+        raise InvariantError("bootstrap_batch_rounds_nonpositive")
+    if int(_BOOTSTRAP_LOG_EVERY_ROUNDS) <= 0:
+        raise InvariantError("bootstrap_log_every_rounds_nonpositive")
+
+    started = float(time.perf_counter())
+    done = 0
+    info(
+        "BACK",
+        "PROG",
+        "BOOT",
+        msg=f"phase={str(phase)} idx=0/{int(total)}",
+    )
+    while int(done) < int(total):
+        end = min(int(total), int(done) + int(_BOOTSTRAP_BATCH_ROUNDS))
+        pipeline.bootstrap_from_closed_rounds(rounds=list(warmup_rounds[int(done): int(end)]))
+        done = int(end)
+
+        should_log = (int(done) == int(total)) or (int(done) % int(_BOOTSTRAP_LOG_EVERY_ROUNDS) == 0)
+        if not bool(should_log):
+            continue
+
+        elapsed = max(1e-6, float(time.perf_counter()) - float(started))
+        rate = float(done) / float(elapsed)
+        remaining = int(total) - int(done)
+        eta = float(remaining) / float(rate) if float(rate) > 0.0 else 0.0
+        info(
+            "BACK",
+            "PROG",
+            "BOOT",
+            msg=(
+                f"phase={str(phase)} idx={int(done)}/{int(total)} "
+                f"elapsed={float(elapsed):.1f}s rate={float(rate):.1f}r/s eta={float(eta):.1f}s"
+            ),
+        )
+
+
 def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) -> None:
     backtest_cfg.validate()
     simulation_size = int(backtest_cfg.simulation_size)
@@ -306,7 +356,11 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
 
         if reset_mode == "continuous":
             pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=all_klines)
-            pipeline.bootstrap_from_closed_rounds(rounds=list(warmup))
+            _bootstrap_pipeline_with_progress(
+                pipeline=pipeline,
+                warmup_rounds=list(warmup),
+                phase="continuous_initial",
+            )
             info(
                 "BACK",
                 "INIT",
@@ -366,7 +420,11 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 )
 
                 chunk_pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=all_klines)
-                chunk_pipeline.bootstrap_from_closed_rounds(rounds=list(chunk_warmup))
+                _bootstrap_pipeline_with_progress(
+                    pipeline=chunk_pipeline,
+                    warmup_rounds=list(chunk_warmup),
+                    phase=f"chunk_{int(chunk_index)}_of_{int(chunk_count)}",
+                )
                 bankroll, rounds_done = _simulate_rounds(
                     pipeline=chunk_pipeline,
                     rounds=list(chunk_rounds),
