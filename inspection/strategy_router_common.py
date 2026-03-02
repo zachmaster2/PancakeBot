@@ -17,7 +17,7 @@ from typing import Any
 
 _VALID_ACTIONS = ("BET", "SKIP")
 _VALID_DIRECTIONS = ("BULL", "BEAR", "")
-_CASH_STRATEGY_NAME = "CASH"
+_SKIP_STRATEGY_NAME = "SKIP"
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,16 +254,16 @@ def direction_to_idx(direction: str) -> int:
     return -1
 
 
-def oracle_cash_pick(
+def oracle_skip_pick(
     rows_by_strategy: dict[str, StrategyTradeRow | None],
 ) -> tuple[str, float]:
-    """Return hindsight best strategy-or-cash choice for one round.
+    """Return hindsight best strategy-or-skip choice for one round.
 
-    `CASH` yields exactly `0.0` BNB and is selected whenever no strategy has a
+    `SKIP` yields exactly `0.0` BNB and is selected whenever no strategy has a
     strictly positive realized profit.
     """
 
-    best_strategy = _CASH_STRATEGY_NAME
+    best_strategy = _SKIP_STRATEGY_NAME
     best_profit_bnb = 0.0
     for strategy_prefix, row in rows_by_strategy.items():
         if row is None or str(row.action) != "BET":
@@ -272,4 +272,3 @@ def oracle_cash_pick(
             best_profit_bnb = float(row.profit_bnb)
             best_strategy = str(strategy_prefix)
     return str(best_strategy), float(best_profit_bnb)
-
