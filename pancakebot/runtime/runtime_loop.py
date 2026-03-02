@@ -6,7 +6,7 @@ Hard rules (project-level):
     and then maintained via an in-memory rolling cache.
 
 This module orchestrates I/O (Graph, on-chain) and strategy execution for the
-single production dislocation pipeline.
+shared production strategy pipeline (candidate providers + router).
 """
 
 from __future__ import annotations
@@ -38,10 +38,11 @@ from pancakebot.domain.features.schema import max_required_context_klines_size, 
 from pancakebot.domain.contiguity import check_klines_contiguous, check_rounds_contiguous
 from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionContract
 from pancakebot.domain.strategy.dislocation_engine import (
-    DislocationEngine,
-    LiveStrategyDecision,
     build_dislocation_engine_from_config,
 )
+from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
+from pancakebot.domain.strategy.pipeline import StrategyPipeline
+from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterConfig
 from pancakebot.runtime.claim_manager import claim_scan_cursor
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 from pancakebot.runtime.sleep import sleep_seconds
@@ -109,7 +110,7 @@ class _ClosedState:
     cache: RollingClosedRoundsCache
     disk_latest_epoch: int
     klines_cache: RollingKlinesCache
-    dislocation_engine: DislocationEngine | None = None
+    strategy_pipeline: StrategyPipeline | None = None
     claim_scan_initialized: bool = False
     simulated_bankroll_bnb: float | None = None
     dry_bets_by_epoch: dict[int, dict[str, object]] | None = None
@@ -608,20 +609,14 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     disk_latest_epoch = int(cache.rounds[-1].epoch)
 
     klines_cache = _init_klines_cache(cfg=cfg, closed_cache=cache)
-    dislocation_engine = build_dislocation_engine_from_config(
-        selector_cfg=cfg.strategy_cfg.dislocation.selector,
-        candidate_cfgs=cfg.strategy_cfg.dislocation.candidates,
-        treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-        cutoff_seconds=int(cfg.cutoff_seconds),
-    )
-    dislocation_engine.refresh_klines(list(klines_cache.klines))
-    dislocation_engine.bootstrap_from_closed_rounds(list(cache.rounds))
+    strategy_pipeline = _build_strategy_pipeline(cfg=cfg, klines_cache=klines_cache)
+    strategy_pipeline.bootstrap_from_closed_rounds(rounds=list(cache.rounds))
 
     closed = _ClosedState(
         cache=cache,
         disk_latest_epoch=disk_latest_epoch,
         klines_cache=klines_cache,
-        dislocation_engine=dislocation_engine,
+        strategy_pipeline=strategy_pipeline,
     )
 
     if cfg.dry:
@@ -666,11 +661,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _dry_settle_available_bets(cfg, closed)
             closed.claim_scan_initialized = True
 
-        # Step 3: Update strategy owner state from newly-closed rounds.
-        if closed.dislocation_engine is None:
-            raise InvariantError("dislocation_engine_missing")
-        closed.dislocation_engine.refresh_klines(list(closed.klines_cache.klines))
-        closed.dislocation_engine.settle_closed_rounds(list(closed.cache.rounds))
+        # Step 3: Update strategy pipeline state from newly-closed rounds.
+        if closed.strategy_pipeline is None:
+            raise InvariantError("strategy_pipeline_missing")
+        closed.strategy_pipeline.refresh_klines(klines=list(closed.klines_cache.klines))
+        closed.strategy_pipeline.settle_closed_rounds(rounds=list(closed.cache.rounds))
 
         # Step 4: Fetch lock_ts(t) (RPC) for open epoch.
         lock_ts_t = int(cfg.contract.lock_ts(int(current_epoch)))
@@ -806,11 +801,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         else:
             bankroll_bnb = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
 
-        if closed.dislocation_engine is None:
-            raise InvariantError("dislocation_engine_missing")
-        decision = closed.dislocation_engine.decide_open_round(
+        if closed.strategy_pipeline is None:
+            raise InvariantError("strategy_pipeline_missing")
+        decision = closed.strategy_pipeline.decide_open_round(
             round_t=open_round,
             bankroll_bnb=float(bankroll_bnb),
+            allow_oracle_mode=False,
         )
         if decision.p_bull is not None:
             pred_p_final = float(decision.p_bull)
@@ -837,7 +833,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             return
 
         # Step 12: Submit bet.
-        amount_wei = int(round(decision.amount_bnb * BNB_WEI))
+        amount_wei = int(round(decision.bet_size_bnb * BNB_WEI))
         if amount_wei <= 0:
             raise InvariantError("bet_amount_wei_nonpositive")
 
@@ -1101,6 +1097,47 @@ def _init_klines_cache(cfg: RuntimeConfig, *, closed_cache: RollingClosedRoundsC
         raise InvariantError("klines_cache_init_empty")
 
     return RollingKlinesCache(klines=list(klines), capacity=len(klines))
+
+
+def _build_strategy_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesCache) -> StrategyPipeline:
+    """Build shared strategy pipeline from runtime config."""
+
+    dislocation_engine = build_dislocation_engine_from_config(
+        selector_cfg=cfg.strategy_cfg.dislocation.selector,
+        candidate_cfgs=cfg.strategy_cfg.dislocation.candidates,
+        treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+        cutoff_seconds=int(cfg.cutoff_seconds),
+    )
+    dislocation_engine.refresh_klines(list(klines_cache.klines))
+
+    router_cfg = StrategyRouterConfig(
+        mode=str(cfg.strategy_cfg.router.mode),
+        score_threshold_bnb=float(cfg.strategy_cfg.router.score_threshold_bnb),
+        online_warmup_rounds=int(cfg.strategy_cfg.router.online_warmup_rounds),
+        online_num_quantile_bins=int(cfg.strategy_cfg.router.online_num_quantile_bins),
+        online_min_cell_obs=int(cfg.strategy_cfg.router.online_min_cell_obs),
+        online_score_threshold_bnb=float(cfg.strategy_cfg.router.online_score_threshold_bnb),
+        online_use_direction_split=bool(cfg.strategy_cfg.router.online_use_direction_split),
+    )
+    router = StrategyRouter(config=router_cfg)
+
+    ml_adapter: MlCandidateAdapter | None = None
+    if bool(cfg.strategy_cfg.ml_candidate.enabled):
+        ml_adapter = MlCandidateAdapter(
+            config=cfg.strategy_cfg.ml_candidate,
+            cutoff_seconds=int(cfg.cutoff_seconds),
+            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+            klines_store_like=klines_cache,
+        )
+
+    pipeline = StrategyPipeline(
+        dislocation_engine=dislocation_engine,
+        router=router,
+        treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+        ml_candidate_adapter=ml_adapter,
+    )
+    pipeline.refresh_klines(klines=list(klines_cache.klines))
+    return pipeline
 
 
 def _append_newly_closed_klines(

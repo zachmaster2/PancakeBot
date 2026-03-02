@@ -341,6 +341,42 @@ perf_gate_min_history = 40
 perf_gate_min_win_rate = 0.52
 perf_gate_min_mean_profit_bnb = 0.0
 
+[strategy.router]
+# Shared router mode for live/dry/backtest:
+# selector_max_score | skip_only | oracle_skip | online_cellmean
+mode = "selector_max_score"
+
+# Extra score gate for selector_max_score mode.
+score_threshold_bnb = -1000000000.0
+
+# Online cell-mean warmup and celling parameters.
+online_warmup_rounds = 50000
+online_num_quantile_bins = 12
+online_min_cell_obs = 5
+online_score_threshold_bnb = 0.0
+online_use_direction_split = true
+
+[strategy.ml_candidate]
+# Optional ML walk-forward candidate routed alongside dislocation candidates.
+enabled = false
+name = "ml_walkforward_v1"
+fixed_bet_bnb = 0.2
+min_tradeable_prob = 0.55
+min_prob_edge = 0.02
+cutoff_pool_total_min_bnb = 1.2
+expected_net_min_bnb = 0.0
+train_size = 20000
+calibrate_size = 2000
+retrain_interval = 500
+recalibrate_interval = 250
+price_alpha = 1.0
+pool_alpha_total = 1.0
+pool_alpha_ratio = 1.0
+recency_weight_floor = 0.7
+recency_weight_power = 1.0
+predictability_baseline_bet_bnb = 0.05
+random_seed = 1337
+
 [backtest]
 # Number of most-recent closed rounds to replay.
 simulation_size = 20000
@@ -353,9 +389,3 @@ reset_mode = "continuous"
 
 # Reset interval in rounds when reset_mode="chunk_reset".
 reset_every_rounds = 0
-
-# Backtest router mode: selector_max_score | skip_only | oracle_skip
-router_mode = "selector_max_score"
-
-# Extra router score gate (BNB) applied on top of selector gating.
-router_score_threshold_bnb = -1000000000.0

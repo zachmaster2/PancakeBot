@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import replace
 import json
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 from pancakebot.backtest.config import BacktestConfig
 from pancakebot.backtest.runner import run_backtest
 from pancakebot.config.load_config import load_app_config
+from pancakebot.config.strategy_config import StrategyConfig
 from pancakebot.core.determinism import set_global_determinism
 from pancakebot.core.errors import InvariantError
 from pancakebot.infra.binance_us_client import BinanceUsClient
@@ -33,7 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--router-mode",
         type=str,
-        choices=("selector_max_score", "skip_only", "oracle_skip"),
+        choices=("selector_max_score", "skip_only", "oracle_skip", "online_cellmean"),
         default=None,
     )
     parser.add_argument("--router-score-threshold-bnb", type=float, default=None)
@@ -68,7 +70,7 @@ def _skip_reason_groups(summary: dict[str, Any]) -> dict[str, int]:
     return {str(k): int(v) for k, v in sorted(raw.items())}
 
 
-def _runtime_cfg_from_app(cfg) -> RuntimeConfig:
+def _runtime_cfg_from_app(*, cfg, strategy_cfg: StrategyConfig) -> RuntimeConfig:
     """Build RuntimeConfig for deterministic backtest execution."""
 
     constants = load_contract_constants()
@@ -81,7 +83,7 @@ def _runtime_cfg_from_app(cfg) -> RuntimeConfig:
         contract=None,
         wallet_address="",
         cutoff_seconds=int(cfg.cutoff_seconds),
-        strategy_cfg=cfg.strategy,
+        strategy_cfg=strategy_cfg,
         treasury_fee_fraction=float(constants.treasury_fee_fraction),
         buffer_seconds=int(constants.buffer_seconds),
         use_onchain_event_bets=False,
@@ -102,16 +104,6 @@ def _build_backtest_cfg(*, app_cfg, args: argparse.Namespace) -> BacktestConfig:
         if args.reset_every_rounds is None
         else int(args.reset_every_rounds)
     )
-    router_mode = (
-        str(app_cfg.backtest.router_mode)
-        if args.router_mode is None
-        else str(args.router_mode)
-    )
-    router_score_threshold_bnb = (
-        float(app_cfg.backtest.router_score_threshold_bnb)
-        if args.router_score_threshold_bnb is None
-        else float(args.router_score_threshold_bnb)
-    )
     backtest_cfg = BacktestConfig(
         simulation_size=(
             int(app_cfg.backtest.simulation_size)
@@ -125,11 +117,27 @@ def _build_backtest_cfg(*, app_cfg, args: argparse.Namespace) -> BacktestConfig:
         ),
         reset_mode=str(reset_mode),
         reset_every_rounds=int(reset_every_rounds),
-        router_mode=str(router_mode),
-        router_score_threshold_bnb=float(router_score_threshold_bnb),
     )
     backtest_cfg.validate()
     return backtest_cfg
+
+
+def _strategy_cfg_with_router_overrides(
+    *,
+    strategy_cfg: StrategyConfig,
+    args: argparse.Namespace,
+) -> StrategyConfig:
+    """Apply optional router CLI overrides to strategy config."""
+
+    router_cfg = strategy_cfg.router
+    if args.router_mode is not None:
+        router_cfg = replace(router_cfg, mode=str(args.router_mode))
+    if args.router_score_threshold_bnb is not None:
+        router_cfg = replace(
+            router_cfg,
+            score_threshold_bnb=float(args.router_score_threshold_bnb),
+        )
+    return replace(strategy_cfg, router=router_cfg)
 
 
 def main() -> None:
@@ -139,7 +147,8 @@ def main() -> None:
     cfg = load_app_config(str(args.config))
     set_global_determinism(seed=int(cfg.random_seed))
 
-    runtime_cfg = _runtime_cfg_from_app(cfg)
+    strategy_cfg = _strategy_cfg_with_router_overrides(strategy_cfg=cfg.strategy, args=args)
+    runtime_cfg = _runtime_cfg_from_app(cfg=cfg, strategy_cfg=strategy_cfg)
     bt_cfg = _build_backtest_cfg(app_cfg=cfg, args=args)
 
     out_dir = Path("var/exp") / str(args.name)
@@ -162,8 +171,8 @@ def main() -> None:
         "initial_bankroll_bnb": float(bt_cfg.initial_bankroll_bnb),
         "reset_mode": str(bt_cfg.reset_mode),
         "reset_every_rounds": int(bt_cfg.reset_every_rounds),
-        "router_mode": str(bt_cfg.router_mode),
-        "router_score_threshold_bnb": float(bt_cfg.router_score_threshold_bnb),
+        "router_mode": str(runtime_cfg.strategy_cfg.router.mode),
+        "router_score_threshold_bnb": float(runtime_cfg.strategy_cfg.router.score_threshold_bnb),
     }
     summary["risk"] = {"max_drawdown_bnb": float(_max_drawdown_bnb(trades_path))}
     summary["skip_reason_groups"] = _skip_reason_groups(summary)

@@ -11,7 +11,9 @@ from pancakebot.config.strategy_config import (
     DislocationCandidateConfig,
     DislocationSelectorConfig,
     DislocationStrategyConfig,
+    MlCandidateConfig,
     StrategyConfig,
+    StrategyRouterConfig,
 )
 from pancakebot.core.errors import InvariantError
 
@@ -144,6 +146,194 @@ def _parse_dislocation_selector(selector: dict[str, Any]) -> DislocationSelector
         score_threshold=float(score_threshold),
         use_direction_split=bool(use_direction_split),
         shadow_initial_bankroll_bnb=float(shadow_initial_bankroll_bnb),
+    )
+
+
+def _parse_strategy_router(router: dict[str, Any]) -> StrategyRouterConfig:
+    defaults = StrategyRouterConfig()
+    allowed = {
+        "mode",
+        "score_threshold_bnb",
+        "online_warmup_rounds",
+        "online_num_quantile_bins",
+        "online_min_cell_obs",
+        "online_score_threshold_bnb",
+        "online_use_direction_split",
+    }
+    _validate_unknown_keys("strategy_router", router, allowed)
+
+    mode = _opt_str(router, "mode", str(defaults.mode))
+    if str(mode) not in ("selector_max_score", "skip_only", "oracle_skip", "online_cellmean"):
+        raise InvariantError("strategy_router_mode_invalid")
+
+    score_threshold_bnb = _opt_float(
+        router,
+        "score_threshold_bnb",
+        float(defaults.score_threshold_bnb),
+    )
+
+    online_warmup_rounds = _opt_int(
+        router,
+        "online_warmup_rounds",
+        int(defaults.online_warmup_rounds),
+    )
+    if int(online_warmup_rounds) <= 0:
+        raise InvariantError("strategy_router_online_warmup_rounds_must_be_positive")
+
+    online_num_quantile_bins = _opt_int(
+        router,
+        "online_num_quantile_bins",
+        int(defaults.online_num_quantile_bins),
+    )
+    if int(online_num_quantile_bins) <= 1:
+        raise InvariantError("strategy_router_online_num_quantile_bins_invalid")
+
+    online_min_cell_obs = _opt_int(
+        router,
+        "online_min_cell_obs",
+        int(defaults.online_min_cell_obs),
+    )
+    if int(online_min_cell_obs) <= 0:
+        raise InvariantError("strategy_router_online_min_cell_obs_must_be_positive")
+
+    online_score_threshold_bnb = _opt_float(
+        router,
+        "online_score_threshold_bnb",
+        float(defaults.online_score_threshold_bnb),
+    )
+    online_use_direction_split = _opt_bool(
+        router,
+        "online_use_direction_split",
+        bool(defaults.online_use_direction_split),
+    )
+
+    return StrategyRouterConfig(
+        mode=str(mode),
+        score_threshold_bnb=float(score_threshold_bnb),
+        online_warmup_rounds=int(online_warmup_rounds),
+        online_num_quantile_bins=int(online_num_quantile_bins),
+        online_min_cell_obs=int(online_min_cell_obs),
+        online_score_threshold_bnb=float(online_score_threshold_bnb),
+        online_use_direction_split=bool(online_use_direction_split),
+    )
+
+
+def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
+    defaults = MlCandidateConfig()
+    allowed = {
+        "enabled",
+        "name",
+        "fixed_bet_bnb",
+        "min_tradeable_prob",
+        "min_prob_edge",
+        "cutoff_pool_total_min_bnb",
+        "expected_net_min_bnb",
+        "train_size",
+        "calibrate_size",
+        "retrain_interval",
+        "recalibrate_interval",
+        "price_alpha",
+        "pool_alpha_total",
+        "pool_alpha_ratio",
+        "recency_weight_floor",
+        "recency_weight_power",
+        "predictability_baseline_bet_bnb",
+        "random_seed",
+    }
+    _validate_unknown_keys("strategy_ml_candidate", candidate, allowed)
+
+    enabled = _opt_bool(candidate, "enabled", bool(defaults.enabled))
+    name = _opt_str(candidate, "name", str(defaults.name))
+    fixed_bet_bnb = _opt_float(candidate, "fixed_bet_bnb", float(defaults.fixed_bet_bnb))
+    if float(fixed_bet_bnb) <= 0.0:
+        raise InvariantError("strategy_ml_candidate_fixed_bet_bnb_must_be_positive")
+
+    min_tradeable_prob = _opt_float(
+        candidate,
+        "min_tradeable_prob",
+        float(defaults.min_tradeable_prob),
+    )
+    if not (0.0 <= float(min_tradeable_prob) <= 1.0):
+        raise InvariantError("strategy_ml_candidate_min_tradeable_prob_out_of_range")
+
+    min_prob_edge = _opt_float(candidate, "min_prob_edge", float(defaults.min_prob_edge))
+    if float(min_prob_edge) < 0.0:
+        raise InvariantError("strategy_ml_candidate_min_prob_edge_negative")
+
+    cutoff_pool_total_min_bnb = _opt_float(
+        candidate,
+        "cutoff_pool_total_min_bnb",
+        float(defaults.cutoff_pool_total_min_bnb),
+    )
+    if float(cutoff_pool_total_min_bnb) < 0.0:
+        raise InvariantError("strategy_ml_candidate_cutoff_pool_total_min_bnb_negative")
+
+    expected_net_min_bnb = _opt_float(
+        candidate,
+        "expected_net_min_bnb",
+        float(defaults.expected_net_min_bnb),
+    )
+    train_size = _opt_int(candidate, "train_size", int(defaults.train_size))
+    calibrate_size = _opt_int(candidate, "calibrate_size", int(defaults.calibrate_size))
+    retrain_interval = _opt_int(candidate, "retrain_interval", int(defaults.retrain_interval))
+    recalibrate_interval = _opt_int(candidate, "recalibrate_interval", int(defaults.recalibrate_interval))
+    if int(train_size) <= 0 or int(calibrate_size) < 0:
+        raise InvariantError("strategy_ml_candidate_train_or_calibrate_size_invalid")
+    if int(retrain_interval) <= 0 or int(recalibrate_interval) < 0:
+        raise InvariantError("strategy_ml_candidate_retrain_or_recalibrate_interval_invalid")
+
+    price_alpha = _opt_float(candidate, "price_alpha", float(defaults.price_alpha))
+    pool_alpha_total = _opt_float(candidate, "pool_alpha_total", float(defaults.pool_alpha_total))
+    pool_alpha_ratio = _opt_float(candidate, "pool_alpha_ratio", float(defaults.pool_alpha_ratio))
+    if float(price_alpha) <= 0.0 or float(pool_alpha_total) <= 0.0 or float(pool_alpha_ratio) <= 0.0:
+        raise InvariantError("strategy_ml_candidate_alpha_must_be_positive")
+
+    recency_weight_floor = _opt_float(
+        candidate,
+        "recency_weight_floor",
+        float(defaults.recency_weight_floor),
+    )
+    recency_weight_power = _opt_float(
+        candidate,
+        "recency_weight_power",
+        float(defaults.recency_weight_power),
+    )
+    if not (0.0 < float(recency_weight_floor) <= 1.0):
+        raise InvariantError("strategy_ml_candidate_recency_weight_floor_out_of_range")
+    if float(recency_weight_power) <= 0.0:
+        raise InvariantError("strategy_ml_candidate_recency_weight_power_must_be_positive")
+
+    predictability_baseline_bet_bnb = _opt_float(
+        candidate,
+        "predictability_baseline_bet_bnb",
+        float(defaults.predictability_baseline_bet_bnb),
+    )
+    if float(predictability_baseline_bet_bnb) <= 0.0:
+        raise InvariantError("strategy_ml_candidate_predictability_baseline_bet_bnb_must_be_positive")
+
+    random_seed = _opt_int(candidate, "random_seed", int(defaults.random_seed))
+    if int(random_seed) < 0:
+        raise InvariantError("strategy_ml_candidate_random_seed_negative")
+
+    return MlCandidateConfig(
+        enabled=bool(enabled),
+        name=str(name),
+        fixed_bet_bnb=float(fixed_bet_bnb),
+        min_tradeable_prob=float(min_tradeable_prob),
+        min_prob_edge=float(min_prob_edge),
+        cutoff_pool_total_min_bnb=float(cutoff_pool_total_min_bnb),
+        expected_net_min_bnb=float(expected_net_min_bnb),
+        train_size=int(train_size),
+        calibrate_size=int(calibrate_size),
+        retrain_interval=int(retrain_interval),
+        recalibrate_interval=int(recalibrate_interval),
+        price_alpha=float(price_alpha),
+        pool_alpha_total=float(pool_alpha_total),
+        pool_alpha_ratio=float(pool_alpha_ratio),
+        recency_weight_floor=float(recency_weight_floor),
+        recency_weight_power=float(recency_weight_power),
+        predictability_baseline_bet_bnb=float(predictability_baseline_bet_bnb),
+        random_seed=int(random_seed),
     )
 
 
@@ -318,7 +508,7 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
 
 
 def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
-    _validate_unknown_keys("strategy", strategy, {"dislocation"})
+    _validate_unknown_keys("strategy", strategy, {"dislocation", "router", "ml_candidate"})
 
     dislocation = strategy.get("dislocation", {})
     if dislocation is None:
@@ -327,6 +517,20 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
         raise InvariantError("config_section_not_dict: strategy.dislocation")
 
     _validate_unknown_keys("strategy_dislocation", dislocation, {"selector", "candidates"})
+
+    router_obj = strategy.get("router", {})
+    if router_obj is None:
+        router_obj = {}
+    if not isinstance(router_obj, dict):
+        raise InvariantError("config_section_not_dict: strategy.router")
+    router_cfg = _parse_strategy_router(router_obj)
+
+    ml_candidate_obj = strategy.get("ml_candidate", {})
+    if ml_candidate_obj is None:
+        ml_candidate_obj = {}
+    if not isinstance(ml_candidate_obj, dict):
+        raise InvariantError("config_section_not_dict: strategy.ml_candidate")
+    ml_candidate_cfg = _parse_ml_candidate(ml_candidate_obj)
 
     selector_obj = dislocation.get("selector", {})
     if selector_obj is None:
@@ -358,7 +562,9 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
         dislocation=DislocationStrategyConfig(
             selector=selector_cfg,
             candidates=candidate_cfgs,
-        )
+        ),
+        router=router_cfg,
+        ml_candidate=ml_candidate_cfg,
     )
 
 
@@ -440,8 +646,6 @@ def load_app_config(path: str) -> AppConfig:
         "initial_bankroll_bnb",
         "reset_mode",
         "reset_every_rounds",
-        "router_mode",
-        "router_score_threshold_bnb",
     }
     _validate_unknown_keys("backtest", backtest, allowed_bt_keys)
 
@@ -460,16 +664,12 @@ def load_app_config(path: str) -> AppConfig:
 
     reset_mode = _opt_str(backtest, "reset_mode", "continuous")
     reset_every_rounds = _opt_int(backtest, "reset_every_rounds", 0)
-    router_mode = _opt_str(backtest, "router_mode", "selector_max_score")
-    router_score_threshold_bnb = _opt_float(backtest, "router_score_threshold_bnb", -1e9)
 
     backtest_cfg = BacktestConfig(
         simulation_size=simulation_size_v,
         initial_bankroll_bnb=initial_bankroll_bnb,
         reset_mode=str(reset_mode),
         reset_every_rounds=int(reset_every_rounds),
-        router_mode=str(router_mode),
-        router_score_threshold_bnb=float(router_score_threshold_bnb),
     )
     backtest_cfg.validate()
 
