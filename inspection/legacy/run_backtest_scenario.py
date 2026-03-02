@@ -6,7 +6,15 @@ import csv
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any, Sequence
+
+# Legacy compatibility island: make `inspection/legacy/pancakebot` resolve first
+# while still allowing fallback to canonical modules via package __path__ overlay.
+_THIS_DIR = Path(__file__).resolve().parent
+_LEGACY_ROOT = str(_THIS_DIR)
+if _LEGACY_ROOT not in sys.path:
+    sys.path.insert(0, _LEGACY_ROOT)
 
 from pancakebot.backtest.config import BacktestConfig
 from pancakebot.backtest.runner import run_backtest
@@ -1136,7 +1144,7 @@ def _bet_diagnostics(trades_csv: Path, *, corr_min_samples: int) -> dict[str, An
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config.toml")
+    parser.add_argument("--config", type=str, default="var/tmp_config.toml")
     parser.add_argument("--name", type=str, required=True)
     parser.add_argument("--train-size", type=int, required=True)
     parser.add_argument("--calibrate-size", type=int, required=True)
