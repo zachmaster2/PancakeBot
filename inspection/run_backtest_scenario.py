@@ -4,6 +4,7 @@ import argparse
 import csv
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from pancakebot.runtime.contract_constants_cache import load_contract_constants
 from pancakebot.runtime.runtime_loop import RuntimeConfig
 
 _BINANCE_US_SYMBOL = "BNBUSDT"
+_DEFAULT_EXP_ROOT = "../PancakeBot_var_exp"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -151,7 +153,8 @@ def main() -> None:
     runtime_cfg = _runtime_cfg_from_app(cfg=cfg, strategy_cfg=strategy_cfg)
     bt_cfg = _build_backtest_cfg(app_cfg=cfg, args=args)
 
-    out_dir = Path("var/exp") / str(args.name)
+    exp_root = Path(os.environ.get("PANCAKEBOT_EXP_DIR", _DEFAULT_EXP_ROOT))
+    out_dir = exp_root / str(args.name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=bt_cfg, out_dir=out_dir)
