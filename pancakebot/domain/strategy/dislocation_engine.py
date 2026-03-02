@@ -956,10 +956,16 @@ class DislocationEngine:
             selected_strategy=str(best_name),
         )
 
+    def selector_ready(self) -> bool:
+        """Return whether selector warmup has completed."""
+
+        return bool(self._selector_ready)
+
     def candidate_signals_for_open_round(self, *, round_t: Round) -> dict[str, StrategyCandidateSignal]:
         """Return per-candidate routing signals for the target open round."""
 
         decisions = self._compute_decisions_for_round(round_t=round_t)
+        self._pending_decisions_by_epoch[int(round_t.epoch)] = decisions
         return self._candidate_signals_from_decisions(decisions=decisions)
 
     def _candidate_signals_from_decisions(
