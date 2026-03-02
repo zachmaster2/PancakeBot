@@ -961,6 +961,61 @@ class DislocationEngine:
 
         return bool(self._selector_ready)
 
+    def export_bootstrap_state(self) -> dict[str, object]:
+        """Export selector/candidate state snapshot for backtest bootstrap cache."""
+
+        return {
+            "candidate_order": list(self._candidate_order),
+            "candidate_states": self._candidate_states,
+            "last_settled_epoch": self._last_settled_epoch,
+            "selector_ready": bool(self._selector_ready),
+            "settled_round_count": int(self._settled_round_count),
+            "warmup_rows_by_candidate": self._warmup_rows_by_candidate,
+            "selector_edges_by_candidate": self._selector_edges_by_candidate,
+            "selector_sum_profit": self._selector_sum_profit,
+            "selector_cnt_profit": self._selector_cnt_profit,
+        }
+
+    def import_bootstrap_state(self, *, state: dict[str, object]) -> None:
+        """Restore selector/candidate state snapshot for backtest bootstrap cache."""
+
+        candidate_order = list(state.get("candidate_order", []))
+        if candidate_order != list(self._candidate_order):
+            raise InvariantError("dislocation_snapshot_candidate_order_mismatch")
+
+        candidate_states = state.get("candidate_states")
+        if not isinstance(candidate_states, dict):
+            raise InvariantError("dislocation_snapshot_candidate_states_missing")
+        if set(candidate_states.keys()) != set(self._candidate_order):
+            raise InvariantError("dislocation_snapshot_candidate_set_mismatch")
+        self._candidate_states = {str(k): candidate_states[str(k)] for k in self._candidate_order}
+
+        last_settled_epoch = state.get("last_settled_epoch")
+        if last_settled_epoch is None:
+            self._last_settled_epoch = None
+        else:
+            self._last_settled_epoch = int(last_settled_epoch)
+
+        self._selector_ready = bool(state.get("selector_ready", False))
+        self._settled_round_count = int(state.get("settled_round_count", 0))
+        warmup_rows_raw = dict(state.get("warmup_rows_by_candidate", {}))
+        self._warmup_rows_by_candidate = {
+            str(name): list(warmup_rows_raw.get(str(name), []))
+            for name in self._candidate_order
+        }
+        self._selector_edges_by_candidate = state.get("selector_edges_by_candidate")
+        selector_sum_raw = dict(state.get("selector_sum_profit", {}))
+        selector_cnt_raw = dict(state.get("selector_cnt_profit", {}))
+        self._selector_sum_profit = {
+            str(name): dict(selector_sum_raw.get(str(name), {}))
+            for name in self._candidate_order
+        }
+        self._selector_cnt_profit = {
+            str(name): dict(selector_cnt_raw.get(str(name), {}))
+            for name in self._candidate_order
+        }
+        self._pending_decisions_by_epoch = {}
+
     def candidate_signals_for_open_round(self, *, round_t: Round) -> dict[str, StrategyCandidateSignal]:
         """Return per-candidate routing signals for the target open round."""
 

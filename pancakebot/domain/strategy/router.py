@@ -127,6 +127,28 @@ class StrategyRouter:
 
         return str(self._config.mode)
 
+    def export_bootstrap_state(self) -> dict[str, object]:
+        """Export online router state snapshot for backtest bootstrap cache."""
+
+        return {
+            "online_ready": bool(self._online_ready),
+            "online_settled_round_count": int(self._online_settled_round_count),
+            "online_warmup_rows_by_candidate": self._online_warmup_rows_by_candidate,
+            "online_edges_by_candidate": self._online_edges_by_candidate,
+            "online_sum_profit_by_candidate": self._online_sum_profit_by_candidate,
+            "online_count_by_candidate": self._online_count_by_candidate,
+        }
+
+    def import_bootstrap_state(self, *, state: dict[str, object]) -> None:
+        """Restore online router state snapshot for backtest bootstrap cache."""
+
+        self._online_ready = bool(state.get("online_ready", False))
+        self._online_settled_round_count = int(state.get("online_settled_round_count", 0))
+        self._online_warmup_rows_by_candidate = dict(state.get("online_warmup_rows_by_candidate", {}))
+        self._online_edges_by_candidate = state.get("online_edges_by_candidate")
+        self._online_sum_profit_by_candidate = dict(state.get("online_sum_profit_by_candidate", {}))
+        self._online_count_by_candidate = dict(state.get("online_count_by_candidate", {}))
+
     def route_round(
         self,
         *,

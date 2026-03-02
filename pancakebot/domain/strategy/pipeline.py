@@ -58,6 +58,48 @@ class StrategyPipeline:
 
         return str(self._router.mode)
 
+    def export_bootstrap_state(self) -> dict[str, object]:
+        """Export full pipeline warmup state for backtest snapshot caching."""
+
+        return {
+            "last_settled_epoch": self._last_settled_epoch,
+            "dislocation_engine_state": self._dislocation_engine.export_bootstrap_state(),
+            "router_state": self._router.export_bootstrap_state(),
+            "ml_state": (
+                self._ml_candidate_adapter.export_bootstrap_state()
+                if self._ml_candidate_adapter is not None and bool(self._ml_candidate_adapter.enabled)
+                else None
+            ),
+        }
+
+    def import_bootstrap_state(self, *, state: dict[str, object]) -> None:
+        """Restore full pipeline warmup state from backtest snapshot cache."""
+
+        dislocation_state = state.get("dislocation_engine_state")
+        if not isinstance(dislocation_state, dict):
+            raise InvariantError("pipeline_snapshot_dislocation_state_missing")
+        self._dislocation_engine.import_bootstrap_state(state=dislocation_state)
+
+        router_state = state.get("router_state")
+        if not isinstance(router_state, dict):
+            raise InvariantError("pipeline_snapshot_router_state_missing")
+        self._router.import_bootstrap_state(state=router_state)
+
+        ml_state = state.get("ml_state")
+        if ml_state is not None:
+            if self._ml_candidate_adapter is None or not bool(self._ml_candidate_adapter.enabled):
+                raise InvariantError("pipeline_snapshot_ml_state_without_adapter")
+            if not isinstance(ml_state, dict):
+                raise InvariantError("pipeline_snapshot_ml_state_invalid")
+            self._ml_candidate_adapter.import_bootstrap_state(state=ml_state)
+
+        last_settled_epoch = state.get("last_settled_epoch")
+        if last_settled_epoch is None:
+            self._last_settled_epoch = None
+        else:
+            self._last_settled_epoch = int(last_settled_epoch)
+        self._pending_candidate_signals_by_epoch = {}
+
     def refresh_klines(self, *, klines: list[Kline]) -> None:
         """Refresh candidate providers with the latest kline context."""
 

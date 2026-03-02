@@ -16,9 +16,11 @@ class FeatureCacheStore:
     canonical feature vectors for the same epoch/context tuple.
     """
 
-    def __init__(self, path_sqlite: str) -> None:
+    def __init__(self, path_sqlite: str, *, commit_every_writes: int = 500) -> None:
         if str(path_sqlite).strip() == "":
             raise InvariantError("feature_cache_path_empty")
+        if int(commit_every_writes) <= 0:
+            raise InvariantError("feature_cache_commit_every_writes_nonpositive")
         self._path = str(path_sqlite)
         p = Path(self._path)
         parent = p.parent
@@ -26,6 +28,9 @@ class FeatureCacheStore:
             parent.mkdir(parents=True, exist_ok=True)
 
         self._lock = RLock()
+        self._commit_every_writes = int(commit_every_writes)
+        self._pending_writes = 0
+        self._closed = False
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
@@ -168,7 +173,34 @@ class FeatureCacheStore:
                     int(time.time()),
                 ),
             )
-            self._conn.commit()
+            self._pending_writes += 1
+            if int(self._pending_writes) >= int(self._commit_every_writes):
+                self._conn.commit()
+                self._pending_writes = 0
+
+    def flush(self) -> None:
+        with self._lock:
+            if bool(self._closed):
+                return
+            if int(self._pending_writes) > 0:
+                self._conn.commit()
+                self._pending_writes = 0
+
+    def close(self) -> None:
+        with self._lock:
+            if bool(self._closed):
+                return
+            if int(self._pending_writes) > 0:
+                self._conn.commit()
+                self._pending_writes = 0
+            self._conn.close()
+            self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            return
 
     @staticmethod
     def _key(
