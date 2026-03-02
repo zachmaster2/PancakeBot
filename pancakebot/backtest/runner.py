@@ -4,14 +4,15 @@ import csv
 import json
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Deque
 
 from pancakebot.backtest.config import BacktestConfig
+from pancakebot.backtest.state_cache import BacktestStateCache, stable_hash
 from pancakebot.core.constants import GAS_COST_BET_BNB
 from pancakebot.core.errors import InvariantError
-from pancakebot.core.logging import info
+from pancakebot.core.logging import info, warn
 from pancakebot.domain.strategy.dislocation_engine import (
     build_dislocation_engine_from_config,
 )
@@ -23,6 +24,8 @@ from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
 _BOOTSTRAP_BATCH_ROUNDS = 1000
 _BOOTSTRAP_LOG_EVERY_ROUNDS = 5000
+_STATE_CACHE_ROOT_DIR = "var/backtest_state_cache"
+_STATE_CACHE_VERSION = "backtest_pipeline_state_v1"
 
 
 def _tail_rounds(store, *, n: int) -> list[Round]:
@@ -254,6 +257,70 @@ def _resolve_reset_settings(backtest_cfg: BacktestConfig) -> tuple[str, int]:
     return str(mode), int(interval)
 
 
+def _store_file_signature(path: str) -> dict[str, object]:
+    p = Path(str(path))
+    if not p.exists():
+        return {"path": str(path), "exists": False}
+    st = p.stat()
+    return {
+        "path": str(path),
+        "exists": True,
+        "size_bytes": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+
+
+def _rounds_signature(rounds: list[Round]) -> dict[str, object]:
+    if not rounds:
+        return {
+            "count": 0,
+            "first_epoch": None,
+            "last_epoch": None,
+            "first_lock_at": None,
+            "last_lock_at": None,
+        }
+    first = rounds[0]
+    last = rounds[-1]
+    return {
+        "count": int(len(rounds)),
+        "first_epoch": int(first.epoch),
+        "last_epoch": int(last.epoch),
+        "first_lock_at": int(first.lock_at) if first.lock_at is not None else None,
+        "last_lock_at": int(last.lock_at) if last.lock_at is not None else None,
+    }
+
+
+def _snapshot_key(
+    *,
+    runtime_cfg,
+    backtest_cfg: BacktestConfig,
+    reset_mode: str,
+    warmup_rounds: list[Round],
+    sim_rounds: list[Round],
+    phase: str,
+) -> str:
+    strategy_cfg = asdict(runtime_cfg.strategy_cfg)
+    payload = {
+        "version": str(_STATE_CACHE_VERSION),
+        "phase": str(phase),
+        "reset_mode": str(reset_mode),
+        "cutoff_seconds": int(runtime_cfg.cutoff_seconds),
+        "treasury_fee_fraction": float(runtime_cfg.treasury_fee_fraction),
+        "buffer_seconds": int(runtime_cfg.buffer_seconds),
+        "backtest": {
+            "simulation_size": int(backtest_cfg.simulation_size),
+            "reset_every_rounds": int(backtest_cfg.reset_every_rounds),
+            "initial_bankroll_bnb": float(backtest_cfg.initial_bankroll_bnb),
+        },
+        "strategy_cfg": strategy_cfg,
+        "round_store": _store_file_signature(runtime_cfg.round_store.path_jsonl),
+        "kline_store": _store_file_signature(runtime_cfg.klines_store.path),
+        "warmup_rounds": _rounds_signature(list(warmup_rounds)),
+        "sim_rounds": _rounds_signature(list(sim_rounds)),
+    }
+    return str(stable_hash(payload))
+
+
 def _bootstrap_pipeline_with_progress(
     *,
     pipeline: StrategyPipeline,
@@ -321,6 +388,7 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
 
     all_klines = _all_klines_from_store(runtime_cfg.klines_store)
     router_cfg = runtime_cfg.strategy_cfg.router
+    state_cache = BacktestStateCache(root_dir=str(_STATE_CACHE_ROOT_DIR))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     trades_path = out_dir / "backtest_trades.csv"
@@ -356,11 +424,38 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
 
         if reset_mode == "continuous":
             pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=all_klines)
-            _bootstrap_pipeline_with_progress(
-                pipeline=pipeline,
+            phase = "continuous_initial"
+            cache_key = _snapshot_key(
+                runtime_cfg=runtime_cfg,
+                backtest_cfg=backtest_cfg,
+                reset_mode=str(reset_mode),
                 warmup_rounds=list(warmup),
-                phase="continuous_initial",
+                sim_rounds=list(sim_rounds),
+                phase=str(phase),
             )
+            snapshot_loaded = False
+            cached_state = state_cache.load(namespace="pipeline_bootstrap", key=str(cache_key))
+            if isinstance(cached_state, dict):
+                try:
+                    pipeline.import_bootstrap_state(state=cached_state)
+                    snapshot_loaded = True
+                    info("BACK", "CACHE", "HIT", msg=f"phase={str(phase)} key={str(cache_key)[:16]}")
+                except Exception as e:
+                    warn("BACK", "CACHE", "LOAD", msg=f"phase={str(phase)} key={str(cache_key)[:16]} err={e}")
+
+            if not bool(snapshot_loaded):
+                info("BACK", "CACHE", "MISS", msg=f"phase={str(phase)} key={str(cache_key)[:16]}")
+                _bootstrap_pipeline_with_progress(
+                    pipeline=pipeline,
+                    warmup_rounds=list(warmup),
+                    phase=str(phase),
+                )
+                state_cache.save(
+                    namespace="pipeline_bootstrap",
+                    key=str(cache_key),
+                    value=pipeline.export_bootstrap_state(),
+                )
+                info("BACK", "CACHE", "SAVE", msg=f"phase={str(phase)} key={str(cache_key)[:16]}")
             info(
                 "BACK",
                 "INIT",
@@ -420,11 +515,43 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 )
 
                 chunk_pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=all_klines)
-                _bootstrap_pipeline_with_progress(
-                    pipeline=chunk_pipeline,
+                chunk_phase = f"chunk_{int(chunk_index)}_of_{int(chunk_count)}"
+                chunk_cache_key = _snapshot_key(
+                    runtime_cfg=runtime_cfg,
+                    backtest_cfg=backtest_cfg,
+                    reset_mode=str(reset_mode),
                     warmup_rounds=list(chunk_warmup),
-                    phase=f"chunk_{int(chunk_index)}_of_{int(chunk_count)}",
+                    sim_rounds=list(chunk_rounds),
+                    phase=str(chunk_phase),
                 )
+                chunk_snapshot_loaded = False
+                chunk_cached_state = state_cache.load(namespace="pipeline_bootstrap", key=str(chunk_cache_key))
+                if isinstance(chunk_cached_state, dict):
+                    try:
+                        chunk_pipeline.import_bootstrap_state(state=chunk_cached_state)
+                        chunk_snapshot_loaded = True
+                        info("BACK", "CACHE", "HIT", msg=f"phase={str(chunk_phase)} key={str(chunk_cache_key)[:16]}")
+                    except Exception as e:
+                        warn(
+                            "BACK",
+                            "CACHE",
+                            "LOAD",
+                            msg=f"phase={str(chunk_phase)} key={str(chunk_cache_key)[:16]} err={e}",
+                        )
+
+                if not bool(chunk_snapshot_loaded):
+                    info("BACK", "CACHE", "MISS", msg=f"phase={str(chunk_phase)} key={str(chunk_cache_key)[:16]}")
+                    _bootstrap_pipeline_with_progress(
+                        pipeline=chunk_pipeline,
+                        warmup_rounds=list(chunk_warmup),
+                        phase=str(chunk_phase),
+                    )
+                    state_cache.save(
+                        namespace="pipeline_bootstrap",
+                        key=str(chunk_cache_key),
+                        value=chunk_pipeline.export_bootstrap_state(),
+                    )
+                    info("BACK", "CACHE", "SAVE", msg=f"phase={str(chunk_phase)} key={str(chunk_cache_key)[:16]}")
                 bankroll, rounds_done = _simulate_rounds(
                     pipeline=chunk_pipeline,
                     rounds=list(chunk_rounds),
@@ -478,6 +605,15 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
 
     finally:
         trades_f.close()
+        feature_cache_store = getattr(runtime_cfg, "feature_cache_store", None)
+        if feature_cache_store is not None:
+            try:
+                if hasattr(feature_cache_store, "flush"):
+                    feature_cache_store.flush()
+                if hasattr(feature_cache_store, "close"):
+                    feature_cache_store.close()
+            except Exception as e:
+                warn("BACK", "CACHE", "FLUSH", msg=f"err={e}")
 
 
 def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) -> None:

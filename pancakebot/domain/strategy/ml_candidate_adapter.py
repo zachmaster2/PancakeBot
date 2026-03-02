@@ -152,6 +152,28 @@ class MlCandidateAdapter:
                 continue
             self._history_rounds.append(round_t)
 
+    def export_bootstrap_state(self) -> dict[str, object]:
+        """Export ML walk-forward state snapshot for backtest bootstrap cache."""
+
+        return {
+            "history_rounds_json": [r.to_json() for r in self._history_rounds],
+            "walk_forward_state": self._state,
+        }
+
+    def import_bootstrap_state(self, *, state: dict[str, object]) -> None:
+        """Restore ML walk-forward state snapshot for backtest bootstrap cache."""
+
+        history_raw = list(state.get("history_rounds_json", []))
+        history: list[Round] = [Round.from_json(obj) for obj in history_raw]
+        history.sort(key=lambda r: int(r.epoch))
+        deduped: list[Round] = []
+        for round_t in history:
+            if deduped and int(round_t.epoch) <= int(deduped[-1].epoch):
+                continue
+            deduped.append(round_t)
+        self._history_rounds = list(deduped)
+        self._state = state.get("walk_forward_state")
+
     def candidate_signal_for_open_round(self, *, round_t: Round) -> StrategyCandidateSignal:
         """Generate one ML candidate signal for the target round."""
 
