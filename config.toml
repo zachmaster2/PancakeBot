@@ -353,3 +353,9 @@ reset_mode = "continuous"
 
 # Reset interval in rounds when reset_mode="chunk_reset".
 reset_every_rounds = 0
+
+# Backtest router mode: selector_max_score | skip_only | oracle_skip
+router_mode = "selector_max_score"
+
+# Extra router score gate (BNB) applied on top of selector gating.
+router_score_threshold_bnb = -1000000000.0

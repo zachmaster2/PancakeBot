@@ -11,9 +11,11 @@ from pancakebot.backtest.config import BacktestConfig
 from pancakebot.core.constants import GAS_COST_BET_BNB
 from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
+from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 from pancakebot.domain.strategy.dislocation_engine import (
     build_dislocation_engine_from_config,
 )
+from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterConfig
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
@@ -59,6 +61,44 @@ def _build_dislocation_engine(*, runtime_cfg, all_klines: list[Kline]):
     return engine
 
 
+def _build_router(*, backtest_cfg: BacktestConfig) -> StrategyRouter:
+    """Build backtest router from backtest config knobs."""
+
+    router_cfg = StrategyRouterConfig(
+        mode=str(backtest_cfg.router_mode),
+        score_threshold_bnb=float(backtest_cfg.router_score_threshold_bnb),
+    )
+    return StrategyRouter(config=router_cfg)
+
+
+def _oracle_realized_profit_by_candidate(
+    *,
+    candidate_signals: dict[str, StrategyCandidateSignal],
+    round_closed: Round,
+    treasury_fee_fraction: float,
+) -> dict[str, float]:
+    """Compute hindsight per-candidate realized profit for one closed round."""
+
+    out: dict[str, float] = {}
+    for candidate_name, signal in candidate_signals.items():
+        profit = 0.0
+        if (
+            str(signal.action) == "BET"
+            and str(signal.bet_side) in ("Bull", "Bear")
+            and float(signal.bet_size_bnb) > 0.0
+        ):
+            outcome = settle_bet_against_closed_round(
+                bet_bnb=float(signal.bet_size_bnb),
+                bet_side=str(signal.bet_side),
+                round_closed=round_closed,
+                treasury_fee_fraction=float(treasury_fee_fraction),
+            )
+            credit_bnb = float(outcome.credit_bnb)
+            profit = float(credit_bnb) - float(signal.bet_size_bnb) - float(GAS_COST_BET_BNB)
+        out[str(candidate_name)] = float(profit)
+    return out
+
+
 def _chunk_bootstrap_rounds(
     *,
     closed_rounds: list[Round],
@@ -95,6 +135,7 @@ class _BacktestStats:
 def _simulate_rounds(
     *,
     engine,
+    router: StrategyRouter,
     rounds: list[Round],
     runtime_cfg,
     trades_w,
@@ -105,26 +146,41 @@ def _simulate_rounds(
 ) -> tuple[float, int]:
     rounds_done = int(rounds_done_before_chunk)
     for round_t in rounds:
-        decision = engine.decide_open_round(round_t=round_t, bankroll_bnb=float(bankroll))
+        candidate_signals = engine.candidate_signals_for_open_round(round_t=round_t)
+        oracle_profit_by_candidate: dict[str, float] | None = None
+        if str(router.mode) == "oracle_skip":
+            oracle_profit_by_candidate = _oracle_realized_profit_by_candidate(
+                candidate_signals=candidate_signals,
+                round_closed=round_t,
+                treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
+            )
+
+        decision = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=float(bankroll),
+            bet_gas_cost_bnb=float(GAS_COST_BET_BNB),
+            selector_ready=bool(engine.selector_ready()),
+            realized_profit_by_candidate=oracle_profit_by_candidate,
+        )
 
         ev = float(decision.expected_profit_bnb)
         profit = 0.0
 
-        if decision.action == "BET" and float(decision.amount_bnb) > 0.0:
+        if decision.action == "BET" and float(decision.bet_size_bnb) > 0.0:
             bet_side = str(decision.bet_side)
             if bet_side not in ("Bull", "Bear"):
                 raise InvariantError("backtest_dislocation_bet_side_invalid")
 
-            bankroll -= float(decision.amount_bnb) + float(GAS_COST_BET_BNB)
+            bankroll -= float(decision.bet_size_bnb) + float(GAS_COST_BET_BNB)
             outcome = settle_bet_against_closed_round(
-                bet_bnb=float(decision.amount_bnb),
+                bet_bnb=float(decision.bet_size_bnb),
                 bet_side=str(decision.bet_side),
                 round_closed=round_t,
                 treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
             )
             credit_bnb = float(outcome.credit_bnb)
             bankroll += float(credit_bnb)
-            profit = float(credit_bnb) - float(decision.amount_bnb) - float(GAS_COST_BET_BNB)
+            profit = float(credit_bnb) - float(decision.bet_size_bnb) - float(GAS_COST_BET_BNB)
 
             stats.num_bets += 1
             if bet_side == "Bull":
@@ -153,7 +209,7 @@ def _simulate_rounds(
                 str(decision.action),
                 str(decision.skip_reason or ""),
                 str(decision.bet_side or ""),
-                float(decision.amount_bnb),
+                float(decision.bet_size_bnb),
                 float(p_final),
                 0.0,
                 0.0,
@@ -161,6 +217,13 @@ def _simulate_rounds(
                 float(ev),
                 float(profit),
                 float(bankroll),
+                str(decision.selected_strategy or ""),
+                str(router.mode),
+                (
+                    float(decision.selector_score_bnb)
+                    if decision.selector_score_bnb is not None
+                    else ""
+                ),
             ]
         )
 
@@ -210,6 +273,7 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
         raise InvariantError("backtest_dislocation_sim_rounds_len_mismatch")
 
     all_klines = _all_klines_from_store(runtime_cfg.klines_store)
+    router = _build_router(backtest_cfg=backtest_cfg)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     trades_path = out_dir / "backtest_trades.csv"
@@ -232,6 +296,9 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 "ev_bnb",
                 "profit_bnb",
                 "bankroll_bnb",
+                "selected_strategy",
+                "router_mode",
+                "selector_score_bnb",
             ]
         )
 
@@ -249,11 +316,14 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 "DISLOC",
                 msg=(
                     f"mode={str(reset_mode)} warmup_n={len(warmup)} sim_n={len(sim_rounds)} "
-                    f"selector_warmup={int(runtime_cfg.strategy_cfg.dislocation.selector.warmup_rounds)}"
+                    f"selector_warmup={int(runtime_cfg.strategy_cfg.dislocation.selector.warmup_rounds)} "
+                    f"router_mode={str(router.mode)} "
+                    f"router_score_threshold_bnb={float(backtest_cfg.router_score_threshold_bnb):.6f}"
                 ),
             )
             bankroll, rounds_done = _simulate_rounds(
                 engine=engine,
+                router=router,
                 rounds=sim_rounds,
                 runtime_cfg=runtime_cfg,
                 trades_w=trades_w,
@@ -271,7 +341,9 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 "DISLOC",
                 msg=(
                     f"mode={str(reset_mode)} reset_every_rounds={int(interval)} "
-                    f"warmup_n={len(warmup)} sim_n={len(sim_rounds)} chunks={int(chunk_count)}"
+                    f"warmup_n={len(warmup)} sim_n={len(sim_rounds)} chunks={int(chunk_count)} "
+                    f"router_mode={str(router.mode)} "
+                    f"router_score_threshold_bnb={float(backtest_cfg.router_score_threshold_bnb):.6f}"
                 ),
             )
             for chunk_index, chunk_start in enumerate(range(0, len(sim_rounds), interval), start=1):
@@ -297,6 +369,7 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 chunk_engine.bootstrap_from_closed_rounds(list(chunk_warmup))
                 bankroll, rounds_done = _simulate_rounds(
                     engine=chunk_engine,
+                    router=router,
                     rounds=list(chunk_rounds),
                     runtime_cfg=runtime_cfg,
                     trades_w=trades_w,
@@ -318,6 +391,8 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
         summary = {
             "reset_mode": str(reset_mode),
             "reset_every_rounds": int(reset_every_rounds),
+            "router_mode": str(router.mode),
+            "router_score_threshold_bnb": float(backtest_cfg.router_score_threshold_bnb),
             "num_rounds": int(num_rounds),
             "num_bets": int(stats.num_bets),
             "num_skips": int(num_skips),

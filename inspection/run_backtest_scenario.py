@@ -30,6 +30,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-bankroll-bnb", type=float, default=None)
     parser.add_argument("--reset-mode", type=str, choices=("continuous", "chunk_reset"), default=None)
     parser.add_argument("--reset-every-rounds", type=int, default=None)
+    parser.add_argument(
+        "--router-mode",
+        type=str,
+        choices=("selector_max_score", "skip_only", "oracle_skip"),
+        default=None,
+    )
+    parser.add_argument("--router-score-threshold-bnb", type=float, default=None)
     return parser
 
 
@@ -95,6 +102,16 @@ def _build_backtest_cfg(*, app_cfg, args: argparse.Namespace) -> BacktestConfig:
         if args.reset_every_rounds is None
         else int(args.reset_every_rounds)
     )
+    router_mode = (
+        str(app_cfg.backtest.router_mode)
+        if args.router_mode is None
+        else str(args.router_mode)
+    )
+    router_score_threshold_bnb = (
+        float(app_cfg.backtest.router_score_threshold_bnb)
+        if args.router_score_threshold_bnb is None
+        else float(args.router_score_threshold_bnb)
+    )
     backtest_cfg = BacktestConfig(
         simulation_size=(
             int(app_cfg.backtest.simulation_size)
@@ -108,6 +125,8 @@ def _build_backtest_cfg(*, app_cfg, args: argparse.Namespace) -> BacktestConfig:
         ),
         reset_mode=str(reset_mode),
         reset_every_rounds=int(reset_every_rounds),
+        router_mode=str(router_mode),
+        router_score_threshold_bnb=float(router_score_threshold_bnb),
     )
     backtest_cfg.validate()
     return backtest_cfg
@@ -143,6 +162,8 @@ def main() -> None:
         "initial_bankroll_bnb": float(bt_cfg.initial_bankroll_bnb),
         "reset_mode": str(bt_cfg.reset_mode),
         "reset_every_rounds": int(bt_cfg.reset_every_rounds),
+        "router_mode": str(bt_cfg.router_mode),
+        "router_score_threshold_bnb": float(bt_cfg.router_score_threshold_bnb),
     }
     summary["risk"] = {"max_drawdown_bnb": float(_max_drawdown_bnb(trades_path))}
     summary["skip_reason_groups"] = _skip_reason_groups(summary)

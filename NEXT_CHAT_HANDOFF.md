@@ -1,5 +1,62 @@
 # PancakeBot Handoff: Refactor Iteration Status (2026-03-01)
 
+## Update (2026-03-02): Shared Router Groundwork (Backtest-Only Integration)
+
+1. Added shared router module:
+   - `pancakebot/domain/strategy/router.py`
+   - Router modes:
+     - `selector_max_score`
+     - `skip_only`
+     - `oracle_skip`
+   - Normalized output contract:
+     - `StrategyRouterDecision` (`BET`/`SKIP`, selected strategy, side, size, expected profit, selector score, skip reason, `p_bull`).
+
+2. Backtest now routes from candidate signals through shared router:
+   - `pancakebot/backtest/runner.py`
+   - Replaced direct `engine.decide_open_round(...)` calls in backtest simulation loop.
+   - Backtest trades now include router telemetry columns:
+     - `selected_strategy`
+     - `router_mode`
+     - `selector_score_bnb`
+   - Backtest summary now includes:
+     - `router_mode`
+     - `router_score_threshold_bnb`
+
+3. Dislocation engine support for router path:
+   - `pancakebot/domain/strategy/dislocation_engine.py`
+   - `candidate_signals_for_open_round(...)` now stores pending decisions by epoch so settle path remains aligned.
+   - Added `selector_ready()` accessor for warmup/no-candidate reason parity in router mode.
+
+4. Backtest config knobs added and parsed:
+   - `pancakebot/backtest/config.py`
+   - `pancakebot/config/load_config.py`
+   - `config.toml`
+   - New `[backtest]` keys:
+     - `router_mode = "selector_max_score"`
+     - `router_score_threshold_bnb = -1000000000.0`
+
+5. Inspection scenario runner kept in sync:
+   - `inspection/run_backtest_scenario.py`
+   - Added optional CLI flags:
+     - `--router-mode`
+     - `--router-score-threshold-bnb`
+   - Scenario metadata now persists router settings.
+
+6. Deterministic tests added:
+   - `tests/test_strategy_router.py`
+   - Covered:
+     - `skip_only` always skips.
+     - `oracle_skip` selects highest positive realized-profit candidate.
+     - selector threshold gate skips below configured threshold.
+
+7. Validation run (using `.\.venv\Scripts\python.exe`):
+   - `compileall` on touched modules.
+   - `unittest tests.test_strategy_router -v` passed.
+   - backtest smoke scenarios passed:
+     - `smoke_router_skip_go` (`--router-mode skip_only`, sim=5)
+     - `smoke_router_selector_go` (`--router-mode selector_max_score`, sim=5)
+     - `smoke_router_oracle_go` (`--router-mode oracle_skip`, sim=5)
+
 ## Iteration Goal
 Unify production around a single dislocation strategy pipeline, eliminate legacy config/runtime clutter, and keep legacy modules only under `inspection/legacy` for one transition cycle.
 

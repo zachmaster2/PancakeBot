@@ -440,6 +440,8 @@ def load_app_config(path: str) -> AppConfig:
         "initial_bankroll_bnb",
         "reset_mode",
         "reset_every_rounds",
+        "router_mode",
+        "router_score_threshold_bnb",
     }
     _validate_unknown_keys("backtest", backtest, allowed_bt_keys)
 
@@ -458,12 +460,16 @@ def load_app_config(path: str) -> AppConfig:
 
     reset_mode = _opt_str(backtest, "reset_mode", "continuous")
     reset_every_rounds = _opt_int(backtest, "reset_every_rounds", 0)
+    router_mode = _opt_str(backtest, "router_mode", "selector_max_score")
+    router_score_threshold_bnb = _opt_float(backtest, "router_score_threshold_bnb", -1e9)
 
     backtest_cfg = BacktestConfig(
         simulation_size=simulation_size_v,
         initial_bankroll_bnb=initial_bankroll_bnb,
         reset_mode=str(reset_mode),
         reset_every_rounds=int(reset_every_rounds),
+        router_mode=str(router_mode),
+        router_score_threshold_bnb=float(router_score_threshold_bnb),
     )
     backtest_cfg.validate()
 
