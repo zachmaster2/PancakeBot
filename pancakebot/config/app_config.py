@@ -13,6 +13,7 @@ class AppConfig:
     # Paths
     closed_rounds_path: str
     klines_path: str
+    feature_cache_path: str
     abi_json_path: str
 
     # Runtime

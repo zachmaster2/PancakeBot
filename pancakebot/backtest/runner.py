@@ -88,6 +88,7 @@ def _build_ml_candidate_adapter(*, runtime_cfg) -> MlCandidateAdapter | None:
         cutoff_seconds=int(runtime_cfg.cutoff_seconds),
         treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
         klines_store_like=runtime_cfg.klines_store,
+        feature_cache_store=runtime_cfg.feature_cache_store,
     )
 
 

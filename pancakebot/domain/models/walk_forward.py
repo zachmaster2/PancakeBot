@@ -44,6 +44,9 @@ from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
+_TRADEABLE_LOG_IMB_FEATURE = "log_imb_w_p_80_to_p_100"
+_TRADEABLE_LOG_IMB_IDX = int(FEATURE_SCHEMA.columns.index(str(_TRADEABLE_LOG_IMB_FEATURE)))
+
 
 @dataclass(frozen=True, slots=True)
 class WalkForwardModels:
@@ -616,8 +619,7 @@ def _rmse(*, y_true: list[float], y_pred: list[float]) -> float:
     return math.sqrt(float(total) / float(len(y_true)))
 
 
-def _context_klines_for_round(*, cfg, round_t: Round) -> list:
-    kk = int(max_required_context_klines_size())
+def _feature_anchor_close_time_ms_for_round(*, cfg, round_t: Round) -> int:
     if round_t.lock_at is None:
         raise InvariantError("round_lock_at_missing")
     lock_ts = int(round_t.lock_at)
@@ -628,15 +630,23 @@ def _context_klines_for_round(*, cfg, round_t: Round) -> list:
         raise InvariantError("klines_store_empty")
     if int(latest_close_ms) < int(anchor_ms):
         anchor_ms = int(latest_close_ms)
+    return int(anchor_ms)
+
+
+def _context_klines_for_round(*, cfg, round_t: Round) -> list:
+    kk = int(max_required_context_klines_size())
+    anchor_ms = _feature_anchor_close_time_ms_for_round(cfg=cfg, round_t=round_t)
     return cfg.klines_store.get_context_klines(anchor_close_time_ms=int(anchor_ms), size=int(kk))
 
 
-def _tradeable_label(*, cfg: Any, round_t: Round, feats: dict[str, float]) -> int:
+def _tradeable_label(*, cfg: Any, round_t: Round, x_row: list[float]) -> int:
     baseline_bet = float(getattr(cfg, "predictability_baseline_bet_bnb", 0.05))
     if not math.isfinite(float(baseline_bet)) or float(baseline_bet) <= 0.0:
         raise InvariantError("predictability_baseline_bet_bnb_invalid")
 
-    log_imb = float(feats.get("log_imb_w_p_80_to_p_100", float("nan")))
+    if int(_TRADEABLE_LOG_IMB_IDX) < 0 or int(_TRADEABLE_LOG_IMB_IDX) >= int(len(x_row)):
+        raise InvariantError("tradeable_log_imb_feature_index_out_of_range")
+    log_imb = float(x_row[int(_TRADEABLE_LOG_IMB_IDX)])
     side = "Bull" if (not math.isfinite(float(log_imb)) or float(log_imb) >= 0.0) else "Bear"
 
     settled = settle_bet_against_closed_round(
@@ -647,6 +657,61 @@ def _tradeable_label(*, cfg: Any, round_t: Round, feats: dict[str, float]) -> in
     )
     pnl = float(settled.credit_bnb) - float(baseline_bet) - float(GAS_COST_BET_BNB)
     return 1 if float(pnl) > 0.0 else 0
+
+
+def _feature_vector_for_round(
+    *,
+    cfg: Any,
+    round_t: Round,
+    prior_context_rounds: list[Round],
+) -> list[float]:
+    if round_t.lock_at is None:
+        raise InvariantError("feature_vector_round_lock_at_missing")
+
+    prior_last_epoch = int(prior_context_rounds[-1].epoch) if prior_context_rounds else 0
+    anchor_close_time_ms = _feature_anchor_close_time_ms_for_round(cfg=cfg, round_t=round_t)
+    lock_at = int(round_t.lock_at)
+    feature_cache = getattr(cfg, "feature_cache_store", None)
+
+    if feature_cache is not None:
+        if not hasattr(feature_cache, "get_vector") or not hasattr(feature_cache, "put_vector"):
+            raise InvariantError("feature_cache_store_invalid")
+        cached = feature_cache.get_vector(
+            epoch=int(round_t.epoch),
+            cutoff_seconds=int(cfg.cutoff_seconds),
+            schema_name=str(FEATURE_SCHEMA.name),
+            start_at=int(round_t.start_at),
+            lock_at=int(lock_at),
+            prior_last_epoch=int(prior_last_epoch),
+            anchor_close_time_ms=int(anchor_close_time_ms),
+        )
+        if cached is not None:
+            return list(cached)
+
+    context_klines = _context_klines_for_round(cfg=cfg, round_t=round_t)
+    if not context_klines:
+        raise InvariantError("feature_vector_context_klines_empty")
+
+    feats = build_features(
+        target_round=round_t,
+        prior_context_rounds=prior_context_rounds,
+        context_klines=context_klines,
+        cutoff_seconds=int(cfg.cutoff_seconds),
+    )
+    x_row = vectorize(features=feats, schema=FEATURE_SCHEMA)
+
+    if feature_cache is not None:
+        feature_cache.put_vector(
+            epoch=int(round_t.epoch),
+            cutoff_seconds=int(cfg.cutoff_seconds),
+            schema_name=str(FEATURE_SCHEMA.name),
+            start_at=int(round_t.start_at),
+            lock_at=int(lock_at),
+            prior_last_epoch=int(prior_last_epoch),
+            anchor_close_time_ms=int(anchor_close_time_ms),
+            vector=list(x_row),
+        )
+    return list(x_row)
 
 
 def _build_training_rows(
@@ -693,16 +758,15 @@ def _build_training_rows(
         if prior_context_rounds and int(prior_context_rounds[-1].epoch) >= int(r_t.epoch):
             raise InvariantError("train_prior_not_strictly_before_t")
 
-        feats = build_features(
-            target_round=r_t,
+        x_row = _feature_vector_for_round(
+            cfg=cfg,
+            round_t=r_t,
             prior_context_rounds=prior_context_rounds,
-            context_klines=_context_klines_for_round(cfg=cfg, round_t=r_t),
-            cutoff_seconds=int(cfg.cutoff_seconds),
         )
 
-        x_price.append(vectorize(features=feats, schema=FEATURE_SCHEMA))
-        x_pool.append(vectorize(features=feats, schema=FEATURE_SCHEMA))
-        x_gate.append(vectorize(features=feats, schema=FEATURE_SCHEMA))
+        x_price.append(list(x_row))
+        x_pool.append(list(x_row))
+        x_gate.append(list(x_row))
 
         price_targets = compute_price_targets(round_t=r_t)
         ret_open = float(price_targets.ret_open)
@@ -724,7 +788,7 @@ def _build_training_rows(
         y_late_inflow_total.append(float(late_total))
         y_late_inflow_bull_frac.append(float(late_frac))
 
-        y_tradeable.append(int(_tradeable_label(cfg=cfg, round_t=r_t, feats=feats)))
+        y_tradeable.append(int(_tradeable_label(cfg=cfg, round_t=r_t, x_row=list(x_row))))
 
         used += 1
 

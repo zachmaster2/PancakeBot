@@ -16,6 +16,7 @@ from pancakebot.core.determinism import set_global_determinism
 from pancakebot.core.errors import InvariantError
 from pancakebot.infra.binance_us_client import BinanceUsClient
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
+from pancakebot.infra.feature_cache_store import FeatureCacheStore
 from pancakebot.infra.klines_store import KlinesStore
 from pancakebot.runtime.contract_constants_cache import load_contract_constants
 from pancakebot.runtime.runtime_loop import RuntimeConfig
@@ -76,6 +77,7 @@ def _runtime_cfg_from_app(*, cfg, strategy_cfg: StrategyConfig) -> RuntimeConfig
     """Build RuntimeConfig for deterministic backtest execution."""
 
     constants = load_contract_constants()
+    feature_cache_store = FeatureCacheStore(str(cfg.feature_cache_path))
     return RuntimeConfig(
         graph_client=None,
         round_store=ClosedRoundsStore(cfg.closed_rounds_path),
@@ -94,6 +96,7 @@ def _runtime_cfg_from_app(*, cfg, strategy_cfg: StrategyConfig) -> RuntimeConfig
         wait_for_bet_receipt=False,
         bet_receipt_timeout_seconds=int(cfg.bet_receipt_timeout_seconds),
         dry=False,
+        feature_cache_store=feature_cache_store,
     )
 
 

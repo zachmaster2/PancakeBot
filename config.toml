@@ -12,6 +12,9 @@ closed_rounds_path = "var/closed_rounds.jsonl"
 # Path to minute kline history JSONL.
 klines_path = "var/klines.jsonl"
 
+# Path to persisted feature-vector cache used by backtest/inspection ML runs.
+feature_cache_path = "../PancakeBot_var_exp/feature_cache_v8.sqlite"
+
 [graph]
 # ABI filepath (must contain ABI array JSON).
 abi_json_path = "abi/prediction_v2_abi.json"

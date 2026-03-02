@@ -104,6 +104,9 @@ class RuntimeConfig:
     # Execution
     dry: bool
 
+    # Optional persisted feature cache store for backtest/inspection acceleration.
+    feature_cache_store: object | None = None
+
 
 @dataclass(slots=True)
 class _ClosedState:
@@ -1128,6 +1131,7 @@ def _build_strategy_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesC
             cutoff_seconds=int(cfg.cutoff_seconds),
             treasury_fee_fraction=float(cfg.treasury_fee_fraction),
             klines_store_like=klines_cache,
+            feature_cache_store=cfg.feature_cache_store,
         )
 
     pipeline = StrategyPipeline(
