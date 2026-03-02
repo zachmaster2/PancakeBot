@@ -42,7 +42,7 @@ def _safe_rate(num: int, den: int) -> float:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--name-prefix", type=str, required=True)
-    p.add_argument("--config", type=str, default="config.toml")
+    p.add_argument("--config", type=str, default="var/tmp_config.toml")
     p.add_argument("--train-size", type=int, required=True)
     p.add_argument("--calibrate-size", type=int, required=True)
     p.add_argument("--rw-floor", type=float, required=True)
@@ -82,7 +82,7 @@ def _run_one(*, args, scenario_name: str, columns_csv: str, sim_offset_rounds: i
     cmd = [
         sys.executable,
         "-m",
-        "inspection.run_backtest_scenario",
+        "inspection.legacy.run_backtest_scenario",
         "--config",
         str(args.config),
         "--name",

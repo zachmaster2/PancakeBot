@@ -56,7 +56,7 @@ def parse_offsets_csv(raw: str) -> list[int]:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=str, default="config.toml")
+    p.add_argument("--config", type=str, default="var/tmp_config.toml")
     p.add_argument("--state-dir", type=str, default="var/exp/_autonomy")
     p.add_argument("--name-prefix", type=str, default="auto")
     p.add_argument("--sim-size", type=int, default=300)
@@ -208,7 +208,7 @@ def candidates(sim_size: int, fixed_override: float | None, seed: int, search_pr
 
 def run_one(config: str, name: str, sim_size: int, sim_offset_rounds: int, c: dict) -> tuple[int, str]:
     cmd = [
-        sys.executable, "-m", "inspection.run_backtest_scenario",
+        sys.executable, "-m", "inspection.legacy.run_backtest_scenario",
         "--config", config, "--name", name,
         "--train-size", str(int(c["train_size"])),
         "--calibrate-size", str(int(c["calibrate_size"])),
