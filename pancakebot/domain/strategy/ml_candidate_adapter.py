@@ -42,6 +42,7 @@ class _MlWalkForwardRuntimeConfig:
     recency_weight_power: float
     predictability_baseline_bet_bnb: float
     treasury_fee_fraction: float
+    feature_cache_store: object | None
 
 
 def _expected_net_from_predicted_final(
@@ -95,6 +96,7 @@ class MlCandidateAdapter:
         cutoff_seconds: int,
         treasury_fee_fraction: float,
         klines_store_like: object,
+        feature_cache_store: object | None = None,
     ) -> None:
         self._config = config
         self._history_rounds: list[Round] = []
@@ -114,6 +116,7 @@ class MlCandidateAdapter:
             recency_weight_power=float(config.recency_weight_power),
             predictability_baseline_bet_bnb=float(config.predictability_baseline_bet_bnb),
             treasury_fee_fraction=float(treasury_fee_fraction),
+            feature_cache_store=feature_cache_store,
         )
         self._validate_config()
 
@@ -188,13 +191,10 @@ class MlCandidateAdapter:
             return self._skip_signal(skip_reason="cutoff_pool_below_min_total")
 
         prior_context_rounds = list(self._history_rounds[-int(k):])
-        features = build_features(
-            target_round=round_t,
+        x_row = self._feature_vector_for_round(
+            round_t=round_t,
             prior_context_rounds=prior_context_rounds,
-            context_klines=self._context_klines(round_t=round_t),
-            cutoff_seconds=int(self._wf_cfg.cutoff_seconds),
         )
-        x_row = vectorize(features=features, schema=FEATURE_SCHEMA)
 
         mu = float(self._state.models.price_model.predict([list(x_row)])[0])
         p_bull = float(predict_probabilities(state=self._state, mu=float(mu)))
@@ -303,6 +303,76 @@ class MlCandidateAdapter:
         if float(self._config.fixed_bet_bnb) <= 0.0:
             raise InvariantError("ml_candidate_fixed_bet_nonpositive")
 
+    def _feature_vector_for_round(
+        self,
+        *,
+        round_t: Round,
+        prior_context_rounds: list[Round],
+    ) -> list[float]:
+        if round_t.lock_at is None:
+            raise InvariantError("ml_round_lock_at_missing")
+        if not prior_context_rounds:
+            raise InvariantError("ml_prior_context_rounds_empty")
+
+        prior_last_epoch = int(prior_context_rounds[-1].epoch)
+        anchor_close_time_ms = self._anchor_close_time_ms(round_t=round_t)
+        lock_at = int(round_t.lock_at)
+        feature_cache = self._wf_cfg.feature_cache_store
+
+        if feature_cache is not None:
+            if not hasattr(feature_cache, "get_vector") or not hasattr(feature_cache, "put_vector"):
+                raise InvariantError("ml_feature_cache_store_invalid")
+            cached = feature_cache.get_vector(
+                epoch=int(round_t.epoch),
+                cutoff_seconds=int(self._wf_cfg.cutoff_seconds),
+                schema_name=str(FEATURE_SCHEMA.name),
+                start_at=int(round_t.start_at),
+                lock_at=int(lock_at),
+                prior_last_epoch=int(prior_last_epoch),
+                anchor_close_time_ms=int(anchor_close_time_ms),
+            )
+            if cached is not None:
+                return list(cached)
+
+        context_klines = self._context_klines(round_t=round_t)
+        if not context_klines:
+            raise InvariantError("ml_context_klines_empty")
+
+        features = build_features(
+            target_round=round_t,
+            prior_context_rounds=prior_context_rounds,
+            context_klines=context_klines,
+            cutoff_seconds=int(self._wf_cfg.cutoff_seconds),
+        )
+        x_row = vectorize(features=features, schema=FEATURE_SCHEMA)
+
+        if feature_cache is not None:
+            feature_cache.put_vector(
+                epoch=int(round_t.epoch),
+                cutoff_seconds=int(self._wf_cfg.cutoff_seconds),
+                schema_name=str(FEATURE_SCHEMA.name),
+                start_at=int(round_t.start_at),
+                lock_at=int(lock_at),
+                prior_last_epoch=int(prior_last_epoch),
+                anchor_close_time_ms=int(anchor_close_time_ms),
+                vector=list(x_row),
+            )
+        return list(x_row)
+
+    def _anchor_close_time_ms(self, *, round_t: Round) -> int:
+        if not hasattr(self._wf_cfg.klines_store, "latest_close_time_ms"):
+            raise InvariantError("ml_klines_store_missing_latest_close_time_ms")
+        if round_t.lock_at is None:
+            raise InvariantError("ml_round_lock_at_missing")
+        cutoff_ts = int(round_t.lock_at) - int(self._wf_cfg.cutoff_seconds)
+        anchor_ms = int(cutoff_ts) * 1000
+        latest_close_ms = self._wf_cfg.klines_store.latest_close_time_ms()
+        if latest_close_ms is None:
+            raise InvariantError("ml_klines_store_empty")
+        if int(latest_close_ms) < int(anchor_ms):
+            anchor_ms = int(latest_close_ms)
+        return int(anchor_ms)
+
     def _context_klines(self, *, round_t: Round) -> list[Kline]:
         """Load cutoff-anchored context klines from the shared kline source."""
 
@@ -316,13 +386,7 @@ class MlCandidateAdapter:
         from pancakebot.domain.features.schema import max_required_context_klines_size
 
         kk = int(max_required_context_klines_size())
-        cutoff_ts = int(round_t.lock_at) - int(self._wf_cfg.cutoff_seconds)
-        anchor_ms = int(cutoff_ts) * 1000
-        latest_close_ms = self._wf_cfg.klines_store.latest_close_time_ms()
-        if latest_close_ms is None:
-            raise InvariantError("ml_klines_store_empty")
-        if int(latest_close_ms) < int(anchor_ms):
-            anchor_ms = int(latest_close_ms)
+        anchor_ms = self._anchor_close_time_ms(round_t=round_t)
         out = self._wf_cfg.klines_store.get_context_klines(
             anchor_close_time_ms=int(anchor_ms),
             size=int(kk),

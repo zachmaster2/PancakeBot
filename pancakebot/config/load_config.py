@@ -584,6 +584,7 @@ def load_app_config(path: str) -> AppConfig:
 
     closed_rounds_path = _req_str(paths, "closed_rounds_path")
     klines_path = _opt_str(paths, "klines_path", "var/klines.jsonl")
+    feature_cache_path = _opt_str(paths, "feature_cache_path", "../PancakeBot_var_exp/feature_cache_v8.sqlite")
     abi_json_path = _req_str(graph, "abi_json_path")
 
     allowed_runtime_keys = {
@@ -656,6 +657,7 @@ def load_app_config(path: str) -> AppConfig:
     return AppConfig(
         closed_rounds_path=closed_rounds_path,
         klines_path=klines_path,
+        feature_cache_path=feature_cache_path,
         abi_json_path=abi_json_path,
         cutoff_seconds=int(cutoff_seconds),
         random_seed=int(random_seed),

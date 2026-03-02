@@ -15,6 +15,7 @@ from pancakebot.core.constants import (
 from pancakebot.infra.binance_us_client import BinanceUsClient
 from pancakebot.infra.klines_store import KlinesStore
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
+from pancakebot.infra.feature_cache_store import FeatureCacheStore
 from pancakebot.infra.graph_client import GraphClient
 from pancakebot.infra.rpc_pool import choose_rpc_url
 from pancakebot.infra.onchain.web3_contract_config import Web3ContractConfig
@@ -37,6 +38,7 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
 
     if backtest:
         constants = load_contract_constants()
+        feature_cache_store = FeatureCacheStore(cfg.feature_cache_path)
         runtime_cfg = RuntimeConfig(
             graph_client=None,
             round_store=round_store,
@@ -53,6 +55,7 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
             bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
             strategy_cfg=cfg.strategy,
             dry=dry,
+            feature_cache_store=feature_cache_store,
             treasury_fee_fraction=float(constants.treasury_fee_fraction),
             buffer_seconds=int(constants.buffer_seconds),
         )
@@ -104,6 +107,7 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
         bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
         strategy_cfg=cfg.strategy,
         dry=dry,
+        feature_cache_store=None,
         treasury_fee_fraction=treasury_fee_fraction,
         buffer_seconds=buffer_seconds,
     )
