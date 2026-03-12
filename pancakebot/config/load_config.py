@@ -104,6 +104,20 @@ def _req_list_str(obj: dict[str, Any], key: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _opt_list_str(obj: dict[str, Any], key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    if key not in obj:
+        return tuple(default)
+    raw = obj[key]
+    if not isinstance(raw, list):
+        raise InvariantError(f"config_key_not_list: {key}")
+    out: list[str] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip():
+            raise InvariantError(f"config_key_list_item_not_nonempty_str: {key}[{i}]")
+        out.append(item.strip())
+    return tuple(out)
+
+
 def _validate_unknown_keys(section_name: str, obj: dict[str, Any], allowed: set[str]) -> None:
     unknown = sorted([k for k in obj.keys() if k not in allowed])
     if unknown:
@@ -170,7 +184,15 @@ def _parse_strategy_router(router: dict[str, Any]) -> StrategyRouterConfig:
     _validate_unknown_keys("strategy_router", router, allowed)
 
     mode = _opt_str(router, "mode", str(defaults.mode))
-    if str(mode) not in ("selector_max_score", "skip_only", "oracle_skip", "online_cellmean"):
+    if str(mode) not in (
+        "selector_max_score",
+        "skip_only",
+        "oracle_skip",
+        "online_cellmean",
+        "online_cellmean_side_gap",
+        "online_cellmean_backoff",
+        "online_cellmean_selector_fallback",
+    ):
         raise InvariantError("strategy_router_mode_invalid")
 
     score_threshold_bnb = _opt_float(
@@ -236,8 +258,10 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         "expected_net_min_bnb",
         "train_size",
         "calibrate_size",
+        "calibration_size",
         "retrain_interval",
         "recalibrate_interval",
+        "recalibration_interval",
         "price_alpha",
         "pool_alpha_total",
         "pool_alpha_ratio",
@@ -267,10 +291,26 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         raise InvariantError("strategy_ml_candidate_cutoff_pool_total_min_bnb_negative")
 
     expected_net_min_bnb = _req_float(candidate, "expected_net_min_bnb")
+
+    def _req_int_with_alias(*, primary: str, alias: str) -> int:
+        has_primary = primary in candidate
+        has_alias = alias in candidate
+        if bool(has_primary) and bool(has_alias):
+            primary_value = _req_int(candidate, primary)
+            alias_value = _req_int(candidate, alias)
+            if int(primary_value) != int(alias_value):
+                raise InvariantError(f"strategy_ml_candidate_alias_conflict: {primary} vs {alias}")
+            return int(primary_value)
+        if bool(has_primary):
+            return int(_req_int(candidate, primary))
+        if bool(has_alias):
+            return int(_req_int(candidate, alias))
+        raise InvariantError(f"missing_config_key: {primary}")
+
     train_size = _req_int(candidate, "train_size")
-    calibrate_size = _req_int(candidate, "calibrate_size")
+    calibrate_size = _req_int_with_alias(primary="calibrate_size", alias="calibration_size")
     retrain_interval = _req_int(candidate, "retrain_interval")
-    recalibrate_interval = _req_int(candidate, "recalibrate_interval")
+    recalibrate_interval = _req_int_with_alias(primary="recalibrate_interval", alias="recalibration_interval")
     if int(train_size) <= 0 or int(calibrate_size) < 0:
         raise InvariantError("strategy_ml_candidate_train_or_calibrate_size_invalid")
     if int(retrain_interval) <= 0 or int(recalibrate_interval) < 0:
@@ -334,12 +374,19 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
         "dislocation_threshold_pp",
         "nowcast_confidence_min",
         "cutoff_pool_total_min_bnb",
+        "pool_total_gate_mode",
+        "projected_final_pool_multiplier",
+        "projected_final_pool_total_min_bnb",
         "expected_net_min_bnb",
+        "bear_expected_net_extra_min_bnb",
         "side_selection_mode",
+        "allowed_sides",
         "market_extreme_min",
+        "nowcast_market_gap_min",
         "flow_window_seconds",
         "flow_min_imbalance",
         "flow_gate_mode",
+        "flow_gate_relax_dislocation_min",
         "adaptive_candidate_modes",
         "adaptive_window",
         "adaptive_min_history",
@@ -350,11 +397,44 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
         "stake_max_bnb",
         "stake_ev_ref_bnb",
         "stake_max_side_pool_frac",
+        "drawdown_stake_guard_enabled",
+        "drawdown_stake_guard_start_bnb",
+        "drawdown_stake_guard_full_bnb",
+        "drawdown_stake_guard_min_scale",
+        "anti_martingale_enabled",
+        "anti_martingale_win_multiplier",
+        "anti_martingale_loss_multiplier",
+        "anti_martingale_min_scale",
+        "anti_martingale_max_scale",
+        "circuit_breaker_enabled",
+        "circuit_breaker_drawdown_trigger_bnb",
+        "circuit_breaker_base_skip_rounds",
+        "circuit_breaker_escalation_multiplier",
+        "circuit_breaker_escalation_window_rounds",
+        "circuit_breaker_max_level",
+        "circuit_breaker_max_skip_rounds",
+        "circuit_breaker_reentry_rounds",
+        "circuit_breaker_reentry_scale",
         "perf_adapt_mode",
         "perf_gate_window",
         "perf_gate_min_history",
         "perf_gate_min_win_rate",
         "perf_gate_min_mean_profit_bnb",
+        "robust_ev_veto_enabled",
+        "robust_ev_veto_min_history",
+        "robust_ev_veto_window",
+        "robust_ev_veto_low_inflow_mult",
+        "robust_ev_veto_extreme_inflow_mult",
+        "robust_ev_veto_adverse_skew",
+        "robust_ev_veto_min_expected_net_bnb",
+        "shock_filter_enabled",
+        "shock_filter_window_seconds",
+        "shock_filter_min_window_total_bnb",
+        "shock_filter_min_abs_imbalance",
+        "shock_filter_min_surge_ratio",
+        "late_model_veto_enabled",
+        "late_model_veto_min_late_ratio",
+        "late_model_veto_min_abs_imbalance",
     }
     _validate_unknown_keys(candidate_name, candidate, allowed)
 
@@ -390,13 +470,49 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
     if cutoff_pool_total_min_bnb < 0.0:
         raise InvariantError("dislocation_candidate_cutoff_pool_total_min_bnb_negative")
 
+    pool_total_gate_mode = _opt_str(candidate, "pool_total_gate_mode", "cutoff_only")
+    if str(pool_total_gate_mode) not in (
+        "cutoff_only",
+        "projected_final_only",
+        "projected_final_model_only",
+    ):
+        raise InvariantError("dislocation_candidate_pool_total_gate_mode_invalid")
+
+    projected_final_pool_multiplier = _opt_float(
+        candidate,
+        "projected_final_pool_multiplier",
+        1.0,
+    )
+    if float(projected_final_pool_multiplier) <= 0.0:
+        raise InvariantError(
+            "dislocation_candidate_projected_final_pool_multiplier_must_be_positive"
+        )
+
+    projected_final_pool_total_min_bnb = _opt_float(
+        candidate,
+        "projected_final_pool_total_min_bnb",
+        0.0,
+    )
+    if float(projected_final_pool_total_min_bnb) < 0.0:
+        raise InvariantError("dislocation_candidate_projected_final_pool_total_min_bnb_negative")
+
     expected_net_min_bnb = _req_float(candidate, "expected_net_min_bnb")
+    bear_expected_net_extra_min_bnb = _opt_float(candidate, "bear_expected_net_extra_min_bnb", 0.0)
+    if float(bear_expected_net_extra_min_bnb) < 0.0:
+        raise InvariantError("dislocation_candidate_bear_expected_net_extra_min_bnb_negative")
 
     side_selection_mode = _req_str(candidate, "side_selection_mode")
+    allowed_sides = _opt_str(candidate, "allowed_sides", "both")
+    if str(allowed_sides) not in ("both", "bull_only", "bear_only"):
+        raise InvariantError("dislocation_candidate_allowed_sides_invalid")
 
     market_extreme_min = _req_float(candidate, "market_extreme_min")
     if market_extreme_min < 0.0:
         raise InvariantError("dislocation_candidate_market_extreme_min_negative")
+
+    nowcast_market_gap_min = _opt_float(candidate, "nowcast_market_gap_min", 0.0)
+    if float(nowcast_market_gap_min) < 0.0:
+        raise InvariantError("dislocation_candidate_nowcast_market_gap_min_negative")
 
     flow_window_seconds = _req_int(candidate, "flow_window_seconds")
     if flow_window_seconds < 0:
@@ -407,6 +523,9 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
         raise InvariantError("dislocation_candidate_flow_min_imbalance_negative")
 
     flow_gate_mode = _req_str(candidate, "flow_gate_mode")
+    flow_gate_relax_dislocation_min = _opt_float(candidate, "flow_gate_relax_dislocation_min", 1.0)
+    if not (0.0 <= float(flow_gate_relax_dislocation_min) <= 1.0):
+        raise InvariantError("dislocation_candidate_flow_gate_relax_dislocation_min_out_of_range")
 
     adaptive_candidate_modes = _req_list_str(candidate, "adaptive_candidate_modes")
 
@@ -436,6 +555,83 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
     if stake_max_side_pool_frac <= 0.0:
         raise InvariantError("dislocation_candidate_stake_max_side_pool_frac_must_be_positive")
 
+    drawdown_stake_guard_enabled = _opt_bool(candidate, "drawdown_stake_guard_enabled", False)
+
+    drawdown_stake_guard_start_bnb = _opt_float(candidate, "drawdown_stake_guard_start_bnb", 0.0)
+    if float(drawdown_stake_guard_start_bnb) < 0.0:
+        raise InvariantError("dislocation_candidate_drawdown_stake_guard_start_bnb_negative")
+
+    drawdown_stake_guard_full_bnb = _opt_float(candidate, "drawdown_stake_guard_full_bnb", 0.0)
+    if float(drawdown_stake_guard_full_bnb) < 0.0:
+        raise InvariantError("dislocation_candidate_drawdown_stake_guard_full_bnb_negative")
+
+    if float(drawdown_stake_guard_full_bnb) > 0.0 and float(drawdown_stake_guard_full_bnb) < float(
+        drawdown_stake_guard_start_bnb
+    ):
+        raise InvariantError("dislocation_candidate_drawdown_stake_guard_full_below_start")
+
+    drawdown_stake_guard_min_scale = _opt_float(candidate, "drawdown_stake_guard_min_scale", 1.0)
+    if not (0.0 < float(drawdown_stake_guard_min_scale) <= 1.0):
+        raise InvariantError("dislocation_candidate_drawdown_stake_guard_min_scale_out_of_range")
+
+    anti_martingale_enabled = _opt_bool(candidate, "anti_martingale_enabled", False)
+
+    anti_martingale_win_multiplier = _opt_float(candidate, "anti_martingale_win_multiplier", 1.15)
+    if float(anti_martingale_win_multiplier) <= 0.0:
+        raise InvariantError("dislocation_candidate_anti_martingale_win_multiplier_nonpositive")
+
+    anti_martingale_loss_multiplier = _opt_float(candidate, "anti_martingale_loss_multiplier", 0.9)
+    if float(anti_martingale_loss_multiplier) <= 0.0:
+        raise InvariantError("dislocation_candidate_anti_martingale_loss_multiplier_nonpositive")
+
+    anti_martingale_min_scale = _opt_float(candidate, "anti_martingale_min_scale", 0.5)
+    anti_martingale_max_scale = _opt_float(candidate, "anti_martingale_max_scale", 1.5)
+    if float(anti_martingale_min_scale) <= 0.0:
+        raise InvariantError("dislocation_candidate_anti_martingale_min_scale_nonpositive")
+    if float(anti_martingale_max_scale) <= 0.0:
+        raise InvariantError("dislocation_candidate_anti_martingale_max_scale_nonpositive")
+    if float(anti_martingale_min_scale) > float(anti_martingale_max_scale):
+        raise InvariantError("dislocation_candidate_anti_martingale_scale_bounds_invalid")
+
+    circuit_breaker_enabled = _opt_bool(candidate, "circuit_breaker_enabled", False)
+    circuit_breaker_drawdown_trigger_bnb = _opt_float(candidate, "circuit_breaker_drawdown_trigger_bnb", 0.0)
+    if float(circuit_breaker_drawdown_trigger_bnb) < 0.0:
+        raise InvariantError("dislocation_candidate_circuit_breaker_drawdown_trigger_bnb_negative")
+
+    circuit_breaker_base_skip_rounds = _opt_int(candidate, "circuit_breaker_base_skip_rounds", 0)
+    if int(circuit_breaker_base_skip_rounds) < 0:
+        raise InvariantError("dislocation_candidate_circuit_breaker_base_skip_rounds_negative")
+
+    circuit_breaker_escalation_multiplier = _opt_float(candidate, "circuit_breaker_escalation_multiplier", 1.5)
+    if float(circuit_breaker_escalation_multiplier) < 1.0:
+        raise InvariantError("dislocation_candidate_circuit_breaker_escalation_multiplier_invalid")
+
+    circuit_breaker_escalation_window_rounds = _opt_int(candidate, "circuit_breaker_escalation_window_rounds", 200)
+    if int(circuit_breaker_escalation_window_rounds) <= 0:
+        raise InvariantError("dislocation_candidate_circuit_breaker_escalation_window_rounds_nonpositive")
+
+    circuit_breaker_max_level = _opt_int(candidate, "circuit_breaker_max_level", 6)
+    if int(circuit_breaker_max_level) <= 0:
+        raise InvariantError("dislocation_candidate_circuit_breaker_max_level_nonpositive")
+
+    circuit_breaker_max_skip_rounds = _opt_int(candidate, "circuit_breaker_max_skip_rounds", 0)
+    if int(circuit_breaker_max_skip_rounds) < 0:
+        raise InvariantError("dislocation_candidate_circuit_breaker_max_skip_rounds_negative")
+
+    circuit_breaker_reentry_rounds = _opt_int(candidate, "circuit_breaker_reentry_rounds", 0)
+    if int(circuit_breaker_reentry_rounds) < 0:
+        raise InvariantError("dislocation_candidate_circuit_breaker_reentry_rounds_negative")
+
+    circuit_breaker_reentry_scale = _opt_float(candidate, "circuit_breaker_reentry_scale", 1.0)
+    if not (0.0 < float(circuit_breaker_reentry_scale) <= 1.0):
+        raise InvariantError("dislocation_candidate_circuit_breaker_reentry_scale_out_of_range")
+
+    if bool(circuit_breaker_enabled):
+        if float(circuit_breaker_drawdown_trigger_bnb) <= 0.0:
+            raise InvariantError("dislocation_candidate_circuit_breaker_drawdown_trigger_bnb_nonpositive")
+        if int(circuit_breaker_base_skip_rounds) <= 0:
+            raise InvariantError("dislocation_candidate_circuit_breaker_base_skip_rounds_nonpositive")
+
     perf_adapt_mode = _req_str(candidate, "perf_adapt_mode")
 
     perf_gate_window = _req_int(candidate, "perf_gate_window")
@@ -452,6 +648,82 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
 
     perf_gate_min_mean_profit_bnb = _req_float(candidate, "perf_gate_min_mean_profit_bnb")
 
+    robust_ev_veto_enabled = _opt_bool(candidate, "robust_ev_veto_enabled", False)
+
+    robust_ev_veto_min_history = _opt_int(candidate, "robust_ev_veto_min_history", 200)
+    if int(robust_ev_veto_min_history) <= 0:
+        raise InvariantError("dislocation_candidate_robust_ev_veto_min_history_nonpositive")
+
+    robust_ev_veto_window = _opt_int(candidate, "robust_ev_veto_window", 4000)
+    if int(robust_ev_veto_window) <= 0:
+        raise InvariantError("dislocation_candidate_robust_ev_veto_window_nonpositive")
+
+    robust_ev_veto_low_inflow_mult = _opt_float(candidate, "robust_ev_veto_low_inflow_mult", 0.5)
+    if float(robust_ev_veto_low_inflow_mult) < 0.0:
+        raise InvariantError("dislocation_candidate_robust_ev_veto_low_inflow_mult_negative")
+
+    robust_ev_veto_extreme_inflow_mult = _opt_float(candidate, "robust_ev_veto_extreme_inflow_mult", 0.2)
+    if float(robust_ev_veto_extreme_inflow_mult) < 0.0:
+        raise InvariantError("dislocation_candidate_robust_ev_veto_extreme_inflow_mult_negative")
+
+    robust_ev_veto_adverse_skew = _opt_float(candidate, "robust_ev_veto_adverse_skew", 0.15)
+    if not (0.0 <= float(robust_ev_veto_adverse_skew) <= 0.49):
+        raise InvariantError("dislocation_candidate_robust_ev_veto_adverse_skew_out_of_range")
+
+    robust_ev_veto_min_expected_net_bnb = _opt_float(
+        candidate,
+        "robust_ev_veto_min_expected_net_bnb",
+        0.0,
+    )
+
+    shock_filter_enabled = _opt_bool(candidate, "shock_filter_enabled", False)
+
+    shock_filter_window_seconds = _opt_int(candidate, "shock_filter_window_seconds", 20)
+    if int(shock_filter_window_seconds) <= 0:
+        raise InvariantError("dislocation_candidate_shock_filter_window_seconds_nonpositive")
+
+    shock_filter_min_window_total_bnb = _opt_float(
+        candidate,
+        "shock_filter_min_window_total_bnb",
+        0.25,
+    )
+    if float(shock_filter_min_window_total_bnb) < 0.0:
+        raise InvariantError("dislocation_candidate_shock_filter_min_window_total_bnb_negative")
+
+    shock_filter_min_abs_imbalance = _opt_float(
+        candidate,
+        "shock_filter_min_abs_imbalance",
+        0.8,
+    )
+    if not (0.0 <= float(shock_filter_min_abs_imbalance) <= 1.0):
+        raise InvariantError("dislocation_candidate_shock_filter_min_abs_imbalance_out_of_range")
+
+    shock_filter_min_surge_ratio = _opt_float(
+        candidate,
+        "shock_filter_min_surge_ratio",
+        2.5,
+    )
+    if float(shock_filter_min_surge_ratio) < 0.0:
+        raise InvariantError("dislocation_candidate_shock_filter_min_surge_ratio_negative")
+
+    late_model_veto_enabled = _opt_bool(candidate, "late_model_veto_enabled", False)
+
+    late_model_veto_min_late_ratio = _opt_float(
+        candidate,
+        "late_model_veto_min_late_ratio",
+        0.45,
+    )
+    if float(late_model_veto_min_late_ratio) < 0.0:
+        raise InvariantError("dislocation_candidate_late_model_veto_min_late_ratio_negative")
+
+    late_model_veto_min_abs_imbalance = _opt_float(
+        candidate,
+        "late_model_veto_min_abs_imbalance",
+        0.35,
+    )
+    if not (0.0 <= float(late_model_veto_min_abs_imbalance) <= 1.0):
+        raise InvariantError("dislocation_candidate_late_model_veto_min_abs_imbalance_out_of_range")
+
     return DislocationCandidateConfig(
         name=str(name),
         lookback1_seconds=int(lookback1_seconds),
@@ -465,12 +737,19 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
         dislocation_threshold_pp=float(dislocation_threshold_pp),
         nowcast_confidence_min=float(nowcast_confidence_min),
         cutoff_pool_total_min_bnb=float(cutoff_pool_total_min_bnb),
+        pool_total_gate_mode=str(pool_total_gate_mode),
+        projected_final_pool_multiplier=float(projected_final_pool_multiplier),
+        projected_final_pool_total_min_bnb=float(projected_final_pool_total_min_bnb),
         expected_net_min_bnb=float(expected_net_min_bnb),
+        bear_expected_net_extra_min_bnb=float(bear_expected_net_extra_min_bnb),
         side_selection_mode=str(side_selection_mode),
+        allowed_sides=str(allowed_sides),
         market_extreme_min=float(market_extreme_min),
+        nowcast_market_gap_min=float(nowcast_market_gap_min),
         flow_window_seconds=int(flow_window_seconds),
         flow_min_imbalance=float(flow_min_imbalance),
         flow_gate_mode=str(flow_gate_mode),
+        flow_gate_relax_dislocation_min=float(flow_gate_relax_dislocation_min),
         adaptive_candidate_modes=tuple(adaptive_candidate_modes),
         adaptive_window=int(adaptive_window),
         adaptive_min_history=int(adaptive_min_history),
@@ -481,11 +760,44 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
         stake_max_bnb=float(stake_max_bnb),
         stake_ev_ref_bnb=float(stake_ev_ref_bnb),
         stake_max_side_pool_frac=float(stake_max_side_pool_frac),
+        drawdown_stake_guard_enabled=bool(drawdown_stake_guard_enabled),
+        drawdown_stake_guard_start_bnb=float(drawdown_stake_guard_start_bnb),
+        drawdown_stake_guard_full_bnb=float(drawdown_stake_guard_full_bnb),
+        drawdown_stake_guard_min_scale=float(drawdown_stake_guard_min_scale),
+        anti_martingale_enabled=bool(anti_martingale_enabled),
+        anti_martingale_win_multiplier=float(anti_martingale_win_multiplier),
+        anti_martingale_loss_multiplier=float(anti_martingale_loss_multiplier),
+        anti_martingale_min_scale=float(anti_martingale_min_scale),
+        anti_martingale_max_scale=float(anti_martingale_max_scale),
+        circuit_breaker_enabled=bool(circuit_breaker_enabled),
+        circuit_breaker_drawdown_trigger_bnb=float(circuit_breaker_drawdown_trigger_bnb),
+        circuit_breaker_base_skip_rounds=int(circuit_breaker_base_skip_rounds),
+        circuit_breaker_escalation_multiplier=float(circuit_breaker_escalation_multiplier),
+        circuit_breaker_escalation_window_rounds=int(circuit_breaker_escalation_window_rounds),
+        circuit_breaker_max_level=int(circuit_breaker_max_level),
+        circuit_breaker_max_skip_rounds=int(circuit_breaker_max_skip_rounds),
+        circuit_breaker_reentry_rounds=int(circuit_breaker_reentry_rounds),
+        circuit_breaker_reentry_scale=float(circuit_breaker_reentry_scale),
         perf_adapt_mode=str(perf_adapt_mode),
         perf_gate_window=int(perf_gate_window),
         perf_gate_min_history=int(perf_gate_min_history),
         perf_gate_min_win_rate=float(perf_gate_min_win_rate),
         perf_gate_min_mean_profit_bnb=float(perf_gate_min_mean_profit_bnb),
+        robust_ev_veto_enabled=bool(robust_ev_veto_enabled),
+        robust_ev_veto_min_history=int(robust_ev_veto_min_history),
+        robust_ev_veto_window=int(robust_ev_veto_window),
+        robust_ev_veto_low_inflow_mult=float(robust_ev_veto_low_inflow_mult),
+        robust_ev_veto_extreme_inflow_mult=float(robust_ev_veto_extreme_inflow_mult),
+        robust_ev_veto_adverse_skew=float(robust_ev_veto_adverse_skew),
+        robust_ev_veto_min_expected_net_bnb=float(robust_ev_veto_min_expected_net_bnb),
+        shock_filter_enabled=bool(shock_filter_enabled),
+        shock_filter_window_seconds=int(shock_filter_window_seconds),
+        shock_filter_min_window_total_bnb=float(shock_filter_min_window_total_bnb),
+        shock_filter_min_abs_imbalance=float(shock_filter_min_abs_imbalance),
+        shock_filter_min_surge_ratio=float(shock_filter_min_surge_ratio),
+        late_model_veto_enabled=bool(late_model_veto_enabled),
+        late_model_veto_min_late_ratio=float(late_model_veto_min_late_ratio),
+        late_model_veto_min_abs_imbalance=float(late_model_veto_min_abs_imbalance),
     )
 
 
@@ -498,7 +810,11 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
     if not isinstance(dislocation, dict):
         raise InvariantError("config_section_not_dict: strategy.dislocation")
 
-    _validate_unknown_keys("strategy_dislocation", dislocation, {"selector", "candidates"})
+    _validate_unknown_keys(
+        "strategy_dislocation",
+        dislocation,
+        {"selector", "candidates", "active_candidate_names"},
+    )
 
     router_obj = strategy.get("router", {})
     if router_obj is None:
@@ -536,7 +852,24 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
             raise InvariantError(f"dislocation_candidate_name_duplicate: {key}")
         seen_names.add(key)
         parsed.append(cfg)
-    candidate_cfgs = tuple(parsed)
+    candidate_cfgs_all = tuple(parsed)
+
+    active_candidate_names = _opt_list_str(dislocation, "active_candidate_names", ())
+    if active_candidate_names:
+        active_set = set(active_candidate_names)
+        if len(active_set) != len(active_candidate_names):
+            raise InvariantError("dislocation_active_candidate_names_duplicate")
+
+        missing = sorted(str(x) for x in active_set if str(x) not in seen_names)
+        if missing:
+            raise InvariantError(f"dislocation_active_candidate_missing: {missing}")
+
+        by_name = {str(c.name): c for c in candidate_cfgs_all}
+        candidate_cfgs = tuple(by_name[str(name)] for name in active_candidate_names)
+        if not candidate_cfgs:
+            raise InvariantError("dislocation_active_candidates_empty")
+    else:
+        candidate_cfgs = tuple(candidate_cfgs_all)
 
     return StrategyConfig(
         dislocation=DislocationStrategyConfig(
@@ -584,7 +917,27 @@ def load_app_config(path: str) -> AppConfig:
 
     closed_rounds_path = _req_str(paths, "closed_rounds_path")
     klines_path = _opt_str(paths, "klines_path", "var/klines.jsonl")
-    feature_cache_path = _opt_str(paths, "feature_cache_path", "var/feature_cache_v8.sqlite")
+    feature_cache_path = _opt_str(paths, "feature_cache_path", "../PancakeBot_var_exp/feature_cache_v8.sqlite")
+    backtest_state_cache_dir = _opt_str(
+        paths,
+        "backtest_state_cache_dir",
+        "../PancakeBot_var_exp/backtest_state_cache",
+    )
+    market_data_db_path = _opt_str(
+        paths,
+        "market_data_db_path",
+        "../PancakeBot_var_exp/market_data_v1.sqlite",
+    )
+    projection_cache_db_path = _opt_str(
+        paths,
+        "projection_cache_db_path",
+        "../PancakeBot_var_exp/projection_cache_v1.sqlite",
+    )
+    run_registry_db_path = _opt_str(
+        paths,
+        "run_registry_db_path",
+        "../PancakeBot_var_exp/run_registry_v1.sqlite",
+    )
     abi_json_path = _req_str(graph, "abi_json_path")
 
     allowed_runtime_keys = {
@@ -627,6 +980,7 @@ def load_app_config(path: str) -> AppConfig:
         "initial_bankroll_bnb",
         "reset_mode",
         "reset_every_rounds",
+        "tail_offset_rounds",
     }
     _validate_unknown_keys("backtest", backtest, allowed_bt_keys)
 
@@ -645,12 +999,14 @@ def load_app_config(path: str) -> AppConfig:
 
     reset_mode = _opt_str(backtest, "reset_mode", "continuous")
     reset_every_rounds = _opt_int(backtest, "reset_every_rounds", 0)
+    tail_offset_rounds = _opt_int(backtest, "tail_offset_rounds", 0)
 
     backtest_cfg = BacktestConfig(
         simulation_size=simulation_size_v,
         initial_bankroll_bnb=initial_bankroll_bnb,
         reset_mode=str(reset_mode),
         reset_every_rounds=int(reset_every_rounds),
+        tail_offset_rounds=int(tail_offset_rounds),
     )
     backtest_cfg.validate()
 
@@ -658,6 +1014,10 @@ def load_app_config(path: str) -> AppConfig:
         closed_rounds_path=closed_rounds_path,
         klines_path=klines_path,
         feature_cache_path=feature_cache_path,
+        backtest_state_cache_dir=backtest_state_cache_dir,
+        market_data_db_path=market_data_db_path,
+        projection_cache_db_path=projection_cache_db_path,
+        run_registry_db_path=run_registry_db_path,
         abi_json_path=abi_json_path,
         cutoff_seconds=int(cutoff_seconds),
         random_seed=int(random_seed),

@@ -57,6 +57,7 @@ _LOCK_SAFETY_MARGIN_SECONDS = 5  # locked
 _CLAIM_CHECK_PADDING_SECONDS = 5
 
 _CLAIM_CURSOR_PATH = "var/claim_scan_cursor.txt"  # locked
+_CLAIM_BATCH_SIZE = 10
 _DRY_BETS_PATH = "var/dry_bets.jsonl"
 _DRY_SETTLED_PATH = "var/dry_settled_epochs.txt"
 _DRY_AUDIT_TRADES_CSV = "var/dry_audit_trades.csv"
@@ -89,6 +90,7 @@ class RuntimeConfig:
     strategy_cfg: StrategyConfig
 
     # Protocol constants (cached at startup)
+    min_bet_amount_bnb: float
     treasury_fee_fraction: float
     buffer_seconds: int
 
@@ -106,6 +108,18 @@ class RuntimeConfig:
 
     # Optional persisted feature cache store for backtest/inspection acceleration.
     feature_cache_store: object | None = None
+
+    # Optional SQLite market-data mirror used by backtests/inspection.
+    market_data_store: object | None = None
+
+    # Optional persistent final-pool projection cache used by ML adapter.
+    projection_cache_store: object | None = None
+
+    # Optional run registry store for experiment bookkeeping.
+    run_registry_store: object | None = None
+
+    # Backtest-only state snapshot cache root directory.
+    backtest_state_cache_dir: str = "../PancakeBot_var_exp/backtest_state_cache"
 
 
 @dataclass(slots=True)
@@ -156,6 +170,8 @@ def _with_lock_at(round_t: Round, lock_at: int) -> Round:
 def run_live_loop(cfg: RuntimeConfig) -> None:
     if not cfg.wallet_address:
         raise InvariantError("wallet_address_required")
+    if float(cfg.min_bet_amount_bnb) <= 0.0:
+        raise InvariantError("runtime_min_bet_amount_nonpositive")
     closed_state = _init_closed_state(cfg)
 
     # After sync, USD conversion uses the latest closed round close_price.
@@ -659,6 +675,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 get_close_ts=closed.cache.get_close_ts,
                 page_size=100,
                 gas_limit=int(GAS_LIMIT_CLAIM),
+                claim_batch_size=int(_CLAIM_BATCH_SIZE),
+                min_bet_with_gas_bnb=float(cfg.min_bet_amount_bnb) + float(GAS_COST_BET_BNB),
             )
 
             _dry_settle_available_bets(cfg, closed)
@@ -1105,11 +1123,29 @@ def _init_klines_cache(cfg: RuntimeConfig, *, closed_cache: RollingClosedRoundsC
 def _build_strategy_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesCache) -> StrategyPipeline:
     """Build shared strategy pipeline from runtime config."""
 
+    needs_pool_projection_model = any(
+        str(c.pool_total_gate_mode) == "projected_final_model_only"
+        or str(c.stake_mode) in ("ev_scaled_projected", "ev_optimal_projected")
+        or bool(c.late_model_veto_enabled)
+        for c in cfg.strategy_cfg.dislocation.candidates
+    )
+    ml_adapter: MlCandidateAdapter | None = None
+    if bool(cfg.strategy_cfg.ml_candidate.enabled) or bool(needs_pool_projection_model):
+        ml_adapter = MlCandidateAdapter(
+            config=cfg.strategy_cfg.ml_candidate,
+            cutoff_seconds=int(cfg.cutoff_seconds),
+            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+            klines_store_like=klines_cache,
+            feature_cache_store=cfg.feature_cache_store,
+            projection_cache_store=cfg.projection_cache_store,
+        )
+
     dislocation_engine = build_dislocation_engine_from_config(
         selector_cfg=cfg.strategy_cfg.dislocation.selector,
         candidate_cfgs=cfg.strategy_cfg.dislocation.candidates,
         treasury_fee_fraction=float(cfg.treasury_fee_fraction),
         cutoff_seconds=int(cfg.cutoff_seconds),
+        projected_pool_provider=ml_adapter,
     )
     dislocation_engine.refresh_klines(list(klines_cache.klines))
 
@@ -1123,16 +1159,6 @@ def _build_strategy_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesC
         online_use_direction_split=bool(cfg.strategy_cfg.router.online_use_direction_split),
     )
     router = StrategyRouter(config=router_cfg)
-
-    ml_adapter: MlCandidateAdapter | None = None
-    if bool(cfg.strategy_cfg.ml_candidate.enabled):
-        ml_adapter = MlCandidateAdapter(
-            config=cfg.strategy_cfg.ml_candidate,
-            cutoff_seconds=int(cfg.cutoff_seconds),
-            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-            klines_store_like=klines_cache,
-            feature_cache_store=cfg.feature_cache_store,
-        )
 
     pipeline = StrategyPipeline(
         dislocation_engine=dislocation_engine,
@@ -1415,6 +1441,8 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
         get_close_ts=closed.cache.get_close_ts,
         page_size=100,
         gas_limit=int(GAS_LIMIT_CLAIM),
+        claim_batch_size=int(_CLAIM_BATCH_SIZE),
+        min_bet_with_gas_bnb=float(cfg.min_bet_amount_bnb) + float(GAS_COST_BET_BNB),
     )
 
     _dry_settle_available_bets(cfg, closed)

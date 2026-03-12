@@ -12,7 +12,15 @@ from dataclasses import dataclass
 from pancakebot.core.errors import InvariantError
 from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 
-_ROUTER_MODES = ("selector_max_score", "skip_only", "oracle_skip", "online_cellmean")
+_ROUTER_MODES = (
+    "selector_max_score",
+    "skip_only",
+    "oracle_skip",
+    "online_cellmean",
+    "online_cellmean_side_gap",
+    "online_cellmean_backoff",
+    "online_cellmean_selector_fallback",
+)
 _VALID_BET_SIDES = ("Bull", "Bear")
 
 
@@ -198,6 +206,40 @@ class StrategyRouter:
                 candidate_signals=candidate_signals,
                 bankroll_bnb=float(bankroll_bnb),
                 bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=False,
+                require_side_gap=False,
+            )
+        if mode == "online_cellmean_side_gap":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=False,
+                require_side_gap=True,
+            )
+        if mode == "online_cellmean_backoff":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=True,
+                allow_selector_fallback=False,
+                require_side_gap=False,
+            )
+        if mode == "online_cellmean_selector_fallback":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=False,
             )
         raise InvariantError("router_mode_unreachable")
 
@@ -209,7 +251,12 @@ class StrategyRouter:
     ) -> None:
         """Consume realized candidate outcomes for online router adaptation."""
 
-        if str(self._config.mode) != "online_cellmean":
+        if str(self._config.mode) not in (
+            "online_cellmean",
+            "online_cellmean_side_gap",
+            "online_cellmean_backoff",
+            "online_cellmean_selector_fallback",
+        ):
             return
 
         self._validate_candidate_signals(candidate_signals)
@@ -301,11 +348,17 @@ class StrategyRouter:
         candidate_signals: dict[str, StrategyCandidateSignal],
         bankroll_bnb: float,
         bet_gas_cost_bnb: float,
+        selector_ready: bool,
+        use_candidate_backoff: bool,
+        allow_selector_fallback: bool,
+        require_side_gap: bool,
     ) -> StrategyRouterDecision:
         if not bool(self._online_ready):
             return self._skip_decision(skip_reason="router_online_warmup")
         if self._online_edges_by_candidate is None:
             raise InvariantError("router_online_edges_missing")
+        if bool(require_side_gap) and not bool(self._config.online_use_direction_split):
+            return self._skip_decision(skip_reason="router_online_side_gap_requires_direction_split")
 
         best_name: str | None = None
         best_estimate = float("-inf")
@@ -328,18 +381,71 @@ class StrategyRouter:
             )
             counts = self._online_count_by_candidate[str(candidate_name)]
             count = int(counts.get(key, 0))
-            if int(count) < int(self._config.online_min_cell_obs):
-                continue
             sums = self._online_sum_profit_by_candidate[str(candidate_name)]
-            estimated = float(sums[key]) / float(count)
+            if int(count) < int(self._config.online_min_cell_obs):
+                if not bool(use_candidate_backoff):
+                    continue
+                total_count = int(sum(int(v) for v in counts.values()))
+                if int(total_count) <= 0:
+                    continue
+                total_sum = float(sum(float(v) for v in sums.values()))
+                estimated = float(total_sum) / float(total_count)
+            else:
+                estimated = float(sums.get(key, 0.0)) / float(count)
             if float(estimated) < float(self._config.online_score_threshold_bnb):
                 continue
+            if bool(require_side_gap):
+                ev_bin, dis_bin, side_bin = key
+                opposite_key = (int(ev_bin), int(dis_bin), int(1 - int(side_bin)))
+                opposite_count = int(counts.get(opposite_key, 0))
+                if int(opposite_count) < int(self._config.online_min_cell_obs):
+                    continue
+                opposite_estimated = float(sums.get(opposite_key, 0.0)) / float(opposite_count)
+                if float(estimated) <= float(opposite_estimated):
+                    continue
+                estimated = float(estimated) - float(opposite_estimated)
             if float(estimated) > float(best_estimate):
                 best_estimate = float(estimated)
                 best_name = str(candidate_name)
 
         if best_name is None:
-            return self._skip_decision(skip_reason="router_online_no_candidate")
+            if not bool(allow_selector_fallback):
+                return self._skip_decision(skip_reason="router_online_no_candidate")
+
+            fallback = self._route_selector_max_score(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+            )
+            if str(fallback.action) != "BET":
+                skip_reason = str(fallback.skip_reason or "router_fallback_selector_no_candidate")
+                if skip_reason == "selector_warmup":
+                    skip_reason = "router_fallback_selector_warmup"
+                elif skip_reason == "selector_no_candidate":
+                    skip_reason = "router_fallback_selector_no_candidate"
+                elif skip_reason == "router_score_below_threshold":
+                    skip_reason = "router_fallback_selector_score_below_threshold"
+                return self._skip_decision(
+                    skip_reason=str(skip_reason),
+                    selected_strategy=fallback.selected_strategy,
+                    selector_score_bnb=fallback.selector_score_bnb,
+                    p_bull=fallback.p_bull,
+                )
+
+            selector_score = (
+                float(fallback.selector_score_bnb)
+                if fallback.selector_score_bnb is not None
+                else float("-inf")
+            )
+            if float(selector_score) < 0.0 or float(fallback.expected_profit_bnb) <= 0.0:
+                return self._skip_decision(
+                    skip_reason="router_fallback_selector_rejected",
+                    selected_strategy=fallback.selected_strategy,
+                    selector_score_bnb=fallback.selector_score_bnb,
+                    p_bull=fallback.p_bull,
+                )
+            return fallback
 
         signal = candidate_signals[str(best_name)]
         return self._to_affordability_checked_decision(

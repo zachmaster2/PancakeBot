@@ -4,6 +4,7 @@ import bisect
 import math
 from collections import deque
 from dataclasses import dataclass, replace
+from typing import Protocol
 
 from pancakebot.config.strategy_config import DislocationCandidateConfig, DislocationSelectorConfig
 from pancakebot.core.constants import BNB_WEI, GAS_COST_BET_BNB, GAS_COST_CLAIM_BNB
@@ -23,6 +24,10 @@ _STATIC_SIDE_SELECTION_MODES = (
     "market_contra",
     "nowcast_when_market_disagree",
     "nowcast_when_market_agree",
+)
+_PROJECTED_EV_STAKE_MODES = (
+    "ev_scaled_projected",
+    "ev_optimal_projected",
 )
 
 
@@ -61,12 +66,19 @@ class CandidateConfig:
     dislocation_threshold_pp: float
     nowcast_confidence_min: float
     cutoff_pool_total_min_bnb: float
+    pool_total_gate_mode: str
+    projected_final_pool_multiplier: float
+    projected_final_pool_total_min_bnb: float
     expected_net_min_bnb: float
+    bear_expected_net_extra_min_bnb: float
     side_selection_mode: str
+    allowed_sides: str
     market_extreme_min: float
+    nowcast_market_gap_min: float
     flow_window_seconds: int
     flow_min_imbalance: float
     flow_gate_mode: str
+    flow_gate_relax_dislocation_min: float
     adaptive_candidate_modes: tuple[str, ...]
     adaptive_window: int
     adaptive_min_history: int
@@ -77,11 +89,44 @@ class CandidateConfig:
     stake_max_bnb: float
     stake_ev_ref_bnb: float
     stake_max_side_pool_frac: float
+    drawdown_stake_guard_enabled: bool
+    drawdown_stake_guard_start_bnb: float
+    drawdown_stake_guard_full_bnb: float
+    drawdown_stake_guard_min_scale: float
+    anti_martingale_enabled: bool
+    anti_martingale_win_multiplier: float
+    anti_martingale_loss_multiplier: float
+    anti_martingale_min_scale: float
+    anti_martingale_max_scale: float
+    circuit_breaker_enabled: bool
+    circuit_breaker_drawdown_trigger_bnb: float
+    circuit_breaker_base_skip_rounds: int
+    circuit_breaker_escalation_multiplier: float
+    circuit_breaker_escalation_window_rounds: int
+    circuit_breaker_max_level: int
+    circuit_breaker_max_skip_rounds: int
+    circuit_breaker_reentry_rounds: int
+    circuit_breaker_reentry_scale: float
     perf_adapt_mode: str
     perf_gate_window: int
     perf_gate_min_history: int
     perf_gate_min_win_rate: float
     perf_gate_min_mean_profit_bnb: float
+    robust_ev_veto_enabled: bool
+    robust_ev_veto_min_history: int
+    robust_ev_veto_window: int
+    robust_ev_veto_low_inflow_mult: float
+    robust_ev_veto_extreme_inflow_mult: float
+    robust_ev_veto_adverse_skew: float
+    robust_ev_veto_min_expected_net_bnb: float
+    shock_filter_enabled: bool
+    shock_filter_window_seconds: int
+    shock_filter_min_window_total_bnb: float
+    shock_filter_min_abs_imbalance: float
+    shock_filter_min_surge_ratio: float
+    late_model_veto_enabled: bool
+    late_model_veto_min_late_ratio: float
+    late_model_veto_min_abs_imbalance: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +141,13 @@ class _KlineIndex:
         return float(self.close_prices[int(idx)])
 
 
+class _ProjectedPoolProvider(Protocol):
+    """Provider contract for model-based final-pool projections."""
+
+    def predict_final_pools_for_round(self, *, round_t: Round) -> tuple[float, float, float] | None:
+        """Return (final_total_bnb, final_bull_bnb, final_bear_bnb) or None if unavailable."""
+
+
 @dataclass(frozen=True, slots=True)
 class _CoreDecision:
     side: str | None
@@ -106,6 +158,8 @@ class _CoreDecision:
     expected_net_bull: float | None
     expected_net_bear: float | None
     expected_net_selected: float | None
+    ev_pool_bull_bnb: float | None = None
+    ev_pool_bear_bnb: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,11 +174,19 @@ class _SelectorBetRow:
 class _CandidateState:
     cfg: CandidateConfig
     shadow_bankroll_bnb: float
+    shadow_peak_bankroll_bnb: float
+    anti_martingale_scale: float
+    circuit_breaker_skip_rounds_remaining: int
+    circuit_breaker_level: int
+    circuit_breaker_last_trigger_settled_round: int | None
+    circuit_breaker_reentry_rounds_remaining: int
     adaptive_shadow_round_profit: dict[str, deque[float]]
     adaptive_shadow_bet_profit: dict[str, deque[float]]
     adaptive_shadow_bet_wins: dict[str, deque[int]]
     perf_shadow_profits: deque[float]
     perf_shadow_wins: deque[int]
+    robust_late_inflow_ratio: deque[float]
+    robust_late_bull_share: deque[float]
 
 
 @dataclass(slots=True)
@@ -147,6 +209,90 @@ def _safe_rate(num: int, den: int) -> float:
     return float(num) / float(den)
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return float(min(float(hi), max(float(lo), float(x))))
+
+
+def _drawdown_stake_scale(
+    *,
+    cfg: CandidateConfig,
+    shadow_bankroll_bnb: float,
+    shadow_peak_bankroll_bnb: float,
+) -> float:
+    if not bool(cfg.drawdown_stake_guard_enabled):
+        return 1.0
+
+    min_scale = _clamp(float(cfg.drawdown_stake_guard_min_scale), 0.0, 1.0)
+    if float(min_scale) >= 1.0:
+        return 1.0
+
+    start_bnb = max(0.0, float(cfg.drawdown_stake_guard_start_bnb))
+    full_bnb = max(0.0, float(cfg.drawdown_stake_guard_full_bnb))
+    if float(full_bnb) <= 0.0:
+        return 1.0
+
+    drawdown_bnb = max(0.0, float(shadow_peak_bankroll_bnb) - float(shadow_bankroll_bnb))
+    if float(drawdown_bnb) <= float(start_bnb):
+        return 1.0
+
+    if float(full_bnb) <= float(start_bnb):
+        return float(min_scale)
+
+    if float(drawdown_bnb) >= float(full_bnb):
+        return float(min_scale)
+
+    frac = float(drawdown_bnb - float(start_bnb)) / float(full_bnb - float(start_bnb))
+    return float(max(float(min_scale), 1.0 - float(frac) * (1.0 - float(min_scale))))
+
+
+def _anti_martingale_next_scale(
+    *,
+    cfg: CandidateConfig,
+    prev_scale: float,
+    realized_profit_bnb: float,
+) -> float:
+    if not bool(cfg.anti_martingale_enabled):
+        return 1.0
+    scale = float(prev_scale)
+    if float(realized_profit_bnb) > 0.0:
+        scale *= float(cfg.anti_martingale_win_multiplier)
+    elif float(realized_profit_bnb) < 0.0:
+        scale *= float(cfg.anti_martingale_loss_multiplier)
+    return float(
+        _clamp(
+            float(scale),
+            float(cfg.anti_martingale_min_scale),
+            float(cfg.anti_martingale_max_scale),
+        )
+    )
+
+
+def _circuit_breaker_skip_rounds_for_level(*, cfg: CandidateConfig, level: int) -> int:
+    base = max(0, int(cfg.circuit_breaker_base_skip_rounds))
+    if int(base) <= 0:
+        return 0
+    lvl = max(1, int(level))
+    mult = max(1.0, float(cfg.circuit_breaker_escalation_multiplier))
+    rounds = int(math.ceil(float(base) * (float(mult) ** float(max(0, int(lvl - 1))))))
+    max_skip = max(0, int(cfg.circuit_breaker_max_skip_rounds))
+    if int(max_skip) > 0:
+        rounds = min(int(rounds), int(max_skip))
+    return max(0, int(rounds))
+
+
+def _median_deque(values: deque[float]) -> float | None:
+    if not values:
+        return None
+    vv = sorted(float(x) for x in values if math.isfinite(float(x)))
+    if not vv:
+        return None
+    n = int(len(vv))
+    mid = int(n // 2)
+    if int(n % 2) == 1:
+        return float(vv[mid])
+    return float((float(vv[mid - 1]) + float(vv[mid])) * 0.5)
+
+
 def _sigmoid(x: float) -> float:
     xx = float(x)
     if xx >= 0.0:
@@ -163,6 +309,30 @@ def _opposite_side(side: str) -> str:
     if s == "BEAR":
         return "BULL"
     raise InvariantError("dislocation_side_invalid")
+
+
+def _side_allowed(*, side: str, allowed_sides: str) -> bool:
+    mode = str(allowed_sides)
+    side_u = str(side).upper()
+    if mode == "both":
+        return side_u in ("BULL", "BEAR")
+    if mode == "bull_only":
+        return side_u == "BULL"
+    if mode == "bear_only":
+        return side_u == "BEAR"
+    raise InvariantError("dislocation_allowed_sides_unknown")
+
+
+def _expected_net_min_for_side(*, cfg: CandidateConfig, side: str) -> float:
+    side_u = str(side).upper()
+    base = float(cfg.expected_net_min_bnb)
+    if side_u == "BEAR":
+        base += max(0.0, float(cfg.bear_expected_net_extra_min_bnb))
+    return float(base)
+
+
+def _flow_gate_relaxed_for_dislocation(*, cfg: CandidateConfig, dislocation_bull: float) -> bool:
+    return abs(float(dislocation_bull)) >= float(cfg.flow_gate_relax_dislocation_min)
 
 
 def _quantile_edges(values: list[float], n_bins: int) -> list[float]:
@@ -300,6 +470,270 @@ def _precutoff_flow_imbalance(
     return float((int(bull_wei) - int(bear_wei)) / float(total))
 
 
+def _precutoff_shock_filter_triggers(
+    *,
+    round_t: Round,
+    cfg: CandidateConfig,
+) -> bool:
+    if not bool(cfg.shock_filter_enabled):
+        return False
+    if round_t.lock_at is None or int(round_t.lock_at) <= 0:
+        return False
+    if int(round_t.start_at) <= 0:
+        return False
+
+    cutoff_ts = int(round_t.lock_at) - int(cfg.cutoff_seconds)
+    win_secs = max(1, int(cfg.shock_filter_window_seconds))
+    win_start = int(cutoff_ts) - int(win_secs)
+
+    bull_win = 0
+    bear_win = 0
+    bull_prev = 0
+    bear_prev = 0
+    for b in round_t.bets:
+        created = int(b.created_at)
+        if int(created) > int(cutoff_ts) or int(created) < int(round_t.start_at):
+            continue
+        pos = str(b.position)
+        if int(created) >= int(win_start):
+            if pos == "Bull":
+                bull_win += int(b.amount_wei)
+            elif pos == "Bear":
+                bear_win += int(b.amount_wei)
+            continue
+        if pos == "Bull":
+            bull_prev += int(b.amount_wei)
+        elif pos == "Bear":
+            bear_prev += int(b.amount_wei)
+
+    win_total = int(bull_win) + int(bear_win)
+    if int(win_total) <= 0:
+        return False
+    win_total_bnb = float(win_total) / float(BNB_WEI)
+    if float(win_total_bnb) < float(cfg.shock_filter_min_window_total_bnb):
+        return False
+
+    win_imb = float(int(bull_win) - int(bear_win)) / float(win_total)
+    if abs(float(win_imb)) < float(cfg.shock_filter_min_abs_imbalance):
+        return False
+
+    prev_total = int(bull_prev) + int(bear_prev)
+    prev_dur = max(1, int(win_start) - int(round_t.start_at))
+    win_rate = float(win_total_bnb) / float(max(1, int(win_secs)))
+    if int(prev_total) <= 0:
+        return float(win_rate) > 0.0
+    prev_rate = (float(prev_total) / float(BNB_WEI)) / float(prev_dur)
+    if float(prev_rate) <= 0.0:
+        return float(win_rate) > 0.0
+    surge_ratio = float(win_rate) / float(prev_rate)
+    return float(surge_ratio) >= float(cfg.shock_filter_min_surge_ratio)
+
+
+def _late_model_veto_triggers(
+    *,
+    cfg: CandidateConfig,
+    side: str,
+    bull_pool_cutoff_bnb: float,
+    bear_pool_cutoff_bnb: float,
+    projected_final_pool_bull_bnb: float | None,
+    projected_final_pool_bear_bnb: float | None,
+) -> bool:
+    if not bool(cfg.late_model_veto_enabled):
+        return False
+    if projected_final_pool_bull_bnb is None or projected_final_pool_bear_bnb is None:
+        return False
+
+    side_u = str(side).upper()
+    if side_u not in ("BULL", "BEAR"):
+        return False
+
+    cut_bull = max(0.0, float(bull_pool_cutoff_bnb))
+    cut_bear = max(0.0, float(bear_pool_cutoff_bnb))
+    cut_total = float(cut_bull) + float(cut_bear)
+    if float(cut_total) <= 0.0:
+        return False
+
+    final_bull = float(projected_final_pool_bull_bnb)
+    final_bear = float(projected_final_pool_bear_bnb)
+    if (
+        not math.isfinite(float(final_bull))
+        or not math.isfinite(float(final_bear))
+        or float(final_bull) <= 0.0
+        or float(final_bear) <= 0.0
+    ):
+        return False
+
+    late_bull = max(0.0, float(final_bull) - float(cut_bull))
+    late_bear = max(0.0, float(final_bear) - float(cut_bear))
+    late_total = float(late_bull) + float(late_bear)
+    if float(late_total) <= 0.0:
+        return False
+
+    late_ratio = float(late_total) / float(cut_total)
+    if float(late_ratio) < float(cfg.late_model_veto_min_late_ratio):
+        return False
+
+    late_imb = (float(late_bull) - float(late_bear)) / float(late_total)
+    if abs(float(late_imb)) < float(cfg.late_model_veto_min_abs_imbalance):
+        return False
+
+    late_sign = 1 if float(late_imb) > 0.0 else -1
+    side_sign = 1 if str(side_u) == "BULL" else -1
+    return int(late_sign) != int(side_sign)
+
+
+def _pool_total_gate_skip_reason(
+    *,
+    cfg: CandidateConfig,
+    cutoff_pool_total_bnb: float,
+    projected_final_pool_total_bnb: float | None,
+) -> str | None:
+    gate_mode = str(cfg.pool_total_gate_mode)
+    cutoff_total = float(cutoff_pool_total_bnb)
+
+    if gate_mode == "cutoff_only":
+        if float(cutoff_total) < float(cfg.cutoff_pool_total_min_bnb):
+            return "cutoff_pool_below_min_total"
+        return None
+
+    if gate_mode == "projected_final_only":
+        projected_total = float(cutoff_total) * float(cfg.projected_final_pool_multiplier)
+        if float(projected_total) < float(cfg.projected_final_pool_total_min_bnb):
+            return "projected_final_pool_below_min_total"
+        return None
+
+    if gate_mode == "projected_final_model_only":
+        if projected_final_pool_total_bnb is None:
+            return "projected_final_pool_model_unavailable"
+        projected_total = float(projected_final_pool_total_bnb)
+        if not math.isfinite(float(projected_total)) or float(projected_total) <= 0.0:
+            return "projected_final_pool_model_unavailable"
+        if float(projected_total) < float(cfg.projected_final_pool_total_min_bnb):
+            return "projected_final_pool_below_min_total"
+        return None
+
+    raise InvariantError("dislocation_pool_total_gate_mode_unknown")
+
+
+def _stake_mode_uses_projected_pool_ev(*, stake_mode: str) -> bool:
+    return str(stake_mode) in _PROJECTED_EV_STAKE_MODES
+
+
+def _effective_ev_pools(
+    *,
+    cfg: CandidateConfig,
+    bull_pool_cutoff_bnb: float,
+    bear_pool_cutoff_bnb: float,
+    projected_final_pool_bull_bnb: float | None,
+    projected_final_pool_bear_bnb: float | None,
+) -> tuple[float, float]:
+    bull_cut = float(bull_pool_cutoff_bnb)
+    bear_cut = float(bear_pool_cutoff_bnb)
+    if not _stake_mode_uses_projected_pool_ev(stake_mode=str(cfg.stake_mode)):
+        return float(bull_cut), float(bear_cut)
+    if projected_final_pool_bull_bnb is None or projected_final_pool_bear_bnb is None:
+        return float(bull_cut), float(bear_cut)
+
+    bull_final = float(projected_final_pool_bull_bnb)
+    bear_final = float(projected_final_pool_bear_bnb)
+    if (
+        not math.isfinite(float(bull_final))
+        or not math.isfinite(float(bear_final))
+        or float(bull_final) <= 0.0
+        or float(bear_final) <= 0.0
+    ):
+        return float(bull_cut), float(bear_cut)
+
+    # Reuse projected_final_pool_multiplier as late-inflow confidence scaling.
+    # 1.0 = full model inflow, 0.0 = cutoff-only fallback, >1.0 = aggressive.
+    inflow_mult = max(0.0, float(cfg.projected_final_pool_multiplier))
+    late_bull = max(0.0, float(bull_final) - float(bull_cut))
+    late_bear = max(0.0, float(bear_final) - float(bear_cut))
+    ev_bull = float(bull_cut) + float(late_bull) * float(inflow_mult)
+    ev_bear = float(bear_cut) + float(late_bear) * float(inflow_mult)
+    if float(ev_bull) <= 0.0 or float(ev_bear) <= 0.0:
+        return float(bull_cut), float(bear_cut)
+    return float(ev_bull), float(ev_bear)
+
+
+def _final_pools_bnb_for_round(*, round_t: Round, lock_at: int) -> tuple[float, float]:
+    bull_wei = 0
+    bear_wei = 0
+    lock_ts = int(lock_at)
+    for b in round_t.bets:
+        created = int(b.created_at)
+        if int(created) > int(lock_ts):
+            continue
+        pos = str(b.position)
+        if pos == "Bull":
+            bull_wei += int(b.amount_wei)
+        elif pos == "Bear":
+            bear_wei += int(b.amount_wei)
+    bull = float(bull_wei) / float(BNB_WEI)
+    bear = float(bear_wei) / float(BNB_WEI)
+    return float(bull), float(bear)
+
+
+def _robust_selected_ev_min(
+    *,
+    cfg: CandidateConfig,
+    side: str,
+    p_nowcast_bull: float,
+    bull_pool_cutoff_bnb: float,
+    bear_pool_cutoff_bnb: float,
+    robust_late_inflow_ratio: float,
+    robust_late_bull_share: float,
+    treasury_fee_fraction: float,
+) -> float:
+    side_u = str(side).upper()
+    if side_u not in ("BULL", "BEAR"):
+        raise InvariantError("dislocation_side_invalid")
+
+    cut_bull = float(bull_pool_cutoff_bnb)
+    cut_bear = float(bear_pool_cutoff_bnb)
+    cut_total = float(cut_bull) + float(cut_bear)
+    if float(cut_bull) <= 0.0 or float(cut_bear) <= 0.0 or float(cut_total) <= 0.0:
+        return float("-inf")
+
+    late_ratio = max(0.0, float(robust_late_inflow_ratio))
+    late_total_base = float(cut_total) * float(late_ratio)
+    late_share_base = _clamp(float(robust_late_bull_share), 0.0, 1.0)
+
+    low_mult = max(0.0, float(cfg.robust_ev_veto_low_inflow_mult))
+    extreme_mult = max(0.0, float(cfg.robust_ev_veto_extreme_inflow_mult))
+    adverse_skew = _clamp(float(cfg.robust_ev_veto_adverse_skew), 0.0, 0.49)
+
+    scenarios: list[tuple[float, float]] = []
+    for mult, is_extreme in ((1.0, False), (float(low_mult), False), (float(extreme_mult), True)):
+        late_total = float(late_total_base) * float(mult)
+        late_share = float(late_share_base)
+        if bool(is_extreme):
+            if side_u == "BULL":
+                late_share = _clamp(float(late_share) - float(adverse_skew), 0.0, 1.0)
+            else:
+                late_share = _clamp(float(late_share) + float(adverse_skew), 0.0, 1.0)
+
+        bull_pool = float(cut_bull) + float(late_total) * float(late_share)
+        bear_pool = float(cut_bear) + float(late_total) * (1.0 - float(late_share))
+        scenarios.append((float(bull_pool), float(bear_pool)))
+
+    evs: list[float] = []
+    for bull_pool, bear_pool in scenarios:
+        evs.append(
+            _expected_net_from_cutoff(
+                p_nowcast_bull=float(p_nowcast_bull),
+                bull_pool_cutoff_bnb=float(bull_pool),
+                bear_pool_cutoff_bnb=float(bear_pool),
+                side=str(side_u),
+                fixed_bet_bnb=float(cfg.fixed_bet_bnb),
+                treasury_fee_fraction=float(treasury_fee_fraction),
+            )
+        )
+    if not evs:
+        return float("-inf")
+    return float(min(evs))
+
+
 def _stake_bnb_for_decision(
     *,
     stake_mode: str,
@@ -312,8 +746,11 @@ def _stake_bnb_for_decision(
     p_nowcast_bull: float | None,
     bull_pool_cutoff_bnb: float | None,
     bear_pool_cutoff_bnb: float | None,
+    bull_pool_ev_bnb: float | None,
+    bear_pool_ev_bnb: float | None,
     treasury_fee_fraction: float,
     stake_max_side_pool_frac: float,
+    stake_scale: float = 1.0,
 ) -> float:
     mn = float(stake_min_bnb)
     mx = float(stake_max_bnb)
@@ -335,11 +772,12 @@ def _stake_bnb_for_decision(
         return 0.0
     mn = min(float(mn), float(mx))
 
+    base_bet_bnb = float(mn)
     mode = str(stake_mode)
     if mode == "fixed":
-        return float(min(float(mx), max(float(mn), float(fixed_bet_bnb))))
+        base_bet_bnb = float(min(float(mx), max(float(mn), float(fixed_bet_bnb))))
 
-    if mode == "ev_scaled":
+    elif mode in ("ev_scaled", "ev_scaled_projected"):
         ref = max(1e-9, float(stake_ev_ref_bnb))
         ev = float(expected_net_selected) if expected_net_selected is not None else float("nan")
         if not math.isfinite(float(ev)):
@@ -347,38 +785,58 @@ def _stake_bnb_for_decision(
         else:
             frac = float(ev) / float(ref)
         frac = max(0.0, min(1.0, float(frac)))
-        return float(mn + (float(mx) - float(mn)) * float(frac))
+        base_bet_bnb = float(mn + (float(mx) - float(mn)) * float(frac))
 
-    if mode == "ev_optimal":
+    elif mode in ("ev_optimal", "ev_optimal_projected"):
         if side is None or p_nowcast_bull is None or bull_pool_cutoff_bnb is None or bear_pool_cutoff_bnb is None:
-            return float(mn)
-        if float(mx) <= float(mn):
-            return float(mn)
+            base_bet_bnb = float(mn)
+        elif float(mx) <= float(mn):
+            base_bet_bnb = float(mn)
+        else:
+            ev_bull_pool = float(bull_pool_cutoff_bnb)
+            ev_bear_pool = float(bear_pool_cutoff_bnb)
+            if (
+                mode == "ev_optimal_projected"
+                and bull_pool_ev_bnb is not None
+                and bear_pool_ev_bnb is not None
+                and math.isfinite(float(bull_pool_ev_bnb))
+                and math.isfinite(float(bear_pool_ev_bnb))
+                and float(bull_pool_ev_bnb) > 0.0
+                and float(bear_pool_ev_bnb) > 0.0
+            ):
+                ev_bull_pool = float(bull_pool_ev_bnb)
+                ev_bear_pool = float(bear_pool_ev_bnb)
 
-        side_u = str(side).upper()
-        if side_u not in ("BULL", "BEAR"):
-            return float(mn)
+            side_u = str(side).upper()
+            if side_u not in ("BULL", "BEAR"):
+                base_bet_bnb = float(mn)
+            else:
+                points = 31
+                best_s = float(mn)
+                best_ev = float("-inf")
+                span = float(mx) - float(mn)
+                for i in range(points):
+                    s = float(mn + (float(span) * float(i) / float(points - 1)))
+                    ev = _expected_net_from_cutoff(
+                        p_nowcast_bull=float(p_nowcast_bull),
+                        bull_pool_cutoff_bnb=float(ev_bull_pool),
+                        bear_pool_cutoff_bnb=float(ev_bear_pool),
+                        side=str(side_u),
+                        fixed_bet_bnb=float(s),
+                        treasury_fee_fraction=float(treasury_fee_fraction),
+                    )
+                    if float(ev) > float(best_ev):
+                        best_ev = float(ev)
+                        best_s = float(s)
+                base_bet_bnb = float(best_s)
 
-        points = 31
-        best_s = float(mn)
-        best_ev = float("-inf")
-        span = float(mx) - float(mn)
-        for i in range(points):
-            s = float(mn + (float(span) * float(i) / float(points - 1)))
-            ev = _expected_net_from_cutoff(
-                p_nowcast_bull=float(p_nowcast_bull),
-                bull_pool_cutoff_bnb=float(bull_pool_cutoff_bnb),
-                bear_pool_cutoff_bnb=float(bear_pool_cutoff_bnb),
-                side=str(side_u),
-                fixed_bet_bnb=float(s),
-                treasury_fee_fraction=float(treasury_fee_fraction),
-            )
-            if float(ev) > float(best_ev):
-                best_ev = float(ev)
-                best_s = float(s)
-        return float(best_s)
+    else:
+        raise InvariantError("dislocation_stake_mode_unknown")
 
-    raise InvariantError("dislocation_stake_mode_unknown")
+    scale = max(0.0, float(stake_scale))
+    if float(scale) <= 0.0:
+        return 0.0
+    return float(max(0.0, min(float(mx), float(base_bet_bnb) * float(scale))))
 
 
 def _adaptive_mode_score(
@@ -422,6 +880,11 @@ def _decide_core(
     cfg: CandidateConfig,
     treasury_fee_fraction: float,
     expected_net_gate_bnb: float,
+    projected_final_pool_total_bnb: float | None,
+    projected_final_pool_bull_bnb: float | None,
+    projected_final_pool_bear_bnb: float | None,
+    robust_late_inflow_ratio: float | None,
+    robust_late_bull_share: float | None,
 ) -> _CoreDecision:
     if round_t.lock_at is None:
         return _CoreDecision(
@@ -450,10 +913,27 @@ def _decide_core(
         )
 
     pool_total_bnb = float(pools.total_wei) / float(BNB_WEI)
-    if float(pool_total_bnb) < float(cfg.cutoff_pool_total_min_bnb):
+    pool_gate_skip_reason = _pool_total_gate_skip_reason(
+        cfg=cfg,
+        cutoff_pool_total_bnb=float(pool_total_bnb),
+        projected_final_pool_total_bnb=projected_final_pool_total_bnb,
+    )
+    if pool_gate_skip_reason is not None:
         return _CoreDecision(
             side=None,
-            reason="cutoff_pool_below_min_total",
+            reason=str(pool_gate_skip_reason),
+            p_nowcast_bull=None,
+            p_market_bull=None,
+            dislocation_bull=None,
+            expected_net_bull=None,
+            expected_net_bear=None,
+            expected_net_selected=None,
+        )
+
+    if _precutoff_shock_filter_triggers(round_t=round_t, cfg=cfg):
+        return _CoreDecision(
+            side=None,
+            reason="precutoff_shock_filter",
             p_nowcast_bull=None,
             p_market_bull=None,
             dislocation_bull=None,
@@ -515,22 +995,43 @@ def _decide_core(
 
     bull_cut_bnb = float(pools.bull_wei) / float(BNB_WEI)
     bear_cut_bnb = float(pools.bear_wei) / float(BNB_WEI)
-    ev_bull = _expected_net_from_cutoff(
-        p_nowcast_bull=float(p_now),
+    ev_pool_bull_bnb, ev_pool_bear_bnb = _effective_ev_pools(
+        cfg=cfg,
         bull_pool_cutoff_bnb=float(bull_cut_bnb),
         bear_pool_cutoff_bnb=float(bear_cut_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    )
+    ev_bull = _expected_net_from_cutoff(
+        p_nowcast_bull=float(p_now),
+        bull_pool_cutoff_bnb=float(ev_pool_bull_bnb),
+        bear_pool_cutoff_bnb=float(ev_pool_bear_bnb),
         side="BULL",
         fixed_bet_bnb=float(cfg.fixed_bet_bnb),
         treasury_fee_fraction=float(treasury_fee_fraction),
     )
     ev_bear = _expected_net_from_cutoff(
         p_nowcast_bull=float(p_now),
-        bull_pool_cutoff_bnb=float(bull_cut_bnb),
-        bear_pool_cutoff_bnb=float(bear_cut_bnb),
+        bull_pool_cutoff_bnb=float(ev_pool_bull_bnb),
+        bear_pool_cutoff_bnb=float(ev_pool_bear_bnb),
         side="BEAR",
         fixed_bet_bnb=float(cfg.fixed_bet_bnb),
         treasury_fee_fraction=float(treasury_fee_fraction),
     )
+    nowcast_market_gap = abs(float(p_now) - float(p_market_bull))
+    if float(nowcast_market_gap) < float(cfg.nowcast_market_gap_min):
+        return _CoreDecision(
+            side=None,
+            reason="nowcast_market_gap_below_min",
+            p_nowcast_bull=float(p_now),
+            p_market_bull=float(p_market_bull),
+            dislocation_bull=float(dislocation_bull),
+            expected_net_bull=float(ev_bull),
+            expected_net_bear=float(ev_bear),
+            expected_net_selected=None,
+            ev_pool_bull_bnb=float(ev_pool_bull_bnb),
+            ev_pool_bear_bnb=float(ev_pool_bear_bnb),
+        )
 
     side_mode = str(cfg.side_selection_mode)
     if side_mode == "ev_max":
@@ -625,6 +1126,11 @@ def _decide_core(
         raise InvariantError("dislocation_side_selection_mode_unknown")
 
     flow_mode = str(cfg.flow_gate_mode)
+    if flow_mode != "off" and _flow_gate_relaxed_for_dislocation(
+        cfg=cfg,
+        dislocation_bull=float(dislocation_bull),
+    ):
+        flow_mode = "off"
     if flow_mode != "off":
         flow_imb = _precutoff_flow_imbalance(
             round_t=round_t,
@@ -684,7 +1190,79 @@ def _decide_core(
             raise InvariantError("dislocation_flow_gate_mode_unknown")
 
     selected_ev = float(ev_bull) if str(side) == "BULL" else float(ev_bear)
-    if float(selected_ev) < float(expected_net_gate_bnb):
+    side_ev_gate_bnb = float(expected_net_gate_bnb)
+    if math.isfinite(float(side_ev_gate_bnb)):
+        side_ev_gate_bnb = max(
+            float(side_ev_gate_bnb),
+            _expected_net_min_for_side(cfg=cfg, side=str(side)),
+        )
+    if _late_model_veto_triggers(
+        cfg=cfg,
+        side=str(side),
+        bull_pool_cutoff_bnb=float(bull_cut_bnb),
+        bear_pool_cutoff_bnb=float(bear_cut_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    ):
+        return _CoreDecision(
+            side=None,
+            reason="projected_late_flow_against_side",
+            p_nowcast_bull=float(p_now),
+            p_market_bull=float(p_market_bull),
+            dislocation_bull=float(dislocation_bull),
+            expected_net_bull=float(ev_bull),
+            expected_net_bear=float(ev_bear),
+            expected_net_selected=float(selected_ev),
+            ev_pool_bull_bnb=float(ev_pool_bull_bnb),
+            ev_pool_bear_bnb=float(ev_pool_bear_bnb),
+        )
+
+    if bool(cfg.robust_ev_veto_enabled):
+        if robust_late_inflow_ratio is None or robust_late_bull_share is None:
+            return _CoreDecision(
+                side=None,
+                reason="robust_ev_history_insufficient",
+                p_nowcast_bull=float(p_now),
+                p_market_bull=float(p_market_bull),
+                dislocation_bull=float(dislocation_bull),
+                expected_net_bull=float(ev_bull),
+                expected_net_bear=float(ev_bear),
+                expected_net_selected=float(selected_ev),
+                ev_pool_bull_bnb=float(ev_pool_bull_bnb),
+                ev_pool_bear_bnb=float(ev_pool_bear_bnb),
+            )
+
+        robust_min_ev = _robust_selected_ev_min(
+            cfg=cfg,
+            side=str(side),
+            p_nowcast_bull=float(p_now),
+            bull_pool_cutoff_bnb=float(bull_cut_bnb),
+            bear_pool_cutoff_bnb=float(bear_cut_bnb),
+            robust_late_inflow_ratio=float(robust_late_inflow_ratio),
+            robust_late_bull_share=float(robust_late_bull_share),
+            treasury_fee_fraction=float(treasury_fee_fraction),
+        )
+        robust_gate = max(
+            0.0,
+            float(side_ev_gate_bnb),
+            float(cfg.robust_ev_veto_min_expected_net_bnb),
+        )
+        if float(robust_min_ev) < float(robust_gate):
+            return _CoreDecision(
+                side=None,
+                reason="robust_ev_below_min",
+                p_nowcast_bull=float(p_now),
+                p_market_bull=float(p_market_bull),
+                dislocation_bull=float(dislocation_bull),
+                expected_net_bull=float(ev_bull),
+                expected_net_bear=float(ev_bear),
+                expected_net_selected=float(robust_min_ev),
+                ev_pool_bull_bnb=float(ev_pool_bull_bnb),
+                ev_pool_bear_bnb=float(ev_pool_bear_bnb),
+            )
+        selected_ev = float(min(float(selected_ev), float(robust_min_ev)))
+
+    if float(selected_ev) < float(side_ev_gate_bnb):
         return _CoreDecision(
             side=None,
             reason="expected_net_below_min",
@@ -694,6 +1272,8 @@ def _decide_core(
             expected_net_bull=float(ev_bull),
             expected_net_bear=float(ev_bear),
             expected_net_selected=float(selected_ev),
+            ev_pool_bull_bnb=float(ev_pool_bull_bnb),
+            ev_pool_bear_bnb=float(ev_pool_bear_bnb),
         )
 
     return _CoreDecision(
@@ -705,6 +1285,8 @@ def _decide_core(
         expected_net_bull=float(ev_bull),
         expected_net_bear=float(ev_bear),
         expected_net_selected=float(selected_ev),
+        ev_pool_bull_bnb=float(ev_pool_bull_bnb),
+        ev_pool_bear_bnb=float(ev_pool_bear_bnb),
     )
 
 
@@ -723,6 +1305,19 @@ def _shadow_profit_for_decision(
         return 0.0, False, False
     if bull_pool_cutoff_bnb is None or bear_pool_cutoff_bnb is None:
         return 0.0, False, False
+    ev_bull_pool = (
+        float(dec.ev_pool_bull_bnb)
+        if dec.ev_pool_bull_bnb is not None and math.isfinite(float(dec.ev_pool_bull_bnb))
+        else float(bull_pool_cutoff_bnb)
+    )
+    ev_bear_pool = (
+        float(dec.ev_pool_bear_bnb)
+        if dec.ev_pool_bear_bnb is not None and math.isfinite(float(dec.ev_pool_bear_bnb))
+        else float(bear_pool_cutoff_bnb)
+    )
+    if float(ev_bull_pool) <= 0.0 or float(ev_bear_pool) <= 0.0:
+        ev_bull_pool = float(bull_pool_cutoff_bnb)
+        ev_bear_pool = float(bear_pool_cutoff_bnb)
 
     bet_bnb = _stake_bnb_for_decision(
         stake_mode=str(cfg.stake_mode),
@@ -735,6 +1330,8 @@ def _shadow_profit_for_decision(
         p_nowcast_bull=dec.p_nowcast_bull,
         bull_pool_cutoff_bnb=float(bull_pool_cutoff_bnb),
         bear_pool_cutoff_bnb=float(bear_pool_cutoff_bnb),
+        bull_pool_ev_bnb=float(ev_bull_pool),
+        bear_pool_ev_bnb=float(ev_bear_pool),
         treasury_fee_fraction=float(treasury_fee_fraction),
         stake_max_side_pool_frac=float(cfg.stake_max_side_pool_frac),
     )
@@ -743,13 +1340,14 @@ def _shadow_profit_for_decision(
 
     selected_ev_actual = _expected_net_from_cutoff(
         p_nowcast_bull=float(dec.p_nowcast_bull),
-        bull_pool_cutoff_bnb=float(bull_pool_cutoff_bnb),
-        bear_pool_cutoff_bnb=float(bear_pool_cutoff_bnb),
+        bull_pool_cutoff_bnb=float(ev_bull_pool),
+        bear_pool_cutoff_bnb=float(ev_bear_pool),
         side=str(dec.side),
         fixed_bet_bnb=float(bet_bnb),
         treasury_fee_fraction=float(treasury_fee_fraction),
     )
-    if float(selected_ev_actual) < float(cfg.expected_net_min_bnb):
+    expected_net_min_side = _expected_net_min_for_side(cfg=cfg, side=str(dec.side))
+    if float(selected_ev_actual) < float(expected_net_min_side):
         return 0.0, False, False
 
     total_cost = float(bet_bnb) + float(GAS_COST_BET_BNB)
@@ -772,6 +1370,7 @@ class DislocationEngine:
         candidate_cfgs: list[CandidateConfig],
         treasury_fee_fraction: float,
         shadow_initial_bankroll_bnb: float,
+        projected_pool_provider: _ProjectedPoolProvider | None = None,
     ) -> None:
         if not candidate_cfgs:
             raise InvariantError("dislocation_candidates_empty")
@@ -782,6 +1381,7 @@ class DislocationEngine:
 
         self._selector_cfg = selector_cfg
         self._treasury_fee_fraction = float(treasury_fee_fraction)
+        self._projected_pool_provider = projected_pool_provider
         self._candidate_order = [str(c.name) for c in candidate_cfgs]
 
         self._candidate_states: dict[str, _CandidateState] = {}
@@ -820,15 +1420,26 @@ class DislocationEngine:
         perf_len = int(cfg.perf_gate_window) if int(cfg.perf_gate_window) > 0 else None
         perf_shadow_profits: deque[float] = deque(maxlen=perf_len)
         perf_shadow_wins: deque[int] = deque(maxlen=perf_len)
+        robust_hist_len = max(1, int(cfg.robust_ev_veto_window))
+        robust_late_inflow_ratio: deque[float] = deque(maxlen=int(robust_hist_len))
+        robust_late_bull_share: deque[float] = deque(maxlen=int(robust_hist_len))
 
         return _CandidateState(
             cfg=cfg,
             shadow_bankroll_bnb=float(shadow_initial_bankroll_bnb),
+            shadow_peak_bankroll_bnb=float(shadow_initial_bankroll_bnb),
+            anti_martingale_scale=1.0,
+            circuit_breaker_skip_rounds_remaining=0,
+            circuit_breaker_level=0,
+            circuit_breaker_last_trigger_settled_round=None,
+            circuit_breaker_reentry_rounds_remaining=0,
             adaptive_shadow_round_profit=adaptive_shadow_round_profit,
             adaptive_shadow_bet_profit=adaptive_shadow_bet_profit,
             adaptive_shadow_bet_wins=adaptive_shadow_bet_wins,
             perf_shadow_profits=perf_shadow_profits,
             perf_shadow_wins=perf_shadow_wins,
+            robust_late_inflow_ratio=robust_late_inflow_ratio,
+            robust_late_bull_share=robust_late_bull_share,
         )
 
     def refresh_klines(self, klines: list[Kline]) -> None:
@@ -960,6 +1571,28 @@ class DislocationEngine:
         """Return whether selector warmup has completed."""
 
         return bool(self._selector_ready)
+
+    def export_kline_index_state(self) -> dict[str, object]:
+        """Export kline index state for backtest cache reuse."""
+
+        return {
+            "close_times_ms": [int(x) for x in self._kidx.close_times_ms],
+            "close_prices": [float(x) for x in self._kidx.close_prices],
+        }
+
+    def import_kline_index_state(self, *, state: dict[str, object]) -> None:
+        """Restore kline index state from backtest cache."""
+
+        times_raw = list(state.get("close_times_ms", []))
+        prices_raw = list(state.get("close_prices", []))
+        if len(times_raw) != len(prices_raw):
+            raise InvariantError("dislocation_kline_index_len_mismatch")
+        if not times_raw:
+            raise InvariantError("dislocation_kline_index_empty")
+
+        times = tuple(int(x) for x in times_raw)
+        prices = tuple(float(x) for x in prices_raw)
+        self._kidx = _KlineIndex(close_times_ms=times, close_prices=prices)
 
     def export_bootstrap_state(self) -> dict[str, object]:
         """Export selector/candidate state snapshot for backtest bootstrap cache."""
@@ -1094,7 +1727,54 @@ class DislocationEngine:
         state: _CandidateState,
     ) -> _CandidateRoundDecision:
         cfg = state.cfg
+        if int(state.circuit_breaker_skip_rounds_remaining) > 0:
+            state.circuit_breaker_skip_rounds_remaining = int(state.circuit_breaker_skip_rounds_remaining) - 1
+            if (
+                int(state.circuit_breaker_skip_rounds_remaining) == 0
+                and int(cfg.circuit_breaker_reentry_rounds) > 0
+            ):
+                state.circuit_breaker_reentry_rounds_remaining = int(cfg.circuit_breaker_reentry_rounds)
+            return _CandidateRoundDecision(
+                action="SKIP",
+                side=None,
+                bet_bnb=0.0,
+                skip_reason="circuit_breaker_cooldown",
+                p_nowcast_bull=None,
+                dislocation_bull=None,
+                expected_net_selected=None,
+                adaptive_mode_decisions=None,
+                base_side=None,
+                perf_shadow_track=False,
+            )
+
+        in_reentry = int(state.circuit_breaker_reentry_rounds_remaining) > 0
+        if bool(in_reentry):
+            state.circuit_breaker_reentry_rounds_remaining = int(state.circuit_breaker_reentry_rounds_remaining) - 1
+
         gate_ev_min = float(cfg.expected_net_min_bnb) if str(cfg.stake_mode) == "fixed" else float("-inf")
+        projected_final_pool_total_bnb: float | None = None
+        projected_final_pool_bull_bnb: float | None = None
+        projected_final_pool_bear_bnb: float | None = None
+        needs_projection = (
+            str(cfg.pool_total_gate_mode) == "projected_final_model_only"
+            or _stake_mode_uses_projected_pool_ev(stake_mode=str(cfg.stake_mode))
+            or bool(cfg.late_model_veto_enabled)
+        )
+        if bool(needs_projection) and self._projected_pool_provider is not None:
+            projected = self._projected_pool_provider.predict_final_pools_for_round(round_t=round_t)
+            if projected is not None:
+                projected_final_pool_total_bnb = float(projected[0])
+                projected_final_pool_bull_bnb = float(projected[1])
+                projected_final_pool_bear_bnb = float(projected[2])
+
+        robust_late_inflow_ratio: float | None = None
+        robust_late_bull_share: float | None = None
+        if bool(cfg.robust_ev_veto_enabled):
+            have_n = int(len(state.robust_late_inflow_ratio))
+            need_n = max(1, int(cfg.robust_ev_veto_min_history))
+            if int(have_n) >= int(need_n):
+                robust_late_inflow_ratio = _median_deque(state.robust_late_inflow_ratio)
+                robust_late_bull_share = _median_deque(state.robust_late_bull_share)
 
         adaptive_decisions: dict[str, _CoreDecision] | None = None
         if str(cfg.side_selection_mode) == "adaptive_shadow":
@@ -1108,6 +1788,11 @@ class DislocationEngine:
                     cfg=mode_cfg,
                     treasury_fee_fraction=float(self._treasury_fee_fraction),
                     expected_net_gate_bnb=float(gate_ev_min),
+                    projected_final_pool_total_bnb=projected_final_pool_total_bnb,
+                    projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+                    projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+                    robust_late_inflow_ratio=robust_late_inflow_ratio,
+                    robust_late_bull_share=robust_late_bull_share,
                 )
 
             fallback_mode = str(cfg.adaptive_fallback_mode)
@@ -1140,6 +1825,11 @@ class DislocationEngine:
                 cfg=cfg,
                 treasury_fee_fraction=float(self._treasury_fee_fraction),
                 expected_net_gate_bnb=float(gate_ev_min),
+                projected_final_pool_total_bnb=projected_final_pool_total_bnb,
+                projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+                projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+                robust_late_inflow_ratio=robust_late_inflow_ratio,
+                robust_late_bull_share=robust_late_bull_share,
             )
 
         if core.side is None:
@@ -1148,6 +1838,20 @@ class DislocationEngine:
                 side=None,
                 bet_bnb=0.0,
                 skip_reason=str(core.reason),
+                p_nowcast_bull=core.p_nowcast_bull,
+                dislocation_bull=core.dislocation_bull,
+                expected_net_selected=core.expected_net_selected,
+                adaptive_mode_decisions=adaptive_decisions,
+                base_side=None,
+                perf_shadow_track=False,
+            )
+
+        if not _side_allowed(side=str(core.side), allowed_sides=str(cfg.allowed_sides)):
+            return _CandidateRoundDecision(
+                action="SKIP",
+                side=None,
+                bet_bnb=0.0,
+                skip_reason="side_not_allowed",
                 p_nowcast_bull=core.p_nowcast_bull,
                 dislocation_bull=core.dislocation_bull,
                 expected_net_selected=core.expected_net_selected,
@@ -1188,7 +1892,36 @@ class DislocationEngine:
 
         bull_cut = float(pools_now.bull_wei) / float(BNB_WEI)
         bear_cut = float(pools_now.bear_wei) / float(BNB_WEI)
+        ev_pool_bull = (
+            float(core.ev_pool_bull_bnb)
+            if core.ev_pool_bull_bnb is not None and math.isfinite(float(core.ev_pool_bull_bnb))
+            else float(bull_cut)
+        )
+        ev_pool_bear = (
+            float(core.ev_pool_bear_bnb)
+            if core.ev_pool_bear_bnb is not None and math.isfinite(float(core.ev_pool_bear_bnb))
+            else float(bear_cut)
+        )
+        if float(ev_pool_bull) <= 0.0 or float(ev_pool_bear) <= 0.0:
+            ev_pool_bull = float(bull_cut)
+            ev_pool_bear = float(bear_cut)
 
+        stake_scale = _drawdown_stake_scale(
+            cfg=cfg,
+            shadow_bankroll_bnb=float(state.shadow_bankroll_bnb),
+            shadow_peak_bankroll_bnb=float(state.shadow_peak_bankroll_bnb),
+        )
+        anti_scale = 1.0
+        if bool(cfg.anti_martingale_enabled):
+            anti_scale = float(state.anti_martingale_scale)
+            if bool(in_reentry):
+                anti_scale = min(float(anti_scale), 1.0)
+
+        reentry_scale = 1.0
+        if bool(in_reentry):
+            reentry_scale = float(cfg.circuit_breaker_reentry_scale)
+
+        effective_stake_scale = float(stake_scale) * float(anti_scale) * float(reentry_scale)
         bet_bnb = _stake_bnb_for_decision(
             stake_mode=str(cfg.stake_mode),
             fixed_bet_bnb=float(cfg.fixed_bet_bnb),
@@ -1200,8 +1933,11 @@ class DislocationEngine:
             p_nowcast_bull=core.p_nowcast_bull,
             bull_pool_cutoff_bnb=float(bull_cut),
             bear_pool_cutoff_bnb=float(bear_cut),
+            bull_pool_ev_bnb=float(ev_pool_bull),
+            bear_pool_ev_bnb=float(ev_pool_bear),
             treasury_fee_fraction=float(self._treasury_fee_fraction),
             stake_max_side_pool_frac=float(cfg.stake_max_side_pool_frac),
+            stake_scale=float(effective_stake_scale),
         )
         if float(bet_bnb) <= 0.0:
             return _CandidateRoundDecision(
@@ -1233,13 +1969,14 @@ class DislocationEngine:
 
         selected_ev_actual = _expected_net_from_cutoff(
             p_nowcast_bull=float(core.p_nowcast_bull),
-            bull_pool_cutoff_bnb=float(bull_cut),
-            bear_pool_cutoff_bnb=float(bear_cut),
+            bull_pool_cutoff_bnb=float(ev_pool_bull),
+            bear_pool_cutoff_bnb=float(ev_pool_bear),
             side=str(core.side),
             fixed_bet_bnb=float(bet_bnb),
             treasury_fee_fraction=float(self._treasury_fee_fraction),
         )
-        if float(selected_ev_actual) < float(cfg.expected_net_min_bnb):
+        expected_net_min_side = _expected_net_min_for_side(cfg=cfg, side=str(core.side))
+        if float(selected_ev_actual) < float(expected_net_min_side):
             return _CandidateRoundDecision(
                 action="SKIP",
                 side=None,
@@ -1285,13 +2022,14 @@ class DislocationEngine:
                     flipped_side = _opposite_side(str(core.side))
                     flipped_ev = _expected_net_from_cutoff(
                         p_nowcast_bull=float(core.p_nowcast_bull),
-                        bull_pool_cutoff_bnb=float(bull_cut),
-                        bear_pool_cutoff_bnb=float(bear_cut),
+                        bull_pool_cutoff_bnb=float(ev_pool_bull),
+                        bear_pool_cutoff_bnb=float(ev_pool_bear),
                         side=str(flipped_side),
                         fixed_bet_bnb=float(bet_bnb),
                         treasury_fee_fraction=float(self._treasury_fee_fraction),
                     )
-                    if float(flipped_ev) < float(cfg.expected_net_min_bnb):
+                    flipped_ev_min = _expected_net_min_for_side(cfg=cfg, side=str(flipped_side))
+                    if float(flipped_ev) < float(flipped_ev_min):
                         action = "SKIP"
                         skip_reason = "perf_flip_expected_net_below_min"
                     else:
@@ -1335,6 +2073,8 @@ class DislocationEngine:
         round_t: Round,
     ) -> _SelectorBetRow | None:
         cfg = state.cfg
+        settled_round_idx = int(self._settled_round_count) + 1
+        self._update_robust_ev_history(state=state, round_t=round_t)
 
         bull_cut_shadow: float | None = None
         bear_cut_shadow: float | None = None
@@ -1388,6 +2128,49 @@ class DislocationEngine:
         )
         profit = -float(total_cost) + float(outcome.credit_bnb)
         state.shadow_bankroll_bnb += float(profit)
+        if float(state.shadow_bankroll_bnb) > float(state.shadow_peak_bankroll_bnb):
+            state.shadow_peak_bankroll_bnb = float(state.shadow_bankroll_bnb)
+
+        if bool(cfg.anti_martingale_enabled):
+            state.anti_martingale_scale = _anti_martingale_next_scale(
+                cfg=cfg,
+                prev_scale=float(state.anti_martingale_scale),
+                realized_profit_bnb=float(profit),
+            )
+        else:
+            state.anti_martingale_scale = 1.0
+
+        if (
+            bool(cfg.circuit_breaker_enabled)
+            and float(profit) < 0.0
+            and int(state.circuit_breaker_skip_rounds_remaining) <= 0
+            and float(cfg.circuit_breaker_drawdown_trigger_bnb) > 0.0
+            and int(cfg.circuit_breaker_base_skip_rounds) > 0
+        ):
+            drawdown_bnb = max(
+                0.0,
+                float(state.shadow_peak_bankroll_bnb) - float(state.shadow_bankroll_bnb),
+            )
+            if float(drawdown_bnb) >= float(cfg.circuit_breaker_drawdown_trigger_bnb):
+                prev_round = state.circuit_breaker_last_trigger_settled_round
+                prev_level = int(state.circuit_breaker_level)
+                if (
+                    prev_round is not None
+                    and int(settled_round_idx - int(prev_round))
+                    <= int(cfg.circuit_breaker_escalation_window_rounds)
+                ):
+                    next_level = min(int(prev_level + 1), int(cfg.circuit_breaker_max_level))
+                else:
+                    next_level = 1
+                state.circuit_breaker_level = int(next_level)
+                state.circuit_breaker_last_trigger_settled_round = int(settled_round_idx)
+                state.circuit_breaker_skip_rounds_remaining = _circuit_breaker_skip_rounds_for_level(
+                    cfg=cfg,
+                    level=int(next_level),
+                )
+                if int(state.circuit_breaker_skip_rounds_remaining) > 0:
+                    state.circuit_breaker_reentry_rounds_remaining = 0
+                    state.anti_martingale_scale = 1.0
 
         if dec.expected_net_selected is None or dec.dislocation_bull is None:
             return None
@@ -1427,6 +2210,51 @@ class DislocationEngine:
             if bool(shadow_is_bet):
                 state.adaptive_shadow_bet_profit[m].append(float(shadow_profit))
                 state.adaptive_shadow_bet_wins[m].append(1 if bool(shadow_is_win) else 0)
+
+    @staticmethod
+    def _update_robust_ev_history(*, state: _CandidateState, round_t: Round) -> None:
+        cfg = state.cfg
+        if round_t.lock_at is None:
+            return
+
+        lock_at = int(round_t.lock_at)
+        cutoff_ts = int(lock_at) - int(cfg.cutoff_seconds)
+        cutoff = compute_pool_amounts_wei_at_or_before(
+            bets=round_t.bets,
+            cutoff_ts=int(cutoff_ts),
+        )
+        if int(cutoff.total_wei) <= 0:
+            return
+
+        bull_final_bnb, bear_final_bnb = _final_pools_bnb_for_round(
+            round_t=round_t,
+            lock_at=int(lock_at),
+        )
+        final_total_bnb = float(bull_final_bnb) + float(bear_final_bnb)
+
+        cut_bull_bnb = float(cutoff.bull_wei) / float(BNB_WEI)
+        cut_bear_bnb = float(cutoff.bear_wei) / float(BNB_WEI)
+        cut_total_bnb = float(cutoff.total_wei) / float(BNB_WEI)
+
+        if float(final_total_bnb) <= 0.0 or float(cut_total_bnb) <= 0.0:
+            return
+
+        late_total_bnb = max(0.0, float(final_total_bnb) - float(cut_total_bnb))
+        late_ratio = float(late_total_bnb) / float(cut_total_bnb)
+        if not math.isfinite(float(late_ratio)):
+            return
+
+        late_bull_bnb = max(0.0, float(bull_final_bnb) - float(cut_bull_bnb))
+        late_bear_bnb = max(0.0, float(bear_final_bnb) - float(cut_bear_bnb))
+        late_side_total = float(late_bull_bnb) + float(late_bear_bnb)
+        if float(late_side_total) <= 0.0:
+            late_bull_share = 0.5
+        else:
+            late_bull_share = float(late_bull_bnb) / float(late_side_total)
+        late_bull_share = _clamp(float(late_bull_share), 0.0, 1.0)
+
+        state.robust_late_inflow_ratio.append(float(max(0.0, float(late_ratio))))
+        state.robust_late_bull_share.append(float(late_bull_share))
 
     def _consume_selector_rows(self, rows_by_candidate: dict[str, _SelectorBetRow]) -> None:
         self._settled_round_count += 1
@@ -1565,12 +2393,19 @@ def _to_candidate_config(
         dislocation_threshold_pp=float(cfg.dislocation_threshold_pp),
         nowcast_confidence_min=float(cfg.nowcast_confidence_min),
         cutoff_pool_total_min_bnb=float(cfg.cutoff_pool_total_min_bnb),
+        pool_total_gate_mode=str(cfg.pool_total_gate_mode),
+        projected_final_pool_multiplier=float(cfg.projected_final_pool_multiplier),
+        projected_final_pool_total_min_bnb=float(cfg.projected_final_pool_total_min_bnb),
         expected_net_min_bnb=float(cfg.expected_net_min_bnb),
+        bear_expected_net_extra_min_bnb=float(cfg.bear_expected_net_extra_min_bnb),
         side_selection_mode=str(cfg.side_selection_mode),
+        allowed_sides=str(cfg.allowed_sides),
         market_extreme_min=float(cfg.market_extreme_min),
+        nowcast_market_gap_min=float(cfg.nowcast_market_gap_min),
         flow_window_seconds=int(cfg.flow_window_seconds),
         flow_min_imbalance=float(cfg.flow_min_imbalance),
         flow_gate_mode=str(cfg.flow_gate_mode),
+        flow_gate_relax_dislocation_min=float(cfg.flow_gate_relax_dislocation_min),
         adaptive_candidate_modes=tuple(str(m) for m in cfg.adaptive_candidate_modes),
         adaptive_window=int(cfg.adaptive_window),
         adaptive_min_history=int(cfg.adaptive_min_history),
@@ -1581,11 +2416,44 @@ def _to_candidate_config(
         stake_max_bnb=float(cfg.stake_max_bnb),
         stake_ev_ref_bnb=float(cfg.stake_ev_ref_bnb),
         stake_max_side_pool_frac=float(cfg.stake_max_side_pool_frac),
+        drawdown_stake_guard_enabled=bool(cfg.drawdown_stake_guard_enabled),
+        drawdown_stake_guard_start_bnb=float(cfg.drawdown_stake_guard_start_bnb),
+        drawdown_stake_guard_full_bnb=float(cfg.drawdown_stake_guard_full_bnb),
+        drawdown_stake_guard_min_scale=float(cfg.drawdown_stake_guard_min_scale),
+        anti_martingale_enabled=bool(cfg.anti_martingale_enabled),
+        anti_martingale_win_multiplier=float(cfg.anti_martingale_win_multiplier),
+        anti_martingale_loss_multiplier=float(cfg.anti_martingale_loss_multiplier),
+        anti_martingale_min_scale=float(cfg.anti_martingale_min_scale),
+        anti_martingale_max_scale=float(cfg.anti_martingale_max_scale),
+        circuit_breaker_enabled=bool(cfg.circuit_breaker_enabled),
+        circuit_breaker_drawdown_trigger_bnb=float(cfg.circuit_breaker_drawdown_trigger_bnb),
+        circuit_breaker_base_skip_rounds=int(cfg.circuit_breaker_base_skip_rounds),
+        circuit_breaker_escalation_multiplier=float(cfg.circuit_breaker_escalation_multiplier),
+        circuit_breaker_escalation_window_rounds=int(cfg.circuit_breaker_escalation_window_rounds),
+        circuit_breaker_max_level=int(cfg.circuit_breaker_max_level),
+        circuit_breaker_max_skip_rounds=int(cfg.circuit_breaker_max_skip_rounds),
+        circuit_breaker_reentry_rounds=int(cfg.circuit_breaker_reentry_rounds),
+        circuit_breaker_reentry_scale=float(cfg.circuit_breaker_reentry_scale),
         perf_adapt_mode=str(cfg.perf_adapt_mode),
         perf_gate_window=int(cfg.perf_gate_window),
         perf_gate_min_history=int(cfg.perf_gate_min_history),
         perf_gate_min_win_rate=float(cfg.perf_gate_min_win_rate),
         perf_gate_min_mean_profit_bnb=float(cfg.perf_gate_min_mean_profit_bnb),
+        robust_ev_veto_enabled=bool(cfg.robust_ev_veto_enabled),
+        robust_ev_veto_min_history=int(cfg.robust_ev_veto_min_history),
+        robust_ev_veto_window=int(cfg.robust_ev_veto_window),
+        robust_ev_veto_low_inflow_mult=float(cfg.robust_ev_veto_low_inflow_mult),
+        robust_ev_veto_extreme_inflow_mult=float(cfg.robust_ev_veto_extreme_inflow_mult),
+        robust_ev_veto_adverse_skew=float(cfg.robust_ev_veto_adverse_skew),
+        robust_ev_veto_min_expected_net_bnb=float(cfg.robust_ev_veto_min_expected_net_bnb),
+        shock_filter_enabled=bool(cfg.shock_filter_enabled),
+        shock_filter_window_seconds=int(cfg.shock_filter_window_seconds),
+        shock_filter_min_window_total_bnb=float(cfg.shock_filter_min_window_total_bnb),
+        shock_filter_min_abs_imbalance=float(cfg.shock_filter_min_abs_imbalance),
+        shock_filter_min_surge_ratio=float(cfg.shock_filter_min_surge_ratio),
+        late_model_veto_enabled=bool(cfg.late_model_veto_enabled),
+        late_model_veto_min_late_ratio=float(cfg.late_model_veto_min_late_ratio),
+        late_model_veto_min_abs_imbalance=float(cfg.late_model_veto_min_abs_imbalance),
     )
 
 
@@ -1595,6 +2463,7 @@ def build_dislocation_engine_from_config(
     candidate_cfgs: tuple[DislocationCandidateConfig, ...],
     cutoff_seconds: int,
     treasury_fee_fraction: float,
+    projected_pool_provider: _ProjectedPoolProvider | None = None,
 ) -> DislocationEngine:
     """Build the production dislocation engine from app config."""
 
@@ -1613,4 +2482,5 @@ def build_dislocation_engine_from_config(
         candidate_cfgs=candidates,
         treasury_fee_fraction=float(treasury_fee_fraction),
         shadow_initial_bankroll_bnb=float(selector_cfg.shadow_initial_bankroll_bnb),
+        projected_pool_provider=projected_pool_provider,
     )

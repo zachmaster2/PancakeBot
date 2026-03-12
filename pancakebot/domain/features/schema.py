@@ -77,11 +77,14 @@ _FLAGS = "flags"
 _LATE_PHASE = "late_phase"
 _REGIME = "regime"
 _PRICE = "price"
+_ARRIVAL_MICRO = "arrival_microstructure"
 
 # Within-round windows (target-only).
 _W0_50 = "w_p_0_to_p_50"
 _W50_100 = "w_p_50_to_p_100"
 _W0_100 = "w_p_0_to_p_100"
+_W40_80 = "w_p_40_to_p_80"
+_W80_100 = "w_p_80_to_p_100"
 
 
 def _w(name: str, window: str) -> str:
@@ -151,6 +154,54 @@ _FEATURES.extend(
         FeatureDef(
             name="total_sum_ratio_w_p_50_to_p_100_over_w_p_0_to_p_50",
             group=_DYNAMICS,
+            required_prior_context_rounds_size=0,
+            required_context_klines_size=0,
+        ),
+    ]
+)
+
+# Arrival microstructure (target-only; cutoff-respecting).
+_FEATURES.extend(
+    [
+        FeatureDef(
+            name=f"bet_count_{_W80_100}",
+            group=_ARRIVAL_MICRO,
+            required_prior_context_rounds_size=0,
+            required_context_klines_size=0,
+        ),
+        FeatureDef(
+            name=f"bet_rate_{_W80_100}",
+            group=_ARRIVAL_MICRO,
+            required_prior_context_rounds_size=0,
+            required_context_klines_size=0,
+        ),
+        FeatureDef(
+            name=f"bet_sum_{_W80_100}",
+            group=_ARRIVAL_MICRO,
+            required_prior_context_rounds_size=0,
+            required_context_klines_size=0,
+        ),
+        FeatureDef(
+            name=f"bet_top1_share_{_W80_100}",
+            group=_ARRIVAL_MICRO,
+            required_prior_context_rounds_size=0,
+            required_context_klines_size=0,
+        ),
+        FeatureDef(
+            name=f"bet_hhi_{_W80_100}",
+            group=_ARRIVAL_MICRO,
+            required_prior_context_rounds_size=0,
+            required_context_klines_size=0,
+        ),
+        FeatureDef(
+            name=f"log_imb_{_W80_100}",
+            group=_ARRIVAL_MICRO,
+            required_prior_context_rounds_size=0,
+            required_context_klines_size=0,
+        ),
+        FeatureDef(
+            name=f"delta_bet_sum_{_W80_100}_minus_{_W40_80}",
+            group=_ARRIVAL_MICRO,
             required_prior_context_rounds_size=0,
             required_context_klines_size=0,
         ),

@@ -1,6 +1,30 @@
 PANCAKEBOT -- CANONICAL DESIGN SPEC (v1.0 FROZEN)
 
 ============================================================
+v1.1 IMPLEMENTATION ADDENDUM (CURRENT CODEBASE)
+============================================================
+
+This document remains the frozen canonical reference for `strategy.mode = "canonical_ml"`.
+
+The current promoted production path is:
+- `strategy.mode = "dislocation_cellmean_plusbad"`
+- Shared execution logic is used across `backtest`, `dry`, and `live` through:
+  - `pancakebot/domain/strategy/dislocation_cellmean_engine.py`
+  - runtime wiring in `pancakebot/runtime/runtime_loop.py`
+  - backtest wiring in `pancakebot/backtest/runner.py`
+
+Current promoted selector defaults (config):
+- `strategy.dislocation_cellmean.warmup_rounds = 20000`
+- `strategy.dislocation_cellmean.num_quantile_bins = 12`
+- `strategy.dislocation_cellmean.min_cell_obs = 5`
+- `strategy.dislocation_cellmean.score_threshold = -0.01`
+- `strategy.dislocation_cellmean.use_direction_split = true`
+
+Operational note:
+- `runtime.cutoff_seconds` must match the promoted strategy cutoff expectation.
+- Current promoted defaults are configured for `runtime.cutoff_seconds = 17`.
+
+============================================================
 A) ROUND STATES & SOURCES OF TRUTH
 ============================================================
 

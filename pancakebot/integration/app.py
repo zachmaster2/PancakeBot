@@ -16,6 +16,9 @@ from pancakebot.infra.binance_us_client import BinanceUsClient
 from pancakebot.infra.klines_store import KlinesStore
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
 from pancakebot.infra.feature_cache_store import FeatureCacheStore
+from pancakebot.infra.market_data_db import MarketDataDb, SqliteKlinesStore
+from pancakebot.infra.projection_cache_store import ProjectionCacheStore
+from pancakebot.infra.run_registry_store import RunRegistryStore
 from pancakebot.infra.graph_client import GraphClient
 from pancakebot.infra.rpc_pool import choose_rpc_url
 from pancakebot.infra.onchain.web3_contract_config import Web3ContractConfig
@@ -38,28 +41,58 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
 
     if backtest:
         constants = load_contract_constants()
+        market_data_store = MarketDataDb(cfg.market_data_db_path)
         feature_cache_store = FeatureCacheStore(cfg.feature_cache_path)
-        runtime_cfg = RuntimeConfig(
-            graph_client=None,
-            round_store=round_store,
-            klines_store=klines_store,
-            binance_us_client=binance_us_client,
-            binance_us_symbol=_BINANCE_US_SYMBOL,
-            contract=None,
-            wallet_address="",
-            cutoff_seconds=cfg.cutoff_seconds,
-            use_onchain_event_bets=False,
-            event_lookback_blocks=cfg.event_lookback_blocks,
-            latency_log_path=cfg.latency_log_path,
-            wait_for_bet_receipt=False,
-            bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
-            strategy_cfg=cfg.strategy,
-            dry=dry,
-            feature_cache_store=feature_cache_store,
-            treasury_fee_fraction=float(constants.treasury_fee_fraction),
-            buffer_seconds=int(constants.buffer_seconds),
-        )
-        run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var"))
+        projection_cache_store = ProjectionCacheStore(cfg.projection_cache_db_path)
+        run_registry_store = RunRegistryStore(cfg.run_registry_db_path)
+        try:
+            market_data_store.ensure_sources_synced(
+                rounds_jsonl_path=str(cfg.closed_rounds_path),
+                klines_jsonl_path=str(cfg.klines_path),
+            )
+            runtime_cfg = RuntimeConfig(
+                graph_client=None,
+                round_store=round_store,
+                klines_store=SqliteKlinesStore(market_data_db=market_data_store),
+                binance_us_client=binance_us_client,
+                binance_us_symbol=_BINANCE_US_SYMBOL,
+                contract=None,
+                wallet_address="",
+                cutoff_seconds=cfg.cutoff_seconds,
+                use_onchain_event_bets=False,
+                event_lookback_blocks=cfg.event_lookback_blocks,
+                latency_log_path=cfg.latency_log_path,
+                wait_for_bet_receipt=False,
+                bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
+                strategy_cfg=cfg.strategy,
+                dry=dry,
+                feature_cache_store=feature_cache_store,
+                market_data_store=market_data_store,
+                projection_cache_store=projection_cache_store,
+                run_registry_store=run_registry_store,
+                backtest_state_cache_dir=cfg.backtest_state_cache_dir,
+                min_bet_amount_bnb=float(constants.min_bet_amount_bnb),
+                treasury_fee_fraction=float(constants.treasury_fee_fraction),
+                buffer_seconds=int(constants.buffer_seconds),
+            )
+            run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var"))
+        finally:
+            try:
+                feature_cache_store.close()
+            except Exception:
+                pass
+            try:
+                projection_cache_store.close()
+            except Exception:
+                pass
+            try:
+                run_registry_store.close()
+            except Exception:
+                pass
+            try:
+                market_data_store.close()
+            except Exception:
+                pass
         return
 
     load_env()
@@ -108,6 +141,11 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
         strategy_cfg=cfg.strategy,
         dry=dry,
         feature_cache_store=None,
+        market_data_store=None,
+        projection_cache_store=None,
+        run_registry_store=None,
+        backtest_state_cache_dir=cfg.backtest_state_cache_dir,
+        min_bet_amount_bnb=float(min_bet_amount_bnb),
         treasury_fee_fraction=treasury_fee_fraction,
         buffer_seconds=buffer_seconds,
     )

@@ -3,7 +3,10 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import pickle
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,10 +50,31 @@ class BacktestStateCache:
     def save(self, *, namespace: str, key: str, value: object) -> Path:
         path = self._path(namespace=namespace, key=key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp = path.with_name(
+            f"{path.name}.{int(os.getpid())}.{str(uuid.uuid4().hex)}.tmp"
+        )
         with gzip.open(tmp, "wb", compresslevel=3) as f:
             pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
-        tmp.replace(path)
+        last_err: Exception | None = None
+        for attempt in range(8):
+            try:
+                tmp.replace(path)
+                return path
+            except PermissionError as e:
+                last_err = e
+                time.sleep(0.03 * float(attempt + 1))
+
+        if path.exists():
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            warn("BACK", "CACHE", "SAVE", msg=f"path={path} concurrent_replace_used_existing=1")
+            return path
+
+        if last_err is not None:
+            raise last_err
         return path
 
     def _path(self, *, namespace: str, key: str) -> Path:

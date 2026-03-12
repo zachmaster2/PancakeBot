@@ -44,12 +44,19 @@ class DislocationCandidateConfig:
     dislocation_threshold_pp: float
     nowcast_confidence_min: float
     cutoff_pool_total_min_bnb: float
+    pool_total_gate_mode: str
+    projected_final_pool_multiplier: float
+    projected_final_pool_total_min_bnb: float
     expected_net_min_bnb: float
+    bear_expected_net_extra_min_bnb: float
     side_selection_mode: str
+    allowed_sides: str
     market_extreme_min: float
+    nowcast_market_gap_min: float
     flow_window_seconds: int
     flow_min_imbalance: float
     flow_gate_mode: str
+    flow_gate_relax_dislocation_min: float
     adaptive_candidate_modes: tuple[str, ...]
     adaptive_window: int
     adaptive_min_history: int
@@ -60,11 +67,44 @@ class DislocationCandidateConfig:
     stake_max_bnb: float
     stake_ev_ref_bnb: float
     stake_max_side_pool_frac: float
+    drawdown_stake_guard_enabled: bool
+    drawdown_stake_guard_start_bnb: float
+    drawdown_stake_guard_full_bnb: float
+    drawdown_stake_guard_min_scale: float
+    anti_martingale_enabled: bool
+    anti_martingale_win_multiplier: float
+    anti_martingale_loss_multiplier: float
+    anti_martingale_min_scale: float
+    anti_martingale_max_scale: float
+    circuit_breaker_enabled: bool
+    circuit_breaker_drawdown_trigger_bnb: float
+    circuit_breaker_base_skip_rounds: int
+    circuit_breaker_escalation_multiplier: float
+    circuit_breaker_escalation_window_rounds: int
+    circuit_breaker_max_level: int
+    circuit_breaker_max_skip_rounds: int
+    circuit_breaker_reentry_rounds: int
+    circuit_breaker_reentry_scale: float
     perf_adapt_mode: str
     perf_gate_window: int
     perf_gate_min_history: int
     perf_gate_min_win_rate: float
     perf_gate_min_mean_profit_bnb: float
+    robust_ev_veto_enabled: bool
+    robust_ev_veto_min_history: int
+    robust_ev_veto_window: int
+    robust_ev_veto_low_inflow_mult: float
+    robust_ev_veto_extreme_inflow_mult: float
+    robust_ev_veto_adverse_skew: float
+    robust_ev_veto_min_expected_net_bnb: float
+    shock_filter_enabled: bool
+    shock_filter_window_seconds: int
+    shock_filter_min_window_total_bnb: float
+    shock_filter_min_abs_imbalance: float
+    shock_filter_min_surge_ratio: float
+    late_model_veto_enabled: bool
+    late_model_veto_min_late_ratio: float
+    late_model_veto_min_abs_imbalance: float
 
 
 @dataclass(frozen=True, slots=True)

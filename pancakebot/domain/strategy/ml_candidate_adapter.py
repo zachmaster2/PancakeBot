@@ -89,6 +89,8 @@ def _expected_net_from_predicted_final(
 class MlCandidateAdapter:
     """Emit one ML candidate signal compatible with the shared router."""
 
+    _MAX_PROJECTION_CACHE_ROWS = 10000
+
     def __init__(
         self,
         *,
@@ -97,10 +99,13 @@ class MlCandidateAdapter:
         treasury_fee_fraction: float,
         klines_store_like: object,
         feature_cache_store: object | None = None,
+        projection_cache_store: object | None = None,
     ) -> None:
         self._config = config
         self._history_rounds: list[Round] = []
         self._state: WalkForwardState | None = None
+        self._final_pool_projection_cache: dict[tuple[int, int, int, int, int], tuple[float, float, float] | None] = {}
+        self._projection_cache_store = projection_cache_store
         self._wf_cfg = _MlWalkForwardRuntimeConfig(
             klines_store=klines_store_like,
             cutoff_seconds=int(cutoff_seconds),
@@ -151,6 +156,102 @@ class MlCandidateAdapter:
             if self._history_rounds and int(round_t.epoch) <= int(self._history_rounds[-1].epoch):
                 continue
             self._history_rounds.append(round_t)
+        latest_epoch = int(self._history_rounds[-1].epoch)
+        self._prune_projection_cache(latest_closed_epoch=latest_epoch)
+
+    def predict_final_pools_for_round(self, *, round_t: Round) -> tuple[float, float, float] | None:
+        """Predict (final_total_bnb, final_bull_bnb, final_bear_bnb) for target round.
+
+        This path is independent of ML candidate trading enablement and exists so
+        other strategies can consume the same learned pool forecast model.
+        """
+
+        if round_t.lock_at is None:
+            return None
+
+        cutoff_ts = int(round_t.lock_at) - int(self._wf_cfg.cutoff_seconds)
+        pools = compute_pool_amounts_wei_at_or_before(
+            bets=round_t.bets,
+            cutoff_ts=int(cutoff_ts),
+        )
+        projection_key = (
+            int(round_t.epoch),
+            int(round_t.lock_at),
+            int(cutoff_ts),
+            int(pools.bull_wei),
+            int(pools.bear_wei),
+        )
+        if projection_key in self._final_pool_projection_cache:
+            cached = self._final_pool_projection_cache[projection_key]
+            if cached is None:
+                return None
+            return float(cached[0]), float(cached[1]), float(cached[2])
+
+        if self._projection_cache_store is not None and hasattr(self._projection_cache_store, "lookup_projection"):
+            found, cached = self._projection_cache_store.lookup_projection(
+                epoch=int(round_t.epoch),
+                lock_at=int(round_t.lock_at),
+                cutoff_ts=int(cutoff_ts),
+                bull_wei=int(pools.bull_wei),
+                bear_wei=int(pools.bear_wei),
+            )
+            if bool(found):
+                self._final_pool_projection_cache[projection_key] = cached
+                if cached is None:
+                    return None
+                return float(cached[0]), float(cached[1]), float(cached[2])
+
+        k = int(max_required_prior_context_rounds_size())
+        if len(self._history_rounds) < int(k):
+            self._cache_projection(projection_key=projection_key, projection=None)
+            return None
+
+        try:
+            self._state = ensure_state(
+                cfg=self._wf_cfg,
+                closed_rounds=list(self._history_rounds),
+                current_epoch=int(round_t.epoch),
+                state=self._state,
+            )
+        except InvariantError:
+            self._cache_projection(projection_key=projection_key, projection=None)
+            return None
+
+        if self._state is None or self._state.models is None:
+            self._cache_projection(projection_key=projection_key, projection=None)
+            return None
+
+        pool_total_bnb = float(pools.total_wei) / float(BNB_WEI)
+        pool_bull_bnb = float(pools.bull_wei) / float(BNB_WEI)
+        pool_bear_bnb = float(pools.bear_wei) / float(BNB_WEI)
+        if float(pool_total_bnb) <= 0.0:
+            self._cache_projection(projection_key=projection_key, projection=None)
+            return None
+
+        prior_context_rounds = list(self._history_rounds[-int(k):])
+        try:
+            x_row = self._feature_vector_for_round(
+                round_t=round_t,
+                prior_context_rounds=prior_context_rounds,
+            )
+        except InvariantError:
+            self._cache_projection(projection_key=projection_key, projection=None)
+            return None
+
+        late_total_bnb, late_bull_frac = self._state.models.pool_model.predict([list(x_row)])[0]
+        late_total_bnb = max(0.0, float(late_total_bnb))
+        late_bull_frac = min(1.0, max(0.0, float(late_bull_frac)))
+
+        final_total_bnb = float(pool_total_bnb) + float(late_total_bnb)
+        final_bull_bnb = float(pool_bull_bnb) + float(late_total_bnb) * float(late_bull_frac)
+        final_bear_bnb = float(pool_bear_bnb) + float(late_total_bnb) * (1.0 - float(late_bull_frac))
+        if float(final_total_bnb) <= 0.0 or float(final_bull_bnb) <= 0.0 or float(final_bear_bnb) <= 0.0:
+            self._cache_projection(projection_key=projection_key, projection=None)
+            return None
+
+        out = (float(final_total_bnb), float(final_bull_bnb), float(final_bear_bnb))
+        self._cache_projection(projection_key=projection_key, projection=out)
+        return out
 
     def export_bootstrap_state(self) -> dict[str, object]:
         """Export ML walk-forward state snapshot for backtest bootstrap cache."""
@@ -158,6 +259,13 @@ class MlCandidateAdapter:
         return {
             "history_rounds_json": [r.to_json() for r in self._history_rounds],
             "walk_forward_state": self._state,
+            "final_pool_projection_cache": [
+                {
+                    "k": [int(x) for x in key],
+                    "v": (None if value is None else [float(value[0]), float(value[1]), float(value[2])]),
+                }
+                for key, value in self._final_pool_projection_cache.items()
+            ],
         }
 
     def import_bootstrap_state(self, *, state: dict[str, object]) -> None:
@@ -173,6 +281,43 @@ class MlCandidateAdapter:
             deduped.append(round_t)
         self._history_rounds = list(deduped)
         self._state = state.get("walk_forward_state")
+        self._final_pool_projection_cache = {}
+        cache_raw = state.get("final_pool_projection_cache")
+        if isinstance(cache_raw, list):
+            for row in cache_raw:
+                if not isinstance(row, dict):
+                    continue
+                key_raw = row.get("k")
+                if not isinstance(key_raw, list) or len(key_raw) != 5:
+                    continue
+                try:
+                    key = (
+                        int(key_raw[0]),
+                        int(key_raw[1]),
+                        int(key_raw[2]),
+                        int(key_raw[3]),
+                        int(key_raw[4]),
+                    )
+                except Exception:
+                    continue
+                val_raw = row.get("v")
+                if val_raw is None:
+                    self._final_pool_projection_cache[key] = None
+                    continue
+                if not isinstance(val_raw, list) or len(val_raw) != 3:
+                    continue
+                try:
+                    value = (float(val_raw[0]), float(val_raw[1]), float(val_raw[2]))
+                except Exception:
+                    continue
+                self._final_pool_projection_cache[key] = value
+        self._prune_projection_cache(
+            latest_closed_epoch=(
+                int(self._history_rounds[-1].epoch)
+                if self._history_rounds
+                else None
+            )
+        )
 
     def candidate_signal_for_open_round(self, *, round_t: Round) -> StrategyCandidateSignal:
         """Generate one ML candidate signal for the target round."""
@@ -394,6 +539,33 @@ class MlCandidateAdapter:
         if int(latest_close_ms) < int(anchor_ms):
             anchor_ms = int(latest_close_ms)
         return int(anchor_ms)
+
+    def _cache_projection(
+        self,
+        *,
+        projection_key: tuple[int, int, int, int, int],
+        projection: tuple[float, float, float] | None,
+    ) -> None:
+        self._final_pool_projection_cache[projection_key] = projection
+        if self._projection_cache_store is not None and hasattr(self._projection_cache_store, "put_projection"):
+            self._projection_cache_store.put_projection(
+                epoch=int(projection_key[0]),
+                lock_at=int(projection_key[1]),
+                cutoff_ts=int(projection_key[2]),
+                bull_wei=int(projection_key[3]),
+                bear_wei=int(projection_key[4]),
+                projection=projection,
+            )
+        self._prune_projection_cache(latest_closed_epoch=None)
+
+    def _prune_projection_cache(self, *, latest_closed_epoch: int | None) -> None:
+        # Keep settled-epoch projections so future runs can reuse them.
+        # We only enforce a hard in-memory cap to avoid unbounded growth.
+        _ = latest_closed_epoch
+
+        while len(self._final_pool_projection_cache) > int(self._MAX_PROJECTION_CACHE_ROWS):
+            oldest_key = next(iter(self._final_pool_projection_cache))
+            self._final_pool_projection_cache.pop(oldest_key, None)
 
     def _context_klines(self, *, round_t: Round) -> list[Kline]:
         """Load cutoff-anchored context klines from the shared kline source."""

@@ -204,6 +204,385 @@ class StrategyRouterTests(unittest.TestCase):
         self.assertEqual("Bull", decision.bet_side)
         self.assertIsNone(decision.skip_reason)
 
+    def test_online_cellmean_side_gap_routes_when_side_outperforms_opposite(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_cellmean_side_gap",
+                online_warmup_rounds=2,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=-1.0,
+                online_use_direction_split=True,
+            )
+        )
+        bull_signal = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=None,
+                skip_reason=None,
+            )
+        }
+        bear_signal = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=None,
+                skip_reason=None,
+            )
+        }
+
+        warmup_1 = router.route_round(
+            candidate_signals=bull_signal,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("router_online_warmup", warmup_1.skip_reason)
+        router.observe_settlement(
+            candidate_signals=bull_signal,
+            realized_profit_by_candidate={"a": 0.03},
+        )
+
+        warmup_2 = router.route_round(
+            candidate_signals=bear_signal,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("router_online_warmup", warmup_2.skip_reason)
+        router.observe_settlement(
+            candidate_signals=bear_signal,
+            realized_profit_by_candidate={"a": -0.01},
+        )
+
+        decision = router.route_round(
+            candidate_signals=bull_signal,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("a", decision.selected_strategy)
+        self.assertEqual("Bull", decision.bet_side)
+        self.assertAlmostEqual(0.04, float(decision.selector_score_bnb))
+
+    def test_online_cellmean_side_gap_skips_when_opposite_side_is_better(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_cellmean_side_gap",
+                online_warmup_rounds=2,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=-1.0,
+                online_use_direction_split=True,
+            )
+        )
+        bull_signal = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=None,
+                skip_reason=None,
+            )
+        }
+        bear_signal = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=None,
+                skip_reason=None,
+            )
+        }
+
+        _ = router.route_round(
+            candidate_signals=bull_signal,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=bull_signal,
+            realized_profit_by_candidate={"a": 0.01},
+        )
+        _ = router.route_round(
+            candidate_signals=bear_signal,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=bear_signal,
+            realized_profit_by_candidate={"a": 0.02},
+        )
+
+        decision = router.route_round(
+            candidate_signals=bull_signal,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("SKIP", decision.action)
+        self.assertEqual("router_online_no_candidate", decision.skip_reason)
+
+    def test_online_cellmean_side_gap_requires_direction_split(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_cellmean_side_gap",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=-1.0,
+                online_use_direction_split=False,
+            )
+        )
+        candidate_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=None,
+                skip_reason=None,
+            )
+        }
+
+        warmup = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("router_online_warmup", warmup.skip_reason)
+        router.observe_settlement(
+            candidate_signals=candidate_signals,
+            realized_profit_by_candidate={"a": 0.01},
+        )
+
+        decision = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("SKIP", decision.action)
+        self.assertEqual("router_online_side_gap_requires_direction_split", decision.skip_reason)
+
+    def test_online_cellmean_selector_fallback_routes_when_online_has_no_candidate(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_cellmean_selector_fallback",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=2,
+                online_score_threshold_bnb=-1.0,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        candidate_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.01,
+                selector_score_bnb=0.05,
+                skip_reason=None,
+            ),
+        }
+        warmup = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("router_online_warmup", warmup.skip_reason)
+
+        router.observe_settlement(
+            candidate_signals=candidate_signals,
+            realized_profit_by_candidate={"a": 0.01, "b": 0.01},
+        )
+
+        decision = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("a", decision.selected_strategy)
+        self.assertEqual("Bull", decision.bet_side)
+        self.assertIsNone(decision.skip_reason)
+
+    def test_online_cellmean_backoff_routes_when_cell_is_sparse(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_cellmean_backoff",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=2,
+                online_score_threshold_bnb=-1.0,
+            )
+        )
+        candidate_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=None,
+                skip_reason=None,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.01,
+                selector_score_bnb=None,
+                skip_reason=None,
+            ),
+        }
+        warmup = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("router_online_warmup", warmup.skip_reason)
+
+        router.observe_settlement(
+            candidate_signals=candidate_signals,
+            realized_profit_by_candidate={"a": 0.03, "b": -0.02},
+        )
+
+        decision = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("a", decision.selected_strategy)
+        self.assertIsNone(decision.skip_reason)
+
+    def test_online_cellmean_selector_fallback_rejects_negative_selector_score(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_cellmean_selector_fallback",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=2,
+                online_score_threshold_bnb=-1.0,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        candidate_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=-0.01,
+                skip_reason=None,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.01,
+                selector_score_bnb=-0.02,
+                skip_reason=None,
+            ),
+        }
+        _ = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=candidate_signals,
+            realized_profit_by_candidate={"a": 0.01, "b": 0.01},
+        )
+
+        decision = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        self.assertEqual("SKIP", decision.action)
+        self.assertEqual("router_fallback_selector_rejected", decision.skip_reason)
+        self.assertEqual("a", decision.selected_strategy)
+
+    def test_online_cellmean_selector_fallback_maps_selector_warmup_reason(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_cellmean_selector_fallback",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=2,
+                online_score_threshold_bnb=-1.0,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        candidate_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+            )
+        }
+        _ = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=candidate_signals,
+            realized_profit_by_candidate={"a": 0.01},
+        )
+
+        decision = router.route_round(
+            candidate_signals=candidate_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=False,
+        )
+        self.assertEqual("SKIP", decision.action)
+        self.assertEqual("router_fallback_selector_warmup", decision.skip_reason)
+
 
 if __name__ == "__main__":
     unittest.main()
