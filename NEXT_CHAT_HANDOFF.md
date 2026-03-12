@@ -980,7 +980,7 @@ Best confirmed (current top non-ML):
 
 Still true:
 - No tested setup is close to target `2.0 BNB / 500`.
-- Bet frequency remains far below user’s desired 30-50% on non-ML path.
+- Bet frequency remains far below userâ€™s desired 30-50% on non-ML path.
 
 ### 7) Current scoreboard snapshot (50k confirms only)
 
@@ -1111,7 +1111,7 @@ Interpretation:
 ### 13) Stage K completed: long-window confirmation of Stage J top family (45k horizon)
 
 Purpose:
-- Confirm whether Stage J’s online-router uplift survives longer horizon.
+- Confirm whether Stage Jâ€™s online-router uplift survives longer horizon.
 
 Command:
 - `PANCAKEBOT_GAS_PRICE_WEI_OVERRIDE=200000000`
@@ -1389,3 +1389,97 @@ Decision:
 Updated best-known candidate from Stage Q+R:
 - `priority_longconfirm2_gas0p2_core_base_20260307` remains best in this family:
   - `mean_per500 +0.086719`, `worst_dd 3.970701`, `mean_bet_rate 0.007938`.
+
+## Update (2026-03-12): Clean Checkpoint + altA Family Strict Multi-Offset Confirm
+
+1. Repo normalized into a clean checkpoint:
+   - Commit:
+     - `8e0e44d`
+     - `Add DB-backed backtest acceleration and model-gate sweep tooling`
+   - Validation before commit:
+     - `.\.venv\Scripts\python.exe -m compileall pancakebot inspection tests`
+     - `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test*.py"`
+     - `.\.venv\Scripts\python.exe -m inspection.run_backtest_scenario --name smoke_repo_coherence_20260312 --sim-size 50 --reset-mode continuous`
+     - `.\.venv\Scripts\python.exe -m inspection.run_final_model_gate_window_sweep --name-prefix smoke_final_model_gate_20260312 --sim-size 500 --offsets 0 --thresholds 2 --profiles base --max-workers 1 --top-k-confirm 1`
+   - Local-only note files preserved via stash:
+     - `stash@{0}: On master: local notes and assistant rules`
+
+2. Artifact history was audited to recover the real continuation point after the older handoff sections:
+   - Command:
+     - `.\.venv\Scripts\python.exe -m inspection.analyze_experiment_history --top-n 15`
+   - Key finding:
+     - stronger-looking single-window 30k results existed for the `altA` selector family
+       (for example `idea40_altA_flowimb015_20260304_off0_sim30000`), but they had not
+       been strict multi-offset confirmed.
+
+3. Strict multi-offset confirmation executed for the `altA` selector family at `0.2 gwei`:
+   - Common settings:
+     - router: `selector_max_score`
+     - keep active ensemble: `--keep-all-candidates`
+     - offsets: `0,1500,3000,4500,5500`
+     - sim size: `45000`
+     - env:
+       - `PANCAKEBOT_GAS_PRICE_WEI_OVERRIDE=200000000`
+
+4. Baseline current family (`altA` target, no overrides):
+   - Command:
+     - `.\.venv\Scripts\python.exe -m inspection.run_alta_single_idea --name-prefix nextstep_altA_base_gas0p2_20260312 --candidate-name disloc_altA_20260227_x80 --router-mode selector_max_score --keep-all-candidates --sim-size 45000 --offsets 0,1500,3000,4500,5500`
+   - Artifact:
+     - `../PancakeBot_var_exp/nextstep_altA_base_gas0p2_20260312_table.json`
+   - Aggregate:
+     - `mean_per500 = +0.040089`
+     - `worst_per500 = -0.022713`
+     - `worst_max_drawdown_bnb = 5.398439`
+     - `worst_loss_from_initial_to_min_bnb = 5.068797`
+     - `positive windows = 3/5`
+
+5. `altA` with stronger flow gate (`flow_min_imbalance = 0.15`):
+   - Command:
+     - `.\.venv\Scripts\python.exe -m inspection.run_alta_single_idea --name-prefix nextstep_altA_flowimb015_gas0p2_20260312 --candidate-name disloc_altA_20260227_x80 --router-mode selector_max_score --keep-all-candidates --sim-size 45000 --offsets 0,1500,3000,4500,5500 --set flow_min_imbalance=0.15`
+   - Artifact:
+     - `../PancakeBot_var_exp/nextstep_altA_flowimb015_gas0p2_20260312_table.json`
+   - Aggregate:
+     - `mean_per500 = +0.052051`
+     - `worst_per500 = -0.006773`
+     - `worst_max_drawdown_bnb = 5.234328`
+     - `worst_loss_from_initial_to_min_bnb = 4.789707`
+     - `positive windows = 4/5`
+   - Interpretation:
+     - better than current baseline across profit robustness and loss-to-min.
+     - still misses the stricter DD objective because one window reached `5.234328` DD.
+
+6. `altA` flow gate + `late_model_veto_enabled=true`:
+   - Command:
+     - `.\.venv\Scripts\python.exe -m inspection.run_alta_single_idea --name-prefix nextstep_altA_flowimb015_lateveto_gas0p2_20260312 --candidate-name disloc_altA_20260227_x80 --router-mode selector_max_score --keep-all-candidates --sim-size 45000 --offsets 0,1500,3000,4500,5500 --set flow_min_imbalance=0.15 --set late_model_veto_enabled=true`
+   - Artifact:
+     - `../PancakeBot_var_exp/nextstep_altA_flowimb015_lateveto_gas0p2_20260312_table.json`
+   - Aggregate:
+     - identical to plain `flowimb015` on these windows:
+       - `mean_per500 = +0.052051`
+       - `worst_per500 = -0.006773`
+       - `worst_max_drawdown_bnb = 5.234328`
+       - `worst_loss_from_initial_to_min_bnb = 4.789707`
+   - Interpretation:
+     - `late_model_veto` was inert for this confirmation slice; keep it out of follow-up
+       sweeps unless a specific targeted hypothesis is introduced.
+
+7. Net result from this continuation step:
+   - The earlier promising 30k single-window `altA` signal does **not** hold robustly at
+     strict 45k multi-offset confirmation.
+   - Best of the tested family is now:
+     - `flow_min_imbalance = 0.15` on `altA` within the current selector ensemble.
+   - Magnitude remains small (`~0.052 / 500`) and far below the user target `2.0 / 500`.
+
+8. Recommended next step if continuing from here:
+   - If staying within this family:
+     - run a very small adjacent sweep around `flow_min_imbalance` (`0.12, 0.15, 0.18`)
+       and optionally compare:
+       - altA-only override
+       - altB-only override
+       - apply-to-all-candidates
+     - only promote if strict multi-offset confirmation improves both:
+       - `mean_per500`
+       - DD / loss-to-min
+   - If prioritizing fastest progress toward the objective:
+     - stop local threshold/gate tweaking in this family and pivot again to a larger model
+       or feature change, because robust edge remains too small.
