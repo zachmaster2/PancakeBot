@@ -62,6 +62,30 @@ def _window_bucket(*, start_ts: int, cutoff_ts: int, created_at: int) -> str | N
     return "w_p_50_to_p_100"
 
 
+def _in_pct_window(
+    *,
+    start_ts: int,
+    cutoff_ts: int,
+    created_at: int,
+    lo_pct: int,
+    hi_pct: int,
+) -> bool:
+    if int(lo_pct) < 0 or int(hi_pct) > 100 or int(lo_pct) >= int(hi_pct):
+        raise ValueError("pct_window_invalid")
+    if int(created_at) < int(start_ts) or int(created_at) > int(cutoff_ts):
+        return False
+    span = int(cutoff_ts) - int(start_ts)
+    if span <= 0:
+        return False
+    rel = int(created_at) - int(start_ts)
+    lhs = int(rel) * 100
+    lo = int(span) * int(lo_pct)
+    hi = int(span) * int(hi_pct)
+    if int(hi_pct) == 100:
+        return int(lhs) >= int(lo) and int(lhs) <= int(hi)
+    return int(lhs) >= int(lo) and int(lhs) < int(hi)
+
+
 def _gini(values: list[float]) -> float:
     """Gini coefficient for non-negative values."""
     if not values:
@@ -98,6 +122,15 @@ def _max(values: list[float]) -> float:
     return float(max(values))
 
 
+def _top1_share(values: list[float]) -> float:
+    if not values:
+        return float("nan")
+    total = float(sum(values))
+    if total <= 0.0:
+        return float("nan")
+    return float(max(values) / total)
+
+
 def _log_imb(*, bull: float, bear: float) -> float:
     return float(math.log((float(bull) + _EPS) / (float(bear) + _EPS)))
 
@@ -128,6 +161,22 @@ def compute_within_round_features(
     }
     bull_vals: dict[str, list[float]] = {"w_p_0_to_p_50": [], "w_p_50_to_p_100": [], "w_p_0_to_p_100": []}
     bear_vals: dict[str, list[float]] = {"w_p_0_to_p_50": [], "w_p_50_to_p_100": [], "w_p_0_to_p_100": []}
+    micro_windows: dict[str, tuple[int, int]] = {
+        "w_p_40_to_p_80": (40, 80),
+        "w_p_80_to_p_100": (80, 100),
+    }
+    micro_sums: dict[str, dict[str, float]] = {
+        "w_p_40_to_p_80": {"Bull": 0.0, "Bear": 0.0},
+        "w_p_80_to_p_100": {"Bull": 0.0, "Bear": 0.0},
+    }
+    micro_counts: dict[str, dict[str, float]] = {
+        "w_p_40_to_p_80": {"Bull": 0.0, "Bear": 0.0},
+        "w_p_80_to_p_100": {"Bull": 0.0, "Bear": 0.0},
+    }
+    micro_vals: dict[str, list[float]] = {
+        "w_p_40_to_p_80": [],
+        "w_p_80_to_p_100": [],
+    }
 
     for b in bets:
         if int(b.created_at) > int(cutoff):
@@ -156,6 +205,19 @@ def compute_within_round_features(
             bull_vals["w_p_0_to_p_100"].append(amt)
         else:
             bear_vals["w_p_0_to_p_100"].append(amt)
+
+        for mw, (lo_pct, hi_pct) in micro_windows.items():
+            if not _in_pct_window(
+                start_ts=int(start_ts),
+                cutoff_ts=int(cutoff),
+                created_at=int(b.created_at),
+                lo_pct=int(lo_pct),
+                hi_pct=int(hi_pct),
+            ):
+                continue
+            micro_sums[mw][pos] += amt
+            micro_counts[mw][pos] += 1.0
+            micro_vals[mw].append(amt)
 
     out: dict[str, float] = {}
 
@@ -198,6 +260,34 @@ def compute_within_round_features(
         den = float(out[f"{side}_sum_{lo}"])
         key = f"{side}_sum_ratio_{hi}_over_{lo}"
         out[key] = float("nan") if den == 0.0 else float(num / den)
+
+    # arrival_microstructure (minimal initial deployment)
+    w_40_80 = "w_p_40_to_p_80"
+    w_80_100 = "w_p_80_to_p_100"
+
+    bull_40_80 = float(micro_sums[w_40_80]["Bull"])
+    bear_40_80 = float(micro_sums[w_40_80]["Bear"])
+    total_40_80 = float(bull_40_80 + bear_40_80)
+
+    bull_80_100 = float(micro_sums[w_80_100]["Bull"])
+    bear_80_100 = float(micro_sums[w_80_100]["Bear"])
+    total_80_100 = float(bull_80_100 + bear_80_100)
+    count_80_100 = float(micro_counts[w_80_100]["Bull"] + micro_counts[w_80_100]["Bear"])
+
+    span_seconds = int(cutoff) - int(start_ts)
+    if int(span_seconds) <= 0:
+        bet_rate_80_100 = float("nan")
+    else:
+        window_seconds_80_100 = max(1.0, float(span_seconds) * 0.20)
+        bet_rate_80_100 = float(count_80_100 / float(window_seconds_80_100))
+
+    out[f"bet_count_{w_80_100}"] = float(count_80_100)
+    out[f"bet_rate_{w_80_100}"] = float(bet_rate_80_100)
+    out[f"bet_sum_{w_80_100}"] = float(total_80_100)
+    out[f"bet_top1_share_{w_80_100}"] = _top1_share(micro_vals[w_80_100])
+    out[f"bet_hhi_{w_80_100}"] = _hhi(micro_vals[w_80_100])
+    out[f"log_imb_{w_80_100}"] = _log_imb(bull=bull_80_100, bear=bear_80_100)
+    out[f"delta_bet_sum_{w_80_100}_minus_{w_40_80}"] = float(total_80_100 - total_40_80)
 
     return out
 

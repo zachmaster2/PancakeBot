@@ -24,8 +24,12 @@ from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
 _BOOTSTRAP_BATCH_ROUNDS = 1000
 _BOOTSTRAP_LOG_EVERY_ROUNDS = 5000
-_STATE_CACHE_ROOT_DIR = "var/backtest_state_cache"
-_STATE_CACHE_VERSION = "backtest_pipeline_state_v1"
+_DEFAULT_STATE_CACHE_ROOT_DIR = "../PancakeBot_var_exp/backtest_state_cache"
+_STATE_CACHE_VERSION = "backtest_pipeline_state_v2"
+_KLINE_INDEX_CACHE_NAMESPACE = "dislocation_kline_index"
+_KLINE_INDEX_CACHE_VERSION = "dislocation_kline_index_v1"
+_ROUND_TAIL_CACHE_NAMESPACE = "closed_rounds_tail"
+_ROUND_TAIL_CACHE_VERSION = "closed_rounds_tail_v1"
 
 
 def _tail_rounds(store, *, n: int) -> list[Round]:
@@ -58,14 +62,21 @@ def _all_klines_from_store(klines_store) -> list[Kline]:
     return list(out)
 
 
-def _build_dislocation_engine(*, runtime_cfg, all_klines: list[Kline]):
+def _build_dislocation_engine(
+    *,
+    runtime_cfg,
+    all_klines: list[Kline] | None,
+    projected_pool_provider: object | None = None,
+):
     engine = build_dislocation_engine_from_config(
         selector_cfg=runtime_cfg.strategy_cfg.dislocation.selector,
         candidate_cfgs=runtime_cfg.strategy_cfg.dislocation.candidates,
         treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
         cutoff_seconds=int(runtime_cfg.cutoff_seconds),
+        projected_pool_provider=projected_pool_provider,
     )
-    engine.refresh_klines(list(all_klines))
+    if all_klines is not None:
+        engine.refresh_klines(list(all_klines))
     return engine
 
 
@@ -84,11 +95,20 @@ def _build_router(*, runtime_cfg) -> StrategyRouter:
     return StrategyRouter(config=router_cfg)
 
 
-def _build_ml_candidate_adapter(*, runtime_cfg) -> MlCandidateAdapter | None:
+def _dislocation_needs_pool_projection_model(*, runtime_cfg) -> bool:
+    return any(
+        str(c.pool_total_gate_mode) == "projected_final_model_only"
+        or str(c.stake_mode) in ("ev_scaled_projected", "ev_optimal_projected")
+        or bool(c.late_model_veto_enabled)
+        for c in runtime_cfg.strategy_cfg.dislocation.candidates
+    )
+
+
+def _build_ml_candidate_adapter(*, runtime_cfg, force_create: bool = False) -> MlCandidateAdapter | None:
     """Build optional ML candidate adapter from shared strategy config."""
 
     ml_cfg = runtime_cfg.strategy_cfg.ml_candidate
-    if not bool(ml_cfg.enabled):
+    if not bool(ml_cfg.enabled) and not bool(force_create):
         return None
     return MlCandidateAdapter(
         config=ml_cfg,
@@ -96,22 +116,32 @@ def _build_ml_candidate_adapter(*, runtime_cfg) -> MlCandidateAdapter | None:
         treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
         klines_store_like=runtime_cfg.klines_store,
         feature_cache_store=runtime_cfg.feature_cache_store,
+        projection_cache_store=getattr(runtime_cfg, "projection_cache_store", None),
     )
 
 
-def _build_strategy_pipeline(*, runtime_cfg, all_klines: list[Kline]) -> StrategyPipeline:
+def _build_strategy_pipeline(*, runtime_cfg, all_klines: list[Kline] | None) -> StrategyPipeline:
     """Build shared strategy pipeline for backtest replay."""
 
-    dislocation_engine = _build_dislocation_engine(runtime_cfg=runtime_cfg, all_klines=all_klines)
+    needs_pool_projection_model = _dislocation_needs_pool_projection_model(runtime_cfg=runtime_cfg)
+    ml_adapter = _build_ml_candidate_adapter(
+        runtime_cfg=runtime_cfg,
+        force_create=bool(needs_pool_projection_model),
+    )
+    dislocation_engine = _build_dislocation_engine(
+        runtime_cfg=runtime_cfg,
+        all_klines=all_klines,
+        projected_pool_provider=ml_adapter,
+    )
     router = _build_router(runtime_cfg=runtime_cfg)
-    ml_adapter = _build_ml_candidate_adapter(runtime_cfg=runtime_cfg)
     pipeline = StrategyPipeline(
         dislocation_engine=dislocation_engine,
         router=router,
         treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
         ml_candidate_adapter=ml_adapter,
     )
-    pipeline.refresh_klines(klines=list(all_klines))
+    if all_klines is not None:
+        pipeline.refresh_klines(klines=list(all_klines))
     return pipeline
 
 
@@ -270,6 +300,99 @@ def _store_file_signature(path: str) -> dict[str, object]:
     }
 
 
+def _rounds_source_signature(*, runtime_cfg) -> dict[str, object]:
+    market_data_store = getattr(runtime_cfg, "market_data_store", None)
+    if market_data_store is not None and hasattr(market_data_store, "rounds_source_signature"):
+        return {
+            "mode": "market_data_db",
+            "db_path": str(getattr(market_data_store, "path", "")),
+            "source": dict(market_data_store.rounds_source_signature()),
+        }
+    return {
+        "mode": "jsonl",
+        "source": _store_file_signature(runtime_cfg.round_store.path_jsonl),
+    }
+
+
+def _kline_source_signature(*, runtime_cfg) -> dict[str, object]:
+    market_data_store = getattr(runtime_cfg, "market_data_store", None)
+    if market_data_store is not None and hasattr(market_data_store, "klines_source_signature"):
+        return {
+            "mode": "market_data_db",
+            "db_path": str(getattr(market_data_store, "path", "")),
+            "source": dict(market_data_store.klines_source_signature()),
+        }
+    return {
+        "mode": "jsonl",
+        "source": _store_file_signature(runtime_cfg.klines_store.path),
+    }
+
+
+def _kline_index_cache_key(*, runtime_cfg) -> str:
+    payload = {
+        "version": str(_KLINE_INDEX_CACHE_VERSION),
+        "cutoff_seconds": int(runtime_cfg.cutoff_seconds),
+        "kline_store": _kline_source_signature(runtime_cfg=runtime_cfg),
+    }
+    return str(stable_hash(payload))
+
+
+def _ensure_pipeline_kline_index(*, pipeline: StrategyPipeline, runtime_cfg, state_cache: BacktestStateCache) -> None:
+    key = _kline_index_cache_key(runtime_cfg=runtime_cfg)
+    cached_state = state_cache.load(namespace=_KLINE_INDEX_CACHE_NAMESPACE, key=str(key))
+    if isinstance(cached_state, dict):
+        try:
+            pipeline.import_kline_index_state(state=cached_state)
+            info("BACK", "CACHE", "HIT", msg=f"phase=kline_index key={str(key)[:16]}")
+            return
+        except Exception as e:
+            warn("BACK", "CACHE", "LOAD", msg=f"phase=kline_index key={str(key)[:16]} err={e}")
+
+    info("BACK", "CACHE", "MISS", msg=f"phase=kline_index key={str(key)[:16]}")
+    all_klines = _all_klines_from_store(runtime_cfg.klines_store)
+    pipeline.refresh_klines(klines=list(all_klines))
+    state_cache.save(
+        namespace=_KLINE_INDEX_CACHE_NAMESPACE,
+        key=str(key),
+        value=pipeline.export_kline_index_state(),
+    )
+    info("BACK", "CACHE", "SAVE", msg=f"phase=kline_index key={str(key)[:16]}")
+
+
+def _tail_rounds_cache_key(*, source_signature: dict[str, object], n: int) -> str:
+    payload = {
+        "version": str(_ROUND_TAIL_CACHE_VERSION),
+        "n": int(n),
+        "round_store": dict(source_signature),
+    }
+    return str(stable_hash(payload))
+
+
+def _tail_rounds_with_cache(*, runtime_cfg, n: int, state_cache: BacktestStateCache) -> list[Round]:
+    source_signature = _rounds_source_signature(runtime_cfg=runtime_cfg)
+    key = _tail_rounds_cache_key(source_signature=dict(source_signature), n=int(n))
+    cached = state_cache.load(namespace=_ROUND_TAIL_CACHE_NAMESPACE, key=str(key))
+    if isinstance(cached, list) and len(cached) == int(n):
+        if all(isinstance(x, Round) for x in cached):
+            info("BACK", "CACHE", "HIT", msg=f"phase=round_tail key={str(key)[:16]} n={int(n)}")
+            return list(cached)
+
+    info("BACK", "CACHE", "MISS", msg=f"phase=round_tail key={str(key)[:16]} n={int(n)}")
+    market_data_store = getattr(runtime_cfg, "market_data_store", None)
+    if market_data_store is not None and hasattr(market_data_store, "load_tail_rounds"):
+        rounds = list(market_data_store.load_tail_rounds(n=int(n)))
+    else:
+        rounds = _tail_rounds(runtime_cfg.round_store, n=int(n))
+    if len(rounds) == int(n):
+        state_cache.save(
+            namespace=_ROUND_TAIL_CACHE_NAMESPACE,
+            key=str(key),
+            value=list(rounds),
+        )
+        info("BACK", "CACHE", "SAVE", msg=f"phase=round_tail key={str(key)[:16]} n={int(n)}")
+    return list(rounds)
+
+
 def _rounds_signature(rounds: list[Round]) -> dict[str, object]:
     if not rounds:
         return {
@@ -300,23 +423,34 @@ def _snapshot_key(
     phase: str,
 ) -> str:
     strategy_cfg = asdict(runtime_cfg.strategy_cfg)
+    phase_name = str(phase)
+    warmup_only_phase = phase_name == "continuous_initial"
+
+    backtest_payload = {
+        "reset_every_rounds": int(backtest_cfg.reset_every_rounds),
+        "initial_bankroll_bnb": float(backtest_cfg.initial_bankroll_bnb),
+        "tail_offset_rounds": int(backtest_cfg.tail_offset_rounds),
+    }
+    sim_rounds_payload: dict[str, object]
+    if bool(warmup_only_phase):
+        sim_rounds_payload = {"scope": "warmup_only"}
+    else:
+        backtest_payload["simulation_size"] = int(backtest_cfg.simulation_size)
+        sim_rounds_payload = _rounds_signature(list(sim_rounds))
+
     payload = {
         "version": str(_STATE_CACHE_VERSION),
-        "phase": str(phase),
+        "phase": str(phase_name),
         "reset_mode": str(reset_mode),
         "cutoff_seconds": int(runtime_cfg.cutoff_seconds),
         "treasury_fee_fraction": float(runtime_cfg.treasury_fee_fraction),
         "buffer_seconds": int(runtime_cfg.buffer_seconds),
-        "backtest": {
-            "simulation_size": int(backtest_cfg.simulation_size),
-            "reset_every_rounds": int(backtest_cfg.reset_every_rounds),
-            "initial_bankroll_bnb": float(backtest_cfg.initial_bankroll_bnb),
-        },
+        "backtest": backtest_payload,
         "strategy_cfg": strategy_cfg,
-        "round_store": _store_file_signature(runtime_cfg.round_store.path_jsonl),
-        "kline_store": _store_file_signature(runtime_cfg.klines_store.path),
+        "round_store": _rounds_source_signature(runtime_cfg=runtime_cfg),
+        "kline_store": _kline_source_signature(runtime_cfg=runtime_cfg),
         "warmup_rounds": _rounds_signature(list(warmup_rounds)),
-        "sim_rounds": _rounds_signature(list(sim_rounds)),
+        "sim_rounds": sim_rounds_payload,
     }
     return str(stable_hash(payload))
 
@@ -371,24 +505,35 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
     backtest_cfg.validate()
     simulation_size = int(backtest_cfg.simulation_size)
     reset_mode, reset_every_rounds = _resolve_reset_settings(backtest_cfg)
+    state_cache_root_dir = getattr(runtime_cfg, "backtest_state_cache_dir", _DEFAULT_STATE_CACHE_ROOT_DIR)
+    state_cache = BacktestStateCache(root_dir=str(state_cache_root_dir))
 
     warmup_rounds = int(runtime_cfg.strategy_cfg.dislocation.selector.warmup_rounds)
     if int(warmup_rounds) <= 0:
         raise InvariantError("dislocation_warmup_rounds_nonpositive")
 
-    total_n = int(warmup_rounds) + int(simulation_size)
-    closed_rounds = _tail_rounds(runtime_cfg.round_store, n=total_n)
-    if len(closed_rounds) < int(total_n):
+    tail_offset_rounds = int(backtest_cfg.tail_offset_rounds)
+    total_n = int(warmup_rounds) + int(simulation_size) + int(tail_offset_rounds)
+    closed_rounds_tail = _tail_rounds_with_cache(
+        runtime_cfg=runtime_cfg,
+        n=total_n,
+        state_cache=state_cache,
+    )
+    if len(closed_rounds_tail) < int(total_n):
         raise InvariantError("backtest_insufficient_closed_rounds_for_dislocation")
+
+    if int(tail_offset_rounds) > 0:
+        effective_n = int(total_n) - int(tail_offset_rounds)
+        closed_rounds = list(closed_rounds_tail[: int(effective_n)])
+    else:
+        closed_rounds = list(closed_rounds_tail)
 
     warmup = closed_rounds[: int(warmup_rounds)]
     sim_rounds = closed_rounds[int(warmup_rounds):]
     if len(sim_rounds) != int(simulation_size):
         raise InvariantError("backtest_dislocation_sim_rounds_len_mismatch")
 
-    all_klines = _all_klines_from_store(runtime_cfg.klines_store)
     router_cfg = runtime_cfg.strategy_cfg.router
-    state_cache = BacktestStateCache(root_dir=str(_STATE_CACHE_ROOT_DIR))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     trades_path = out_dir / "backtest_trades.csv"
@@ -423,7 +568,12 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
         rounds_done = 0
 
         if reset_mode == "continuous":
-            pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=all_klines)
+            pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=None)
+            _ensure_pipeline_kline_index(
+                pipeline=pipeline,
+                runtime_cfg=runtime_cfg,
+                state_cache=state_cache,
+            )
             phase = "continuous_initial"
             cache_key = _snapshot_key(
                 runtime_cfg=runtime_cfg,
@@ -462,6 +612,7 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 "DISLOC",
                 msg=(
                     f"mode={str(reset_mode)} warmup_n={len(warmup)} sim_n={len(sim_rounds)} "
+                    f"tail_offset_rounds={int(tail_offset_rounds)} "
                     f"selector_warmup={int(runtime_cfg.strategy_cfg.dislocation.selector.warmup_rounds)} "
                     f"router_mode={str(router_cfg.mode)} "
                     f"router_score_threshold_bnb={float(router_cfg.score_threshold_bnb):.6f} "
@@ -489,11 +640,18 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 msg=(
                     f"mode={str(reset_mode)} reset_every_rounds={int(interval)} "
                     f"warmup_n={len(warmup)} sim_n={len(sim_rounds)} chunks={int(chunk_count)} "
+                    f"tail_offset_rounds={int(tail_offset_rounds)} "
                     f"router_mode={str(router_cfg.mode)} "
                     f"router_score_threshold_bnb={float(router_cfg.score_threshold_bnb):.6f} "
                     f"router_online_warmup_rounds={int(router_cfg.online_warmup_rounds)} "
                     f"ml_candidate_enabled={bool(runtime_cfg.strategy_cfg.ml_candidate.enabled)}"
                 ),
+            )
+            chunk_pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=None)
+            _ensure_pipeline_kline_index(
+                pipeline=chunk_pipeline,
+                runtime_cfg=runtime_cfg,
+                state_cache=state_cache,
             )
             for chunk_index, chunk_start in enumerate(range(0, len(sim_rounds), interval), start=1):
                 chunk_end = min(int(chunk_start) + int(interval), len(sim_rounds))
@@ -514,7 +672,6 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                     ),
                 )
 
-                chunk_pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=all_klines)
                 chunk_phase = f"chunk_{int(chunk_index)}_of_{int(chunk_count)}"
                 chunk_cache_key = _snapshot_key(
                     runtime_cfg=runtime_cfg,
@@ -540,6 +697,12 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                         )
 
                 if not bool(chunk_snapshot_loaded):
+                    chunk_pipeline = _build_strategy_pipeline(runtime_cfg=runtime_cfg, all_klines=None)
+                    _ensure_pipeline_kline_index(
+                        pipeline=chunk_pipeline,
+                        runtime_cfg=runtime_cfg,
+                        state_cache=state_cache,
+                    )
                     info("BACK", "CACHE", "MISS", msg=f"phase={str(chunk_phase)} key={str(chunk_cache_key)[:16]}")
                     _bootstrap_pipeline_with_progress(
                         pipeline=chunk_pipeline,
@@ -575,6 +738,7 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
         summary = {
             "reset_mode": str(reset_mode),
             "reset_every_rounds": int(reset_every_rounds),
+            "tail_offset_rounds": int(tail_offset_rounds),
             "router_mode": str(router_cfg.mode),
             "router_score_threshold_bnb": float(router_cfg.score_threshold_bnb),
             "router_online_warmup_rounds": int(router_cfg.online_warmup_rounds),
@@ -605,15 +769,17 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
 
     finally:
         trades_f.close()
-        feature_cache_store = getattr(runtime_cfg, "feature_cache_store", None)
-        if feature_cache_store is not None:
+        for attr in ("feature_cache_store", "projection_cache_store"):
+            cache_store = getattr(runtime_cfg, str(attr), None)
+            if cache_store is None:
+                continue
             try:
-                if hasattr(feature_cache_store, "flush"):
-                    feature_cache_store.flush()
-                if hasattr(feature_cache_store, "close"):
-                    feature_cache_store.close()
+                if hasattr(cache_store, "flush"):
+                    cache_store.flush()
+                if hasattr(cache_store, "close"):
+                    cache_store.close()
             except Exception as e:
-                warn("BACK", "CACHE", "FLUSH", msg=f"err={e}")
+                warn("BACK", "CACHE", "FLUSH", msg=f"store={str(attr)} err={e}")
 
 
 def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) -> None:

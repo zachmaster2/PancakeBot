@@ -14,6 +14,10 @@ class AppConfig:
     closed_rounds_path: str
     klines_path: str
     feature_cache_path: str
+    backtest_state_cache_dir: str
+    market_data_db_path: str
+    projection_cache_db_path: str
+    run_registry_db_path: str
     abi_json_path: str
 
     # Runtime

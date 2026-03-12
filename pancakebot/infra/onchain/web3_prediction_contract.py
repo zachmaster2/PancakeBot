@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Sequence
+import time
+from dataclasses import dataclass
+from typing import Any, Literal, Sequence
 
 from web3 import Web3
+from web3.exceptions import TimeExhausted
 
 from pancakebot.core.constants import (
     BNB_WEI,
@@ -12,7 +15,7 @@ from pancakebot.core.constants import (
     TREASURY_FEE_DIVISOR,
 )
 from pancakebot.infra.onchain.web3_contract_config import Web3ContractConfig
-from pancakebot.core.errors import InvariantError
+from pancakebot.core.errors import InvariantError, TransientRpcError
 
 
 def _load_abi_list(path: str) -> list[dict[str, Any]]:
@@ -34,6 +37,28 @@ def _load_abi_list(path: str) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             raise InvariantError(f'abi_item_not_object: idx={i}')
     return obj  # type: ignore[return-value]
+
+
+@dataclass(frozen=True, slots=True)
+class BetEvent:
+    wallet_address: str
+    epoch: int
+    amount_wei: int
+    position: Literal["Bull", "Bear"]
+    block_number: int
+    block_timestamp: int
+    tx_hash: str
+    log_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class TxSubmitResult:
+    tx_hash: str
+    t_tx_signed_mono_ms: float
+    t_tx_hash_received_mono_ms: float
+    t_receipt_confirmed_mono_ms: float | None
+    included_block_number: int | None
+    included_block_timestamp: int | None
 
 
 class Web3PredictionContract:
@@ -109,6 +134,80 @@ class Web3PredictionContract:
         r = self._contract.functions.rounds(int(epoch)).call()
         return int(r[3])
 
+    def latest_block_number(self) -> int:
+        try:
+            return int(Web3.to_int(self._w3.eth.block_number))
+        except Exception as e:
+            raise TransientRpcError(f"latest_block_number_failed: {e}") from e
+
+    def block_timestamp(self, block_number: int) -> int:
+        if int(block_number) < 0:
+            raise InvariantError("block_number_negative")
+        try:
+            b = self._w3.eth.get_block(int(block_number))
+        except Exception as e:
+            raise TransientRpcError(f"block_timestamp_failed: block={int(block_number)} err={e}") from e
+        return int(b["timestamp"])
+
+    def fetch_bet_events_for_epoch(
+        self,
+        *,
+        epoch: int,
+        from_block: int,
+        to_block: int,
+    ) -> list[BetEvent]:
+        if int(epoch) <= 0:
+            raise InvariantError("event_epoch_nonpositive")
+        if int(from_block) <= 0:
+            raise InvariantError("event_from_block_nonpositive")
+        if int(to_block) < int(from_block):
+            raise InvariantError("event_block_range_invalid")
+
+        try:
+            bull_logs = list(
+                self._contract.events.BetBull().get_logs(
+                    argument_filters={"epoch": int(epoch)},
+                    from_block=int(from_block),
+                    to_block=int(to_block),
+                )
+            )
+            bear_logs = list(
+                self._contract.events.BetBear().get_logs(
+                    argument_filters={"epoch": int(epoch)},
+                    from_block=int(from_block),
+                    to_block=int(to_block),
+                )
+            )
+        except Exception as e:
+            raise TransientRpcError(f"event_log_fetch_failed: {e}") from e
+
+        out: list[BetEvent] = []
+        block_ts_cache: dict[int, int] = {}
+
+        def _mk(log_obj: Any, side: Literal["Bull", "Bear"]) -> BetEvent:
+            args = log_obj["args"]
+            bn = int(log_obj["blockNumber"])
+            if bn not in block_ts_cache:
+                block_ts_cache[bn] = int(self.block_timestamp(int(bn)))
+            return BetEvent(
+                wallet_address=str(args["sender"]),
+                epoch=int(args["epoch"]),
+                amount_wei=int(args["amount"]),
+                position=str(side),
+                block_number=int(bn),
+                block_timestamp=int(block_ts_cache[int(bn)]),
+                tx_hash=str(log_obj["transactionHash"].hex()),
+                log_index=int(log_obj["logIndex"]),
+            )
+
+        for ev in bull_logs:
+            out.append(_mk(ev, "Bull"))
+        for ev in bear_logs:
+            out.append(_mk(ev, "Bear"))
+
+        out.sort(key=lambda x: (int(x.block_number), int(x.log_index)))
+        return out
+
     def suggest_gas_price_wei(self) -> int:
         """Return the node-suggested gas price (wei)."""
         return Web3.to_int(self._w3.eth.gas_price)
@@ -137,35 +236,156 @@ class Web3PredictionContract:
 
     # ---- Write calls ----
 
-    def bet_bull(self, *, epoch: int, amount_wei: int, gas_limit: int, gas_price_wei: int) -> str:
-        fn = self._contract.functions.betBull(int(epoch))
-        tx = fn.build_transaction(
+    def _submit_tx_with_timing(
+        self,
+        *,
+        tx: dict[str, Any],
+        wait_receipt: bool,
+        receipt_timeout_seconds: int,
+    ) -> TxSubmitResult:
+        signed = self._account.sign_transaction(tx)
+        t_tx_signed = float(time.perf_counter() * 1000.0)
+        try:
+            txh = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+        except Exception as e:
+            raise TransientRpcError(f"tx_send_failed: {e}") from e
+        t_tx_hash = float(time.perf_counter() * 1000.0)
+
+        tx_hash = str(txh.hex())
+        t_receipt = None
+        block_number = None
+        block_timestamp = None
+
+        if bool(wait_receipt):
+            if int(receipt_timeout_seconds) <= 0:
+                raise InvariantError("receipt_timeout_seconds_nonpositive")
+            try:
+                receipt = self._w3.eth.wait_for_transaction_receipt(
+                    txh,
+                    timeout=float(receipt_timeout_seconds),
+                    poll_latency=0.2,
+                )
+                t_receipt = float(time.perf_counter() * 1000.0)
+                block_number = int(receipt["blockNumber"])
+                block_timestamp = int(self.block_timestamp(int(block_number)))
+            except TimeExhausted:
+                t_receipt = None
+                block_number = None
+                block_timestamp = None
+            except Exception as e:
+                raise TransientRpcError(f"tx_receipt_wait_failed: {e}") from e
+
+        return TxSubmitResult(
+            tx_hash=str(tx_hash),
+            t_tx_signed_mono_ms=float(t_tx_signed),
+            t_tx_hash_received_mono_ms=float(t_tx_hash),
+            t_receipt_confirmed_mono_ms=float(t_receipt) if t_receipt is not None else None,
+            included_block_number=int(block_number) if block_number is not None else None,
+            included_block_timestamp=int(block_timestamp) if block_timestamp is not None else None,
+        )
+
+    def _build_bet_tx(
+        self,
+        *,
+        side: Literal["Bull", "Bear"],
+        epoch: int,
+        amount_wei: int,
+        gas_limit: int,
+        gas_price_wei: int,
+    ) -> dict[str, Any]:
+        if int(epoch) <= 0:
+            raise InvariantError("bet_epoch_nonpositive")
+        if int(amount_wei) <= 0:
+            raise InvariantError("bet_amount_wei_nonpositive")
+        if int(gas_limit) <= 0:
+            raise InvariantError("bet_gas_limit_nonpositive")
+        if int(gas_price_wei) <= 0:
+            raise InvariantError("bet_gas_price_nonpositive")
+
+        if str(side) == "Bull":
+            fn = self._contract.functions.betBull(int(epoch))
+        elif str(side) == "Bear":
+            fn = self._contract.functions.betBear(int(epoch))
+        else:
+            raise InvariantError("bet_side_invalid")
+
+        return fn.build_transaction(
             {
-                'from': self._account.address,
-                'value': int(amount_wei),
-                'nonce': Web3.to_int(self._w3.eth.get_transaction_count(self._account.address)),
-                'gas': int(gas_limit),
-                'gasPrice': int(gas_price_wei),
+                "from": self._account.address,
+                "value": int(amount_wei),
+                "nonce": Web3.to_int(self._w3.eth.get_transaction_count(self._account.address)),
+                "gas": int(gas_limit),
+                "gasPrice": int(gas_price_wei),
             }
         )
-        signed = self._account.sign_transaction(tx)
-        txh = self._w3.eth.send_raw_transaction(signed.raw_transaction)
-        return str(txh.hex())
+
+    def bet_bull_timed(
+        self,
+        *,
+        epoch: int,
+        amount_wei: int,
+        gas_limit: int,
+        gas_price_wei: int,
+        wait_receipt: bool,
+        receipt_timeout_seconds: int,
+    ) -> TxSubmitResult:
+        tx = self._build_bet_tx(
+            side="Bull",
+            epoch=int(epoch),
+            amount_wei=int(amount_wei),
+            gas_limit=int(gas_limit),
+            gas_price_wei=int(gas_price_wei),
+        )
+        return self._submit_tx_with_timing(
+            tx=tx,
+            wait_receipt=bool(wait_receipt),
+            receipt_timeout_seconds=int(receipt_timeout_seconds),
+        )
+
+    def bet_bear_timed(
+        self,
+        *,
+        epoch: int,
+        amount_wei: int,
+        gas_limit: int,
+        gas_price_wei: int,
+        wait_receipt: bool,
+        receipt_timeout_seconds: int,
+    ) -> TxSubmitResult:
+        tx = self._build_bet_tx(
+            side="Bear",
+            epoch=int(epoch),
+            amount_wei=int(amount_wei),
+            gas_limit=int(gas_limit),
+            gas_price_wei=int(gas_price_wei),
+        )
+        return self._submit_tx_with_timing(
+            tx=tx,
+            wait_receipt=bool(wait_receipt),
+            receipt_timeout_seconds=int(receipt_timeout_seconds),
+        )
+
+    def bet_bull(self, *, epoch: int, amount_wei: int, gas_limit: int, gas_price_wei: int) -> str:
+        out = self.bet_bull_timed(
+            epoch=int(epoch),
+            amount_wei=int(amount_wei),
+            gas_limit=int(gas_limit),
+            gas_price_wei=int(gas_price_wei),
+            wait_receipt=False,
+            receipt_timeout_seconds=1,
+        )
+        return str(out.tx_hash)
 
     def bet_bear(self, *, epoch: int, amount_wei: int, gas_limit: int, gas_price_wei: int) -> str:
-        fn = self._contract.functions.betBear(int(epoch))
-        tx = fn.build_transaction(
-            {
-                'from': self._account.address,
-                'value': int(amount_wei),
-                'nonce': Web3.to_int(self._w3.eth.get_transaction_count(self._account.address)),
-                'gas': int(gas_limit),
-                'gasPrice': int(gas_price_wei),
-            }
+        out = self.bet_bear_timed(
+            epoch=int(epoch),
+            amount_wei=int(amount_wei),
+            gas_limit=int(gas_limit),
+            gas_price_wei=int(gas_price_wei),
+            wait_receipt=False,
+            receipt_timeout_seconds=1,
         )
-        signed = self._account.sign_transaction(tx)
-        txh = self._w3.eth.send_raw_transaction(signed.raw_transaction)
-        return str(txh.hex())
+        return str(out.tx_hash)
 
     def claim(self, *, epochs: Sequence[int], gas_limit: int, gas_price_wei: int) -> str:
         fn = self._contract.functions.claim([int(e) for e in epochs])

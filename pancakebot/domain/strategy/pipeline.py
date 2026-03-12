@@ -58,6 +58,16 @@ class StrategyPipeline:
 
         return str(self._router.mode)
 
+    def export_kline_index_state(self) -> dict[str, object]:
+        """Export dislocation kline index state for backtest caching."""
+
+        return self._dislocation_engine.export_kline_index_state()
+
+    def import_kline_index_state(self, *, state: dict[str, object]) -> None:
+        """Restore dislocation kline index state from backtest cache."""
+
+        self._dislocation_engine.import_kline_index_state(state=state)
+
     def export_bootstrap_state(self) -> dict[str, object]:
         """Export full pipeline warmup state for backtest snapshot caching."""
 
@@ -67,7 +77,7 @@ class StrategyPipeline:
             "router_state": self._router.export_bootstrap_state(),
             "ml_state": (
                 self._ml_candidate_adapter.export_bootstrap_state()
-                if self._ml_candidate_adapter is not None and bool(self._ml_candidate_adapter.enabled)
+                if self._ml_candidate_adapter is not None
                 else None
             ),
         }
@@ -87,7 +97,7 @@ class StrategyPipeline:
 
         ml_state = state.get("ml_state")
         if ml_state is not None:
-            if self._ml_candidate_adapter is None or not bool(self._ml_candidate_adapter.enabled):
+            if self._ml_candidate_adapter is None:
                 raise InvariantError("pipeline_snapshot_ml_state_without_adapter")
             if not isinstance(ml_state, dict):
                 raise InvariantError("pipeline_snapshot_ml_state_invalid")
@@ -200,7 +210,7 @@ class StrategyPipeline:
 
     def _settle_providers(self, *, rounds: list[Round]) -> None:
         self._dislocation_engine.settle_closed_rounds(list(rounds))
-        if self._ml_candidate_adapter is not None and bool(self._ml_candidate_adapter.enabled):
+        if self._ml_candidate_adapter is not None:
             self._ml_candidate_adapter.settle_closed_rounds(rounds=list(rounds))
 
     def _realized_profit_by_candidate(

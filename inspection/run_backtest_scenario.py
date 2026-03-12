@@ -17,7 +17,9 @@ from pancakebot.core.errors import InvariantError
 from pancakebot.infra.binance_us_client import BinanceUsClient
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
 from pancakebot.infra.feature_cache_store import FeatureCacheStore
-from pancakebot.infra.klines_store import KlinesStore
+from pancakebot.infra.market_data_db import MarketDataDb, SqliteKlinesStore
+from pancakebot.infra.projection_cache_store import ProjectionCacheStore
+from pancakebot.infra.run_registry_store import RunRegistryStore
 from pancakebot.runtime.contract_constants_cache import load_contract_constants
 from pancakebot.runtime.runtime_loop import RuntimeConfig
 
@@ -42,6 +44,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--router-score-threshold-bnb", type=float, default=None)
+    parser.add_argument("--ml-train-size", type=int, default=None)
+    parser.add_argument("--ml-calibrate-size", "--ml-calibration-size", dest="ml_calibrate_size", type=int, default=None)
+    parser.add_argument("--ml-retrain-interval", type=int, default=None)
+    parser.add_argument(
+        "--ml-recalibrate-interval",
+        "--ml-recalibration-interval",
+        dest="ml_recalibrate_interval",
+        type=int,
+        default=None,
+    )
     return parser
 
 
@@ -77,17 +89,25 @@ def _runtime_cfg_from_app(*, cfg, strategy_cfg: StrategyConfig) -> RuntimeConfig
     """Build RuntimeConfig for deterministic backtest execution."""
 
     constants = load_contract_constants()
+    market_data_store = MarketDataDb(str(cfg.market_data_db_path))
+    market_data_store.ensure_sources_synced(
+        rounds_jsonl_path=str(cfg.closed_rounds_path),
+        klines_jsonl_path=str(cfg.klines_path),
+    )
     feature_cache_store = FeatureCacheStore(str(cfg.feature_cache_path))
+    projection_cache_store = ProjectionCacheStore(str(cfg.projection_cache_db_path))
+    run_registry_store = RunRegistryStore(str(cfg.run_registry_db_path))
     return RuntimeConfig(
         graph_client=None,
         round_store=ClosedRoundsStore(cfg.closed_rounds_path),
-        klines_store=KlinesStore(cfg.klines_path),
+        klines_store=SqliteKlinesStore(market_data_db=market_data_store),
         binance_us_client=BinanceUsClient(timeout_seconds=10.0),
         binance_us_symbol=_BINANCE_US_SYMBOL,
         contract=None,
         wallet_address="",
         cutoff_seconds=int(cfg.cutoff_seconds),
         strategy_cfg=strategy_cfg,
+        min_bet_amount_bnb=float(constants.min_bet_amount_bnb),
         treasury_fee_fraction=float(constants.treasury_fee_fraction),
         buffer_seconds=int(constants.buffer_seconds),
         use_onchain_event_bets=False,
@@ -97,6 +117,10 @@ def _runtime_cfg_from_app(*, cfg, strategy_cfg: StrategyConfig) -> RuntimeConfig
         bet_receipt_timeout_seconds=int(cfg.bet_receipt_timeout_seconds),
         dry=False,
         feature_cache_store=feature_cache_store,
+        market_data_store=market_data_store,
+        projection_cache_store=projection_cache_store,
+        run_registry_store=run_registry_store,
+        backtest_state_cache_dir=str(cfg.backtest_state_cache_dir),
     )
 
 
@@ -142,7 +166,25 @@ def _strategy_cfg_with_router_overrides(
             router_cfg,
             score_threshold_bnb=float(args.router_score_threshold_bnb),
         )
-    return replace(strategy_cfg, router=router_cfg)
+    ml_cfg = strategy_cfg.ml_candidate
+    if args.ml_train_size is not None:
+        if int(args.ml_train_size) <= 0:
+            raise InvariantError("scenario_ml_train_size_nonpositive")
+        ml_cfg = replace(ml_cfg, train_size=int(args.ml_train_size))
+    if args.ml_calibrate_size is not None:
+        if int(args.ml_calibrate_size) < 0:
+            raise InvariantError("scenario_ml_calibrate_size_negative")
+        ml_cfg = replace(ml_cfg, calibrate_size=int(args.ml_calibrate_size))
+    if args.ml_retrain_interval is not None:
+        if int(args.ml_retrain_interval) <= 0:
+            raise InvariantError("scenario_ml_retrain_interval_nonpositive")
+        ml_cfg = replace(ml_cfg, retrain_interval=int(args.ml_retrain_interval))
+    if args.ml_recalibrate_interval is not None:
+        if int(args.ml_recalibrate_interval) < 0:
+            raise InvariantError("scenario_ml_recalibrate_interval_negative")
+        ml_cfg = replace(ml_cfg, recalibrate_interval=int(args.ml_recalibrate_interval))
+
+    return replace(strategy_cfg, router=router_cfg, ml_candidate=ml_cfg)
 
 
 def main() -> None:
@@ -159,8 +201,26 @@ def main() -> None:
     exp_root = Path(os.environ.get("PANCAKEBOT_EXP_DIR", _DEFAULT_EXP_ROOT))
     out_dir = exp_root / str(args.name)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=bt_cfg, out_dir=out_dir)
+    run_registry_store = getattr(runtime_cfg, "run_registry_store", None)
+    if run_registry_store is not None and hasattr(run_registry_store, "start_run"):
+        run_registry_store.start_run(
+            run_name=str(args.name),
+            config_path=str(args.config),
+            metadata={
+                "simulation_size": int(bt_cfg.simulation_size),
+                "reset_mode": str(bt_cfg.reset_mode),
+                "reset_every_rounds": int(bt_cfg.reset_every_rounds),
+            },
+        )
+    try:
+        run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=bt_cfg, out_dir=out_dir)
+    except Exception as e:
+        if run_registry_store is not None and hasattr(run_registry_store, "fail_run"):
+            try:
+                run_registry_store.fail_run(run_name=str(args.name), error_text=str(e))
+            except Exception:
+                pass
+        raise
 
     summary_path = out_dir / "backtest_summary.json"
     trades_path = out_dir / "backtest_trades.csv"
@@ -179,10 +239,23 @@ def main() -> None:
         "reset_every_rounds": int(bt_cfg.reset_every_rounds),
         "router_mode": str(runtime_cfg.strategy_cfg.router.mode),
         "router_score_threshold_bnb": float(runtime_cfg.strategy_cfg.router.score_threshold_bnb),
+        "ml_train_size": int(runtime_cfg.strategy_cfg.ml_candidate.train_size),
+        "ml_calibrate_size": int(runtime_cfg.strategy_cfg.ml_candidate.calibrate_size),
+        "ml_retrain_interval": int(runtime_cfg.strategy_cfg.ml_candidate.retrain_interval),
+        "ml_recalibrate_interval": int(runtime_cfg.strategy_cfg.ml_candidate.recalibrate_interval),
     }
     summary["risk"] = {"max_drawdown_bnb": float(_max_drawdown_bnb(trades_path))}
     summary["skip_reason_groups"] = _skip_reason_groups(summary)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+    if run_registry_store is not None and hasattr(run_registry_store, "complete_run"):
+        run_registry_store.complete_run(
+            run_name=str(args.name),
+            summary_path=str(summary_path),
+            trades_path=str(trades_path),
+            summary=dict(summary),
+            max_drawdown_bnb=float(summary["risk"]["max_drawdown_bnb"]),
+            profit_per_500_bnb=float(summary["net_profit_bnb"]) * 500.0 / float(bt_cfg.simulation_size),
+        )
 
     print(f"SCENARIO={args.name}")
     print(f"SUMMARY={summary_path}")
@@ -190,6 +263,23 @@ def main() -> None:
     print(f"NET={summary['net_profit_bnb']}")
     print(f"BETS={summary['num_bets']}")
     print(f"BET_RATE={summary['bet_rate']}")
+
+    for attr in (
+        "feature_cache_store",
+        "projection_cache_store",
+        "run_registry_store",
+        "market_data_store",
+    ):
+        store = getattr(runtime_cfg, str(attr), None)
+        if store is None:
+            continue
+        try:
+            if hasattr(store, "flush"):
+                store.flush()
+            if hasattr(store, "close"):
+                store.close()
+        except Exception:
+            continue
 
 
 if __name__ == "__main__":

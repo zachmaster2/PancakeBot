@@ -15,6 +15,7 @@ class BacktestConfig:
     initial_bankroll_bnb: float
     reset_mode: str = "continuous"
     reset_every_rounds: int = 0
+    tail_offset_rounds: int = 0
 
     def validate(self) -> None:
         if not isinstance(self.simulation_size, int):
@@ -39,3 +40,8 @@ class BacktestConfig:
             raise InvariantError("backtest_reset_every_rounds_negative")
         if mode == "chunk_reset" and int(self.reset_every_rounds) <= 0:
             raise InvariantError("backtest_chunk_reset_every_rounds_must_be_positive")
+
+        if not isinstance(self.tail_offset_rounds, int):
+            raise InvariantError("backtest_tail_offset_rounds_not_int")
+        if int(self.tail_offset_rounds) < 0:
+            raise InvariantError("backtest_tail_offset_rounds_negative")
