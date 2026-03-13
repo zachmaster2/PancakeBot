@@ -1705,3 +1705,149 @@ Updated best-known candidate from Stage Q+R:
      - `regime_only`
      - `arrival_microstructure_only`
      - `arrival_microstructure_plus_regime`
+
+## Update (2026-03-12): Contrarian Label Redesign + Follow-on Threshold Sweep
+
+1. Code changes completed for the next label redesign cycle:
+   - Added new predictability label modes:
+     - `contrarian_log_imbalance_side`
+     - `contrarian_price_regime_vote_15_30_r20_r60_side`
+   - Refactored `walk_forward._tradeable_label(...)` so side selection is centralized in
+     `_tradeable_label_side(...)` instead of being duplicated per mode.
+   - Added focused tests covering:
+     - invalid label mode rejection
+     - contrarian log-imbalance side inversion
+     - contrarian multi-feature vote inversion
+
+2. Before running the live gate again, a raw fixed-policy baseline screen was run over the
+   most recent `10k` rounds with a flat `0.05 BNB` stake:
+   - `log_imb_majority`:
+     - `net_per_500 = -2.589967`
+   - `log_imb_majority_inverse`:
+     - `net_per_500 = -1.578921`
+   - `price_regime_vote_15_30_r20_r60_inverse`:
+     - `net_per_500 = -1.718260`
+   - Interpretation:
+     - the original majority-side cutoff imbalance proxy was one of the worst simple
+       policies.
+     - the contrarian log-imbalance side was the strongest raw deterministic policy in
+       this candidate set.
+     - the inverse price+regime vote was the best less-coupled alternative and therefore
+       the best next live-gate candidate.
+
+3. Recent-`500` live score probe across gate families:
+   - `contrarian_log_imbalance_side`:
+     - `regime_only` mean `0.498051`
+     - `arrival_microstructure_only` mean `0.498210`
+     - `arrival_microstructure_plus_regime` mean `0.498299`
+     - all `500/500` rounds were below `0.51` for every family.
+   - `contrarian_price_regime_vote_15_30_r20_r60_side`:
+     - `regime_only` mean `0.508739`, rounds below `0.51`: `434/500`
+     - `arrival_microstructure_only` mean `0.508357`, rounds below `0.51`: `384/500`
+     - `arrival_microstructure_plus_regime` mean `0.508567`, rounds below `0.51`: `331/500`
+   - Interpretation:
+     - the contrarian log-imbalance label would need a much lower threshold band.
+     - the inverse price+regime vote preserved the old narrow-but-usable `~0.51`
+       operating range, with the best spread in `arrival_microstructure_plus_regime`.
+
+4. First full `10k` confirmations:
+   - `arrival_microstructure_only + contrarian_log_imbalance_side`
+     - `min_tradeable_prob = 0.500`
+     - aggregate:
+       - `net_per_500 = -0.321482`
+       - `net_total = -6.429645`
+       - `bets_total = 343`
+       - `positive_blocks = 4/20`
+     - aggregate skip totals:
+       - `cutoff_pool_below_min_total = 4910`
+       - `predictability_below_min = 2872`
+       - `p_bull_edge_below_min = 1108`
+       - `expected_net_below_min = 767`
+     - most recent block (`off0`):
+       - `net_profit_bnb = -0.847989`
+       - `num_bets = 18`
+       - `predictability_below_min = 308`
+   - `arrival_microstructure_plus_regime + contrarian_price_regime_vote_15_30_r20_r60_side`
+     - `min_tradeable_prob = 0.510`
+     - aggregate:
+       - `net_per_500 = -0.071146`
+       - `net_total = -1.422927`
+       - `bets_total = 158`
+       - `positive_blocks = 4/20`
+     - aggregate skip totals:
+       - `cutoff_pool_below_min_total = 4910`
+       - `predictability_below_min = 3801`
+       - `p_bull_edge_below_min = 738`
+       - `expected_net_below_min = 393`
+     - most recent block (`off0`):
+       - `net_profit_bnb = -0.637893`
+       - `num_bets = 22`
+       - `predictability_below_min = 266`
+   - Net result:
+     - the contrarian log-imbalance branch was a clear regression.
+     - the less-coupled arrival+regime contrarian-vote branch became the new best tested
+       label-redesign family and was materially better than the previous best live gate
+       (`-0.231208 / 500`).
+
+5. Follow-on threshold sweep on the new best family:
+   - family:
+     - `arrival_microstructure_plus_regime + contrarian_price_regime_vote_15_30_r20_r60_side`
+   - `min_tradeable_prob = 0.510`
+     - `net_per_500 = -0.071146`
+     - `bets_total = 158`
+     - `positive_blocks = 4/20`
+   - `min_tradeable_prob = 0.511`
+     - `net_per_500 = -0.053565`
+     - `net_total = -1.071309`
+     - `bets_total = 133`
+     - `positive_blocks = 3/20`
+     - aggregate skip totals:
+       - `cutoff_pool_below_min_total = 4910`
+       - `predictability_below_min = 4016`
+       - `p_bull_edge_below_min = 620`
+       - `expected_net_below_min = 321`
+     - most recent block (`off0`):
+       - `net_profit_bnb = -0.018237`
+       - `num_bets = 5`
+       - `predictability_below_min = 377`
+   - `min_tradeable_prob = 0.512`
+     - `net_per_500 = -0.056697`
+     - `net_total = -1.133942`
+     - `bets_total = 118`
+     - `positive_blocks = 5/20`
+     - most recent block (`off0`):
+       - `net_profit_bnb = -0.402000`
+       - `num_bets = 2`
+       - `predictability_below_min = 398`
+
+6. Best observed result in this cycle:
+   - `arrival_microstructure_plus_regime + contrarian_price_regime_vote_15_30_r20_r60_side`
+   - `min_tradeable_prob = 0.511`
+   - `net_per_500 = -0.053565`
+   - This is the best gate result found so far in the ML pivot line, but it is still
+     negative and still far below the project objective.
+
+7. Interpretation:
+   - This redesign was not another inert failure:
+     - it found a new family that beats the prior best live gate by roughly `0.178 / 500`
+       while still taking `133` bets over `10k` rounds, so the improvement is not coming
+       purely from near-total refusal to trade.
+   - But it still did not cross into a promotable regime:
+     - latest-window behaviour remains fragile.
+     - the best threshold is only modestly better than its neighbors, so the edge is still
+       small.
+   - Current research conclusion:
+     - label redesign can still move the loss curve materially.
+     - this particular family appears close to exhausted without another change to either
+       direction selection or EV filtering.
+
+8. Recommended next step from here:
+   - If continuing inside this family, run the deferred family comparison at the tuned
+     threshold:
+     - `regime_only + contrarian_price_regime_vote_15_30_r20_r60_side`
+     - `arrival_microstructure_only + contrarian_price_regime_vote_15_30_r20_r60_side`
+     - compare both against the tuned `arrival_microstructure_plus_regime` winner at
+       `min_tradeable_prob = 0.511`
+   - If that does not produce a positive variant, stop iterating on label-only changes and
+     move to the next structural pivot:
+     - redesign the live direction / EV selection coupling rather than only the gate label.

@@ -43,7 +43,11 @@ from pancakebot.domain.models.predictability_modes import (
     DEFAULT_PREDICTABILITY_FEATURE_MODE,
     DEFAULT_PREDICTABILITY_LABEL_MODE,
     PREDICTABILITY_LABEL_MODE_BASELINE_LOG_IMBALANCE_SIDE,
+    PREDICTABILITY_LABEL_MODE_CONTRARIAN_LOG_IMBALANCE_SIDE,
+    PREDICTABILITY_LABEL_MODE_CONTRARIAN_PRICE_REGIME_VOTE_15_30_R20_R60_SIDE,
     PREDICTABILITY_LABEL_MODE_EITHER_SIDE_PROFITABLE,
+    PREDICTABILITY_LABEL_MODE_PRICE_MOMENTUM_K15_SIDE,
+    PREDICTABILITY_LABEL_MODE_REGIME_MAJORITY_R20_SIDE,
     predictability_feature_indices,
     validate_predictability_feature_mode,
     validate_predictability_label_mode,
@@ -55,6 +59,14 @@ from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
 _TRADEABLE_LOG_IMB_FEATURE = "log_imb_w_p_80_to_p_100"
 _TRADEABLE_LOG_IMB_IDX = int(FEATURE_SCHEMA.columns.index(str(_TRADEABLE_LOG_IMB_FEATURE)))
+_TRADEABLE_PRICE_MOMENTUM_FEATURE = "price_log_return_mean_k_15"
+_TRADEABLE_PRICE_MOMENTUM_IDX = int(FEATURE_SCHEMA.columns.index(str(_TRADEABLE_PRICE_MOMENTUM_FEATURE)))
+_TRADEABLE_PRICE_MOMENTUM_K30_FEATURE = "price_log_return_mean_k_30"
+_TRADEABLE_PRICE_MOMENTUM_K30_IDX = int(FEATURE_SCHEMA.columns.index(str(_TRADEABLE_PRICE_MOMENTUM_K30_FEATURE)))
+_TRADEABLE_REGIME_BULL_FRAC_FEATURE = "regime_bull_frac_r_20"
+_TRADEABLE_REGIME_BULL_FRAC_IDX = int(FEATURE_SCHEMA.columns.index(str(_TRADEABLE_REGIME_BULL_FRAC_FEATURE)))
+_TRADEABLE_REGIME_BULL_FRAC_R60_FEATURE = "regime_bull_frac_r_60"
+_TRADEABLE_REGIME_BULL_FRAC_R60_IDX = int(FEATURE_SCHEMA.columns.index(str(_TRADEABLE_REGIME_BULL_FRAC_R60_FEATURE)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,6 +684,98 @@ def _context_klines_for_round(*, cfg, round_t: Round) -> list:
     return cfg.klines_store.get_context_klines(anchor_close_time_ms=int(anchor_ms), size=int(kk))
 
 
+def _tradeable_feature_value(*, x_row: list[float], idx: int, error_code: str) -> float:
+    if int(idx) < 0 or int(idx) >= int(len(x_row)):
+        raise InvariantError(str(error_code))
+    return float(x_row[int(idx)])
+
+
+def _bullish_vote(*, value: float, threshold: float) -> int:
+    return 1 if (not math.isfinite(float(value)) or float(value) >= float(threshold)) else -1
+
+
+def _invert_side(side: str) -> str:
+    side_norm = str(side)
+    if str(side_norm) == "Bull":
+        return "Bear"
+    if str(side_norm) == "Bear":
+        return "Bull"
+    raise InvariantError("tradeable_side_invalid")
+
+
+def _tradeable_label_side(*, label_mode: str, x_row: list[float]) -> str:
+    if str(label_mode) == PREDICTABILITY_LABEL_MODE_BASELINE_LOG_IMBALANCE_SIDE:
+        log_imb = _tradeable_feature_value(
+            x_row=x_row,
+            idx=int(_TRADEABLE_LOG_IMB_IDX),
+            error_code="tradeable_log_imb_feature_index_out_of_range",
+        )
+        return "Bull" if _bullish_vote(value=float(log_imb), threshold=0.0) > 0 else "Bear"
+
+    if str(label_mode) == PREDICTABILITY_LABEL_MODE_CONTRARIAN_LOG_IMBALANCE_SIDE:
+        return _invert_side(
+            _tradeable_label_side(
+                label_mode=PREDICTABILITY_LABEL_MODE_BASELINE_LOG_IMBALANCE_SIDE,
+                x_row=list(x_row),
+            )
+        )
+
+    if str(label_mode) == PREDICTABILITY_LABEL_MODE_PRICE_MOMENTUM_K15_SIDE:
+        momentum = _tradeable_feature_value(
+            x_row=x_row,
+            idx=int(_TRADEABLE_PRICE_MOMENTUM_IDX),
+            error_code="tradeable_price_momentum_feature_index_out_of_range",
+        )
+        return "Bull" if _bullish_vote(value=float(momentum), threshold=0.0) > 0 else "Bear"
+
+    if str(label_mode) == PREDICTABILITY_LABEL_MODE_REGIME_MAJORITY_R20_SIDE:
+        bull_frac = _tradeable_feature_value(
+            x_row=x_row,
+            idx=int(_TRADEABLE_REGIME_BULL_FRAC_IDX),
+            error_code="tradeable_regime_bull_frac_feature_index_out_of_range",
+        )
+        return "Bull" if _bullish_vote(value=float(bull_frac), threshold=0.5) > 0 else "Bear"
+
+    if str(label_mode) == PREDICTABILITY_LABEL_MODE_CONTRARIAN_PRICE_REGIME_VOTE_15_30_R20_R60_SIDE:
+        vote_total = 0
+        vote_total += _bullish_vote(
+            value=_tradeable_feature_value(
+                x_row=x_row,
+                idx=int(_TRADEABLE_PRICE_MOMENTUM_IDX),
+                error_code="tradeable_price_momentum_feature_index_out_of_range",
+            ),
+            threshold=0.0,
+        )
+        vote_total += _bullish_vote(
+            value=_tradeable_feature_value(
+                x_row=x_row,
+                idx=int(_TRADEABLE_PRICE_MOMENTUM_K30_IDX),
+                error_code="tradeable_price_momentum_k30_feature_index_out_of_range",
+            ),
+            threshold=0.0,
+        )
+        vote_total += _bullish_vote(
+            value=_tradeable_feature_value(
+                x_row=x_row,
+                idx=int(_TRADEABLE_REGIME_BULL_FRAC_IDX),
+                error_code="tradeable_regime_bull_frac_feature_index_out_of_range",
+            ),
+            threshold=0.5,
+        )
+        vote_total += _bullish_vote(
+            value=_tradeable_feature_value(
+                x_row=x_row,
+                idx=int(_TRADEABLE_REGIME_BULL_FRAC_R60_IDX),
+                error_code="tradeable_regime_bull_frac_r60_feature_index_out_of_range",
+            ),
+            threshold=0.5,
+        )
+        consensus_side = "Bull" if int(vote_total) >= 0 else "Bear"
+        return _invert_side(str(consensus_side))
+
+    raise InvariantError("predictability_label_mode_unknown")
+
+
 def _tradeable_label(*, cfg: Any, round_t: Round, x_row: list[float]) -> int:
     baseline_bet = float(getattr(cfg, "predictability_baseline_bet_bnb", 0.05))
     if not math.isfinite(float(baseline_bet)) or float(baseline_bet) <= 0.0:
@@ -692,13 +796,7 @@ def _tradeable_label(*, cfg: Any, round_t: Round, x_row: list[float]) -> int:
         bear_pnl = _baseline_pnl_for_side("Bear")
         return 1 if max(float(bull_pnl), float(bear_pnl)) > 0.0 else 0
 
-    if str(label_mode) != PREDICTABILITY_LABEL_MODE_BASELINE_LOG_IMBALANCE_SIDE:
-        raise InvariantError("predictability_label_mode_unknown")
-
-    if int(_TRADEABLE_LOG_IMB_IDX) < 0 or int(_TRADEABLE_LOG_IMB_IDX) >= int(len(x_row)):
-        raise InvariantError("tradeable_log_imb_feature_index_out_of_range")
-    log_imb = float(x_row[int(_TRADEABLE_LOG_IMB_IDX)])
-    side = "Bull" if (not math.isfinite(float(log_imb)) or float(log_imb) >= 0.0) else "Bear"
+    side = _tradeable_label_side(label_mode=str(label_mode), x_row=list(x_row))
     pnl = _baseline_pnl_for_side(str(side))
     return 1 if float(pnl) > 0.0 else 0
 
