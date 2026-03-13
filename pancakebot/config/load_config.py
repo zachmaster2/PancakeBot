@@ -16,6 +16,12 @@ from pancakebot.config.strategy_config import (
     StrategyRouterConfig,
 )
 from pancakebot.core.errors import InvariantError
+from pancakebot.domain.models.predictability_modes import (
+    DEFAULT_PREDICTABILITY_FEATURE_MODE,
+    DEFAULT_PREDICTABILITY_LABEL_MODE,
+    validate_predictability_feature_mode,
+    validate_predictability_label_mode,
+)
 
 
 def _req(obj: dict[str, Any], key: str) -> Any:
@@ -268,6 +274,8 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         "recency_weight_floor",
         "recency_weight_power",
         "predictability_baseline_bet_bnb",
+        "predictability_feature_mode",
+        "predictability_label_mode",
         "random_seed",
     }
     _validate_unknown_keys("strategy_ml_candidate", candidate, allowed)
@@ -333,6 +341,13 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
     if float(predictability_baseline_bet_bnb) <= 0.0:
         raise InvariantError("strategy_ml_candidate_predictability_baseline_bet_bnb_must_be_positive")
 
+    predictability_feature_mode = validate_predictability_feature_mode(
+        _opt_str(candidate, "predictability_feature_mode", DEFAULT_PREDICTABILITY_FEATURE_MODE)
+    )
+    predictability_label_mode = validate_predictability_label_mode(
+        _opt_str(candidate, "predictability_label_mode", DEFAULT_PREDICTABILITY_LABEL_MODE)
+    )
+
     random_seed = _req_int(candidate, "random_seed")
     if int(random_seed) < 0:
         raise InvariantError("strategy_ml_candidate_random_seed_negative")
@@ -356,6 +371,8 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         recency_weight_power=float(recency_weight_power),
         predictability_baseline_bet_bnb=float(predictability_baseline_bet_bnb),
         random_seed=int(random_seed),
+        predictability_feature_mode=str(predictability_feature_mode),
+        predictability_label_mode=str(predictability_label_mode),
     )
 
 

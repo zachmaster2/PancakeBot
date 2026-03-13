@@ -31,6 +31,13 @@ from pancakebot.domain.models.walk_forward import (
     predict_probabilities,
     predict_tradeable_probability,
 )
+from pancakebot.domain.models.predictability_modes import (
+    ALLOWED_PREDICTABILITY_FEATURE_MODES,
+    ALLOWED_PREDICTABILITY_LABEL_MODES,
+    DEFAULT_PREDICTABILITY_FEATURE_MODE,
+    DEFAULT_PREDICTABILITY_LABEL_MODE,
+    predictability_feature_columns,
+)
 from pancakebot.domain.types import Kline, Round
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
 from pancakebot.infra.klines_store import KlinesStore
@@ -69,6 +76,8 @@ class MlWalkForwardConfig:
 
     # Settlement semantics.
     treasury_fee_fraction: float
+    predictability_feature_mode: str = DEFAULT_PREDICTABILITY_FEATURE_MODE
+    predictability_label_mode: str = DEFAULT_PREDICTABILITY_LABEL_MODE
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,6 +420,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recency-weight-floor", type=float, default=0.7)
     parser.add_argument("--recency-weight-power", type=float, default=1.0)
     parser.add_argument("--predictability-baseline-bet-bnb", type=float, default=0.05)
+    parser.add_argument(
+        "--predictability-feature-mode",
+        type=str,
+        choices=ALLOWED_PREDICTABILITY_FEATURE_MODES,
+        default=DEFAULT_PREDICTABILITY_FEATURE_MODE,
+    )
+    parser.add_argument(
+        "--predictability-label-mode",
+        type=str,
+        choices=ALLOWED_PREDICTABILITY_LABEL_MODES,
+        default=DEFAULT_PREDICTABILITY_LABEL_MODE,
+    )
     parser.add_argument("--random-seed", type=int, default=1337)
     return parser
 
@@ -444,6 +465,8 @@ def main() -> None:
         recency_weight_power=float(args.recency_weight_power),
         predictability_baseline_bet_bnb=float(args.predictability_baseline_bet_bnb),
         treasury_fee_fraction=float(constants.treasury_fee_fraction),
+        predictability_feature_mode=str(args.predictability_feature_mode),
+        predictability_label_mode=str(args.predictability_label_mode),
     )
 
     rounds = _valid_rounds_from_store(ClosedRoundsStore(str(args.closed_rounds_path)))
@@ -629,6 +652,14 @@ def main() -> None:
                 "recency_weight_floor": float(cfg.recency_weight_floor),
                 "recency_weight_power": float(cfg.recency_weight_power),
                 "predictability_baseline_bet_bnb": float(cfg.predictability_baseline_bet_bnb),
+                "predictability_feature_mode": str(cfg.predictability_feature_mode),
+                "predictability_label_mode": str(cfg.predictability_label_mode),
+                "predictability_feature_columns": list(
+                    predictability_feature_columns(
+                        schema=FEATURE_SCHEMA,
+                        mode=str(cfg.predictability_feature_mode),
+                    )
+                ),
             },
             "initial_bankroll_bnb": float(args.initial_bankroll_bnb),
             "final_bankroll_bnb": float(bankroll_bnb),

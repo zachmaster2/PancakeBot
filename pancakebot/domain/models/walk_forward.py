@@ -39,6 +39,15 @@ from pancakebot.domain.features.targets import compute_pool_forecast_targets, co
 from pancakebot.domain.models.calibration import IsotonicCalibrator
 from pancakebot.domain.models.final_pool_model import FinalPoolModel
 from pancakebot.domain.models.predictability_model import PredictabilityModel
+from pancakebot.domain.models.predictability_modes import (
+    DEFAULT_PREDICTABILITY_FEATURE_MODE,
+    DEFAULT_PREDICTABILITY_LABEL_MODE,
+    PREDICTABILITY_LABEL_MODE_BASELINE_LOG_IMBALANCE_SIDE,
+    PREDICTABILITY_LABEL_MODE_EITHER_SIDE_PROFITABLE,
+    predictability_feature_indices,
+    validate_predictability_feature_mode,
+    validate_predictability_label_mode,
+)
 from pancakebot.domain.models.price_return_model import PriceReturnModel
 from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
@@ -63,6 +72,18 @@ class WalkForwardState:
     steps_since_calibrate: int = 0
     last_train_epoch: int | None = None
     last_calibrate_epoch: int | None = None
+
+
+def _predictability_feature_mode(*, cfg: Any) -> str:
+    return validate_predictability_feature_mode(
+        str(getattr(cfg, "predictability_feature_mode", DEFAULT_PREDICTABILITY_FEATURE_MODE))
+    )
+
+
+def _predictability_label_mode(*, cfg: Any) -> str:
+    return validate_predictability_label_mode(
+        str(getattr(cfg, "predictability_label_mode", DEFAULT_PREDICTABILITY_LABEL_MODE))
+    )
 
 
 def ensure_state(
@@ -133,6 +154,8 @@ def ensure_state(
                 f"Walk-forward train ({train_reason}) epoch={int(current_epoch)} "
                 f"train_size={int(train_size)} calibrate_size={int(calibrate_size)} "
                 f"recency_weight_floor={float(recency_weight_floor):.4f} recency_weight_power={float(recency_weight_power):.4f} "
+                f"predictability_feature_mode={str(_predictability_feature_mode(cfg=cfg))} "
+                f"predictability_label_mode={str(_predictability_label_mode(cfg=cfg))} "
                 f"prior_context_rounds_required={int(max_required_prior_context_rounds_size())}"
             ),
         )
@@ -229,6 +252,10 @@ def _train_and_maybe_calibrate(
     calibrate_size: int,
 ) -> tuple[WalkForwardModels, IsotonicCalibrator | None]:
     k = int(max_required_prior_context_rounds_size())
+    gate_feature_indices = predictability_feature_indices(
+        schema=FEATURE_SCHEMA,
+        mode=str(_predictability_feature_mode(cfg=cfg)),
+    )
 
     required = k + train_size + calibrate_size
     if len(closed_rounds) < required:
@@ -285,7 +312,10 @@ def _train_and_maybe_calibrate(
             y_late_inflow_bull_frac,
             sample_weight=train_sample_weight,
         )
-        predictability_model = PredictabilityModel(seed=int(cfg.random_seed))
+        predictability_model = PredictabilityModel(
+            seed=int(cfg.random_seed),
+            feature_indices=gate_feature_indices,
+        )
         predictability_model.fit(
             x_gate_train,
             y_tradeable_train,
@@ -353,7 +383,10 @@ def _train_and_maybe_calibrate(
         y_frac_eval=y_late_inflow_bull_frac_cal,
         sample_weight=train_sample_weight,
     )
-    predictability_model = PredictabilityModel(seed=int(cfg.random_seed))
+    predictability_model = PredictabilityModel(
+        seed=int(cfg.random_seed),
+        feature_indices=gate_feature_indices,
+    )
     predictability_model.fit(
         x_gate_train,
         y_tradeable_train,
@@ -644,18 +677,29 @@ def _tradeable_label(*, cfg: Any, round_t: Round, x_row: list[float]) -> int:
     if not math.isfinite(float(baseline_bet)) or float(baseline_bet) <= 0.0:
         raise InvariantError("predictability_baseline_bet_bnb_invalid")
 
+    def _baseline_pnl_for_side(side: str) -> float:
+        settled = settle_bet_against_closed_round(
+            bet_bnb=float(baseline_bet),
+            bet_side=str(side),
+            round_closed=round_t,
+            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+        )
+        return float(settled.credit_bnb) - float(baseline_bet) - float(GAS_COST_BET_BNB)
+
+    label_mode = _predictability_label_mode(cfg=cfg)
+    if str(label_mode) == PREDICTABILITY_LABEL_MODE_EITHER_SIDE_PROFITABLE:
+        bull_pnl = _baseline_pnl_for_side("Bull")
+        bear_pnl = _baseline_pnl_for_side("Bear")
+        return 1 if max(float(bull_pnl), float(bear_pnl)) > 0.0 else 0
+
+    if str(label_mode) != PREDICTABILITY_LABEL_MODE_BASELINE_LOG_IMBALANCE_SIDE:
+        raise InvariantError("predictability_label_mode_unknown")
+
     if int(_TRADEABLE_LOG_IMB_IDX) < 0 or int(_TRADEABLE_LOG_IMB_IDX) >= int(len(x_row)):
         raise InvariantError("tradeable_log_imb_feature_index_out_of_range")
     log_imb = float(x_row[int(_TRADEABLE_LOG_IMB_IDX)])
     side = "Bull" if (not math.isfinite(float(log_imb)) or float(log_imb) >= 0.0) else "Bear"
-
-    settled = settle_bet_against_closed_round(
-        bet_bnb=float(baseline_bet),
-        bet_side=str(side),
-        round_closed=round_t,
-        treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-    )
-    pnl = float(settled.credit_bnb) - float(baseline_bet) - float(GAS_COST_BET_BNB)
+    pnl = _baseline_pnl_for_side(str(side))
     return 1 if float(pnl) > 0.0 else 0
 
 

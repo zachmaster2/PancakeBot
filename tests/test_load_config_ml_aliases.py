@@ -41,6 +41,54 @@ class LoadConfigMlAliasTests(unittest.TestCase):
             with self.assertRaises(InvariantError):
                 load_app_config(str(cfg_path))
 
+    def test_predictability_modes_are_accepted(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            'predictability_feature_mode = "all_features"',
+            'predictability_feature_mode = "arrival_microstructure_plus_regime"',
+            1,
+        ).replace(
+            'predictability_label_mode = "baseline_log_imbalance_side"',
+            'predictability_label_mode = "either_side_profitable"',
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_ml_predictability_modes.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            cfg = load_app_config(str(cfg_path))
+
+        self.assertEqual("arrival_microstructure_plus_regime", cfg.strategy.ml_candidate.predictability_feature_mode)
+        self.assertEqual("either_side_profitable", cfg.strategy.ml_candidate.predictability_label_mode)
+
+    def test_invalid_predictability_feature_mode_is_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            'predictability_feature_mode = "all_features"',
+            'predictability_feature_mode = "not_a_mode"',
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_ml_bad_feature_mode.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
+    def test_invalid_predictability_label_mode_is_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            'predictability_label_mode = "baseline_log_imbalance_side"',
+            'predictability_label_mode = "bad_label_mode"',
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_ml_bad_label_mode.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
 
 if __name__ == "__main__":
     unittest.main()

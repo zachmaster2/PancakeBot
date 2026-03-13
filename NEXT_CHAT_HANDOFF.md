@@ -1483,3 +1483,131 @@ Updated best-known candidate from Stage Q+R:
    - If prioritizing fastest progress toward the objective:
      - stop local threshold/gate tweaking in this family and pivot again to a larger model
        or feature change, because robust edge remains too small.
+
+## Update (2026-03-12): Predictability-Gate Pivot Implemented + First Full Probe
+
+1. Code changes completed for the predictability-gate pivot:
+   - Added configurable gate feature families:
+     - `all_features`
+     - `regime_only`
+     - `arrival_microstructure_only`
+     - `arrival_microstructure_plus_regime`
+     - `arrival_microstructure_plus_regime_plus_price`
+   - Added configurable label modes:
+     - `baseline_log_imbalance_side` (existing deterministic fixed-policy baseline)
+     - `either_side_profitable` (research-only probe)
+   - Wiring added end-to-end through:
+     - `config.toml`
+     - `pancakebot/config/load_config.py`
+     - `pancakebot/config/strategy_config.py`
+     - `pancakebot/domain/models/predictability_modes.py`
+     - `pancakebot/domain/models/predictability_model.py`
+     - `pancakebot/domain/models/walk_forward.py`
+     - `pancakebot/domain/strategy/ml_candidate_adapter.py`
+     - `inspection/run_ml_strategy_blocks.py`
+   - New tests:
+     - `tests/test_predictability_modes.py`
+     - expanded `tests/test_load_config_ml_aliases.py`
+
+2. Validation after the pivot code:
+   - `.\.venv\Scripts\python.exe -m compileall pancakebot inspection tests`
+   - `.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test*.py"`
+   - Result:
+     - `54` tests passed.
+
+3. First A/B/C gate-family probe used the new `either_side_profitable` label mode on a 10k block replay:
+   - Shared settings:
+     - block layout: `20 x 500`
+     - `train_size=8000`
+     - `calibrate_size=4000`
+     - `min_tradeable_prob=0.51`
+     - `min_prob_edge=0.0015`
+     - fixed bet `0.2`
+   - Runs:
+     - `pivot_gate_regime_20260312`
+     - `pivot_gate_arrival_20260312`
+     - `pivot_gate_combined_20260312`
+   - Result:
+     - all three were **bit-for-bit identical**
+     - aggregate:
+       - `net_per_500 = -0.525679`
+       - `bets_total = 1063`
+       - `positive_blocks = 5/20`
+   - Skip totals (aggregate):
+     - `cutoff_pool_below_min_total = 4910`
+     - `expected_net_below_min = 3928`
+     - `p_bull_edge_below_min = 99`
+     - `predictability_below_min = 0`
+
+4. Root cause of the inert A/B/C result:
+   - Direct probability probe on the most-recent `500` rounds for
+     `arrival_microstructure_plus_regime + either_side_profitable` showed:
+     - `p_tradeable == 1.0` for every sampled round
+   - Interpretation:
+     - `either_side_profitable` is degenerate under the current baseline-bet semantics;
+       it produces an always-pass gate and should **not** be used as-is for promotion.
+
+5. Fixed-policy label probe (`baseline_log_imbalance_side`) on the most recent `500` rounds:
+   - `regime_only`:
+     - `mean p_tradeable = 0.507473`
+     - `q10 = 0.504443`, `q50 = 0.507263`, `q90 = 0.510954`
+     - rounds below `0.51`: `434/500`
+   - `arrival_microstructure_only`:
+     - `mean p_tradeable = 0.508059`
+     - `q10 = 0.499052`, `q50 = 0.508005`, `q90 = 0.517310`
+     - rounds below `0.51`: `313/500`
+   - `arrival_microstructure_plus_regime`:
+     - `mean p_tradeable = 0.507649`
+     - `q10 = 0.504478`, `q50 = 0.507509`, `q90 = 0.510597`
+     - rounds below `0.51`: `332/500`
+   - Interpretation:
+     - `arrival_microstructure_only` had the only materially wider score spread near the
+       live threshold and became the best follow-up candidate.
+
+6. Full 10k replay for the strongest live pivot candidate:
+   - Command family:
+     - `pivot_gate_arrival_baseline_20260312`
+     - settings:
+       - `predictability_feature_mode = arrival_microstructure_only`
+       - `predictability_label_mode = baseline_log_imbalance_side`
+       - `min_tradeable_prob = 0.51`
+   - Aggregate:
+     - `net_per_500 = -0.231208`
+     - `net_total = -4.624158`
+     - `bets_total = 78`
+     - `positive_blocks = 2/20`
+     - `win_rate_weighted = 0.384615`
+   - Aggregate skip totals:
+     - `cutoff_pool_below_min_total = 4910`
+     - `predictability_below_min = 4791`
+     - `expected_net_below_min = 221`
+   - Most recent block (`off0`) remained bad:
+     - `net_profit_bnb = -2.771001`
+     - `num_bets = 57`
+     - `predictability_below_min = 248`
+
+7. Net conclusion from this pivot stage:
+   - The code pivot was worth doing:
+     - it produced a live microstructure gate that materially reduced trade count and
+       improved loss vs the degenerate/inert gate setup.
+   - But it is still not close to acceptable:
+     - `-0.231 / 500` is a clear improvement over `-0.526 / 500`
+       yet still far below break-even and nowhere near the objective.
+   - Current best research takeaway:
+     - `arrival_microstructure_only + baseline_log_imbalance_side` is the only tested
+       pivot variant that actually behaves like a gate and improves robustness at all.
+
+8. Recommended next step from here:
+   - Do **not** promote `either_side_profitable` without redesign; it is currently an
+     always-pass label.
+   - Next highest-signal research step:
+     - run a tight threshold sweep around the live microstructure gate
+       (`min_tradeable_prob` roughly `0.508` to `0.518`)
+       using `arrival_microstructure_only + baseline_log_imbalance_side`
+     - reason:
+       - the score distribution is extremely narrow, so the threshold is now the main
+         control knob.
+   - If that still fails:
+     - redesign the label itself to a non-degenerate fixed directional policy that is
+       less tightly coupled to `log_imb_w_p_80_to_p_100`, then re-run the same family
+       comparison.
