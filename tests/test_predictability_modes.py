@@ -9,8 +9,13 @@ from pancakebot.domain.features.schema import FEATURE_SCHEMA
 from pancakebot.domain.models.predictability_modes import (
     PREDICTABILITY_FEATURE_MODE_ARRIVAL_MICRO_ONLY,
     PREDICTABILITY_FEATURE_MODE_ARRIVAL_MICRO_PLUS_REGIME,
+    PREDICTABILITY_LABEL_MODE_CONTRARIAN_LOG_IMBALANCE_SIDE,
+    PREDICTABILITY_LABEL_MODE_CONTRARIAN_PRICE_REGIME_VOTE_15_30_R20_R60_SIDE,
     PREDICTABILITY_LABEL_MODE_EITHER_SIDE_PROFITABLE,
+    PREDICTABILITY_LABEL_MODE_PRICE_MOMENTUM_K15_SIDE,
+    PREDICTABILITY_LABEL_MODE_REGIME_MAJORITY_R20_SIDE,
     predictability_feature_columns,
+    validate_predictability_label_mode,
     validate_predictability_feature_mode,
 )
 from pancakebot.domain.models.walk_forward import _tradeable_label
@@ -49,6 +54,10 @@ class PredictabilityModeTests(unittest.TestCase):
         with self.assertRaises(InvariantError):
             validate_predictability_feature_mode("bad_mode")
 
+    def test_invalid_label_mode_is_rejected(self) -> None:
+        with self.assertRaises(InvariantError):
+            validate_predictability_label_mode("bad_label")
+
     def test_either_side_profitable_label_uses_both_sides(self) -> None:
         cfg = SimpleNamespace(
             predictability_baseline_bet_bnb=0.05,
@@ -78,6 +87,72 @@ class PredictabilityModeTests(unittest.TestCase):
         x_row = [0.0] * len(FEATURE_SCHEMA.columns)
         log_imb_idx = int(FEATURE_SCHEMA.columns.index("log_imb_w_p_80_to_p_100"))
         x_row[log_imb_idx] = -1.0
+
+        with patch("pancakebot.domain.models.walk_forward.settle_bet_against_closed_round") as settle_mock:
+            settle_mock.return_value = SimpleNamespace(credit_bnb=0.0)
+            _tradeable_label(cfg=cfg, round_t=SimpleNamespace(), x_row=x_row)
+
+        self.assertEqual("Bear", str(settle_mock.call_args.kwargs["bet_side"]))
+
+    def test_price_momentum_label_uses_k15_sign(self) -> None:
+        cfg = SimpleNamespace(
+            predictability_baseline_bet_bnb=0.05,
+            treasury_fee_fraction=0.03,
+            predictability_label_mode=PREDICTABILITY_LABEL_MODE_PRICE_MOMENTUM_K15_SIDE,
+        )
+        x_row = [0.0] * len(FEATURE_SCHEMA.columns)
+        idx = int(FEATURE_SCHEMA.columns.index("price_log_return_mean_k_15"))
+        x_row[idx] = -0.01
+
+        with patch("pancakebot.domain.models.walk_forward.settle_bet_against_closed_round") as settle_mock:
+            settle_mock.return_value = SimpleNamespace(credit_bnb=0.0)
+            _tradeable_label(cfg=cfg, round_t=SimpleNamespace(), x_row=x_row)
+
+        self.assertEqual("Bear", str(settle_mock.call_args.kwargs["bet_side"]))
+
+    def test_regime_majority_label_uses_r20_bull_frac(self) -> None:
+        cfg = SimpleNamespace(
+            predictability_baseline_bet_bnb=0.05,
+            treasury_fee_fraction=0.03,
+            predictability_label_mode=PREDICTABILITY_LABEL_MODE_REGIME_MAJORITY_R20_SIDE,
+        )
+        x_row = [0.0] * len(FEATURE_SCHEMA.columns)
+        idx = int(FEATURE_SCHEMA.columns.index("regime_bull_frac_r_20"))
+        x_row[idx] = 0.3
+
+        with patch("pancakebot.domain.models.walk_forward.settle_bet_against_closed_round") as settle_mock:
+            settle_mock.return_value = SimpleNamespace(credit_bnb=0.0)
+            _tradeable_label(cfg=cfg, round_t=SimpleNamespace(), x_row=x_row)
+
+        self.assertEqual("Bear", str(settle_mock.call_args.kwargs["bet_side"]))
+
+    def test_contrarian_log_imbalance_label_inverts_log_imb_sign(self) -> None:
+        cfg = SimpleNamespace(
+            predictability_baseline_bet_bnb=0.05,
+            treasury_fee_fraction=0.03,
+            predictability_label_mode=PREDICTABILITY_LABEL_MODE_CONTRARIAN_LOG_IMBALANCE_SIDE,
+        )
+        x_row = [0.0] * len(FEATURE_SCHEMA.columns)
+        log_imb_idx = int(FEATURE_SCHEMA.columns.index("log_imb_w_p_80_to_p_100"))
+        x_row[log_imb_idx] = -1.0
+
+        with patch("pancakebot.domain.models.walk_forward.settle_bet_against_closed_round") as settle_mock:
+            settle_mock.return_value = SimpleNamespace(credit_bnb=0.0)
+            _tradeable_label(cfg=cfg, round_t=SimpleNamespace(), x_row=x_row)
+
+        self.assertEqual("Bull", str(settle_mock.call_args.kwargs["bet_side"]))
+
+    def test_contrarian_price_regime_vote_label_inverts_consensus_side(self) -> None:
+        cfg = SimpleNamespace(
+            predictability_baseline_bet_bnb=0.05,
+            treasury_fee_fraction=0.03,
+            predictability_label_mode=PREDICTABILITY_LABEL_MODE_CONTRARIAN_PRICE_REGIME_VOTE_15_30_R20_R60_SIDE,
+        )
+        x_row = [0.0] * len(FEATURE_SCHEMA.columns)
+        x_row[int(FEATURE_SCHEMA.columns.index("price_log_return_mean_k_15"))] = 0.01
+        x_row[int(FEATURE_SCHEMA.columns.index("price_log_return_mean_k_30"))] = 0.01
+        x_row[int(FEATURE_SCHEMA.columns.index("regime_bull_frac_r_20"))] = 0.8
+        x_row[int(FEATURE_SCHEMA.columns.index("regime_bull_frac_r_60"))] = 0.7
 
         with patch("pancakebot.domain.models.walk_forward.settle_bet_against_closed_round") as settle_mock:
             settle_mock.return_value = SimpleNamespace(credit_bnb=0.0)
