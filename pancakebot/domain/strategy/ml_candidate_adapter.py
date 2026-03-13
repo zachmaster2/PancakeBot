@@ -43,6 +43,8 @@ class _MlWalkForwardRuntimeConfig:
     predictability_baseline_bet_bnb: float
     treasury_fee_fraction: float
     feature_cache_store: object | None
+    predictability_feature_mode: str = "all_features"
+    predictability_label_mode: str = "baseline_log_imbalance_side"
 
 
 def _expected_net_from_predicted_final(
@@ -122,6 +124,8 @@ class MlCandidateAdapter:
             predictability_baseline_bet_bnb=float(config.predictability_baseline_bet_bnb),
             treasury_fee_fraction=float(treasury_fee_fraction),
             feature_cache_store=feature_cache_store,
+            predictability_feature_mode=str(config.predictability_feature_mode),
+            predictability_label_mode=str(config.predictability_label_mode),
         )
         self._validate_config()
 
