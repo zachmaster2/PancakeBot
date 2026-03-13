@@ -1611,3 +1611,97 @@ Updated best-known candidate from Stage Q+R:
      - redesign the label itself to a non-degenerate fixed directional policy that is
        less tightly coupled to `log_imb_w_p_80_to_p_100`, then re-run the same family
        comparison.
+
+## Update (2026-03-12): Tight Threshold Sweep For Live Microstructure Gate
+
+1. Follow-up executed exactly as recommended from the prior pivot checkpoint:
+   - family:
+     - `arrival_microstructure_only + baseline_log_imbalance_side`
+   - all other settings held fixed:
+     - `train_size=8000`
+     - `calibrate_size=4000`
+     - `fixed_bet_bnb=0.2`
+     - `min_prob_edge=0.0015`
+     - `cutoff_pool_total_min_bnb=1.2`
+     - `expected_net_min_bnb=0.0`
+   - block layout:
+     - `20 x 500` (`10k` total rounds)
+
+2. Threshold sweep run:
+   - `min_tradeable_prob = 0.508`
+     - `net_per_500 = -0.271320`
+     - `net_total = -5.426393`
+     - `bets_total = 139`
+     - `positive_blocks = 2/20`
+   - `min_tradeable_prob = 0.510`
+     - `net_per_500 = -0.231208`
+     - `net_total = -4.624158`
+     - `bets_total = 78`
+     - `positive_blocks = 2/20`
+   - `min_tradeable_prob = 0.512`
+     - `net_per_500 = -0.134212`
+     - `net_total = -2.684234`
+     - `bets_total = 48`
+     - `positive_blocks = 1/20`
+   - `min_tradeable_prob = 0.514`
+     - `net_per_500 = -0.102600`
+     - `net_total = -2.052004`
+     - `bets_total = 32`
+     - `positive_blocks = 1/20`
+   - `min_tradeable_prob = 0.516`
+     - `net_per_500 = -0.078939`
+     - `net_total = -1.578773`
+     - `bets_total = 22`
+     - `positive_blocks = 0/20`
+   - `min_tradeable_prob = 0.518`
+     - `net_per_500 = -0.053601`
+     - `net_total = -1.072027`
+     - `bets_total = 16`
+     - `positive_blocks = 0/20`
+   - extension:
+     - `min_tradeable_prob = 0.520`
+       - `net_per_500 = -0.041210`
+       - `net_total = -0.824208`
+       - `bets_total = 13`
+       - `positive_blocks = 0/20`
+     - `min_tradeable_prob = 0.522`
+       - `net_per_500 = -0.034781`
+       - `net_total = -0.695628`
+       - `bets_total = 9`
+       - `positive_blocks = 0/20`
+
+3. Best observed threshold in this sweep:
+   - `0.522`
+   - But the improvement came only from near-complete trade starvation:
+     - `9` bets across `10k` rounds
+     - aggregate skip totals:
+       - `cutoff_pool_below_min_total = 4910`
+       - `predictability_below_min = 5066`
+       - `expected_net_below_min = 15`
+     - most recent block (`off0`) still negative:
+       - `net_profit_bnb = -0.695628`
+       - `num_bets = 9`
+       - `predictability_below_min = 392`
+
+4. Interpretation:
+   - The sweep was monotone:
+     - higher threshold -> fewer bets -> less loss
+   - There was **no interior optimum** in the tested band.
+   - This means the current microstructure gate is not finding a profitable subset;
+     it is only approaching break-even by asymptotically refusing to trade.
+
+5. Net conclusion after the full pivot + threshold sweep:
+   - The microstructure gate is directionally better than the inert gate variants.
+   - But threshold tuning alone does **not** rescue the strategy.
+   - If continued, the next work should shift away from threshold search and toward
+     label redesign / direction-policy redesign.
+
+6. Recommended next step from here:
+   - Stop sweeping `min_tradeable_prob` in this family.
+   - Redesign the gate label to a non-degenerate deterministic directional policy that:
+     - is not the trivial always-pass `either_side_profitable`
+     - is less tightly coupled to `log_imb_w_p_80_to_p_100`
+   - Then re-run the same three-family comparison:
+     - `regime_only`
+     - `arrival_microstructure_only`
+     - `arrival_microstructure_plus_regime`
