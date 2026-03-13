@@ -262,6 +262,7 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         "min_prob_edge",
         "cutoff_pool_total_min_bnb",
         "expected_net_min_bnb",
+        "expected_net_max_bnb",
         "train_size",
         "calibrate_size",
         "calibration_size",
@@ -299,6 +300,13 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         raise InvariantError("strategy_ml_candidate_cutoff_pool_total_min_bnb_negative")
 
     expected_net_min_bnb = _req_float(candidate, "expected_net_min_bnb")
+    expected_net_max_bnb: float | None = None
+    if "expected_net_max_bnb" in candidate:
+        expected_net_max_bnb = _req_float(candidate, "expected_net_max_bnb")
+        if float(expected_net_max_bnb) < 0.0:
+            raise InvariantError("strategy_ml_candidate_expected_net_max_bnb_negative")
+        if float(expected_net_max_bnb) < float(expected_net_min_bnb):
+            raise InvariantError("strategy_ml_candidate_expected_net_max_below_min")
 
     def _req_int_with_alias(*, primary: str, alias: str) -> int:
         has_primary = primary in candidate
@@ -371,6 +379,9 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         recency_weight_power=float(recency_weight_power),
         predictability_baseline_bet_bnb=float(predictability_baseline_bet_bnb),
         random_seed=int(random_seed),
+        expected_net_max_bnb=(
+            None if expected_net_max_bnb is None else float(expected_net_max_bnb)
+        ),
         predictability_feature_mode=str(predictability_feature_mode),
         predictability_label_mode=str(predictability_label_mode),
     )

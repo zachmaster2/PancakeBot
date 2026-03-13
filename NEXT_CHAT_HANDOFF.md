@@ -1851,3 +1851,161 @@ Updated best-known candidate from Stage Q+R:
    - If that does not produce a positive variant, stop iterating on label-only changes and
      move to the next structural pivot:
      - redesign the live direction / EV selection coupling rather than only the gate label.
+
+## Update (2026-03-13): EV-Cap Promotion + Router-Threshold Combined Strategy Follow-up
+
+1. Code promotion completed for the EV-cap pivot:
+   - Added `expected_net_max_bnb` to the ML candidate config surface and loader:
+     - `pancakebot/config/strategy_config.py`
+     - `pancakebot/config/load_config.py`
+   - Added runtime enforcement in the shared ML candidate adapter:
+     - skip reason: `expected_net_above_max`
+     - file: `pancakebot/domain/strategy/ml_candidate_adapter.py`
+   - Extended canonical scenario tooling so shared-path backtests can override:
+     - ML enablement
+     - `min_tradeable_prob`
+     - `min_prob_edge`
+     - `cutoff_pool_total_min_bnb`
+     - `expected_net_min_bnb`
+     - `expected_net_max_bnb`
+     - predictability feature/label modes
+     - full router mode set
+     - file: `inspection/run_backtest_scenario.py`
+   - Extended the multi-offset comparison harness with router score-threshold support:
+     - file: `inspection/run_alta_single_idea.py`
+   - Added tests:
+     - loader accepts/rejects `expected_net_max_bnb` correctly
+     - ML adapter skips `expected_net_above_max`
+     - files:
+       - `tests/test_load_config_ml_aliases.py`
+       - `tests/test_ml_candidate_adapter.py`
+
+2. Focused validation completed:
+   - `compileall` on touched modules: passed
+   - `unittest tests.test_ml_candidate_adapter tests.test_load_config_ml_aliases -v`: passed
+   - scenario/help smokes for:
+     - `inspection.run_backtest_scenario`
+     - `inspection.run_alta_single_idea`
+
+3. First real combined-strategy comparison (shared pipeline, all dislocation candidates kept,
+   router=`selector_max_score`, `sim=500`, offsets `0,500,1000,1500,2000`):
+   - baseline:
+     - run prefix: `combo_selector_baseline_20260313`
+     - aggregate:
+       - `mean_per_500 = -0.036278`
+       - `worst_per_500 = -1.204000`
+       - `worst_max_drawdown_bnb = 1.445926`
+   - tuned ML branch enabled:
+     - run prefix: `combo_selector_ml_contravote_20260313`
+     - ML overrides:
+       - `min_tradeable_prob = 0.508`
+       - `cutoff_pool_total_min_bnb = 1.5`
+       - `expected_net_max_bnb = 0.005`
+       - `predictability_feature_mode = arrival_microstructure_only`
+       - `predictability_label_mode = contrarian_price_regime_vote_15_30_r20_r60_side`
+     - aggregate:
+       - `mean_per_500 = -0.100200`
+       - `worst_per_500 = -1.731032`
+       - `worst_max_drawdown_bnb = 1.884360`
+   - interpretation:
+     - the raw tuned ML branch **hurt** the combined selector path.
+     - root cause was not inertness: the ML candidate was actually being selected.
+     - worst window (`offset=1000`) mix:
+       - `ml_arrival_contravote_cap005_pool15:12`
+       - `disloc_altA_20260227_x80:2`
+       - `disloc_altB_20260227_x80:2`
+       - net: `-1.731032`
+
+4. Exact trade-row follow-up on those official artifacts found the next real lever:
+   - adding a router score floor on `selector_score_bnb` is exact for this selector path
+     when applied as an additional skip on saved trades.
+   - key exact results:
+     - baseline run:
+       - `threshold >= 0.001` -> `+0.084122 / 500`
+     - combined ML run:
+       - `threshold >= 0.004` -> `+0.149516 / 500`
+       - `threshold >= 0.005` -> `+0.084122 / 500`
+   - interpretation:
+     - the combined ML gain does **not** come from accepting every ML signal.
+     - the best observed combined path keeps only the higher-score ML subset and also
+       rejects one low-score dislocation loser.
+
+5. Official multi-offset confirmation of the thresholded selector:
+   - baseline with router floor:
+     - run prefix: `combo_selector_baseline_thr0p001_20260313`
+     - router:
+       - `mode = selector_max_score`
+       - `score_threshold_bnb = 0.001`
+     - aggregate:
+       - `mean_per_500 = +0.084122`
+       - `worst_per_500 = -1.204000`
+       - `worst_max_drawdown_bnb = 1.204000`
+   - combined ML + router floor:
+     - run prefix: `combo_selector_ml_contravote_thr0p004_20260313`
+     - router:
+       - `mode = selector_max_score`
+       - `score_threshold_bnb = 0.004`
+     - same ML overrides as above
+     - aggregate:
+       - `mean_per_500 = +0.149516`
+       - `worst_per_500 = -1.214567`
+       - `worst_max_drawdown_bnb = 1.214567`
+   - net result:
+     - the thresholded ML selector beat the thresholded non-ML baseline by about
+       `+0.065394 / 500` on this `5 x 500` window check.
+
+6. Longer continuous confirm on the most recent `2000` rounds:
+   - baseline thresholded:
+     - scenario: `combo_selector_baseline_thr0p001_long2000_20260313`
+     - `net_profit_bnb = -0.104799`
+     - `profit_per_500_rounds_bnb = -0.026200`
+     - `num_bets = 8`
+   - thresholded ML selector:
+     - scenario: `combo_selector_ml_contravote_thr0p004_long2000_20260313`
+     - `net_profit_bnb = +0.092953`
+     - `profit_per_500_rounds_bnb = +0.023238`
+     - `num_bets = 14`
+   - selected-strategy breakdown on the `2000`-round ML run:
+     - `disloc_altA_20260227_x80: 1 bet, -0.301000`
+     - `disloc_altB_20260227_x80: 7 bets, +0.196201`
+     - `mlwf_bestset_adapt_v1: 6 bets, +0.197753`
+   - interpretation:
+     - the ML branch still added value on the longer slice.
+     - but the edge compressed sharply versus the short `5 x 500` sweep.
+     - this is still nowhere close to the `2.0 / 500` project target.
+
+7. Current best official combined path from this cycle:
+   - router:
+     - `selector_max_score`
+     - `router_score_threshold_bnb = 0.004`
+   - ML candidate:
+     - enabled
+     - `min_tradeable_prob = 0.508`
+     - `cutoff_pool_total_min_bnb = 1.5`
+     - `expected_net_max_bnb = 0.005`
+     - `predictability_feature_mode = arrival_microstructure_only`
+     - `predictability_label_mode = contrarian_price_regime_vote_15_30_r20_r60_side`
+   - best short-window official aggregate:
+     - `+0.149516 / 500` over `5 x 500`
+   - longer confirm:
+     - `+0.023238 / 500` over the latest `2000`
+
+8. Research conclusion after chaining through the next plans automatically:
+   - The EV-cap pivot was real:
+     - it survives promotion into the shared strategy path.
+   - The next useful general lever was the router score floor:
+     - `-inf` score threshold was too permissive.
+   - The ML branch can add incremental value after that router floor is applied.
+   - But the longer-horizon edge is still tiny and fragile relative to the project goal.
+
+9. Recommended next step from here:
+   - Do **not** promote this to active config yet.
+   - First run a robustness pass on the thresholded combined selector, centered on:
+     - `router_score_threshold_bnb in {0.003, 0.004, 0.005}`
+     - longer windows than `500`
+     - compare directly against the thresholded non-ML baseline
+   - If the longer-window edge stays positive, then consider promoting:
+     - router score threshold as a first-class selector preset
+     - the ML EV-cap branch as an optional additive candidate
+   - If it collapses on longer windows, the next structural pivot should target:
+     - score calibration / ranking quality for the combined selector, not just more gate tweaks.

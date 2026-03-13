@@ -434,6 +434,12 @@ class MlCandidateAdapter:
                 p_bull=float(p_bull),
                 dislocation_bull=float(dislocation_bull),
             )
+        if self._config.expected_net_max_bnb is not None and float(best_ev) > float(self._config.expected_net_max_bnb):
+            return self._skip_signal(
+                skip_reason="expected_net_above_max",
+                p_bull=float(p_bull),
+                dislocation_bull=float(dislocation_bull),
+            )
 
         return StrategyCandidateSignal(
             candidate_name=str(self._config.name),
@@ -473,6 +479,11 @@ class MlCandidateAdapter:
             raise InvariantError("ml_candidate_name_empty")
         if float(self._config.fixed_bet_bnb) <= 0.0:
             raise InvariantError("ml_candidate_fixed_bet_nonpositive")
+        if self._config.expected_net_max_bnb is not None:
+            if float(self._config.expected_net_max_bnb) < 0.0:
+                raise InvariantError("ml_candidate_expected_net_max_negative")
+            if float(self._config.expected_net_max_bnb) < float(self._config.expected_net_min_bnb):
+                raise InvariantError("ml_candidate_expected_net_max_below_min")
 
     def _feature_vector_for_round(
         self,
