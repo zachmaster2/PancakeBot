@@ -10,6 +10,7 @@ from unittest.mock import patch
 from pancakebot.core.constants import BNB_WEI
 from pancakebot.config.strategy_config import MlCandidateConfig
 from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
+from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 from pancakebot.domain.types import Bet, Round
 
 
@@ -265,6 +266,106 @@ class MlCandidateAdapterTests(unittest.TestCase):
 
         self.assertEqual("SKIP", signal.action)
         self.assertEqual("expected_net_above_max", signal.skip_reason)
+
+    def test_candidate_specific_expected_net_veto_reason_is_returned(self) -> None:
+        cfg = self._ml_cfg(enabled=True, name="ml_test")
+        cfg = replace(
+            cfg,
+            expected_net_min_bnb=0.01,
+            veto_candidate_expected_net_below_min=True,
+        )
+        adapter = MlCandidateAdapter(
+            config=cfg,
+            cutoff_seconds=17,
+            treasury_fee_fraction=0.03,
+            klines_store_like=object(),
+        )
+
+        history_round = Round(
+            epoch=122,
+            start_at=999_700,
+            lock_at=1_000_000,
+            close_at=1_000_300,
+            lock_price=600.0,
+            close_price=601.0,
+            position="Bull",
+            failed=False,
+            bets=(),
+        )
+        adapter.settle_closed_rounds(rounds=[history_round])
+
+        round_t = Round(
+            epoch=123,
+            start_at=1_000_000,
+            lock_at=1_000_300,
+            close_at=1_000_600,
+            lock_price=600.0,
+            close_price=601.0,
+            position="Bull",
+            failed=False,
+            bets=(
+                Bet(
+                    wallet_address="0xabc",
+                    amount_wei=int(BNB_WEI),
+                    position="Bull",
+                    created_at=1_000_250,
+                ),
+                Bet(
+                    wallet_address="0xdef",
+                    amount_wei=int(BNB_WEI),
+                    position="Bear",
+                    created_at=1_000_250,
+                ),
+            ),
+        )
+        candidate_signal = StrategyCandidateSignal(
+            candidate_name="altA",
+            action="BET",
+            bet_side="Bear",
+            bet_size_bnb=0.2,
+            expected_profit_bnb=0.02,
+            selector_score_bnb=0.02,
+            skip_reason=None,
+            p_bull=None,
+            dislocation_bull=None,
+        )
+
+        fake_price_model = SimpleNamespace(predict=lambda _rows: [0.2])
+        fake_pool_model = SimpleNamespace(predict=lambda _rows: [(2.0, 0.6)])
+        fake_state = SimpleNamespace(
+            models=SimpleNamespace(price_model=fake_price_model, pool_model=fake_pool_model),
+            calibrator_final=object(),
+        )
+
+        with (
+            patch(
+                "pancakebot.domain.strategy.ml_candidate_adapter.max_required_prior_context_rounds_size",
+                return_value=1,
+            ),
+            patch(
+                "pancakebot.domain.strategy.ml_candidate_adapter.ensure_state",
+                return_value=fake_state,
+            ),
+            patch.object(
+                MlCandidateAdapter,
+                "_feature_vector_for_round",
+                return_value=[0.1, 0.2],
+            ),
+            patch(
+                "pancakebot.domain.strategy.ml_candidate_adapter.predict_probabilities",
+                return_value=0.8,
+            ),
+            patch(
+                "pancakebot.domain.strategy.ml_candidate_adapter.predict_tradeable_probability",
+                return_value=0.9,
+            ),
+        ):
+            skip_reason = adapter.candidate_veto_skip_reason_for_open_round(
+                round_t=round_t,
+                candidate_signal=candidate_signal,
+            )
+
+        self.assertEqual("ml_veto_candidate_expected_net_below_min", skip_reason)
 
 
 if __name__ == "__main__":

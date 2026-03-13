@@ -422,6 +422,11 @@ recency_weight_power = 2.0
 predictability_baseline_bet_bnb = 0.05
 predictability_feature_mode = "all_features"
 predictability_label_mode = "baseline_log_imbalance_side"
+emit_candidate = true
+veto_opposite_side_candidates = false
+veto_untradeable_candidates = false
+veto_candidate_expected_net_below_min = false
+rescore_baseline_candidates_with_expected_net = false
 random_seed = 1337
 
 [backtest]

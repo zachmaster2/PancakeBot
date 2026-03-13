@@ -62,6 +62,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ml-cutoff-pool-total-min-bnb", type=float, default=None)
     parser.add_argument("--ml-expected-net-min-bnb", type=float, default=None)
     parser.add_argument("--ml-expected-net-max-bnb", type=float, default=None)
+    parser.add_argument("--ml-veto-candidate-expected-net-below-min", type=str, default=None)
+    parser.add_argument("--ml-rescore-baseline-candidates-with-expected-net", type=str, default=None)
     parser.add_argument("--ml-train-size", type=int, default=None)
     parser.add_argument("--ml-calibrate-size", "--ml-calibration-size", dest="ml_calibrate_size", type=int, default=None)
     parser.add_argument("--ml-retrain-interval", type=int, default=None)
@@ -234,6 +236,24 @@ def _strategy_cfg_with_router_overrides(
         if float(args.ml_expected_net_max_bnb) < 0.0:
             raise InvariantError("scenario_ml_expected_net_max_bnb_negative")
         ml_cfg = replace(ml_cfg, expected_net_max_bnb=float(args.ml_expected_net_max_bnb))
+    ml_veto_candidate_expected_net_below_min = _parse_optional_bool_token(
+        args.ml_veto_candidate_expected_net_below_min
+    )
+    if ml_veto_candidate_expected_net_below_min is not None:
+        ml_cfg = replace(
+            ml_cfg,
+            veto_candidate_expected_net_below_min=bool(ml_veto_candidate_expected_net_below_min),
+        )
+    ml_rescore_baseline_candidates_with_expected_net = _parse_optional_bool_token(
+        args.ml_rescore_baseline_candidates_with_expected_net
+    )
+    if ml_rescore_baseline_candidates_with_expected_net is not None:
+        ml_cfg = replace(
+            ml_cfg,
+            rescore_baseline_candidates_with_expected_net=bool(
+                ml_rescore_baseline_candidates_with_expected_net
+            ),
+        )
     if args.ml_train_size is not None:
         if int(args.ml_train_size) <= 0:
             raise InvariantError("scenario_ml_train_size_nonpositive")
@@ -327,6 +347,12 @@ def main() -> None:
             None
             if runtime_cfg.strategy_cfg.ml_candidate.expected_net_max_bnb is None
             else float(runtime_cfg.strategy_cfg.ml_candidate.expected_net_max_bnb)
+        ),
+        "ml_veto_candidate_expected_net_below_min": bool(
+            runtime_cfg.strategy_cfg.ml_candidate.veto_candidate_expected_net_below_min
+        ),
+        "ml_rescore_baseline_candidates_with_expected_net": bool(
+            runtime_cfg.strategy_cfg.ml_candidate.rescore_baseline_candidates_with_expected_net
         ),
         "ml_train_size": int(runtime_cfg.strategy_cfg.ml_candidate.train_size),
         "ml_calibrate_size": int(runtime_cfg.strategy_cfg.ml_candidate.calibrate_size),

@@ -47,6 +47,18 @@ class _MlWalkForwardRuntimeConfig:
     predictability_label_mode: str = "baseline_log_imbalance_side"
 
 
+@dataclass(frozen=True, slots=True)
+class _MlOpenRoundContext:
+    """Shared ML forecast context for one open round."""
+
+    p_bull: float
+    p_tradeable: float
+    dislocation_bull: float
+    final_total_bnb: float
+    final_bull_bnb: float
+    final_bear_bnb: float
+
+
 def _expected_net_from_predicted_final(
     *,
     p_bull: float,
@@ -92,6 +104,7 @@ class MlCandidateAdapter:
     """Emit one ML candidate signal compatible with the shared router."""
 
     _MAX_PROJECTION_CACHE_ROWS = 10000
+    _MAX_OPEN_ROUND_CONTEXT_ROWS = 2048
 
     def __init__(
         self,
@@ -107,6 +120,7 @@ class MlCandidateAdapter:
         self._history_rounds: list[Round] = []
         self._state: WalkForwardState | None = None
         self._final_pool_projection_cache: dict[tuple[int, int, int, int, int], tuple[float, float, float] | None] = {}
+        self._open_round_context_cache: dict[tuple[int, int, int, int, int], _MlOpenRoundContext] = {}
         self._projection_cache_store = projection_cache_store
         self._wf_cfg = _MlWalkForwardRuntimeConfig(
             klines_store=klines_store_like,
@@ -140,6 +154,36 @@ class MlCandidateAdapter:
         """Return ML candidate name emitted to the router."""
 
         return str(self._config.name)
+
+    @property
+    def emit_candidate(self) -> bool:
+        """Return whether the ML signal should be routed as its own candidate."""
+
+        return bool(self._config.emit_candidate)
+
+    @property
+    def veto_opposite_side_candidates(self) -> bool:
+        """Return whether the ML signal vetoes opposite-side baseline bets."""
+
+        return bool(self._config.veto_opposite_side_candidates)
+
+    @property
+    def veto_untradeable_candidates(self) -> bool:
+        """Return whether low-confidence ML skips veto baseline bets."""
+
+        return bool(self._config.veto_untradeable_candidates)
+
+    @property
+    def veto_candidate_expected_net_below_min(self) -> bool:
+        """Return whether ML vetoes baseline bets with low modeled candidate EV."""
+
+        return bool(self._config.veto_candidate_expected_net_below_min)
+
+    @property
+    def rescore_baseline_candidates_with_expected_net(self) -> bool:
+        """Return whether baseline candidates should use ML EV as their selector score."""
+
+        return bool(self._config.rescore_baseline_candidates_with_expected_net)
 
     def refresh_klines(self, *, klines: list[Kline]) -> None:
         """No-op hook for pipeline parity with dislocation providers."""
@@ -328,55 +372,13 @@ class MlCandidateAdapter:
 
         if not bool(self._config.enabled):
             return self._skip_signal(skip_reason="ml_candidate_disabled")
-        if round_t.lock_at is None:
-            return self._skip_signal(skip_reason="round_lock_at_missing")
+        context, skip_reason = self._open_round_context(round_t=round_t)
+        if context is None:
+            return self._skip_signal(skip_reason=str(skip_reason or "ml_state_not_ready"))
 
-        k = int(max_required_prior_context_rounds_size())
-        if len(self._history_rounds) < int(k):
-            return self._skip_signal(skip_reason="ml_history_insufficient")
-
-        try:
-            self._state = ensure_state(
-                cfg=self._wf_cfg,
-                closed_rounds=list(self._history_rounds),
-                current_epoch=int(round_t.epoch),
-                state=self._state,
-            )
-        except InvariantError:
-            return self._skip_signal(skip_reason="ml_state_not_ready")
-
-        if self._state is None or self._state.models is None or self._state.calibrator_final is None:
-            return self._skip_signal(skip_reason="ml_state_not_ready")
-
-        cutoff_ts = int(round_t.lock_at) - int(self._wf_cfg.cutoff_seconds)
-        pools = compute_pool_amounts_wei_at_or_before(
-            bets=round_t.bets,
-            cutoff_ts=int(cutoff_ts),
-        )
-        pool_total_bnb = float(pools.total_wei) / float(BNB_WEI)
-        pool_bull_bnb = float(pools.bull_wei) / float(BNB_WEI)
-        pool_bear_bnb = float(pools.bear_wei) / float(BNB_WEI)
-        if float(pool_total_bnb) <= 0.0:
-            return self._skip_signal(skip_reason="cutoff_pool_empty")
-        if float(pool_total_bnb) < float(self._config.cutoff_pool_total_min_bnb):
-            return self._skip_signal(skip_reason="cutoff_pool_below_min_total")
-
-        prior_context_rounds = list(self._history_rounds[-int(k):])
-        x_row = self._feature_vector_for_round(
-            round_t=round_t,
-            prior_context_rounds=prior_context_rounds,
-        )
-
-        mu = float(self._state.models.price_model.predict([list(x_row)])[0])
-        p_bull = float(predict_probabilities(state=self._state, mu=float(mu)))
-        p_tradeable = float(
-            predict_tradeable_probability(
-                state=self._state,
-                x_row=list(x_row),
-            )
-        )
-        p_market_bull = float(pool_bull_bnb / pool_total_bnb)
-        dislocation_bull = float(p_bull) - float(p_market_bull)
+        p_bull = float(context.p_bull)
+        p_tradeable = float(context.p_tradeable)
+        dislocation_bull = float(context.dislocation_bull)
 
         if float(p_tradeable) < float(self._config.min_tradeable_prob):
             return self._skip_signal(
@@ -391,34 +393,20 @@ class MlCandidateAdapter:
                 dislocation_bull=float(dislocation_bull),
             )
 
-        late_total_bnb, late_bull_frac = self._state.models.pool_model.predict([list(x_row)])[0]
-        late_total_bnb = max(0.0, float(late_total_bnb))
-        late_bull_frac = min(1.0, max(0.0, float(late_bull_frac)))
-
-        final_total_bnb = float(pool_total_bnb) + float(late_total_bnb)
-        final_bull_bnb = float(pool_bull_bnb) + float(late_total_bnb) * float(late_bull_frac)
-        final_bear_bnb = float(pool_bear_bnb) + float(late_total_bnb) * (1.0 - float(late_bull_frac))
-        if float(final_total_bnb) <= 0.0 or float(final_bull_bnb) <= 0.0 or float(final_bear_bnb) <= 0.0:
-            return self._skip_signal(
-                skip_reason="predicted_pool_invalid",
-                p_bull=float(p_bull),
-                dislocation_bull=float(dislocation_bull),
-            )
-
         ev_bull = _expected_net_from_predicted_final(
             p_bull=float(p_bull),
             side="BULL",
             stake_bnb=float(self._config.fixed_bet_bnb),
-            final_bull_bnb=float(final_bull_bnb),
-            final_bear_bnb=float(final_bear_bnb),
+            final_bull_bnb=float(context.final_bull_bnb),
+            final_bear_bnb=float(context.final_bear_bnb),
             treasury_fee_fraction=float(self._wf_cfg.treasury_fee_fraction),
         )
         ev_bear = _expected_net_from_predicted_final(
             p_bull=float(p_bull),
             side="BEAR",
             stake_bnb=float(self._config.fixed_bet_bnb),
-            final_bull_bnb=float(final_bull_bnb),
-            final_bear_bnb=float(final_bear_bnb),
+            final_bull_bnb=float(context.final_bull_bnb),
+            final_bear_bnb=float(context.final_bear_bnb),
             treasury_fee_fraction=float(self._wf_cfg.treasury_fee_fraction),
         )
         if float(ev_bull) >= float(ev_bear):
@@ -474,11 +462,72 @@ class MlCandidateAdapter:
             ),
         )
 
+    def candidate_expected_net_for_open_round(
+        self,
+        *,
+        round_t: Round,
+        candidate_signal: StrategyCandidateSignal,
+    ) -> float | None:
+        """Return modeled EV for one baseline candidate under the current ML forecast."""
+
+        if str(candidate_signal.action) != "BET":
+            return None
+        side = str(candidate_signal.bet_side or "")
+        if side not in ("Bull", "Bear"):
+            return None
+        if float(candidate_signal.bet_size_bnb) <= 0.0:
+            return None
+
+        context, _skip_reason = self._open_round_context(round_t=round_t)
+        if context is None:
+            return None
+
+        return float(
+            _expected_net_from_predicted_final(
+                p_bull=float(context.p_bull),
+                side=str(side),
+                stake_bnb=float(candidate_signal.bet_size_bnb),
+                final_bull_bnb=float(context.final_bull_bnb),
+                final_bear_bnb=float(context.final_bear_bnb),
+                treasury_fee_fraction=float(self._wf_cfg.treasury_fee_fraction),
+            )
+        )
+
+    def candidate_veto_skip_reason_for_open_round(
+        self,
+        *,
+        round_t: Round,
+        candidate_signal: StrategyCandidateSignal,
+    ) -> str | None:
+        """Return veto reason for one baseline candidate, if the ML filter rejects it."""
+
+        if not bool(self._config.veto_candidate_expected_net_below_min):
+            return None
+        expected_net = self.candidate_expected_net_for_open_round(
+            round_t=round_t,
+            candidate_signal=candidate_signal,
+        )
+        if expected_net is None:
+            return None
+        if float(expected_net) < float(self._config.expected_net_min_bnb):
+            return "ml_veto_candidate_expected_net_below_min"
+        return None
+
     def _validate_config(self) -> None:
         if str(self._config.name).strip() == "":
             raise InvariantError("ml_candidate_name_empty")
         if float(self._config.fixed_bet_bnb) <= 0.0:
             raise InvariantError("ml_candidate_fixed_bet_nonpositive")
+        if not isinstance(self._config.emit_candidate, bool):
+            raise InvariantError("ml_candidate_emit_candidate_not_bool")
+        if not isinstance(self._config.veto_opposite_side_candidates, bool):
+            raise InvariantError("ml_candidate_veto_opposite_side_not_bool")
+        if not isinstance(self._config.veto_untradeable_candidates, bool):
+            raise InvariantError("ml_candidate_veto_untradeable_not_bool")
+        if not isinstance(self._config.veto_candidate_expected_net_below_min, bool):
+            raise InvariantError("ml_candidate_veto_candidate_expected_net_not_bool")
+        if not isinstance(self._config.rescore_baseline_candidates_with_expected_net, bool):
+            raise InvariantError("ml_candidate_rescore_baseline_candidates_not_bool")
         if self._config.expected_net_max_bnb is not None:
             if float(self._config.expected_net_max_bnb) < 0.0:
                 raise InvariantError("ml_candidate_expected_net_max_negative")
@@ -582,6 +631,93 @@ class MlCandidateAdapter:
             oldest_key = next(iter(self._final_pool_projection_cache))
             self._final_pool_projection_cache.pop(oldest_key, None)
 
+    def _open_round_context(
+        self,
+        *,
+        round_t: Round,
+    ) -> tuple[_MlOpenRoundContext | None, str | None]:
+        if round_t.lock_at is None:
+            return None, "round_lock_at_missing"
+
+        k = int(max_required_prior_context_rounds_size())
+        if len(self._history_rounds) < int(k):
+            return None, "ml_history_insufficient"
+
+        cutoff_ts = int(round_t.lock_at) - int(self._wf_cfg.cutoff_seconds)
+        pools = compute_pool_amounts_wei_at_or_before(
+            bets=round_t.bets,
+            cutoff_ts=int(cutoff_ts),
+        )
+        cache_key = (
+            int(round_t.epoch),
+            int(round_t.lock_at),
+            int(cutoff_ts),
+            int(pools.bull_wei),
+            int(pools.bear_wei),
+        )
+        cached = self._open_round_context_cache.get(cache_key)
+        if cached is not None:
+            return cached, None
+
+        try:
+            self._state = ensure_state(
+                cfg=self._wf_cfg,
+                closed_rounds=list(self._history_rounds),
+                current_epoch=int(round_t.epoch),
+                state=self._state,
+            )
+        except InvariantError:
+            return None, "ml_state_not_ready"
+
+        if self._state is None or self._state.models is None or self._state.calibrator_final is None:
+            return None, "ml_state_not_ready"
+
+        pool_total_bnb = float(pools.total_wei) / float(BNB_WEI)
+        pool_bull_bnb = float(pools.bull_wei) / float(BNB_WEI)
+        pool_bear_bnb = float(pools.bear_wei) / float(BNB_WEI)
+        if float(pool_total_bnb) <= 0.0:
+            return None, "cutoff_pool_empty"
+        if float(pool_total_bnb) < float(self._config.cutoff_pool_total_min_bnb):
+            return None, "cutoff_pool_below_min_total"
+
+        prior_context_rounds = list(self._history_rounds[-int(k):])
+        x_row = self._feature_vector_for_round(
+            round_t=round_t,
+            prior_context_rounds=prior_context_rounds,
+        )
+        mu = float(self._state.models.price_model.predict([list(x_row)])[0])
+        p_bull = float(predict_probabilities(state=self._state, mu=float(mu)))
+        p_tradeable = float(
+            predict_tradeable_probability(
+                state=self._state,
+                x_row=list(x_row),
+            )
+        )
+        p_market_bull = float(pool_bull_bnb / pool_total_bnb)
+        dislocation_bull = float(p_bull) - float(p_market_bull)
+
+        late_total_bnb, late_bull_frac = self._state.models.pool_model.predict([list(x_row)])[0]
+        late_total_bnb = max(0.0, float(late_total_bnb))
+        late_bull_frac = min(1.0, max(0.0, float(late_bull_frac)))
+
+        final_total_bnb = float(pool_total_bnb) + float(late_total_bnb)
+        final_bull_bnb = float(pool_bull_bnb) + float(late_total_bnb) * float(late_bull_frac)
+        final_bear_bnb = float(pool_bear_bnb) + float(late_total_bnb) * (1.0 - float(late_bull_frac))
+        if float(final_total_bnb) <= 0.0 or float(final_bull_bnb) <= 0.0 or float(final_bear_bnb) <= 0.0:
+            return None, "predicted_pool_invalid"
+
+        context = _MlOpenRoundContext(
+            p_bull=float(p_bull),
+            p_tradeable=float(p_tradeable),
+            dislocation_bull=float(dislocation_bull),
+            final_total_bnb=float(final_total_bnb),
+            final_bull_bnb=float(final_bull_bnb),
+            final_bear_bnb=float(final_bear_bnb),
+        )
+        self._open_round_context_cache[cache_key] = context
+        self._prune_open_round_context_cache()
+        return context, None
+
     def _context_klines(self, *, round_t: Round) -> list[Kline]:
         """Load cutoff-anchored context klines from the shared kline source."""
 
@@ -601,3 +737,8 @@ class MlCandidateAdapter:
             size=int(kk),
         )
         return list(out)
+
+    def _prune_open_round_context_cache(self) -> None:
+        while len(self._open_round_context_cache) > int(self._MAX_OPEN_ROUND_CONTEXT_ROWS):
+            oldest_key = next(iter(self._open_round_context_cache))
+            self._open_round_context_cache.pop(oldest_key, None)

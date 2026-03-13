@@ -76,6 +76,61 @@ class LoadConfigMlAliasTests(unittest.TestCase):
 
         self.assertEqual(0.005, float(cfg.strategy.ml_candidate.expected_net_max_bnb))
 
+    def test_ml_filter_flags_are_accepted(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            "emit_candidate = true",
+            "emit_candidate = false",
+            1,
+        ).replace(
+            "veto_opposite_side_candidates = false",
+            "veto_opposite_side_candidates = true",
+            1,
+        ).replace(
+            "veto_untradeable_candidates = false",
+            "veto_untradeable_candidates = true",
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_ml_filter_flags.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            cfg = load_app_config(str(cfg_path))
+
+        self.assertFalse(bool(cfg.strategy.ml_candidate.emit_candidate))
+        self.assertTrue(bool(cfg.strategy.ml_candidate.veto_opposite_side_candidates))
+        self.assertTrue(bool(cfg.strategy.ml_candidate.veto_untradeable_candidates))
+
+    def test_ml_candidate_ev_veto_flag_is_accepted(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            "veto_candidate_expected_net_below_min = false",
+            "veto_candidate_expected_net_below_min = true",
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_ml_candidate_ev_veto.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            cfg = load_app_config(str(cfg_path))
+
+        self.assertTrue(bool(cfg.strategy.ml_candidate.veto_candidate_expected_net_below_min))
+
+    def test_ml_candidate_rescore_flag_is_accepted(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            "rescore_baseline_candidates_with_expected_net = false",
+            "rescore_baseline_candidates_with_expected_net = true",
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_ml_candidate_rescore.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            cfg = load_app_config(str(cfg_path))
+
+        self.assertTrue(bool(cfg.strategy.ml_candidate.rescore_baseline_candidates_with_expected_net))
+
     def test_expected_net_max_below_min_is_rejected(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
         patched = str(base_text).replace(

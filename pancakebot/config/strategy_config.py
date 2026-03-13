@@ -140,6 +140,11 @@ class MlCandidateConfig:
     expected_net_max_bnb: float | None = None
     predictability_feature_mode: str = "all_features"
     predictability_label_mode: str = "baseline_log_imbalance_side"
+    emit_candidate: bool = True
+    veto_opposite_side_candidates: bool = False
+    veto_untradeable_candidates: bool = False
+    veto_candidate_expected_net_below_min: bool = False
+    rescore_baseline_candidates_with_expected_net: bool = False
 
 
 @dataclass(frozen=True, slots=True)

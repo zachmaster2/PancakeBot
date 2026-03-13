@@ -2009,3 +2009,389 @@ Updated best-known candidate from Stage Q+R:
      - the ML EV-cap branch as an optional additive candidate
    - If it collapses on longer windows, the next structural pivot should target:
      - score calibration / ranking quality for the combined selector, not just more gate tweaks.
+
+## Update (2026-03-13): Combined-Selector Robustness Failure + ML Filter/Veto Pivot
+
+1. The deferred robustness pass on the thresholded combined selector was completed on
+   older `2000`-round windows (`offsets = 6000,8000,10000`):
+   - thresholded baseline:
+     - router:
+       - `selector_max_score`
+       - `router_score_threshold_bnb = 0.001`
+     - aggregate:
+       - `mean_per_500 = +0.151805`
+       - `worst_per_500 = -0.291743`
+       - `worst_max_drawdown_bnb = 1.562450`
+       - `positive_windows = 1/3`
+   - thresholded ML selector:
+     - router:
+       - `selector_max_score`
+       - `router_score_threshold_bnb = 0.003`
+     - ML overrides:
+       - `min_tradeable_prob = 0.508`
+       - `cutoff_pool_total_min_bnb = 1.5`
+       - `expected_net_max_bnb = 0.005`
+       - `predictability_feature_mode = arrival_microstructure_only`
+       - `predictability_label_mode = contrarian_price_regime_vote_15_30_r20_r60_side`
+     - aggregate:
+       - `mean_per_500 = +0.126639`
+       - `worst_per_500 = -0.291743`
+       - `worst_max_drawdown_bnb = 1.562450`
+       - `positive_windows = 1/3`
+   - interpretation:
+     - the `0.003` standalone-ML combined-selector branch did **not** survive the older
+       windows and was not promotable.
+
+2. Score/ranking follow-up isolated why more threshold tuning was not attractive:
+   - recent `2000 x {0,2000,4000}` with thresholded standalone ML:
+     - `+0.516983 / 500`
+     - ML standalone contribution stayed positive.
+   - older `2000 x {6000,8000,10000}`:
+     - `+0.126639 / 500`
+     - ML standalone contribution was negative.
+   - latest `5000`:
+     - `+0.461140 / 500`
+     - low-score ML bins were mixed.
+   - interpretation:
+     - simple `selector_score_bnb` floor tuning did not produce a stable ranking fix.
+
+3. An online-router calibration follow-up was tested directly on the same ML branch over
+   the latest `2000` rounds:
+   - `selector_max_score @ 0.003`:
+     - `+0.177990 / 500`
+   - `online_cellmean` (`bins=6`, `min_obs=15`, `thr=-0.002`, `dir_split=false`):
+     - `-0.532638 / 500`
+   - `online_cellmean_backoff` with same settings:
+     - `-0.532638 / 500`
+   - `online_cellmean_selector_fallback` with the same online settings plus selector floor
+     `0.003`:
+     - `-0.348760 / 500`
+   - interpretation:
+     - the old online-router calibration path was materially worse than the plain selector
+       path for this current ML branch.
+
+4. Next structural pivot implemented in the shared strategy pipeline:
+   - goal:
+     - stop treating the current ML branch only as a standalone candidate and test it as a
+       baseline filter/veto layer instead.
+   - code changes:
+     - `strategy.ml_candidate` now supports:
+       - `emit_candidate`
+       - `veto_opposite_side_candidates`
+       - `veto_untradeable_candidates`
+     - parser + config loader updated accordingly.
+     - shared pipeline now applies ML veto coupling before routing:
+       - untradeable ML `SKIP` can veto baseline `BET` candidates
+       - ML `BET` can veto opposite-side baseline `BET` candidates
+     - `expected_net_below_min` was added to the shared ML-untradeable veto reason set.
+   - tests added/updated:
+     - loader coverage for the new boolean flags
+     - focused shared-pipeline tests for:
+       - filter-only mode
+       - opposite-side veto
+       - untradeable veto
+       - `expected_net_below_min` veto
+
+5. Latest-`2000` screen on the new coupling modes:
+   - baseline, no ML:
+     - `-0.026200 / 500`
+   - filter-only, opposite-side veto only:
+     - inert; identical to baseline
+   - filter-only, untradeable veto only:
+     - `+0.199550 / 500`
+     - `max_drawdown_bnb = 0.301000`
+   - filter-only, both vetoes:
+     - identical to untradeable-only
+   - net takeaway:
+     - the real lever was:
+       - `emit_candidate = false`
+       - `veto_untradeable_candidates = true`
+     - opposite-side veto was inert in this slice.
+
+6. Official recent multi-offset confirmation of the best new filter-only branch
+   (`2000 x {0,2000,4000}`):
+   - router:
+     - `selector_max_score`
+     - `router_score_threshold_bnb = 0.001`
+   - ML overrides:
+     - `emit_candidate = false`
+     - `veto_untradeable_candidates = true`
+     - `veto_opposite_side_candidates = false`
+     - `min_tradeable_prob = 0.508`
+     - `cutoff_pool_total_min_bnb = 1.5`
+     - `expected_net_max_bnb = 0.005`
+     - `predictability_feature_mode = arrival_microstructure_only`
+     - `predictability_label_mode = contrarian_price_regime_vote_15_30_r20_r60_side`
+   - aggregate:
+     - `mean_per_500 = +0.381938`
+     - `worst_per_500 = +0.199550`
+     - `worst_max_drawdown_bnb = 0.903000`
+     - `positive_windows = 3/3`
+   - all selected bets in this run already had `selector_score_bnb >= 0.008`, so a
+     higher router floor did not change this branch.
+
+7. Older-window confirmation of the same filter-only branch (`2000 x {6000,8000,10000}`):
+   - base variant (`expected_net_min_bnb = 0.0`):
+     - `mean_per_500 = +0.037540`
+     - `worst_per_500 = -0.150500`
+     - `worst_max_drawdown_bnb = 0.602000`
+     - `positive_windows = 1/3`
+   - stricter filter with `expected_net_min_bnb = 0.001`:
+     - `mean_per_500 = +0.069298`
+     - `worst_per_500 = -0.075250`
+     - `worst_max_drawdown_bnb = 0.301000`
+     - `positive_windows = 1/3`
+   - stricter filter with `expected_net_min_bnb = 0.002`:
+     - `mean_per_500 = +0.052126`
+     - `worst_per_500 = -0.075250`
+   - stricter tradeability threshold (`min_tradeable_prob = 0.512`,
+     `expected_net_min_bnb = 0.001`):
+     - `mean_per_500 = +0.001679`
+     - `worst_per_500 = -0.075250`
+   - interpretation:
+     - adding a small positive EV floor (`0.001`) improved old-window safety the most.
+     - higher `min_tradeable_prob` mostly starved the only strong positive old window.
+
+8. Latest `5000` continuous confirm for the best new filter-only branch:
+   - settings:
+     - same as above with `expected_net_min_bnb = 0.0`
+   - result:
+     - `profit_per_500_rounds_bnb = +0.518866`
+     - `net_profit_bnb = +5.188664`
+     - `max_drawdown_bnb = 0.903000`
+     - `num_bets = 51`
+   - this beat the prior standalone-ML latest-`5000` result and the latest baseline run.
+
+9. Research conclusion after the next automatic pivot:
+   - The standalone thresholded ML candidate path is not robust on older windows.
+   - The online-router rescue attempt did not help.
+   - The ML filter-only coupling pivot is real:
+     - it improves recent medium-horizon performance,
+     - materially reduces drawdown,
+     - and makes older losing windows much smaller.
+   - But it still does **not** solve the core objective:
+     - older windows remain mixed,
+     - the best robustness setting is still far below the `2.0 / 500` target.
+
+10. Current best branch from this cycle:
+   - router:
+     - `selector_max_score`
+     - `router_score_threshold_bnb = 0.001`
+   - ML coupling:
+     - `emit_candidate = false`
+     - `veto_untradeable_candidates = true`
+     - `veto_opposite_side_candidates = false`
+   - ML gates:
+     - `min_tradeable_prob = 0.508`
+     - `cutoff_pool_total_min_bnb = 1.5`
+     - `expected_net_min_bnb = 0.001` is the strongest old-window safety point
+     - `expected_net_max_bnb = 0.005`
+     - `predictability_feature_mode = arrival_microstructure_only`
+     - `predictability_label_mode = contrarian_price_regime_vote_15_30_r20_r60_side`
+
+11. Recommended next step from here:
+   - This current generic tradeability filter family now looks close to exhausted.
+   - The next structural pivot should supervise ML directly against baseline-candidate
+     outcomes, not generic market tradeability:
+     - candidate-specific success labels, or
+     - a direction / veto policy tied directly to dislocation-candidate quality.
+   - In other words:
+     - move from “is the market tradeable?” to
+       “should this specific baseline candidate be allowed through?”
+
+## Update (2026-03-13): Candidate-Specific ML EV Coupling + Ranking Pivot
+
+1. Shared-pipeline config surface was extended again so ML can act on baseline candidates
+   directly instead of only emitting its own standalone signal:
+   - added ML config flags:
+     - `veto_candidate_expected_net_below_min`
+     - `rescore_baseline_candidates_with_expected_net`
+   - loader + default config updated.
+   - shared pipeline now supports:
+     - per-candidate ML EV veto
+     - per-candidate ML EV rescoring (replacing `expected_profit_bnb` and
+       `selector_score_bnb` on baseline `BET` candidates before routing)
+   - canonical scenario runner was updated so the new filter/rescore flags are exposed in
+     scenario metadata.
+   - focused tests added for:
+     - config acceptance
+     - candidate-specific veto application
+     - candidate-specific rescoring application
+
+2. First pivot stage: candidate-specific EV veto without ranking rewrite.
+   - setup:
+     - router:
+       - `selector_max_score`
+       - `router_score_threshold_bnb = 0.001`
+     - ML:
+       - `emit_candidate = false`
+       - `veto_candidate_expected_net_below_min = true`
+       - `veto_untradeable_candidates = false`
+       - `rescore_baseline_candidates_with_expected_net = false`
+       - `min_tradeable_prob = 0.508`
+       - `cutoff_pool_total_min_bnb = 1.5`
+       - `expected_net_min_bnb = 0.001`
+       - `expected_net_max_bnb = 0.005`
+       - `predictability_feature_mode = arrival_microstructure_only`
+       - `predictability_label_mode = contrarian_price_regime_vote_15_30_r20_r60_side`
+   - latest `2000`:
+     - `+0.049959 / 500`
+     - `num_bets = 3`
+     - `max_drawdown_bnb = 0.301000`
+   - recent `3 x 2000` (`offsets = 0,2000,4000`):
+     - off0:
+       - `+0.049959 / 500`
+     - off2000:
+       - `+0.194635 / 500`
+     - off4000:
+       - `+0.781750 / 500`
+     - aggregate:
+       - `mean_per_500 = +0.342115`
+       - `worst_per_500 = +0.049959`
+       - `worst_max_drawdown_bnb = 0.653963`
+       - `positive_windows = 3/3`
+   - older `3 x 2000` (`offsets = 6000,8000,10000`):
+     - off6000:
+       - `+0.797682 / 500`
+     - off8000:
+       - `-0.168198 / 500`
+     - off10000:
+       - `-0.033809 / 500`
+     - aggregate:
+       - `mean_per_500 = +0.198559`
+       - `worst_per_500 = -0.168198`
+       - `worst_max_drawdown_bnb = 0.903000`
+       - `positive_windows = 1/3`
+   - latest `5000`:
+     - `+0.466221 / 500`
+     - `num_bets = 43`
+     - `max_drawdown_bnb = 1.241041`
+   - interpretation:
+     - candidate-specific EV veto was a real, different branch:
+       - better average older-window profit than the generic untradeable filter,
+       - but with weaker safety and two negative older windows.
+
+3. Second pivot stage: candidate-specific ML EV rescoring.
+   - pure rescoring without veto regressed on the latest `2000`:
+     - `-0.094057 / 500`
+     - `num_bets = 7`
+     - `max_drawdown_bnb = 1.204000`
+   - adding the EV veto back on top of rescoring was the key combination:
+     - latest `2000`:
+       - `+0.155429 / 500`
+       - `num_bets = 8`
+       - `max_drawdown_bnb = 0.602000`
+     - this clearly beat:
+       - no ML baseline (`-0.026200 / 500`)
+       - candidate-EV veto only (`+0.049959 / 500`)
+       - rescoring only (`-0.094057 / 500`)
+
+4. Official follow-up confirms for the best new branch
+   (`veto_candidate_expected_net_below_min = true` +
+   `rescore_baseline_candidates_with_expected_net = true`):
+   - recent `3 x 2000` (`offsets = 0,2000,4000`):
+     - off0:
+       - `+0.155429 / 500`
+       - `num_bets = 8`
+       - `max_drawdown_bnb = 0.602000`
+     - off2000:
+       - `-0.008213 / 500`
+       - `num_bets = 23`
+       - `max_drawdown_bnb = 1.317745`
+     - off4000:
+       - `+1.169464 / 500`
+       - `num_bets = 27`
+       - `max_drawdown_bnb = 0.392947`
+     - aggregate:
+       - `mean_per_500 = +0.438893`
+       - `worst_per_500 = -0.008213`
+       - `worst_max_drawdown_bnb = 1.317745`
+       - `positive_windows = 2/3`
+   - older `3 x 2000` (`offsets = 6000,8000,10000`):
+     - off6000:
+       - `+0.587659 / 500`
+       - `num_bets = 68`
+       - `max_drawdown_bnb = 1.486940`
+     - off8000:
+       - `+0.120359 / 500`
+       - `num_bets = 11`
+       - `max_drawdown_bnb = 0.672792`
+     - off10000:
+       - `+0.129056 / 500`
+       - `num_bets = 7`
+       - `max_drawdown_bnb = 0.353376`
+     - aggregate:
+       - `mean_per_500 = +0.279025`
+       - `worst_per_500 = +0.120359`
+       - `worst_max_drawdown_bnb = 1.486940`
+       - `positive_windows = 3/3`
+   - latest `5000` continuous:
+     - `+0.495839 / 500`
+     - `net_profit_bnb = +4.958389`
+     - `num_bets = 55`
+     - `max_drawdown_bnb = 1.021529`
+
+5. Exact router-threshold follow-up on the best new branch (using saved trade logs, exact for
+   `selector_max_score` because the selected candidate already has the max score in each round):
+   - threshold `0.001`:
+     - recent mean `+0.438893 / 500`
+     - older mean `+0.279025 / 500`
+     - latest `5000`: `+0.495839 / 500`
+   - threshold `0.002`:
+     - recent mean `+0.412943 / 500`
+     - older mean `+0.286644 / 500`
+     - latest `5000`: `+0.448639 / 500`
+   - threshold `0.003`:
+     - recent mean `+0.412943 / 500`
+     - older mean `+0.311727 / 500`
+     - latest `5000`: `+0.415938 / 500`
+   - threshold `0.004`:
+     - recent mean `+0.346160 / 500`
+     - older mean `+0.336811 / 500`
+     - latest `5000`: `+0.441342 / 500`
+   - conclusion:
+     - `0.001` remains the best overall trade-off once recent + older + long-window behavior
+       are considered together.
+
+6. Current best branch from this cycle:
+   - router:
+     - `selector_max_score`
+     - `router_score_threshold_bnb = 0.001`
+   - ML coupling:
+     - `emit_candidate = false`
+     - `veto_candidate_expected_net_below_min = true`
+     - `rescore_baseline_candidates_with_expected_net = true`
+     - `veto_untradeable_candidates = false`
+     - `veto_opposite_side_candidates = false`
+   - ML gates:
+     - `min_tradeable_prob = 0.508`
+     - `cutoff_pool_total_min_bnb = 1.5`
+     - `expected_net_min_bnb = 0.001`
+     - `expected_net_max_bnb = 0.005`
+     - `predictability_feature_mode = arrival_microstructure_only`
+     - `predictability_label_mode = contrarian_price_regime_vote_15_30_r20_r60_side`
+
+7. Research conclusion after chaining through the next structural plans automatically:
+   - The generic untradeable-veto family was not the end of the line.
+   - Candidate-specific ML EV has real signal for baseline-candidate quality.
+   - Pure rescoring is too aggressive.
+   - The winning combination is:
+     - first veto baseline candidates that are too weak under the ML EV forecast,
+     - then re-rank the surviving baseline candidates by that same ML EV forecast.
+   - This is the strongest robustness result in the ML pivot line so far:
+     - older stressed windows are all positive,
+     - recent windows are strongly positive on average,
+     - latest `5000` is near `+0.50 / 500`.
+   - But it is still far below the `2.0 / 500` objective, so this is a meaningful improvement,
+     not final success.
+
+8. Recommended next step from here:
+   - Keep this branch as the new research leader.
+   - Next highest-signal follow-up:
+     - sweep the candidate-EV floor (`expected_net_min_bnb`) around `0.001`
+       inside the same veto+rescore architecture,
+     - because thresholding now operates on the directly useful candidate-level ML EV signal,
+       not the old generic tradeability score.
+   - If that plateaus quickly:
+     - the next pivot should target richer candidate-specific supervision / ranking features,
+       not a return to the old generic gate family.
