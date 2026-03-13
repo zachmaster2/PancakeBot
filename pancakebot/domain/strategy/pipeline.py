@@ -6,7 +6,7 @@ with the shared strategy router.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from pancakebot.core.constants import GAS_COST_BET_BNB
 from pancakebot.core.errors import InvariantError
@@ -16,6 +16,15 @@ from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterDecision
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
+
+_ML_UNTRADEABLE_SKIP_REASONS = frozenset(
+    {
+        "predictability_below_min",
+        "p_bull_edge_below_min",
+        "expected_net_below_min",
+    }
+)
+_VALID_BET_SIDES = frozenset({"Bull", "Bear"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,11 +211,131 @@ class StrategyPipeline:
         signals = self._dislocation_engine.candidate_signals_for_open_round(round_t=round_t)
         if self._ml_candidate_adapter is not None and bool(self._ml_candidate_adapter.enabled):
             ml_signal = self._ml_candidate_adapter.candidate_signal_for_open_round(round_t=round_t)
-            ml_name = str(ml_signal.candidate_name)
-            if ml_name in signals:
-                raise InvariantError("strategy_pipeline_candidate_name_duplicate")
-            signals[ml_name] = ml_signal
+            signals = self._apply_ml_signal_coupling(
+                round_t=round_t,
+                candidate_signals=signals,
+                ml_signal=ml_signal,
+            )
+            if bool(self._ml_candidate_adapter.emit_candidate):
+                ml_name = str(ml_signal.candidate_name)
+                if ml_name in signals:
+                    raise InvariantError("strategy_pipeline_candidate_name_duplicate")
+                signals[ml_name] = ml_signal
         return dict(signals)
+
+    def _apply_ml_signal_coupling(
+        self,
+        *,
+        round_t: Round,
+        candidate_signals: dict[str, StrategyCandidateSignal],
+        ml_signal: StrategyCandidateSignal,
+    ) -> dict[str, StrategyCandidateSignal]:
+        if self._ml_candidate_adapter is None:
+            return dict(candidate_signals)
+
+        out = dict(candidate_signals)
+        if (
+            bool(self._ml_candidate_adapter.veto_untradeable_candidates)
+            and str(ml_signal.action) == "SKIP"
+            and str(ml_signal.skip_reason or "") in _ML_UNTRADEABLE_SKIP_REASONS
+        ):
+            return {
+                str(name): self._veto_candidate_signal(
+                    signal=signal,
+                    skip_reason="ml_veto_untradeable",
+                )
+                for name, signal in out.items()
+            }
+
+        if (
+            bool(self._ml_candidate_adapter.veto_opposite_side_candidates)
+            and str(ml_signal.action) == "BET"
+            and str(ml_signal.bet_side or "") in _VALID_BET_SIDES
+        ):
+            ml_side = str(ml_signal.bet_side)
+            out = {
+                str(name): (
+                    self._veto_candidate_signal(
+                        signal=signal,
+                        skip_reason="ml_veto_opposite_side",
+                    )
+                    if str(signal.action) == "BET"
+                    and str(signal.bet_side or "") in _VALID_BET_SIDES
+                    and str(signal.bet_side) != str(ml_side)
+                    else signal
+                )
+                for name, signal in out.items()
+            }
+
+        if bool(self._ml_candidate_adapter.veto_candidate_expected_net_below_min):
+            out = {
+                str(name): self._veto_candidate_signal(
+                    signal=signal,
+                    skip_reason=str(skip_reason),
+                )
+                if (
+                    (
+                        skip_reason := self._ml_candidate_adapter.candidate_veto_skip_reason_for_open_round(
+                            round_t=round_t,
+                            candidate_signal=signal,
+                        )
+                    )
+                    is not None
+                )
+                else signal
+                for name, signal in out.items()
+            }
+        if bool(self._ml_candidate_adapter.rescore_baseline_candidates_with_expected_net):
+            out = {
+                str(name): (
+                    self._rescore_candidate_signal(
+                        signal=signal,
+                        expected_profit_bnb=float(expected_net),
+                    )
+                    if expected_net is not None
+                    else signal
+                )
+                for name, signal in out.items()
+                for expected_net in [
+                    self._ml_candidate_adapter.candidate_expected_net_for_open_round(
+                        round_t=round_t,
+                        candidate_signal=signal,
+                    )
+                ]
+            }
+        return out
+
+    @staticmethod
+    def _veto_candidate_signal(
+        *,
+        signal: StrategyCandidateSignal,
+        skip_reason: str,
+    ) -> StrategyCandidateSignal:
+        if str(signal.action) != "BET":
+            return signal
+        return replace(
+            signal,
+            action="SKIP",
+            bet_side=None,
+            bet_size_bnb=0.0,
+            expected_profit_bnb=None,
+            selector_score_bnb=None,
+            skip_reason=str(skip_reason),
+        )
+
+    @staticmethod
+    def _rescore_candidate_signal(
+        *,
+        signal: StrategyCandidateSignal,
+        expected_profit_bnb: float,
+    ) -> StrategyCandidateSignal:
+        if str(signal.action) != "BET":
+            return signal
+        return replace(
+            signal,
+            expected_profit_bnb=float(expected_profit_bnb),
+            selector_score_bnb=float(expected_profit_bnb),
+        )
 
     def _settle_providers(self, *, rounds: list[Round]) -> None:
         self._dislocation_engine.settle_closed_rounds(list(rounds))

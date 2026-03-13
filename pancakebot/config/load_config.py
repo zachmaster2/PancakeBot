@@ -277,6 +277,11 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         "predictability_baseline_bet_bnb",
         "predictability_feature_mode",
         "predictability_label_mode",
+        "emit_candidate",
+        "veto_opposite_side_candidates",
+        "veto_untradeable_candidates",
+        "veto_candidate_expected_net_below_min",
+        "rescore_baseline_candidates_with_expected_net",
         "random_seed",
     }
     _validate_unknown_keys("strategy_ml_candidate", candidate, allowed)
@@ -355,6 +360,31 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
     predictability_label_mode = validate_predictability_label_mode(
         _opt_str(candidate, "predictability_label_mode", DEFAULT_PREDICTABILITY_LABEL_MODE)
     )
+    emit_candidate = _opt_bool(
+        candidate,
+        "emit_candidate",
+        bool(MlCandidateConfig.__dataclass_fields__["emit_candidate"].default),
+    )
+    veto_opposite_side_candidates = _opt_bool(
+        candidate,
+        "veto_opposite_side_candidates",
+        bool(MlCandidateConfig.__dataclass_fields__["veto_opposite_side_candidates"].default),
+    )
+    veto_untradeable_candidates = _opt_bool(
+        candidate,
+        "veto_untradeable_candidates",
+        bool(MlCandidateConfig.__dataclass_fields__["veto_untradeable_candidates"].default),
+    )
+    veto_candidate_expected_net_below_min = _opt_bool(
+        candidate,
+        "veto_candidate_expected_net_below_min",
+        bool(MlCandidateConfig.__dataclass_fields__["veto_candidate_expected_net_below_min"].default),
+    )
+    rescore_baseline_candidates_with_expected_net = _opt_bool(
+        candidate,
+        "rescore_baseline_candidates_with_expected_net",
+        bool(MlCandidateConfig.__dataclass_fields__["rescore_baseline_candidates_with_expected_net"].default),
+    )
 
     random_seed = _req_int(candidate, "random_seed")
     if int(random_seed) < 0:
@@ -384,6 +414,11 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         ),
         predictability_feature_mode=str(predictability_feature_mode),
         predictability_label_mode=str(predictability_label_mode),
+        emit_candidate=bool(emit_candidate),
+        veto_opposite_side_candidates=bool(veto_opposite_side_candidates),
+        veto_untradeable_candidates=bool(veto_untradeable_candidates),
+        veto_candidate_expected_net_below_min=bool(veto_candidate_expected_net_below_min),
+        rescore_baseline_candidates_with_expected_net=bool(rescore_baseline_candidates_with_expected_net),
     )
 
 
