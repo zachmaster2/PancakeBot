@@ -137,6 +137,7 @@ class MlCandidateConfig:
     recency_weight_power: float
     predictability_baseline_bet_bnb: float
     random_seed: int
+    expected_net_max_bnb: float | None = None
     predictability_feature_mode: str = "all_features"
     predictability_label_mode: str = "baseline_log_imbalance_side"
 

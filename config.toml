@@ -408,6 +408,8 @@ min_tradeable_prob = 0.51
 min_prob_edge = 0.0015
 cutoff_pool_total_min_bnb = 1.2
 expected_net_min_bnb = 0.0
+# Optional EV ceiling for the ML candidate; omit to disable.
+# expected_net_max_bnb = 0.005
 train_size = 8000
 calibrate_size = 4000
 retrain_interval = 500

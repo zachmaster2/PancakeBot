@@ -61,6 +61,35 @@ class LoadConfigMlAliasTests(unittest.TestCase):
         self.assertEqual("arrival_microstructure_plus_regime", cfg.strategy.ml_candidate.predictability_feature_mode)
         self.assertEqual("either_side_profitable", cfg.strategy.ml_candidate.predictability_label_mode)
 
+    def test_expected_net_max_is_accepted(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            "expected_net_min_bnb = 0.0",
+            "expected_net_min_bnb = 0.0\nexpected_net_max_bnb = 0.005",
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_ml_expected_net_max.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            cfg = load_app_config(str(cfg_path))
+
+        self.assertEqual(0.005, float(cfg.strategy.ml_candidate.expected_net_max_bnb))
+
+    def test_expected_net_max_below_min_is_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            "expected_net_min_bnb = 0.0",
+            "expected_net_min_bnb = 0.01\nexpected_net_max_bnb = 0.005",
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_ml_expected_net_max_invalid.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
     def test_invalid_predictability_feature_mode_is_rejected(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
         patched = str(base_text).replace(

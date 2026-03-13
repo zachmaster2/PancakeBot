@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -36,6 +37,7 @@ class MlCandidateAdapterTests(unittest.TestCase):
             recency_weight_power=2.0,
             predictability_baseline_bet_bnb=0.05,
             random_seed=1337,
+            expected_net_max_bnb=None,
         )
 
     def test_disabled_ml_candidate_emits_skip_signal(self) -> None:
@@ -180,6 +182,89 @@ class MlCandidateAdapterTests(unittest.TestCase):
         cache = adapter._final_pool_projection_cache  # noqa: SLF001
         self.assertIn(projection_key, cache)
         self.assertEqual((3.0, 1.8, 1.2), cache[projection_key])
+
+    def test_expected_net_above_max_skips_candidate(self) -> None:
+        cfg = self._ml_cfg(enabled=True, name="ml_test")
+        cfg = replace(cfg, expected_net_max_bnb=0.01)
+        adapter = MlCandidateAdapter(
+            config=cfg,
+            cutoff_seconds=17,
+            treasury_fee_fraction=0.03,
+            klines_store_like=object(),
+        )
+
+        history_round = Round(
+            epoch=122,
+            start_at=999_700,
+            lock_at=1_000_000,
+            close_at=1_000_300,
+            lock_price=600.0,
+            close_price=601.0,
+            position="Bull",
+            failed=False,
+            bets=(),
+        )
+        adapter.settle_closed_rounds(rounds=[history_round])
+
+        round_t = Round(
+            epoch=123,
+            start_at=1_000_000,
+            lock_at=1_000_300,
+            close_at=1_000_600,
+            lock_price=600.0,
+            close_price=601.0,
+            position="Bull",
+            failed=False,
+            bets=(
+                Bet(
+                    wallet_address="0xabc",
+                    amount_wei=int(BNB_WEI),
+                    position="Bull",
+                    created_at=1_000_250,
+                ),
+                Bet(
+                    wallet_address="0xdef",
+                    amount_wei=int(BNB_WEI),
+                    position="Bear",
+                    created_at=1_000_250,
+                ),
+            ),
+        )
+
+        fake_price_model = SimpleNamespace(predict=lambda _rows: [0.2])
+        fake_pool_model = SimpleNamespace(predict=lambda _rows: [(2.0, 0.6)])
+        fake_state = SimpleNamespace(
+            models=SimpleNamespace(price_model=fake_price_model, pool_model=fake_pool_model),
+            calibrator_final=object(),
+        )
+
+        with (
+            patch(
+                "pancakebot.domain.strategy.ml_candidate_adapter.max_required_prior_context_rounds_size",
+                return_value=1,
+            ),
+            patch(
+                "pancakebot.domain.strategy.ml_candidate_adapter.ensure_state",
+                return_value=fake_state,
+            ),
+            patch.object(
+                MlCandidateAdapter,
+                "_feature_vector_for_round",
+                return_value=[0.1, 0.2],
+            ),
+            patch(
+                "pancakebot.domain.strategy.ml_candidate_adapter.predict_probabilities",
+                return_value=0.8,
+            ),
+            patch(
+                "pancakebot.domain.strategy.ml_candidate_adapter.predict_tradeable_probability",
+                return_value=0.9,
+            ),
+        ):
+            signal = adapter.candidate_signal_for_open_round(round_t=round_t)
+
+        self.assertEqual("SKIP", signal.action)
+        self.assertEqual("expected_net_above_max", signal.skip_reason)
 
 
 if __name__ == "__main__":

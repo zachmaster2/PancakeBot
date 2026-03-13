@@ -35,6 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--offsets", type=str, default="0,5000,10000")
     p.add_argument("--initial-bankroll-bnb", type=float, default=None)
     p.add_argument("--router-mode", type=str, default="selector_max_score")
+    p.add_argument("--router-score-threshold-bnb", type=float, default=None)
     p.add_argument("--stake-scale", type=float, default=1.0)
     p.add_argument(
         "--candidate-overrides-json",
@@ -305,6 +306,11 @@ def main() -> None:
         tuned_candidates = (_tuned_for_name(str(target_name)),)
     dislocation_cfg = replace(cfg.strategy.dislocation, candidates=tuned_candidates)
     router_cfg = replace(cfg.strategy.router, mode=str(args.router_mode))
+    if args.router_score_threshold_bnb is not None:
+        router_cfg = replace(
+            router_cfg,
+            score_threshold_bnb=float(args.router_score_threshold_bnb),
+        )
     strategy_cfg = replace(
         cfg.strategy,
         dislocation=dislocation_cfg,
@@ -444,6 +450,7 @@ def main() -> None:
                 "name_prefix": str(args.name_prefix),
                 "candidate_name": str(target_name),
                 "router_mode": str(args.router_mode),
+                "router_score_threshold_bnb": float(router_cfg.score_threshold_bnb),
                 "sim_size": int(sim_size),
                 "offsets": [int(x) for x in offsets],
                 "stake_scale": float(args.stake_scale),

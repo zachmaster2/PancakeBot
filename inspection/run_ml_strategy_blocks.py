@@ -231,6 +231,7 @@ def _predict_round_decision(
     min_prob_edge: float,
     cutoff_pool_total_min_bnb: float,
     expected_net_min_bnb: float,
+    expected_net_max_bnb: float | None,
 ) -> MlDecision:
     k = int(max_required_prior_context_rounds_size())
     if len(history_rounds) < int(k):
@@ -379,6 +380,21 @@ def _predict_round_decision(
             bet_size_bnb=0.0,
         )
 
+    if expected_net_max_bnb is not None and float(best_ev) > float(expected_net_max_bnb):
+        return MlDecision(
+            action="SKIP",
+            direction=None,
+            skip_reason="expected_net_above_max",
+            p_bull=float(p_bull),
+            p_market_bull=float(p_market_bull),
+            dislocation_bull=float(dislocation_bull),
+            expected_net_bull=float(ev_bull),
+            expected_net_bear=float(ev_bear),
+            expected_net_selected=float(best_ev),
+            pool_total_bnb_cutoff=float(pool_total_bnb),
+            bet_size_bnb=0.0,
+        )
+
     return MlDecision(
         action="BET",
         direction=str(direction),
@@ -410,6 +426,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-prob-edge", type=float, default=0.02)
     parser.add_argument("--cutoff-pool-total-min-bnb", type=float, default=1.2)
     parser.add_argument("--expected-net-min-bnb", type=float, default=0.0)
+    parser.add_argument("--expected-net-max-bnb", type=float, default=None)
     parser.add_argument("--train-size", type=int, default=20000)
     parser.add_argument("--calibrate-size", type=int, default=2000)
     parser.add_argument("--retrain-interval", type=int, default=500)
@@ -448,6 +465,11 @@ def main() -> None:
         raise InvariantError("ml_fixed_bet_nonpositive")
     if float(args.initial_bankroll_bnb) <= 0.0:
         raise InvariantError("ml_initial_bankroll_nonpositive")
+    if args.expected_net_max_bnb is not None:
+        if float(args.expected_net_max_bnb) < 0.0:
+            raise InvariantError("ml_expected_net_max_negative")
+        if float(args.expected_net_max_bnb) < float(args.expected_net_min_bnb):
+            raise InvariantError("ml_expected_net_max_below_min")
 
     constants = load_contract_constants()
     cfg = MlWalkForwardConfig(
@@ -579,6 +601,9 @@ def main() -> None:
                 min_prob_edge=float(args.min_prob_edge),
                 cutoff_pool_total_min_bnb=float(args.cutoff_pool_total_min_bnb),
                 expected_net_min_bnb=float(args.expected_net_min_bnb),
+                expected_net_max_bnb=(
+                    None if args.expected_net_max_bnb is None else float(args.expected_net_max_bnb)
+                ),
             )
 
             profit_bnb = 0.0
@@ -642,6 +667,9 @@ def main() -> None:
                 "min_prob_edge": float(args.min_prob_edge),
                 "cutoff_pool_total_min_bnb": float(args.cutoff_pool_total_min_bnb),
                 "expected_net_min_bnb": float(args.expected_net_min_bnb),
+                "expected_net_max_bnb": (
+                    None if args.expected_net_max_bnb is None else float(args.expected_net_max_bnb)
+                ),
                 "train_size": int(cfg.train_size),
                 "calibrate_size": int(cfg.calibrate_size),
                 "retrain_interval": int(cfg.retrain_interval),
