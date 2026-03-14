@@ -2395,3 +2395,278 @@ Updated best-known candidate from Stage Q+R:
    - If that plateaus quickly:
      - the next pivot should target richer candidate-specific supervision / ranking features,
        not a return to the old generic gate family.
+
+## Update (2026-03-13): Full-History Ranking at 1 Gwei + Baseline Reset
+
+1. User clarified the comparison standard:
+   - treat `1 gwei` as the default realistic on-chain gas assumption.
+   - future comparisons should be judged against the best full-history result at `1 gwei`,
+     not against mixed-gas or shorter-window leaders.
+
+2. Full usable history definition for current dataset/config:
+   - settled rounds available: `100984`
+   - selector warmup: `50000`
+   - max continuous evaluated span after warmup: `50984`
+
+3. Full-history replays run at `1 gwei` (`PANCAKEBOT_GAS_PRICE_WEI_OVERRIDE=1000000000`):
+   - thresholded selector baseline (`selector_max_score`, router floor `0.001`, ML off):
+     - command:
+       - `.\.venv\Scripts\python.exe -m inspection.run_alta_single_idea --name-prefix combo_selector_baseline_thr0p001_full50984_gas1_20260313 --sim-size 50984 --offsets 0 --keep-all-candidates --router-mode selector_max_score --router-score-threshold-bnb 0.001`
+     - result:
+       - `net_profit_bnb = +8.396034`
+       - `per_500 = +0.082340`
+       - `max_drawdown_bnb = 4.217983`
+       - `num_bets = 382`
+   - model-gate selector baseline (`baseline_modelgate_selector_p0p5`, ML off):
+     - command:
+       - `.\.venv\Scripts\python.exe -m inspection.run_alta_single_idea --name-prefix fullhistory_modelgate_selector_p0p5_gas1_20260313 --sim-size 50984 --offsets 0 --keep-all-candidates --apply-overrides-to-all-candidates --router-mode selector_max_score --set pool_total_gate_mode=projected_final_model_only --set projected_final_pool_total_min_bnb=0.5`
+     - result:
+       - `net_profit_bnb = +11.134439`
+       - `per_500 = +0.109195`
+       - `max_drawdown_bnb = 2.990543`
+       - `num_bets = 265`
+   - ML veto+rescore branch:
+     - command:
+       - `.\.venv\Scripts\python.exe -m inspection.run_alta_single_idea --name-prefix ml_candidateev_veto_rescore_full50984_gas1_20260313 --sim-size 50984 --offsets 0 --keep-all-candidates --router-mode selector_max_score --router-score-threshold-bnb 0.001 --ml-enabled true --ml-set min_tradeable_prob=0.508 --ml-set cutoff_pool_total_min_bnb=1.5 --ml-set expected_net_min_bnb=0.001 --ml-set expected_net_max_bnb=0.005 --ml-set predictability_feature_mode=arrival_microstructure_only --ml-set predictability_label_mode=contrarian_price_regime_vote_15_30_r20_r60_side --ml-set emit_candidate=false --ml-set veto_opposite_side_candidates=false --ml-set veto_untradeable_candidates=false --ml-set veto_candidate_expected_net_below_min=true --ml-set rescore_baseline_candidates_with_expected_net=true`
+     - result:
+       - `net_profit_bnb = +4.397520`
+       - `per_500 = +0.043126`
+       - `max_drawdown_bnb = 5.442559`
+       - `num_bets = 264`
+   - tuned core online baseline (`online_cellmean`, bins `6`, min_obs `15`, thr `-0.002`, no split):
+     - command:
+       - `.\.venv\Scripts\python.exe -m inspection.run_backtest_router_matrix --name-prefix fullhistory_core_online_gas1_20260313 --sim-size 50984 --reset-mode continuous --router-modes online_cellmean --online-warmup-rounds 50000 --online-num-quantile-bins 6 --online-min-cell-obs 15 --online-score-thresholds -0.002 --online-use-direction-split-list false`
+     - result:
+       - `net_profit_bnb = +0.933823`
+       - `per_500 = +0.009158`
+       - `max_drawdown_bnb = 6.655228`
+       - `num_bets = 426`
+
+4. Decision:
+   - New baseline for future work is `baseline_modelgate_selector_p0p5` at `1 gwei`.
+   - Reason:
+     - it produced the best full-history result among the serious contenders rerun on the same
+       `50984`-round span,
+     - and it also beat the thresholded selector baseline on both profit and drawdown.
+
+5. Going-forward comparison rule:
+   - Unless explicitly stated otherwise, compare all new ideas against:
+     - gas assumption: `1 gwei`
+     - history span: full usable history when practical (`50984` rounds continuous after warmup)
+     - baseline path:
+       - router `selector_max_score`
+       - ML disabled
+       - candidate override applied to all active candidates:
+         - `pool_total_gate_mode = projected_final_model_only`
+         - `projected_final_pool_total_min_bnb = 0.5`
+
+6. Important interpretation:
+   - This is the best full-history benchmark currently known, not a success-state.
+   - Even the new baseline only delivered `+0.109195 / 500`, still far below the project goal
+     of `+2.0 / 500`.
+
+## Update (2026-03-14): Baseline Attribution + First Attribution-Driven Improvement
+
+1. New inspection tooling added for canonical backtest attribution:
+   - script:
+     - `inspection/run_backtest_feature_attribution.py`
+   - tests:
+     - `tests/test_run_backtest_feature_attribution.py`
+   - purpose:
+     - join a canonical backtest trade log to canonical v8 feature rows,
+     - emit strategy/side summaries and feature-decile attribution tables for both
+       `all_rounds` and `bet_rounds`,
+     - keep future regime diagnosis inside the shared pipeline path rather than legacy tooling.
+
+2. Baseline attribution run on locked benchmark
+   (`baseline_modelgate_selector_p0p5`, full usable history, `1 gwei`):
+   - artifact prefix:
+     - `baseline_modelgate_selector_p0p5_gas1_fullhistory_attr_20260314`
+   - core findings:
+     - total result remained:
+       - `+11.134439 BNB`
+       - `+0.109195 / 500`
+       - `265` bets
+     - selected-strategy contribution:
+       - `disloc_altB_20260227_x80`: `+8.586730 BNB` on `130` bets
+       - `disloc_altA_20260227_x80`: `+2.547709 BNB` on `135` bets
+     - strategy-side contribution:
+       - `altB|Bull`: `+4.903785`
+       - `altB|Bear`: `+3.682945`
+       - `altA|Bull`: `+2.773210`
+       - `altA|Bear`: `-0.225501`
+   - strongest `all_rounds` positive pockets:
+     - highest `total_sum_w_p_0_to_p_100` decile: `+1.152495 / 500`
+     - most negative `log_imb_w_p_0_to_p_100` decile: `+0.931149 / 500`
+     - `regime_streak_len = 1` pocket: `+0.465387 / 500`
+     - high `regime_flip_rate_r_20` pocket (`~0.58-0.63`): `+0.401758 / 500`
+     - highest `bet_top1_share_w_p_80_to_p_100` decile: `+0.343991 / 500`
+   - weakest `all_rounds` pockets:
+     - near-neutral `late_log_imb` (`~ -0.05 to +0.22`): `-0.192828 / 500`
+     - neutral `regime_bull_frac_r_60` (`~0.47-0.50`): `-0.133236 / 500`
+     - low `bet_top1_share_w_p_80_to_p_100` (`~0.22-0.26`): `-0.133194 / 500`
+     - low `regime_flip_rate_r_20` (`~0.11-0.37`): `-0.103232 / 500`
+   - interpretation:
+     - the baseline edge is concentrated in stronger market-extreme / one-sided-flow pockets,
+       while the persistent losses sit in more neutral or sticky regimes.
+
+3. Attribution-driven full-history probe set at `1 gwei`
+   (all against the locked baseline benchmark):
+   - `projected_final_pool_total_min_bnb = 1.0`:
+     - identical to baseline on this span (`+0.109195 / 500`), so baseline-selected bets
+       were already above that threshold.
+   - `projected_final_pool_total_min_bnb = 1.5`:
+     - regressed to `+0.098348 / 500`, though DD improved to `2.485217`.
+   - `flow_gate_mode = against_side`, `flow_min_imbalance = 0.15` applied to all candidates:
+     - regressed hard to `+0.053091 / 500`.
+   - `market_extreme_min = 0.02` applied to all candidates, while keeping
+     `projected_final_pool_total_min_bnb = 0.5`:
+     - improved to `+0.141524 / 500`
+     - net `+14.430901 BNB`
+     - max DD `2.553999`
+     - `275` bets
+   - conclusion:
+     - the attribution signal translated into a real improvement via a modest
+       market-extreme gate.
+
+4. Tight sweep around the new signal (`market_extreme_min` at `1 gwei`, full `50984`):
+   - `0.01`: `+0.123279 / 500`, DD `3.292786`
+   - `0.02`: `+0.141524 / 500`, DD `2.553999`
+   - `0.03`: `+0.098380 / 500`, DD `2.986093`
+   - `0.05`: `+0.094672 / 500`, DD `2.475311`
+   - `0.08`: `+0.026482 / 500`, DD `5.149081`
+   - conclusion:
+     - `market_extreme_min = 0.02` is the best observed point in this local family.
+
+5. Multi-offset robustness check at `1 gwei` (`sim=45000`, offsets `0,1500,3000,4500,5500`):
+   - locked comparison baseline
+     (`baseline_modelgate_selector_p0p5`):
+     - `mean_per500 = +0.102579`
+     - `worst_per500 = +0.069659`
+     - `worst_max_drawdown_bnb = 2.990543`
+     - `positive_windows = 5/5`
+   - attribution-driven variant
+     (`baseline_modelgate_selector_p0p5 + market_extreme_min=0.02`):
+     - `mean_per500 = +0.125663`
+     - `worst_per500 = +0.075672`
+     - `worst_max_drawdown_bnb = 2.553999`
+     - `positive_windows = 5/5`
+   - interpretation:
+     - the improvement is not a single-window artifact.
+     - this is the new research leader, but not the new comparison baseline unless explicitly promoted.
+
+6. Attribution on the new research leader (`market_extreme_min = 0.02`):
+   - artifact prefix:
+     - `baseline_modelgate_selector_p0p5_mext0p02_gas1_fullhistory_attr_20260314`
+   - selected-strategy contribution:
+     - `altB`: `+10.835634` on `159` bets
+     - `altA`: `+3.595268` on `116` bets
+   - strategy-side contribution:
+     - `altB|Bull`: `+8.202794`
+     - `altB|Bear`: `+2.632840`
+     - `altA|Bull`: `+3.476476`
+     - `altA|Bear`: `+0.118792`
+   - key interpretation:
+     - the market-extreme gate largely fixed the old `altA|Bear` drag and improved the bull side most.
+     - remaining weak pockets still cluster around neutral regime mixes (`regime_bull_frac_r_20/r_60`
+       near `0.5`) and near-zero `late_log_imb`.
+
+7. Recommended next step from here:
+   - Keep the official comparison baseline unchanged as requested:
+     - `baseline_modelgate_selector_p0p5` at `1 gwei`.
+   - Treat `market_extreme_min = 0.02` as the new research leader to beat.
+   - Next highest-signal structural follow-up:
+     - build a candidate family or router overlay that explicitly avoids the still-bad
+       neutral/near-zero-late-imbalance pockets,
+     - with special attention to candidate-specific side behavior (`altA|Bear` was the weak leg
+       before the market-extreme filter).
+
+## Update (2026-03-14): Late-Veto Promotion, Old-Family Exhaustion, and Inactive-Candidate Tooling
+
+1. New research leader promoted on full usable history (`50984` rounds, `1 gwei`):
+   - base branch:
+     - `baseline_modelgate_selector_p0p5`
+   - added overlays:
+     - `market_extreme_min = 0.02`
+     - `late_model_veto_enabled = true`
+     - `late_model_veto_min_late_ratio = 0.05`
+     - `late_model_veto_min_abs_imbalance = 0.10`
+   - full-history result:
+     - `+14.724817 BNB`
+     - `+0.144406 / 500`
+     - `max_dd = 2.327951`
+     - `274` bets
+   - interpretation:
+     - this is the best full-history result currently known, but it is still only a research leader.
+     - the official user baseline remains `baseline_modelgate_selector_p0p5` unless explicitly promoted.
+
+2. Robustness confirm for the new leader (`sim=45000`, offsets `0,1500,3000,4500,5500`, `1 gwei`):
+   - new leader:
+     - `mean_per500 = +0.127960`
+     - `worst_per500 = +0.078184`
+     - `worst_max_drawdown_bnb = 2.327951`
+     - `positive_windows = 5/5`
+   - direct comparison:
+     - locked baseline: `mean +0.102579`, `worst +0.069659`, `worst_dd 2.990543`
+     - prior research leader (`market_extreme_min=0.02` only):
+       - `mean +0.125663`
+       - `worst +0.075672`
+       - `worst_dd 2.553999`
+   - interpretation:
+     - the late-veto gain survived the same multi-offset promotion gate.
+
+3. Follow-up overlay probe on the new leader:
+   - pre-cutoff `shock_filter` was tested on top of the new leader and failed.
+   - representative results:
+     - moderate filter (`window=20s`, `min_total=0.25`, `min_abs_imb=0.60`, `surge=1.5`):
+       - `+0.014741 / 500`
+       - only `26` bets
+     - stricter filter (`window=20s`, `min_total=0.50`, `min_abs_imb=0.80`, `surge=2.5`):
+       - `+0.045353 / 500`
+       - `143` bets
+   - conclusion:
+     - the shock-filter path is too blunt for this family and should not be pursued further
+       without redesign.
+
+4. Tooling added to search inactive config-defined candidate families without mutating `config.toml`:
+   - `inspection/backtest_harness_common.py`:
+     - added `load_all_dislocation_candidates(...)`
+   - `inspection/run_alta_single_idea.py`:
+     - added `--candidate-source active|all_config`
+   - tests:
+     - `tests/test_run_alta_single_idea.py`
+   - purpose:
+     - allow research runs against inactive candidate blocks already present in `config.toml`
+       while keeping the official active baseline unchanged.
+
+5. Inactive-family screen under the current research overlays
+   (`projected_final_pool_total_min_bnb=0.5`, `market_extreme_min=0.02`,
+   `late_model_veto=(0.05, 0.10)`, full history, `1 gwei`):
+   - `disloc_stageH_sidenowcast_when_market_disagree_perfflip...` alone:
+     - `+0.054874 / 500`
+     - `max_dd = 3.108462`
+   - `disloc_stageB_side_adaptive_shadow...` alone:
+     - `-0.002917 / 500`
+   - `disloc_best_20260227_x80` alone:
+     - `-0.004272 / 500`
+   - `disloc_cons_20260227_x80` alone:
+     - `-0.004272 / 500`
+   - `disloc_stageG2_r37_x80` alone:
+     - `-0.489566 / 500`
+     - bankroll nearly fully destroyed
+   - `altA + altB + stageH` ensemble:
+     - `+0.009344 / 500`
+     - `max_dd = 6.811733`
+   - conclusion:
+     - none of the inactive families beat the current research leader.
+     - stage-H was positive by itself but destructive in the real router competition.
+     - the old/inactive candidate family search is exhausted under the current `1 gwei` regime.
+
+6. Recommended next step from here:
+   - Keep the official baseline unchanged:
+     - `baseline_modelgate_selector_p0p5` at `1 gwei`.
+   - Keep the new research leader for future comparisons:
+     - `baseline_modelgate_selector_p0p5 + market_extreme_min=0.02 + late_model_veto(0.05, 0.10)`
+   - Stop spending cycles on old candidate families and blunt overlay filters.
+   - Next real move should be a new candidate design or score source aimed directly at the
+     remaining neutral / weak-late-imbalance loss pockets, not another local sweep of the old families.

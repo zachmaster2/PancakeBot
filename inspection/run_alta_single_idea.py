@@ -12,6 +12,7 @@ from pancakebot.core.errors import InvariantError
 
 from inspection.backtest_harness_common import (
     load_cfg,
+    load_all_dislocation_candidates,
     max_drawdown_bnb,
     render_table,
     resolve_exp_root,
@@ -30,6 +31,13 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Optional comma-separated candidate subset to run.",
+    )
+    p.add_argument(
+        "--candidate-source",
+        type=str,
+        choices=("active", "all_config"),
+        default="active",
+        help="Whether candidate lookup should use only active candidates or all config-defined candidates.",
     )
     p.add_argument("--sim-size", type=int, default=30000)
     p.add_argument("--offsets", type=str, default="0,5000,10000")
@@ -102,6 +110,15 @@ def _parse_name_list(raw: str) -> list[str]:
 def _count_jsonl_lines(path: Path) -> int:
     with Path(path).open("r", encoding="utf-8") as f:
         return int(sum(1 for _ in f))
+
+
+def _candidate_pool(*, cfg, config_path: str, candidate_source: str) -> tuple[Any, ...]:
+    source = str(candidate_source)
+    if source == "active":
+        return tuple(cfg.strategy.dislocation.candidates)
+    if source == "all_config":
+        return load_all_dislocation_candidates(config_path=str(config_path))
+    raise InvariantError(f"altA_single_idea_candidate_source_unknown: {candidate_source}")
 
 
 def _selected_mix(*, trades_csv_path: Path, limit: int) -> str:
@@ -258,7 +275,12 @@ def main() -> None:
                 f"altA_single_idea_sim_window_exceeds_history: needed={needed} total={total_rounds}"
             )
 
-    c_map = {str(c.name): c for c in cfg.strategy.dislocation.candidates}
+    candidate_pool = _candidate_pool(
+        cfg=cfg,
+        config_path=str(args.config),
+        candidate_source=str(args.candidate_source),
+    )
+    c_map = {str(c.name): c for c in candidate_pool}
     target_name = str(args.candidate_name)
     if str(target_name) not in c_map:
         raise InvariantError(f"altA_single_idea_candidate_missing: {target_name}")
@@ -301,7 +323,7 @@ def main() -> None:
             tuned_list.append(_tuned_for_name(str(name)))
         tuned_candidates = tuple(tuned_list)
     elif bool(args.keep_all_candidates):
-        tuned_candidates = tuple(_tuned_for_name(str(c.name)) for c in cfg.strategy.dislocation.candidates)
+        tuned_candidates = tuple(_tuned_for_name(str(c.name)) for c in candidate_pool)
     else:
         tuned_candidates = (_tuned_for_name(str(target_name)),)
     dislocation_cfg = replace(cfg.strategy.dislocation, candidates=tuned_candidates)
