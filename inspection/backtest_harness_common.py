@@ -5,13 +5,14 @@ import json
 import os
 import shutil
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from pancakebot.backtest.config import BacktestConfig
 from pancakebot.backtest.runner import run_backtest
-from pancakebot.config.load_config import load_app_config
+from pancakebot.config.load_config import _parse_dislocation_candidate, load_app_config
 from pancakebot.config.strategy_config import StrategyConfig
 from pancakebot.core.determinism import set_global_determinism
 from pancakebot.core.errors import InvariantError
@@ -44,6 +45,41 @@ def load_cfg(*, config_path: str):
     cfg = load_app_config(str(config_path))
     set_global_determinism(seed=int(cfg.random_seed))
     return cfg
+
+
+def load_all_dislocation_candidates(*, config_path: str) -> tuple[Any, ...]:
+    config = Path(str(config_path))
+    if not config.exists():
+        raise InvariantError(f"config_file_missing: {config_path}")
+    try:
+        raw = tomllib.loads(config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise InvariantError(f"config_toml_parse_failed: {e}") from e
+    if not isinstance(raw, dict):
+        raise InvariantError("config_root_not_dict")
+    strategy = raw.get("strategy")
+    if not isinstance(strategy, dict):
+        raise InvariantError("config_section_not_dict: strategy")
+    dislocation = strategy.get("dislocation")
+    if not isinstance(dislocation, dict):
+        raise InvariantError("config_section_not_dict: strategy.dislocation")
+    candidates_obj = dislocation.get("candidates")
+    if not isinstance(candidates_obj, list):
+        raise InvariantError("config_section_not_list: strategy.dislocation.candidates")
+    if not candidates_obj:
+        raise InvariantError("dislocation_candidates_empty")
+    parsed: list[Any] = []
+    seen_names: set[str] = set()
+    for idx, item in enumerate(candidates_obj):
+        if not isinstance(item, dict):
+            raise InvariantError(f"dislocation_candidate_not_dict: idx={idx}")
+        cfg = _parse_dislocation_candidate(item, idx=idx)
+        key = str(cfg.name)
+        if key in seen_names:
+            raise InvariantError(f"dislocation_candidate_name_duplicate: {key}")
+        seen_names.add(key)
+        parsed.append(cfg)
+    return tuple(parsed)
 
 
 def resolve_exp_root() -> Path:
