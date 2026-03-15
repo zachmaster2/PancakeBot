@@ -7,6 +7,16 @@ from pancakebot.config.strategy_config import StrategyConfig
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeStatePathsConfig:
+    """Filesystem paths for mutable runtime state shared by live and dry modes."""
+
+    claim_scan_cursor_path: str
+    dry_bets_path: str
+    dry_settled_epochs_path: str
+    dry_audit_trades_path: str
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     """User-facing configuration loaded from config.toml."""
 
@@ -28,6 +38,9 @@ class AppConfig:
     latency_log_path: str
     wait_for_bet_receipt: bool
     bet_receipt_timeout_seconds: int
+
+    # Runtime state paths
+    runtime_state_paths: RuntimeStatePathsConfig
 
     # Strategy
     strategy: StrategyConfig

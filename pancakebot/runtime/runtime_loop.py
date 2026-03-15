@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
+from pancakebot.config.app_config import RuntimeStatePathsConfig
 from pancakebot.config.strategy_config import StrategyConfig
 from pancakebot.core.constants import (
     BNB_WEI,
@@ -56,11 +57,7 @@ _LOCK_SAFETY_MARGIN_SECONDS = 5  # locked
 # Extra cushion added to the claim-check wake time to avoid alignment retries near Graph/RPC boundaries.
 _CLAIM_CHECK_PADDING_SECONDS = 5
 
-_CLAIM_CURSOR_PATH = "var/claim_scan_cursor.txt"  # locked
 _CLAIM_BATCH_SIZE = 10
-_DRY_BETS_PATH = "var/dry_bets.jsonl"
-_DRY_SETTLED_PATH = "var/dry_settled_epochs.txt"
-_DRY_AUDIT_TRADES_CSV = "var/dry_audit_trades.csv"
 _BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
@@ -120,6 +117,14 @@ class RuntimeConfig:
 
     # Backtest-only state snapshot cache root directory.
     backtest_state_cache_dir: str = "../PancakeBot_var_exp/backtest_state_cache"
+
+    # Mutable runtime state paths used by live/dry loops.
+    runtime_state_paths: RuntimeStatePathsConfig = RuntimeStatePathsConfig(
+        claim_scan_cursor_path="var/runtime/claim_scan_cursor.txt",
+        dry_bets_path="var/runtime/dry_bets.jsonl",
+        dry_settled_epochs_path="var/runtime/dry_settled_epochs.txt",
+        dry_audit_trades_path="var/runtime/dry_audit_trades.csv",
+    )
 
 
 @dataclass(slots=True)
@@ -354,6 +359,7 @@ def _append_dry_settled_epoch(path: str, epoch: int) -> None:
 
 
 def _dry_record_bet(
+    cfg: RuntimeConfig,
     closed: _ClosedState,
     *,
     epoch: int,
@@ -378,7 +384,7 @@ def _dry_record_bet(
         "bankroll_after_bet_bnb": float(bankroll_after_bet_bnb),
     }
     closed.dry_bets_by_epoch[int(epoch)] = rec
-    _append_jsonl(str(_DRY_BETS_PATH), rec)
+    _append_jsonl(str(cfg.runtime_state_paths.dry_bets_path), rec)
 
 
 def _ensure_dry_audit_csv(path: str) -> list[str]:
@@ -448,7 +454,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             raise InvariantError("dry_bet_bnb_type_invalid")
         if bet_bnb <= 0:
             closed.dry_settled_epochs.add(e)
-            _append_dry_settled_epoch(_DRY_SETTLED_PATH, e)
+            _append_dry_settled_epoch(str(cfg.runtime_state_paths.dry_settled_epochs_path), e)
             continue
 
         settle = settle_bet_against_closed_round(
@@ -519,7 +525,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             placed_ts_val = ""
 
         _append_dry_audit_row(
-            _DRY_AUDIT_TRADES_CSV,
+            str(cfg.runtime_state_paths.dry_audit_trades_path),
             {
                 "epoch": int(e),
                 "placed_ts": placed_ts_val,
@@ -543,7 +549,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         )
 
         closed.dry_settled_epochs.add(e)
-        _append_dry_settled_epoch(_DRY_SETTLED_PATH, e)
+        _append_dry_settled_epoch(str(cfg.runtime_state_paths.dry_settled_epochs_path), e)
 
 
 def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
@@ -640,9 +646,11 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
 
     if cfg.dry:
         closed.simulated_bankroll_bnb = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
-        closed.dry_bets_by_epoch = _load_dry_bets(_DRY_BETS_PATH)
-        closed.dry_settled_epochs = _load_dry_settled_epochs(_DRY_SETTLED_PATH)
-        _ensure_dry_audit_csv(_DRY_AUDIT_TRADES_CSV)
+        closed.dry_bets_by_epoch = _load_dry_bets(str(cfg.runtime_state_paths.dry_bets_path))
+        closed.dry_settled_epochs = _load_dry_settled_epochs(
+            str(cfg.runtime_state_paths.dry_settled_epochs_path)
+        )
+        _ensure_dry_audit_csv(str(cfg.runtime_state_paths.dry_audit_trades_path))
 
     return closed
 
@@ -667,7 +675,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 contract=cfg.contract,
                 wallet_address=cfg.wallet_address,
                 dry=bool(cfg.dry),
-                cursor_path=str(_CLAIM_CURSOR_PATH),
+                cursor_path=str(cfg.runtime_state_paths.claim_scan_cursor_path),
                 locked_epoch=int(locked_epoch),
                 current_epoch=int(current_epoch),
                 now_ts=int(now_ts()),
@@ -956,6 +964,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 ),
             )
             _dry_record_bet(
+                cfg,
                 closed,
                 epoch=int(current_epoch),
                 side=str(decision.bet_side),
@@ -1433,7 +1442,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
         contract=cfg.contract,
         wallet_address=cfg.wallet_address,
         dry=bool(cfg.dry),
-        cursor_path=str(_CLAIM_CURSOR_PATH),
+        cursor_path=str(cfg.runtime_state_paths.claim_scan_cursor_path),
         locked_epoch=int(locked_epoch2),
         current_epoch=int(current_epoch2),
         now_ts=int(now_ts()),
