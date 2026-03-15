@@ -6,7 +6,7 @@ from typing import Any
 import tomllib
 
 from pancakebot.backtest.config import BacktestConfig
-from pancakebot.config.app_config import AppConfig
+from pancakebot.config.app_config import AppConfig, RuntimeStatePathsConfig
 from pancakebot.config.strategy_config import (
     DislocationCandidateConfig,
     DislocationSelectorConfig,
@@ -1052,7 +1052,7 @@ def load_app_config(path: str) -> AppConfig:
         raise InvariantError(f"config_file_missing: {path}")
 
     try:
-        raw = tomllib.loads(p.read_text())
+        raw = tomllib.loads(p.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise InvariantError(f"config_toml_parse_failed: {e}") from e
 
@@ -1080,6 +1080,21 @@ def load_app_config(path: str) -> AppConfig:
     if not isinstance(backtest, dict):
         raise InvariantError("config_section_not_dict: backtest")
 
+    allowed_path_keys = {
+        "closed_rounds_path",
+        "klines_path",
+        "feature_cache_path",
+        "backtest_state_cache_dir",
+        "market_data_db_path",
+        "projection_cache_db_path",
+        "run_registry_db_path",
+        "claim_scan_cursor_path",
+        "dry_bets_path",
+        "dry_settled_epochs_path",
+        "dry_audit_trades_path",
+    }
+    _validate_unknown_keys("paths", paths, allowed_path_keys)
+
     closed_rounds_path = _req_str(paths, "closed_rounds_path")
     klines_path = _opt_str(paths, "klines_path", "var/klines.jsonl")
     feature_cache_path = _opt_str(paths, "feature_cache_path", "../PancakeBot_var_exp/feature_cache_v8.sqlite")
@@ -1103,6 +1118,28 @@ def load_app_config(path: str) -> AppConfig:
         "run_registry_db_path",
         "../PancakeBot_var_exp/run_registry_v1.sqlite",
     )
+    claim_scan_cursor_path = _opt_str(
+        paths,
+        "claim_scan_cursor_path",
+        "var/runtime/claim_scan_cursor.txt",
+    )
+    dry_bets_path = _opt_str(
+        paths,
+        "dry_bets_path",
+        "var/runtime/dry_bets.jsonl",
+    )
+    dry_settled_epochs_path = _opt_str(
+        paths,
+        "dry_settled_epochs_path",
+        "var/runtime/dry_settled_epochs.txt",
+    )
+    dry_audit_trades_path = _opt_str(
+        paths,
+        "dry_audit_trades_path",
+        "var/runtime/dry_audit_trades.csv",
+    )
+
+    _validate_unknown_keys("graph", graph, {"abi_json_path"})
     abi_json_path = _req_str(graph, "abi_json_path")
 
     allowed_runtime_keys = {
@@ -1191,6 +1228,12 @@ def load_app_config(path: str) -> AppConfig:
         latency_log_path=str(latency_log_path),
         wait_for_bet_receipt=bool(wait_for_bet_receipt),
         bet_receipt_timeout_seconds=int(bet_receipt_timeout_seconds),
+        runtime_state_paths=RuntimeStatePathsConfig(
+            claim_scan_cursor_path=str(claim_scan_cursor_path),
+            dry_bets_path=str(dry_bets_path),
+            dry_settled_epochs_path=str(dry_settled_epochs_path),
+            dry_audit_trades_path=str(dry_audit_trades_path),
+        ),
         strategy=strategy_cfg,
         backtest=backtest_cfg,
     )

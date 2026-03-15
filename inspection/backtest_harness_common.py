@@ -188,6 +188,7 @@ def build_runtime_cfg(
                 gas_price_wei=int(gas_price_wei_override),
             )
         ),
+        runtime_state_paths=cfg.runtime_state_paths,
     )
 
 

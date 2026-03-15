@@ -176,6 +176,7 @@ def _runtime_cfg_from_app(*, cfg, strategy_cfg: StrategyConfig) -> RuntimeConfig
         projection_cache_store=projection_cache_store,
         run_registry_store=run_registry_store,
         backtest_state_cache_dir=str(cfg.backtest_state_cache_dir),
+        runtime_state_paths=cfg.runtime_state_paths,
     )
 
 

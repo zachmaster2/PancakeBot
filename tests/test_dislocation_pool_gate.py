@@ -33,7 +33,18 @@ from pancakebot.domain.types import Bet, Round
 
 class DislocationPoolGateTests(unittest.TestCase):
     def test_candidate_defaults_use_cutoff_only_gate(self) -> None:
-        cfg = load_app_config("config.toml")
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = base_text.replace(
+            'active_candidate_names = [\n  "disloc_altA_20260227_x80",\n  "disloc_altB_20260227_x80",\n]\n',
+            'active_candidate_names = [\n  "disloc_best_20260227_x80"\n]\n',
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_default_candidate.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            cfg = load_app_config(str(cfg_path))
+
         candidate = cfg.strategy.dislocation.candidates[0]
         self.assertEqual("cutoff_only", candidate.pool_total_gate_mode)
         self.assertAlmostEqual(1.0, float(candidate.projected_final_pool_multiplier))
@@ -89,9 +100,8 @@ class DislocationPoolGateTests(unittest.TestCase):
     def test_parse_projected_gate_fields(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
         patched = base_text.replace(
-            'name = "disloc_altA_20260227_x80"\n',
+            'pool_total_gate_mode = "projected_final_model_only"\nprojected_final_pool_total_min_bnb = 0.5\n',
             (
-                'name = "disloc_altA_20260227_x80"\n'
                 'pool_total_gate_mode = "projected_final_only"\n'
                 "projected_final_pool_multiplier = 1.8\n"
                 "projected_final_pool_total_min_bnb = 2.0\n"
@@ -112,11 +122,8 @@ class DislocationPoolGateTests(unittest.TestCase):
     def test_invalid_pool_total_gate_mode_rejected(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
         patched = base_text.replace(
-            'name = "disloc_altA_20260227_x80"\n',
-            (
-                'name = "disloc_altA_20260227_x80"\n'
-                'pool_total_gate_mode = "bad_mode"\n'
-            ),
+            'pool_total_gate_mode = "projected_final_model_only"',
+            'pool_total_gate_mode = "bad_mode"',
             1,
         )
 
@@ -198,11 +205,8 @@ class DislocationPoolGateTests(unittest.TestCase):
     def test_invalid_bear_expected_net_extra_min_rejected(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
         patched = base_text.replace(
-            'name = "disloc_altA_20260227_x80"\n',
-            (
-                'name = "disloc_altA_20260227_x80"\n'
-                "bear_expected_net_extra_min_bnb = -0.01\n"
-            ),
+            "bear_expected_net_extra_min_bnb = 0.01",
+            "bear_expected_net_extra_min_bnb = -0.01",
             1,
         )
 

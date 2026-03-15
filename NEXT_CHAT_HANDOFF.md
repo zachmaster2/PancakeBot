@@ -2772,3 +2772,54 @@ Updated best-known candidate from Stage Q+R:
      - rerun the candidate-profit branch with cache hits on the `+0.193092` leader overlays,
      - only continue ML iteration if it beats the current leader on full history; otherwise stop
        spending cycles on this ML coupling line.
+
+## Update (2026-03-15): Promoted Official Baseline and Dry-Run Readiness Cleanup
+
+1. Official baseline is now promoted in code, not just in notes:
+   - active candidates:
+     - `disloc_altA_20260227_x80`
+     - `disloc_altB_20260227_x80`
+   - shared candidate overlay in `config.toml`:
+     - `pool_total_gate_mode = projected_final_model_only`
+     - `projected_final_pool_total_min_bnb = 0.5`
+     - `market_extreme_min = 0.02`
+     - `late_model_veto_enabled = true`
+     - `late_model_veto_min_late_ratio = 0.05`
+     - `late_model_veto_min_abs_imbalance = 0.10`
+   - candidate-specific overlay:
+     - `disloc_altA_20260227_x80: bear_expected_net_extra_min_bnb = 0.01`
+   - router:
+     - `mode = online_selector_score_fallback`
+     - `online_score_threshold_bnb = 0.008`
+
+2. Shared gas accounting is now aligned with the promoted baseline:
+   - default accounting gas moved to `1 gwei`.
+   - this removes the old mismatch where dry/live defaulted to `5 gwei` accounting
+     while research/baseline comparisons were being judged at `1 gwei`.
+
+3. Dry/live runtime state is now explicit config instead of hidden hard-coded paths:
+   - new `[paths]` keys:
+     - `claim_scan_cursor_path`
+     - `dry_bets_path`
+     - `dry_settled_epochs_path`
+     - `dry_audit_trades_path`
+   - default location is now under `var/runtime/`.
+   - impact:
+     - week-long dry runs can be smoke-tested and reset more safely,
+     - path drift is covered by config-load tests.
+
+4. New reproducible preset for the promoted baseline:
+   - `inspection/presets/baseline_online_selector_fallback_gas1_fullhistory_v1.json`
+   - benchmark snapshot:
+     - net `+19.689196 BNB`
+     - `+0.193092 / 500`
+     - `max_dd = 2.027066`
+     - `379` bets
+
+5. New config-lock coverage:
+   - current baseline defaults are now asserted by test.
+   - runtime-state path overrides and unknown-path-key rejection are also covered.
+
+6. Immediate next step after this cleanup:
+   - run a short shared-pipeline smoke on the promoted baseline,
+   - then start the real dry-mode smoke run from `config.toml`.

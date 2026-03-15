@@ -1,0 +1,48 @@
+{
+  "name": "baseline_online_selector_fallback_gas1_fullhistory_v1",
+  "script": "inspection.run_alta_single_idea",
+  "description": "Official current baseline: online-selector leader on full usable history at 1 gwei.",
+  "env": {
+    "PANCAKEBOT_GAS_PRICE_WEI_OVERRIDE": "1000000000"
+  },
+  "replay_command": [
+    ".venv\\Scripts\\python.exe",
+    "-m",
+    "inspection.run_alta_single_idea",
+    "--name-prefix",
+    "baseline_online_selector_fallback_gas1_fullhistory_v1_replay",
+    "--sim-size",
+    "50984",
+    "--offsets",
+    "0",
+    "--candidate-names",
+    "disloc_altA_20260227_x80,disloc_altB_20260227_x80",
+    "--router-mode",
+    "online_selector_score_fallback",
+    "--router-set",
+    "online_score_threshold_bnb=0.008",
+    "--apply-overrides-to-all-candidates",
+    "--set",
+    "pool_total_gate_mode=projected_final_model_only",
+    "--set",
+    "projected_final_pool_total_min_bnb=0.5",
+    "--set",
+    "market_extreme_min=0.02",
+    "--set",
+    "late_model_veto_enabled=true",
+    "--set",
+    "late_model_veto_min_late_ratio=0.05",
+    "--set",
+    "late_model_veto_min_abs_imbalance=0.10",
+    "--candidate-set",
+    "disloc_altA_20260227_x80:bear_expected_net_extra_min_bnb=0.01"
+  ],
+  "benchmark_snapshot": {
+    "source_table_json": "../PancakeBot_var_exp/fullhistory_p0p5_mext0p02_lateveto005_010_altAbearextra001_onlineselscorefallback_thr0008_gas1_20260314_table.json",
+    "net_profit_bnb": 19.689196117807318,
+    "profit_per_500_rounds_bnb": 0.19309214629622867,
+    "max_drawdown_bnb": 2.0270657511445826,
+    "loss_from_initial_to_min_bnb": 0.45407088355749605,
+    "num_bets": 379
+  }
+}

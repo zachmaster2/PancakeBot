@@ -45,9 +45,9 @@ BNB_WEI = 1_000_000_000_000_000_000
 
 # --- Gas foundation (v1.0 frozen) ---
 
-# Deterministic gas *cost* accounting used for EV/backtest bankroll.
-# NOTE: Runtime transaction gas pricing policy is intentionally separate.
-GAS_PRICE_WEI = 5_000_000_000
+# Deterministic gas *cost* accounting used for EV/backtest/dry bankroll.
+# Runtime transaction submission still uses on-chain gas suggestions.
+GAS_PRICE_WEI = 1_000_000_000
 
 # Deterministic gas limits (used for cost accounting; may also be used as tx gas limits).
 GAS_LIMIT_BET = 200_000
