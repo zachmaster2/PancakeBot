@@ -2670,3 +2670,105 @@ Updated best-known candidate from Stage Q+R:
    - Stop spending cycles on old candidate families and blunt overlay filters.
    - Next real move should be a new candidate design or score source aimed directly at the
      remaining neutral / weak-late-imbalance loss pockets, not another local sweep of the old families.
+
+## Update (2026-03-15): Online-Selector Research Leader, Late-Flow Exhaustion, and ML Throughput Bottleneck
+
+1. New best full-history research leader at `1 gwei`:
+   - branch:
+     - `baseline_modelgate_selector_p0p5`
+     - `pool_total_gate_mode = projected_final_model_only`
+     - `projected_final_pool_total_min_bnb = 0.5`
+     - `market_extreme_min = 0.02`
+     - `late_model_veto_enabled = true`
+     - `late_model_veto_min_late_ratio = 0.05`
+     - `late_model_veto_min_abs_imbalance = 0.10`
+     - `disloc_altA_20260227_x80: bear_expected_net_extra_min_bnb = 0.01`
+     - router:
+       - `mode = online_selector_score_fallback`
+       - `online_score_threshold_bnb = 0.008`
+   - full usable history (`50984` rounds after warmup):
+     - `+19.689196 BNB`
+     - `+0.193092 / 500`
+     - `max_dd = 2.027066`
+     - `loss_from_initial_to_min = 0.454071`
+     - `379` bets
+   - artifact:
+     - `../PancakeBot_var_exp/fullhistory_p0p5_mext0p02_lateveto005_010_altAbearextra001_onlineselscorefallback_thr0008_gas1_20260314_table.json`
+   - interpretation:
+     - this is materially stronger than the prior `+0.144406 / 500` leader.
+     - official baseline for user-facing comparison still remains `baseline_modelgate_selector_p0p5`
+       unless explicitly promoted.
+
+2. Attribution on the `+0.193092 / 500` leader:
+   - artifact prefix:
+     - `../PancakeBot_var_exp/feature_attr_p0p5_mext0p02_lateveto005_010_altAbearextra001_onlineselscorefallback_thr0008_gas1_20260314`
+   - selected-strategy contribution:
+     - `altB`: `209` bets
+     - `altA`: `170` bets
+   - side contribution from direct trade grouping:
+     - `altA Bull`: `+8.057224`
+     - `altB Bull`: `+6.582831`
+     - `altB Bear`: `+3.633972`
+     - `altA Bear`: `+1.415169`
+   - interpretation:
+     - all four active side buckets are positive now.
+     - remaining weakness still clusters in ambiguous late-flow / middling-regime pockets.
+
+3. Full-history late-flow follow-ups on top of the new leader:
+   - `nowcast_market_gap_min = 0.01`: identical to leader.
+   - `nowcast_market_gap_min = 0.02`: identical to leader.
+   - mild side-aware late-support skip gate:
+     - `+12.162755 BNB`
+     - `+0.119280 / 500`
+     - `max_dd = 3.349909`
+   - continuous late-support EV bonus:
+     - `late_support_ev_scale_bnb = 0.02`: identical to leader.
+     - `late_support_ev_scale_bnb = 0.10`: identical to leader.
+   - late-conflict flip:
+     - `late_model_conflict_flip_enabled = true`: identical to leader.
+   - conclusion:
+     - the cheap dislocation-only late-flow structural space now looks exhausted.
+     - new late-flow knobs either did nothing on the leader slice or made it worse.
+
+4. Code promoted in this cycle:
+   - router/context expansion and tests:
+     - `pancakebot/domain/strategy/router.py`
+     - `tests/test_strategy_router.py`
+   - late-flow candidate metadata and controls:
+     - `pancakebot/domain/strategy/candidate_signal.py`
+     - `pancakebot/domain/strategy/dislocation_engine.py`
+     - `pancakebot/config/strategy_config.py`
+     - `pancakebot/config/load_config.py`
+     - `tests/test_dislocation_pool_gate.py`
+   - ML baseline-candidate profit calibration plumbing:
+     - `pancakebot/domain/strategy/ml_candidate_adapter.py`
+     - `pancakebot/domain/strategy/pipeline.py`
+     - `tests/test_ml_candidate_adapter.py`
+     - `tests/test_strategy_pipeline.py`
+     - `tests/test_load_config_ml_aliases.py`
+   - harness/CLI support:
+     - `inspection/run_alta_single_idea.py`
+     - `inspection/run_backtest_scenario.py`
+     - `tests/test_run_alta_single_idea.py`
+
+5. ML candidate-profit model status:
+   - logic/tests passed on focused coverage.
+   - a smoke run with `candidate_profit_model_enabled = true` completed cleanly.
+   - practical issue:
+     - full-history uncached runs are too expensive for blind iteration.
+     - one uncached full-history attempt consumed roughly `44` minutes of CPU and did not yield a
+       usable summary after the execution wrapper timed out.
+   - interpretation:
+     - this is the remaining non-dead larger pivot, but it needs a dedicated throughput/cache step
+       before it becomes a usable research loop.
+
+6. Recommended next steps:
+   - Keep official baseline unchanged:
+     - `baseline_modelgate_selector_p0p5` at `1 gwei`.
+   - Treat the `+0.193092 / 500` online-selector branch as the research leader to beat.
+   - Next concrete plan:
+     - add an exact-config warm-cache helper for the ML candidate-profit branch so `continuous_initial`
+       state is populated separately from long evaluation runs,
+     - rerun the candidate-profit branch with cache hits on the `+0.193092` leader overlays,
+     - only continue ML iteration if it beats the current leader on full history; otherwise stop
+       spending cycles on this ML coupling line.

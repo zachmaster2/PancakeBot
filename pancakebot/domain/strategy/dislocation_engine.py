@@ -70,7 +70,13 @@ class CandidateConfig:
     projected_final_pool_multiplier: float
     projected_final_pool_total_min_bnb: float
     expected_net_min_bnb: float
+    bull_expected_net_extra_min_bnb: float
     bear_expected_net_extra_min_bnb: float
+    bull_late_min_ratio: float
+    bull_late_min_imbalance: float
+    bear_late_min_ratio: float
+    bear_late_max_imbalance: float
+    late_support_ev_scale_bnb: float
     side_selection_mode: str
     allowed_sides: str
     market_extreme_min: float
@@ -124,9 +130,13 @@ class CandidateConfig:
     shock_filter_min_window_total_bnb: float
     shock_filter_min_abs_imbalance: float
     shock_filter_min_surge_ratio: float
+    late_model_conflict_flip_enabled: bool
     late_model_veto_enabled: bool
     late_model_veto_min_late_ratio: float
     late_model_veto_min_abs_imbalance: float
+    late_model_neutral_filter_enabled: bool
+    late_model_neutral_min_late_ratio: float
+    late_model_neutral_max_abs_imbalance: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +211,8 @@ class _CandidateRoundDecision:
     adaptive_mode_decisions: dict[str, _CoreDecision] | None
     base_side: str | None
     perf_shadow_track: bool
+    projected_late_ratio: float | None = None
+    projected_late_imbalance: float | None = None
 
 
 def _safe_rate(num: int, den: int) -> float:
@@ -326,9 +338,48 @@ def _side_allowed(*, side: str, allowed_sides: str) -> bool:
 def _expected_net_min_for_side(*, cfg: CandidateConfig, side: str) -> float:
     side_u = str(side).upper()
     base = float(cfg.expected_net_min_bnb)
+    if side_u == "BULL":
+        base += max(0.0, float(cfg.bull_expected_net_extra_min_bnb))
     if side_u == "BEAR":
         base += max(0.0, float(cfg.bear_expected_net_extra_min_bnb))
     return float(base)
+
+
+def _late_projection_metrics(
+    *,
+    bull_pool_cutoff_bnb: float,
+    bear_pool_cutoff_bnb: float,
+    projected_final_pool_bull_bnb: float | None,
+    projected_final_pool_bear_bnb: float | None,
+) -> tuple[float, float] | None:
+    if projected_final_pool_bull_bnb is None or projected_final_pool_bear_bnb is None:
+        return None
+
+    cut_bull = max(0.0, float(bull_pool_cutoff_bnb))
+    cut_bear = max(0.0, float(bear_pool_cutoff_bnb))
+    cut_total = float(cut_bull) + float(cut_bear)
+    if float(cut_total) <= 0.0:
+        return None
+
+    final_bull = float(projected_final_pool_bull_bnb)
+    final_bear = float(projected_final_pool_bear_bnb)
+    if (
+        not math.isfinite(float(final_bull))
+        or not math.isfinite(float(final_bear))
+        or float(final_bull) <= 0.0
+        or float(final_bear) <= 0.0
+    ):
+        return None
+
+    late_bull = max(0.0, float(final_bull) - float(cut_bull))
+    late_bear = max(0.0, float(final_bear) - float(cut_bear))
+    late_total = float(late_bull) + float(late_bear)
+    if float(late_total) <= 0.0:
+        return None
+
+    late_ratio = float(late_total) / float(cut_total)
+    late_imb = (float(late_bull) - float(late_bear)) / float(late_total)
+    return float(late_ratio), float(late_imb)
 
 
 def _flow_gate_relaxed_for_dislocation(*, cfg: CandidateConfig, dislocation_bull: float) -> bool:
@@ -540,46 +591,146 @@ def _late_model_veto_triggers(
 ) -> bool:
     if not bool(cfg.late_model_veto_enabled):
         return False
-    if projected_final_pool_bull_bnb is None or projected_final_pool_bear_bnb is None:
+    late_metrics = _late_projection_metrics(
+        bull_pool_cutoff_bnb=float(bull_pool_cutoff_bnb),
+        bear_pool_cutoff_bnb=float(bear_pool_cutoff_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    )
+    if late_metrics is None:
         return False
 
     side_u = str(side).upper()
     if side_u not in ("BULL", "BEAR"):
         return False
 
-    cut_bull = max(0.0, float(bull_pool_cutoff_bnb))
-    cut_bear = max(0.0, float(bear_pool_cutoff_bnb))
-    cut_total = float(cut_bull) + float(cut_bear)
-    if float(cut_total) <= 0.0:
-        return False
-
-    final_bull = float(projected_final_pool_bull_bnb)
-    final_bear = float(projected_final_pool_bear_bnb)
-    if (
-        not math.isfinite(float(final_bull))
-        or not math.isfinite(float(final_bear))
-        or float(final_bull) <= 0.0
-        or float(final_bear) <= 0.0
-    ):
-        return False
-
-    late_bull = max(0.0, float(final_bull) - float(cut_bull))
-    late_bear = max(0.0, float(final_bear) - float(cut_bear))
-    late_total = float(late_bull) + float(late_bear)
-    if float(late_total) <= 0.0:
-        return False
-
-    late_ratio = float(late_total) / float(cut_total)
+    late_ratio, late_imb = late_metrics
     if float(late_ratio) < float(cfg.late_model_veto_min_late_ratio):
         return False
 
-    late_imb = (float(late_bull) - float(late_bear)) / float(late_total)
     if abs(float(late_imb)) < float(cfg.late_model_veto_min_abs_imbalance):
         return False
 
     late_sign = 1 if float(late_imb) > 0.0 else -1
     side_sign = 1 if str(side_u) == "BULL" else -1
     return int(late_sign) != int(side_sign)
+
+
+def _late_model_conflict_flip_side(
+    *,
+    cfg: CandidateConfig,
+    side: str,
+    bull_pool_cutoff_bnb: float,
+    bear_pool_cutoff_bnb: float,
+    projected_final_pool_bull_bnb: float | None,
+    projected_final_pool_bear_bnb: float | None,
+) -> str:
+    if not bool(cfg.late_model_conflict_flip_enabled):
+        return str(side)
+    side_u = str(side).upper()
+    if side_u not in ("BULL", "BEAR"):
+        return str(side)
+    if not _late_model_veto_triggers(
+        cfg=cfg,
+        side=str(side),
+        bull_pool_cutoff_bnb=float(bull_pool_cutoff_bnb),
+        bear_pool_cutoff_bnb=float(bear_pool_cutoff_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    ):
+        return str(side)
+    return "BEAR" if side_u == "BULL" else "BULL"
+
+
+def _late_model_neutral_filter_triggers(
+    *,
+    cfg: CandidateConfig,
+    bull_pool_cutoff_bnb: float,
+    bear_pool_cutoff_bnb: float,
+    projected_final_pool_bull_bnb: float | None,
+    projected_final_pool_bear_bnb: float | None,
+) -> bool:
+    if not bool(cfg.late_model_neutral_filter_enabled):
+        return False
+    late_metrics = _late_projection_metrics(
+        bull_pool_cutoff_bnb=float(bull_pool_cutoff_bnb),
+        bear_pool_cutoff_bnb=float(bear_pool_cutoff_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    )
+    if late_metrics is None:
+        return False
+
+    late_ratio, late_imb = late_metrics
+    if float(late_ratio) < float(cfg.late_model_neutral_min_late_ratio):
+        return False
+
+    return abs(float(late_imb)) <= float(cfg.late_model_neutral_max_abs_imbalance)
+
+
+def _late_side_support_skip_reason(
+    *,
+    cfg: CandidateConfig,
+    side: str,
+    bull_pool_cutoff_bnb: float,
+    bear_pool_cutoff_bnb: float,
+    projected_final_pool_bull_bnb: float | None,
+    projected_final_pool_bear_bnb: float | None,
+) -> str | None:
+    side_u = str(side).upper()
+    if side_u not in ("BULL", "BEAR"):
+        return None
+    late_metrics = _late_projection_metrics(
+        bull_pool_cutoff_bnb=float(bull_pool_cutoff_bnb),
+        bear_pool_cutoff_bnb=float(bear_pool_cutoff_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    )
+    if late_metrics is None:
+        return None
+    late_ratio, late_imb = late_metrics
+
+    if side_u == "BULL":
+        if float(late_ratio) < float(cfg.bull_late_min_ratio):
+            return "projected_late_ratio_below_bull_min"
+        if float(late_imb) < float(cfg.bull_late_min_imbalance):
+            return "projected_late_bull_imbalance_below_min"
+        return None
+
+    if float(late_ratio) < float(cfg.bear_late_min_ratio):
+        return "projected_late_ratio_below_bear_min"
+    if float(late_imb) > float(cfg.bear_late_max_imbalance):
+        return "projected_late_bear_imbalance_above_max"
+    return None
+
+
+def _late_support_ev_adjustment(
+    *,
+    cfg: CandidateConfig,
+    side: str,
+    bull_pool_cutoff_bnb: float,
+    bear_pool_cutoff_bnb: float,
+    projected_final_pool_bull_bnb: float | None,
+    projected_final_pool_bear_bnb: float | None,
+) -> float:
+    scale = float(cfg.late_support_ev_scale_bnb)
+    if float(scale) <= 0.0:
+        return 0.0
+    side_u = str(side).upper()
+    if side_u not in ("BULL", "BEAR"):
+        return 0.0
+    late_metrics = _late_projection_metrics(
+        bull_pool_cutoff_bnb=float(bull_pool_cutoff_bnb),
+        bear_pool_cutoff_bnb=float(bear_pool_cutoff_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    )
+    if late_metrics is None:
+        return 0.0
+    late_ratio, late_imb = late_metrics
+    aligned_imb = float(late_imb) if side_u == "BULL" else -float(late_imb)
+    support_weight = max(0.0, min(1.0, float(late_ratio)))
+    return float(scale) * float(support_weight) * float(aligned_imb)
 
 
 def _pool_total_gate_skip_reason(
@@ -1189,12 +1340,48 @@ def _decide_core(
         else:
             raise InvariantError("dislocation_flow_gate_mode_unknown")
 
+    side = _late_model_conflict_flip_side(
+        cfg=cfg,
+        side=str(side),
+        bull_pool_cutoff_bnb=float(bull_cut_bnb),
+        bear_pool_cutoff_bnb=float(bear_cut_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    )
+
     selected_ev = float(ev_bull) if str(side) == "BULL" else float(ev_bear)
+    selected_ev += _late_support_ev_adjustment(
+        cfg=cfg,
+        side=str(side),
+        bull_pool_cutoff_bnb=float(bull_cut_bnb),
+        bear_pool_cutoff_bnb=float(bear_cut_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    )
     side_ev_gate_bnb = float(expected_net_gate_bnb)
     if math.isfinite(float(side_ev_gate_bnb)):
         side_ev_gate_bnb = max(
             float(side_ev_gate_bnb),
             _expected_net_min_for_side(cfg=cfg, side=str(side)),
+        )
+    if _late_model_neutral_filter_triggers(
+        cfg=cfg,
+        bull_pool_cutoff_bnb=float(bull_cut_bnb),
+        bear_pool_cutoff_bnb=float(bear_cut_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    ):
+        return _CoreDecision(
+            side=None,
+            reason="projected_late_flow_neutral",
+            p_nowcast_bull=float(p_now),
+            p_market_bull=float(p_market_bull),
+            dislocation_bull=float(dislocation_bull),
+            expected_net_bull=float(ev_bull),
+            expected_net_bear=float(ev_bear),
+            expected_net_selected=float(selected_ev),
+            ev_pool_bull_bnb=float(ev_pool_bull_bnb),
+            ev_pool_bear_bnb=float(ev_pool_bear_bnb),
         )
     if _late_model_veto_triggers(
         cfg=cfg,
@@ -1207,6 +1394,27 @@ def _decide_core(
         return _CoreDecision(
             side=None,
             reason="projected_late_flow_against_side",
+            p_nowcast_bull=float(p_now),
+            p_market_bull=float(p_market_bull),
+            dislocation_bull=float(dislocation_bull),
+            expected_net_bull=float(ev_bull),
+            expected_net_bear=float(ev_bear),
+            expected_net_selected=float(selected_ev),
+            ev_pool_bull_bnb=float(ev_pool_bull_bnb),
+            ev_pool_bear_bnb=float(ev_pool_bear_bnb),
+        )
+    late_side_skip_reason = _late_side_support_skip_reason(
+        cfg=cfg,
+        side=str(side),
+        bull_pool_cutoff_bnb=float(bull_cut_bnb),
+        bear_pool_cutoff_bnb=float(bear_cut_bnb),
+        projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+        projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+    )
+    if late_side_skip_reason is not None:
+        return _CoreDecision(
+            side=None,
+            reason=str(late_side_skip_reason),
             p_nowcast_bull=float(p_now),
             p_market_bull=float(p_market_bull),
             dislocation_bull=float(dislocation_bull),
@@ -1711,6 +1919,16 @@ class DislocationEngine:
             dislocation_bull=(
                 float(dec.dislocation_bull) if dec.dislocation_bull is not None else None
             ),
+            projected_late_ratio=(
+                float(dec.projected_late_ratio)
+                if dec.projected_late_ratio is not None
+                else None
+            ),
+            projected_late_imbalance=(
+                float(dec.projected_late_imbalance)
+                if dec.projected_late_imbalance is not None
+                else None
+            ),
         )
 
     def _compute_decisions_for_round(self, *, round_t: Round) -> dict[str, _CandidateRoundDecision]:
@@ -1758,7 +1976,14 @@ class DislocationEngine:
         needs_projection = (
             str(cfg.pool_total_gate_mode) == "projected_final_model_only"
             or _stake_mode_uses_projected_pool_ev(stake_mode=str(cfg.stake_mode))
+            or bool(cfg.late_model_conflict_flip_enabled)
             or bool(cfg.late_model_veto_enabled)
+            or bool(cfg.late_model_neutral_filter_enabled)
+            or float(cfg.late_support_ev_scale_bnb) > 0.0
+            or float(cfg.bull_late_min_ratio) > 0.0
+            or float(cfg.bull_late_min_imbalance) > -1.0
+            or float(cfg.bear_late_min_ratio) > 0.0
+            or float(cfg.bear_late_max_imbalance) < 1.0
         )
         if bool(needs_projection) and self._projected_pool_provider is not None:
             projected = self._projected_pool_provider.predict_final_pools_for_round(round_t=round_t)
@@ -1892,6 +2117,17 @@ class DislocationEngine:
 
         bull_cut = float(pools_now.bull_wei) / float(BNB_WEI)
         bear_cut = float(pools_now.bear_wei) / float(BNB_WEI)
+        late_metrics = _late_projection_metrics(
+            bull_pool_cutoff_bnb=float(bull_cut),
+            bear_pool_cutoff_bnb=float(bear_cut),
+            projected_final_pool_bull_bnb=projected_final_pool_bull_bnb,
+            projected_final_pool_bear_bnb=projected_final_pool_bear_bnb,
+        )
+        projected_late_ratio = None
+        projected_late_imbalance = None
+        if late_metrics is not None:
+            projected_late_ratio = float(late_metrics[0])
+            projected_late_imbalance = float(late_metrics[1])
         ev_pool_bull = (
             float(core.ev_pool_bull_bnb)
             if core.ev_pool_bull_bnb is not None and math.isfinite(float(core.ev_pool_bull_bnb))
@@ -1988,6 +2224,8 @@ class DislocationEngine:
                 adaptive_mode_decisions=adaptive_decisions,
                 base_side=None,
                 perf_shadow_track=False,
+                projected_late_ratio=projected_late_ratio,
+                projected_late_imbalance=projected_late_imbalance,
             )
 
         effective_side = str(core.side)
@@ -2050,6 +2288,8 @@ class DislocationEngine:
                 adaptive_mode_decisions=adaptive_decisions,
                 base_side=str(core.side),
                 perf_shadow_track=bool(perf_shadow_track),
+                projected_late_ratio=projected_late_ratio,
+                projected_late_imbalance=projected_late_imbalance,
             )
 
         return _CandidateRoundDecision(
@@ -2063,6 +2303,8 @@ class DislocationEngine:
             adaptive_mode_decisions=adaptive_decisions,
             base_side=str(core.side),
             perf_shadow_track=bool(perf_shadow_track),
+            projected_late_ratio=projected_late_ratio,
+            projected_late_imbalance=projected_late_imbalance,
         )
 
     def _settle_candidate_decision(
@@ -2397,7 +2639,13 @@ def _to_candidate_config(
         projected_final_pool_multiplier=float(cfg.projected_final_pool_multiplier),
         projected_final_pool_total_min_bnb=float(cfg.projected_final_pool_total_min_bnb),
         expected_net_min_bnb=float(cfg.expected_net_min_bnb),
+        bull_expected_net_extra_min_bnb=float(cfg.bull_expected_net_extra_min_bnb),
         bear_expected_net_extra_min_bnb=float(cfg.bear_expected_net_extra_min_bnb),
+        bull_late_min_ratio=float(cfg.bull_late_min_ratio),
+        bull_late_min_imbalance=float(cfg.bull_late_min_imbalance),
+        bear_late_min_ratio=float(cfg.bear_late_min_ratio),
+        bear_late_max_imbalance=float(cfg.bear_late_max_imbalance),
+        late_support_ev_scale_bnb=float(cfg.late_support_ev_scale_bnb),
         side_selection_mode=str(cfg.side_selection_mode),
         allowed_sides=str(cfg.allowed_sides),
         market_extreme_min=float(cfg.market_extreme_min),
@@ -2451,9 +2699,13 @@ def _to_candidate_config(
         shock_filter_min_window_total_bnb=float(cfg.shock_filter_min_window_total_bnb),
         shock_filter_min_abs_imbalance=float(cfg.shock_filter_min_abs_imbalance),
         shock_filter_min_surge_ratio=float(cfg.shock_filter_min_surge_ratio),
+        late_model_conflict_flip_enabled=bool(cfg.late_model_conflict_flip_enabled),
         late_model_veto_enabled=bool(cfg.late_model_veto_enabled),
         late_model_veto_min_late_ratio=float(cfg.late_model_veto_min_late_ratio),
         late_model_veto_min_abs_imbalance=float(cfg.late_model_veto_min_abs_imbalance),
+        late_model_neutral_filter_enabled=bool(cfg.late_model_neutral_filter_enabled),
+        late_model_neutral_min_late_ratio=float(cfg.late_model_neutral_min_late_ratio),
+        late_model_neutral_max_abs_imbalance=float(cfg.late_model_neutral_max_abs_imbalance),
     )
 
 

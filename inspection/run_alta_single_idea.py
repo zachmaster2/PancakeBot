@@ -44,6 +44,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--initial-bankroll-bnb", type=float, default=None)
     p.add_argument("--router-mode", type=str, default="selector_max_score")
     p.add_argument("--router-score-threshold-bnb", type=float, default=None)
+    p.add_argument(
+        "--router-set",
+        action="append",
+        default=[],
+        help="Router override as key=value. May be repeated.",
+    )
     p.add_argument("--stake-scale", type=float, default=1.0)
     p.add_argument(
         "--candidate-overrides-json",
@@ -56,6 +62,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Candidate override as key=value. May be repeated.",
+    )
+    p.add_argument(
+        "--candidate-set",
+        action="append",
+        default=[],
+        help="Per-candidate override as candidate_name:key=value. May be repeated.",
     )
     p.add_argument(
         "--ml-enabled",
@@ -214,12 +226,40 @@ def _parse_set_overrides(tokens: list[str]) -> dict[str, Any]:
             try:
                 parsed = json.loads(raw_value)
             except json.JSONDecodeError as e:
-                raise InvariantError("altA_single_idea_set_override_json_list_invalid") from e
+                inner = str(raw_value[1:-1]).strip()
+                if inner == "":
+                    parsed = []
+                else:
+                    parsed = [
+                        _coerce_scalar(str(item).strip().strip("'").strip('"'))
+                        for item in str(inner).split(",")
+                        if str(item).strip() != ""
+                    ]
+                    if not parsed:
+                        raise InvariantError("altA_single_idea_set_override_json_list_invalid") from e
             if not isinstance(parsed, list):
                 raise InvariantError("altA_single_idea_set_override_list_expected")
             out[str(key)] = parsed
             continue
         out[str(key)] = _coerce_scalar(raw_value)
+    return out
+
+
+def _parse_candidate_specific_overrides(tokens: list[str]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for token in tokens:
+        text = str(token)
+        if ":" not in text:
+            raise InvariantError(f"altA_single_idea_candidate_set_override_invalid: {text}")
+        candidate_name, remainder = text.split(":", 1)
+        candidate_name = str(candidate_name).strip()
+        if candidate_name == "":
+            raise InvariantError(
+                f"altA_single_idea_candidate_set_override_empty_candidate: {text}"
+            )
+        parsed = _parse_set_overrides([str(remainder)])
+        bucket = out.setdefault(str(candidate_name), {})
+        bucket.update(parsed)
     return out
 
 
@@ -251,6 +291,30 @@ def _apply_candidate_overrides(*, base_candidate: Any, overrides: dict[str, Any]
             continue
         payload[str(key)] = value
     return type(c)(**payload)
+
+
+def _apply_router_overrides(
+    *,
+    base_router: Any,
+    router_mode: str,
+    router_score_threshold_bnb: float | None,
+    router_overrides: dict[str, Any],
+):
+    router_cfg = replace(base_router, mode=str(router_mode))
+    if router_score_threshold_bnb is not None:
+        router_cfg = replace(
+            router_cfg,
+            score_threshold_bnb=float(router_score_threshold_bnb),
+        )
+    if not router_overrides:
+        return router_cfg
+
+    payload = asdict(router_cfg)
+    for key, value in router_overrides.items():
+        if str(key) not in payload:
+            raise InvariantError(f"altA_single_idea_router_override_unknown_field: {key}")
+        payload[str(key)] = value
+    return type(router_cfg)(**payload)
 
 
 def main() -> None:
@@ -288,6 +352,7 @@ def main() -> None:
     overrides = _parse_candidate_overrides(str(args.candidate_overrides_json))
     set_overrides = _parse_set_overrides(list(args.set))
     overrides.update(set_overrides)
+    candidate_specific_overrides = _parse_candidate_specific_overrides(list(args.candidate_set))
 
     ml_cfg = cfg.strategy.ml_candidate
     ml_overrides = _parse_set_overrides(list(args.ml_set))
@@ -300,17 +365,25 @@ def main() -> None:
                 raise InvariantError(f"altA_single_idea_ml_override_unknown_field: {key}")
             payload[str(key)] = value
         ml_cfg = type(ml_cfg)(**payload)
+    router_overrides = _parse_set_overrides(list(args.router_set))
     apply_all = bool(args.apply_overrides_to_all_candidates)
 
     def _tuned_for_name(name: str):
-        base = c_map[str(name)]
+        tuned = c_map[str(name)]
         if bool(apply_all) or str(name) == str(target_name):
-            return _apply_candidate_overrides(
-                base_candidate=base,
+            tuned = _apply_candidate_overrides(
+                base_candidate=tuned,
                 overrides=overrides,
                 stake_scale=float(args.stake_scale),
             )
-        return base
+        extra_overrides = candidate_specific_overrides.get(str(name), {})
+        if extra_overrides:
+            tuned = _apply_candidate_overrides(
+                base_candidate=tuned,
+                overrides=dict(extra_overrides),
+                stake_scale=1.0,
+            )
+        return tuned
 
     if str(args.candidate_names).strip() != "":
         if bool(args.keep_all_candidates):
@@ -327,12 +400,12 @@ def main() -> None:
     else:
         tuned_candidates = (_tuned_for_name(str(target_name)),)
     dislocation_cfg = replace(cfg.strategy.dislocation, candidates=tuned_candidates)
-    router_cfg = replace(cfg.strategy.router, mode=str(args.router_mode))
-    if args.router_score_threshold_bnb is not None:
-        router_cfg = replace(
-            router_cfg,
-            score_threshold_bnb=float(args.router_score_threshold_bnb),
-        )
+    router_cfg = _apply_router_overrides(
+        base_router=cfg.strategy.router,
+        router_mode=str(args.router_mode),
+        router_score_threshold_bnb=args.router_score_threshold_bnb,
+        router_overrides=router_overrides,
+    )
     strategy_cfg = replace(
         cfg.strategy,
         dislocation=dislocation_cfg,
@@ -473,6 +546,7 @@ def main() -> None:
                 "candidate_name": str(target_name),
                 "router_mode": str(args.router_mode),
                 "router_score_threshold_bnb": float(router_cfg.score_threshold_bnb),
+                "router_overrides": dict(router_overrides),
                 "sim_size": int(sim_size),
                 "offsets": [int(x) for x in offsets],
                 "stake_scale": float(args.stake_scale),

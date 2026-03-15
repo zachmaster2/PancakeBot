@@ -20,6 +20,16 @@ _ROUTER_MODES = (
     "online_cellmean_side_gap",
     "online_cellmean_backoff",
     "online_cellmean_selector_fallback",
+    "online_cellmean_selector_gate",
+    "online_selector_score_fallback",
+    "online_selector_score_gate",
+    "online_selector_score_side_gap",
+    "online_selector_score_late_imb_fallback",
+    "online_selector_score_late_imb_gate",
+    "online_selector_score_side_late_fallback",
+    "online_selector_score_side_late_gate",
+    "online_selector_score_side_support_fallback",
+    "online_selector_score_side_support_gate",
 )
 _VALID_BET_SIDES = ("Bull", "Bear")
 
@@ -63,8 +73,8 @@ def _side_idx(side: str) -> int:
 class _OnlineCellRow:
     """Internal online cell-mean row for one candidate-round observation."""
 
-    expected_profit_bnb: float
-    abs_dislocation_bull: float
+    feature_bnb: float
+    context_value: float
     side_idx: int
     realized_profit_bnb: float
 
@@ -210,6 +220,7 @@ class StrategyRouter:
                 use_candidate_backoff=False,
                 allow_selector_fallback=False,
                 require_side_gap=False,
+                prefer_selector_score=False,
             )
         if mode == "online_cellmean_side_gap":
             return self._route_online_cellmean(
@@ -220,6 +231,7 @@ class StrategyRouter:
                 use_candidate_backoff=False,
                 allow_selector_fallback=False,
                 require_side_gap=True,
+                prefer_selector_score=False,
             )
         if mode == "online_cellmean_backoff":
             return self._route_online_cellmean(
@@ -230,6 +242,7 @@ class StrategyRouter:
                 use_candidate_backoff=True,
                 allow_selector_fallback=False,
                 require_side_gap=False,
+                prefer_selector_score=False,
             )
         if mode == "online_cellmean_selector_fallback":
             return self._route_online_cellmean(
@@ -240,6 +253,117 @@ class StrategyRouter:
                 use_candidate_backoff=False,
                 allow_selector_fallback=True,
                 require_side_gap=False,
+                prefer_selector_score=False,
+            )
+        if mode == "online_cellmean_selector_gate":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=False,
+                prefer_selector_score=True,
+            )
+        if mode == "online_selector_score_fallback":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=False,
+                prefer_selector_score=False,
+            )
+        if mode == "online_selector_score_gate":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=False,
+                prefer_selector_score=True,
+            )
+        if mode == "online_selector_score_side_gap":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=True,
+                prefer_selector_score=False,
+            )
+        if mode == "online_selector_score_late_imb_fallback":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=False,
+                prefer_selector_score=False,
+            )
+        if mode == "online_selector_score_late_imb_gate":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=False,
+                prefer_selector_score=True,
+            )
+        if mode == "online_selector_score_side_late_fallback":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=False,
+                prefer_selector_score=False,
+            )
+        if mode == "online_selector_score_side_late_gate":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=False,
+                prefer_selector_score=True,
+            )
+        if mode == "online_selector_score_side_support_fallback":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=False,
+                prefer_selector_score=False,
+            )
+        if mode == "online_selector_score_side_support_gate":
+            return self._route_online_cellmean(
+                candidate_signals=candidate_signals,
+                bankroll_bnb=float(bankroll_bnb),
+                bet_gas_cost_bnb=float(bet_gas_cost_bnb),
+                selector_ready=bool(selector_ready),
+                use_candidate_backoff=False,
+                allow_selector_fallback=True,
+                require_side_gap=False,
+                prefer_selector_score=True,
             )
         raise InvariantError("router_mode_unreachable")
 
@@ -256,6 +380,16 @@ class StrategyRouter:
             "online_cellmean_side_gap",
             "online_cellmean_backoff",
             "online_cellmean_selector_fallback",
+            "online_cellmean_selector_gate",
+            "online_selector_score_fallback",
+            "online_selector_score_gate",
+            "online_selector_score_side_gap",
+            "online_selector_score_late_imb_fallback",
+            "online_selector_score_late_imb_gate",
+            "online_selector_score_side_late_fallback",
+            "online_selector_score_side_late_gate",
+            "online_selector_score_side_support_fallback",
+            "online_selector_score_side_support_gate",
         ):
             return
 
@@ -271,11 +405,11 @@ class StrategyRouter:
                 raise InvariantError("router_candidate_bet_side_invalid")
             if str(candidate_name) not in realized_profit_by_candidate:
                 raise InvariantError("router_observe_missing_realized_profit")
-            if signal.expected_profit_bnb is None or signal.dislocation_bull is None:
+            if signal.dislocation_bull is None:
                 continue
             rows_by_candidate[str(candidate_name)] = _OnlineCellRow(
-                expected_profit_bnb=float(signal.expected_profit_bnb),
-                abs_dislocation_bull=abs(float(signal.dislocation_bull)),
+                feature_bnb=float(self._online_feature_value(signal=signal)),
+                context_value=float(self._online_context_value(signal=signal)),
                 side_idx=int(_side_idx(str(side))),
                 realized_profit_bnb=float(realized_profit_by_candidate[str(candidate_name)]),
             )
@@ -292,7 +426,11 @@ class StrategyRouter:
             raise InvariantError("router_online_edges_missing")
         for candidate_name, row in rows_by_candidate.items():
             ev_edges, dis_edges = self._online_edges_by_candidate[str(candidate_name)]
-            key = self._online_cell_key(row=row, ev_edges=ev_edges, dis_edges=dis_edges)
+            key = self._online_cell_key(
+                row=row,
+                ev_edges=ev_edges,
+                context_edges=dis_edges,
+            )
             sums = self._online_sum_profit_by_candidate[str(candidate_name)]
             counts = self._online_count_by_candidate[str(candidate_name)]
             sums[key] = float(sums.get(key, 0.0) + float(row.realized_profit_bnb))
@@ -352,6 +490,7 @@ class StrategyRouter:
         use_candidate_backoff: bool,
         allow_selector_fallback: bool,
         require_side_gap: bool,
+        prefer_selector_score: bool,
     ) -> StrategyRouterDecision:
         if not bool(self._online_ready):
             return self._skip_decision(skip_reason="router_online_warmup")
@@ -361,7 +500,8 @@ class StrategyRouter:
             return self._skip_decision(skip_reason="router_online_side_gap_requires_direction_split")
 
         best_name: str | None = None
-        best_estimate = float("-inf")
+        best_rank_score = float("-inf")
+        best_output_score = float("-inf")
         for candidate_name, signal in candidate_signals.items():
             if str(signal.action) != "BET":
                 continue
@@ -377,7 +517,7 @@ class StrategyRouter:
             key = self._online_cell_key_for_signal(
                 signal=signal,
                 ev_edges=ev_edges,
-                dis_edges=dis_edges,
+                context_edges=dis_edges,
             )
             counts = self._online_count_by_candidate[str(candidate_name)]
             count = int(counts.get(key, 0))
@@ -404,8 +544,14 @@ class StrategyRouter:
                 if float(estimated) <= float(opposite_estimated):
                     continue
                 estimated = float(estimated) - float(opposite_estimated)
-            if float(estimated) > float(best_estimate):
-                best_estimate = float(estimated)
+            rank_score = float(estimated)
+            output_score = float(estimated)
+            if bool(prefer_selector_score) and signal.selector_score_bnb is not None:
+                rank_score = float(signal.selector_score_bnb)
+                output_score = float(signal.selector_score_bnb)
+            if float(rank_score) > float(best_rank_score):
+                best_rank_score = float(rank_score)
+                best_output_score = float(output_score)
                 best_name = str(candidate_name)
 
         if best_name is None:
@@ -453,7 +599,7 @@ class StrategyRouter:
             signal=signal,
             bankroll_bnb=float(bankroll_bnb),
             bet_gas_cost_bnb=float(bet_gas_cost_bnb),
-            selector_score_bnb=float(best_estimate),
+            selector_score_bnb=float(best_output_score),
         )
 
     def _route_oracle_skip(
@@ -533,11 +679,14 @@ class StrategyRouter:
     def _freeze_online_cells(self) -> None:
         edges_by_candidate: dict[str, tuple[list[float], list[float]]] = {}
         for candidate_name, rows in self._online_warmup_rows_by_candidate.items():
-            ev_values = [float(r.expected_profit_bnb) for r in rows]
-            dis_values = [float(r.abs_dislocation_bull) for r in rows]
+            ev_values = [float(r.feature_bnb) for r in rows]
+            context_values = [float(r.context_value) for r in rows]
             ev_edges = _quantile_edges(ev_values, int(self._config.online_num_quantile_bins))
-            dis_edges = _quantile_edges(dis_values, int(self._config.online_num_quantile_bins))
-            edges_by_candidate[str(candidate_name)] = (ev_edges, dis_edges)
+            context_edges = _quantile_edges(
+                context_values,
+                int(self._config.online_num_quantile_bins),
+            )
+            edges_by_candidate[str(candidate_name)] = (ev_edges, context_edges)
 
         self._online_edges_by_candidate = edges_by_candidate
         for candidate_name, rows in self._online_warmup_rows_by_candidate.items():
@@ -547,9 +696,13 @@ class StrategyRouter:
                 self._online_count_by_candidate[str(candidate_name)] = {}
             sums = self._online_sum_profit_by_candidate[str(candidate_name)]
             counts = self._online_count_by_candidate[str(candidate_name)]
-            ev_edges, dis_edges = edges_by_candidate[str(candidate_name)]
+            ev_edges, context_edges = edges_by_candidate[str(candidate_name)]
             for row in rows:
-                key = self._online_cell_key(row=row, ev_edges=ev_edges, dis_edges=dis_edges)
+                key = self._online_cell_key(
+                    row=row,
+                    ev_edges=ev_edges,
+                    context_edges=context_edges,
+                )
                 sums[key] = float(sums.get(key, 0.0) + float(row.realized_profit_bnb))
                 counts[key] = int(counts.get(key, 0) + 1)
 
@@ -575,33 +728,101 @@ class StrategyRouter:
         *,
         signal: StrategyCandidateSignal,
         ev_edges: list[float],
-        dis_edges: list[float],
+        context_edges: list[float],
     ) -> tuple[int, int, int]:
-        if signal.expected_profit_bnb is None:
-            raise InvariantError("router_online_expected_profit_missing")
-        if signal.dislocation_bull is None:
-            raise InvariantError("router_online_dislocation_missing")
         if signal.bet_side is None:
             raise InvariantError("router_online_bet_side_missing")
         row = _OnlineCellRow(
-            expected_profit_bnb=float(signal.expected_profit_bnb),
-            abs_dislocation_bull=abs(float(signal.dislocation_bull)),
+            feature_bnb=float(self._online_feature_value(signal=signal)),
+            context_value=float(self._online_context_value(signal=signal)),
             side_idx=int(_side_idx(str(signal.bet_side))),
             realized_profit_bnb=0.0,
         )
-        return self._online_cell_key(row=row, ev_edges=ev_edges, dis_edges=dis_edges)
+        return self._online_cell_key(row=row, ev_edges=ev_edges, context_edges=context_edges)
 
     def _online_cell_key(
         self,
         *,
         row: _OnlineCellRow,
         ev_edges: list[float],
-        dis_edges: list[float],
+        context_edges: list[float],
     ) -> tuple[int, int, int]:
-        ev_bin = _bin_index(float(row.expected_profit_bnb), ev_edges)
-        dis_bin = _bin_index(float(row.abs_dislocation_bull), dis_edges)
+        ev_bin = _bin_index(float(row.feature_bnb), ev_edges)
+        context_bin = _bin_index(float(row.context_value), context_edges)
         side_bin = int(row.side_idx) if bool(self._config.online_use_direction_split) else 0
-        return int(ev_bin), int(dis_bin), int(side_bin)
+        return int(ev_bin), int(context_bin), int(side_bin)
+
+    def _online_feature_value(self, *, signal: StrategyCandidateSignal) -> float:
+        if str(self._config.mode) in (
+            "online_selector_score_fallback",
+            "online_selector_score_gate",
+            "online_selector_score_side_gap",
+            "online_selector_score_late_imb_fallback",
+            "online_selector_score_late_imb_gate",
+            "online_selector_score_side_late_fallback",
+            "online_selector_score_side_late_gate",
+            "online_selector_score_side_support_fallback",
+            "online_selector_score_side_support_gate",
+        ):
+            if signal.selector_score_bnb is not None:
+                return float(signal.selector_score_bnb)
+        if signal.expected_profit_bnb is None:
+            raise InvariantError("router_online_expected_profit_missing")
+        return float(signal.expected_profit_bnb)
+
+    def _online_context_value(self, *, signal: StrategyCandidateSignal) -> float:
+        if str(self._config.mode) in (
+            "online_selector_score_late_imb_fallback",
+            "online_selector_score_late_imb_gate",
+        ):
+            if signal.projected_late_imbalance is None:
+                raise InvariantError("router_online_projected_late_imbalance_missing")
+            return float(signal.projected_late_imbalance)
+        if str(self._config.mode) in (
+            "online_selector_score_side_late_fallback",
+            "online_selector_score_side_late_gate",
+        ):
+            return self._selected_side_late_support(signal=signal)
+        if str(self._config.mode) in (
+            "online_selector_score_side_support_fallback",
+            "online_selector_score_side_support_gate",
+        ):
+            return self._selected_side_combined_support(signal=signal)
+        if signal.dislocation_bull is None:
+            raise InvariantError("router_online_dislocation_missing")
+        return abs(float(signal.dislocation_bull))
+
+    @staticmethod
+    def _selected_side_sign(*, signal: StrategyCandidateSignal) -> float:
+        side = str(signal.bet_side or "")
+        if side == "Bull":
+            return 1.0
+        if side == "Bear":
+            return -1.0
+        raise InvariantError("router_candidate_bet_side_invalid")
+
+    @classmethod
+    def _selected_side_late_support(cls, *, signal: StrategyCandidateSignal) -> float:
+        if signal.projected_late_imbalance is None:
+            raise InvariantError("router_online_projected_late_imbalance_missing")
+        return float(cls._selected_side_sign(signal=signal)) * float(signal.projected_late_imbalance)
+
+    @classmethod
+    def _selected_side_nowcast_edge(cls, *, signal: StrategyCandidateSignal) -> float:
+        if signal.p_bull is None:
+            raise InvariantError("router_online_p_bull_missing")
+        support_prob = float(signal.p_bull)
+        if str(signal.bet_side or "") == "Bear":
+            support_prob = 1.0 - float(support_prob)
+        return 2.0 * float(support_prob) - 1.0
+
+    @classmethod
+    def _selected_side_combined_support(cls, *, signal: StrategyCandidateSignal) -> float:
+        nowcast_edge = cls._selected_side_nowcast_edge(signal=signal)
+        if signal.projected_late_imbalance is None:
+            return float(nowcast_edge)
+        late_support = cls._selected_side_late_support(signal=signal)
+        return 0.5 * (float(nowcast_edge) + float(late_support))
 
     @staticmethod
     def _validate_candidate_signals(candidate_signals: dict[str, StrategyCandidateSignal]) -> None:

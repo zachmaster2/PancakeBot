@@ -48,7 +48,13 @@ class DislocationCandidateConfig:
     projected_final_pool_multiplier: float
     projected_final_pool_total_min_bnb: float
     expected_net_min_bnb: float
+    bull_expected_net_extra_min_bnb: float
     bear_expected_net_extra_min_bnb: float
+    bull_late_min_ratio: float
+    bull_late_min_imbalance: float
+    bear_late_min_ratio: float
+    bear_late_max_imbalance: float
+    late_support_ev_scale_bnb: float
     side_selection_mode: str
     allowed_sides: str
     market_extreme_min: float
@@ -102,9 +108,13 @@ class DislocationCandidateConfig:
     shock_filter_min_window_total_bnb: float
     shock_filter_min_abs_imbalance: float
     shock_filter_min_surge_ratio: float
+    late_model_conflict_flip_enabled: bool
     late_model_veto_enabled: bool
     late_model_veto_min_late_ratio: float
     late_model_veto_min_abs_imbalance: float
+    late_model_neutral_filter_enabled: bool
+    late_model_neutral_min_late_ratio: float
+    late_model_neutral_max_abs_imbalance: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +155,10 @@ class MlCandidateConfig:
     veto_untradeable_candidates: bool = False
     veto_candidate_expected_net_below_min: bool = False
     rescore_baseline_candidates_with_expected_net: bool = False
+    candidate_profit_model_enabled: bool = False
+    candidate_profit_model_warmup_rounds: int = 5000
+    candidate_profit_model_num_quantile_bins: int = 8
+    candidate_profit_model_min_cell_obs: int = 5
 
 
 @dataclass(frozen=True, slots=True)

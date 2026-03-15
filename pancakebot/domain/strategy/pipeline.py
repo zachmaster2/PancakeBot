@@ -144,6 +144,12 @@ class StrategyPipeline:
                 candidate_signals=signals,
                 realized_profit_by_candidate=realized,
             )
+            if self._ml_candidate_adapter is not None:
+                self._ml_candidate_adapter.observe_baseline_candidate_settlement(
+                    round_t=round_t,
+                    candidate_signals=signals,
+                    realized_profit_by_candidate=realized,
+                )
             self._settle_providers(rounds=[round_t])
             self._pending_candidate_signals_by_epoch.pop(int(epoch), None)
             self._last_settled_epoch = int(epoch)
@@ -204,6 +210,12 @@ class StrategyPipeline:
                 candidate_signals=signals,
                 realized_profit_by_candidate=realized,
             )
+            if self._ml_candidate_adapter is not None:
+                self._ml_candidate_adapter.observe_baseline_candidate_settlement(
+                    round_t=round_t,
+                    candidate_signals=signals,
+                    realized_profit_by_candidate=realized,
+                )
             self._settle_providers(rounds=[round_t])
             self._last_settled_epoch = int(epoch)
 

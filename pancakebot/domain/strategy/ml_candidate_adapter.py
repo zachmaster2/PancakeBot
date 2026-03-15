@@ -23,6 +23,43 @@ from pancakebot.domain.models.walk_forward import (
 from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 from pancakebot.domain.types import Kline, Round
 
+_VALID_BET_SIDES = ("Bull", "Bear")
+
+
+def _quantile_edges(values: list[float], n_bins: int) -> list[float]:
+    if int(n_bins) <= 1:
+        raise InvariantError("ml_candidate_profit_model_num_quantile_bins_invalid")
+    if not values:
+        return [0.0 for _ in range(int(n_bins) + 1)]
+    vv = sorted(float(x) for x in values)
+    out: list[float] = []
+    for i in range(int(n_bins) + 1):
+        q = float(i) / float(n_bins)
+        idx = int(round((len(vv) - 1) * q))
+        idx = max(0, min(len(vv) - 1, idx))
+        out.append(float(vv[idx]))
+    return out
+
+
+def _bin_index(x: float, edges: list[float]) -> int:
+    n_bins = int(len(edges) - 1)
+    if int(n_bins) <= 1:
+        return 0
+    for i in range(int(n_bins)):
+        lo = float(edges[i])
+        hi = float(edges[i + 1])
+        if float(x) >= float(lo) and (float(x) < float(hi) or int(i) == int(n_bins - 1)):
+            return int(i)
+    return int(n_bins - 1)
+
+
+def _side_idx(side: str) -> int:
+    if str(side) == "Bull":
+        return 0
+    if str(side) == "Bear":
+        return 1
+    raise InvariantError("ml_candidate_profit_model_side_invalid")
+
 
 @dataclass(frozen=True, slots=True)
 class _MlWalkForwardRuntimeConfig:
@@ -57,6 +94,16 @@ class _MlOpenRoundContext:
     final_total_bnb: float
     final_bull_bnb: float
     final_bear_bnb: float
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateProfitRow:
+    """One realized baseline-candidate outcome used for score calibration."""
+
+    modeled_expected_net_bnb: float
+    abs_dislocation_bull: float
+    side_idx: int
+    realized_profit_bnb: float
 
 
 def _expected_net_from_predicted_final(
@@ -121,6 +168,16 @@ class MlCandidateAdapter:
         self._state: WalkForwardState | None = None
         self._final_pool_projection_cache: dict[tuple[int, int, int, int, int], tuple[float, float, float] | None] = {}
         self._open_round_context_cache: dict[tuple[int, int, int, int, int], _MlOpenRoundContext] = {}
+        self._candidate_profit_model_ready = False
+        self._candidate_profit_model_observed_round_count = 0
+        self._candidate_profit_model_warmup_rows_by_candidate: dict[str, list[_CandidateProfitRow]] = {}
+        self._candidate_profit_model_edges_by_candidate: dict[str, tuple[list[float], list[float]]] | None = None
+        self._candidate_profit_model_sum_by_candidate: dict[str, dict[tuple[int, int, int], float]] = {}
+        self._candidate_profit_model_count_by_candidate: dict[str, dict[tuple[int, int, int], int]] = {}
+        self._candidate_profit_model_side_sum_by_candidate: dict[str, dict[int, float]] = {}
+        self._candidate_profit_model_side_count_by_candidate: dict[str, dict[int, int]] = {}
+        self._candidate_profit_model_total_sum_by_candidate: dict[str, float] = {}
+        self._candidate_profit_model_total_count_by_candidate: dict[str, int] = {}
         self._projection_cache_store = projection_cache_store
         self._wf_cfg = _MlWalkForwardRuntimeConfig(
             klines_store=klines_store_like,
@@ -184,6 +241,12 @@ class MlCandidateAdapter:
         """Return whether baseline candidates should use ML EV as their selector score."""
 
         return bool(self._config.rescore_baseline_candidates_with_expected_net)
+
+    @property
+    def candidate_profit_model_enabled(self) -> bool:
+        """Return whether direct baseline-candidate profit calibration is active."""
+
+        return bool(self._config.candidate_profit_model_enabled)
 
     def refresh_klines(self, *, klines: list[Kline]) -> None:
         """No-op hook for pipeline parity with dislocation providers."""
@@ -314,6 +377,18 @@ class MlCandidateAdapter:
                 }
                 for key, value in self._final_pool_projection_cache.items()
             ],
+            "candidate_profit_model_ready": bool(self._candidate_profit_model_ready),
+            "candidate_profit_model_observed_round_count": int(
+                self._candidate_profit_model_observed_round_count
+            ),
+            "candidate_profit_model_warmup_rows_by_candidate": self._candidate_profit_model_warmup_rows_by_candidate,
+            "candidate_profit_model_edges_by_candidate": self._candidate_profit_model_edges_by_candidate,
+            "candidate_profit_model_sum_by_candidate": self._candidate_profit_model_sum_by_candidate,
+            "candidate_profit_model_count_by_candidate": self._candidate_profit_model_count_by_candidate,
+            "candidate_profit_model_side_sum_by_candidate": self._candidate_profit_model_side_sum_by_candidate,
+            "candidate_profit_model_side_count_by_candidate": self._candidate_profit_model_side_count_by_candidate,
+            "candidate_profit_model_total_sum_by_candidate": self._candidate_profit_model_total_sum_by_candidate,
+            "candidate_profit_model_total_count_by_candidate": self._candidate_profit_model_total_count_by_candidate,
         }
 
     def import_bootstrap_state(self, *, state: dict[str, object]) -> None:
@@ -330,6 +405,32 @@ class MlCandidateAdapter:
         self._history_rounds = list(deduped)
         self._state = state.get("walk_forward_state")
         self._final_pool_projection_cache = {}
+        self._candidate_profit_model_ready = bool(state.get("candidate_profit_model_ready", False))
+        self._candidate_profit_model_observed_round_count = int(
+            state.get("candidate_profit_model_observed_round_count", 0)
+        )
+        self._candidate_profit_model_warmup_rows_by_candidate = dict(
+            state.get("candidate_profit_model_warmup_rows_by_candidate", {})
+        )
+        self._candidate_profit_model_edges_by_candidate = state.get("candidate_profit_model_edges_by_candidate")
+        self._candidate_profit_model_sum_by_candidate = dict(
+            state.get("candidate_profit_model_sum_by_candidate", {})
+        )
+        self._candidate_profit_model_count_by_candidate = dict(
+            state.get("candidate_profit_model_count_by_candidate", {})
+        )
+        self._candidate_profit_model_side_sum_by_candidate = dict(
+            state.get("candidate_profit_model_side_sum_by_candidate", {})
+        )
+        self._candidate_profit_model_side_count_by_candidate = dict(
+            state.get("candidate_profit_model_side_count_by_candidate", {})
+        )
+        self._candidate_profit_model_total_sum_by_candidate = dict(
+            state.get("candidate_profit_model_total_sum_by_candidate", {})
+        )
+        self._candidate_profit_model_total_count_by_candidate = dict(
+            state.get("candidate_profit_model_total_count_by_candidate", {})
+        )
         cache_raw = state.get("final_pool_projection_cache")
         if isinstance(cache_raw, list):
             for row in cache_raw:
@@ -462,6 +563,64 @@ class MlCandidateAdapter:
             ),
         )
 
+    def observe_baseline_candidate_settlement(
+        self,
+        *,
+        round_t: Round,
+        candidate_signals: dict[str, StrategyCandidateSignal],
+        realized_profit_by_candidate: dict[str, float],
+    ) -> None:
+        """Learn direct baseline-candidate profitability from realized outcomes."""
+
+        if not bool(self._config.candidate_profit_model_enabled):
+            return
+
+        self._ensure_candidate_profit_model_candidate_tables(candidate_signals=candidate_signals)
+        rows_by_candidate: dict[str, _CandidateProfitRow] = {}
+        for candidate_name, signal in candidate_signals.items():
+            if str(signal.action) != "BET":
+                continue
+            side = str(signal.bet_side or "")
+            if side not in _VALID_BET_SIDES:
+                raise InvariantError("ml_candidate_profit_model_side_invalid")
+            if str(candidate_name) not in realized_profit_by_candidate:
+                raise InvariantError("ml_candidate_profit_model_missing_realized_profit")
+            raw_expected_net = self._candidate_raw_expected_net_for_open_round(
+                round_t=round_t,
+                candidate_signal=signal,
+            )
+            if raw_expected_net is None or signal.dislocation_bull is None:
+                continue
+            rows_by_candidate[str(candidate_name)] = _CandidateProfitRow(
+                modeled_expected_net_bnb=float(raw_expected_net),
+                abs_dislocation_bull=abs(float(signal.dislocation_bull)),
+                side_idx=int(_side_idx(str(side))),
+                realized_profit_bnb=float(realized_profit_by_candidate[str(candidate_name)]),
+            )
+
+        if not bool(self._candidate_profit_model_ready):
+            for candidate_name, row in rows_by_candidate.items():
+                self._candidate_profit_model_warmup_rows_by_candidate[str(candidate_name)].append(row)
+            self._candidate_profit_model_observed_round_count += 1
+            if (
+                int(self._candidate_profit_model_observed_round_count)
+                >= int(self._config.candidate_profit_model_warmup_rounds)
+            ):
+                self._freeze_candidate_profit_model()
+            return
+
+        if self._candidate_profit_model_edges_by_candidate is None:
+            raise InvariantError("ml_candidate_profit_model_edges_missing")
+        for candidate_name, row in rows_by_candidate.items():
+            ev_edges, dis_edges = self._candidate_profit_model_edges_by_candidate[str(candidate_name)]
+            key = self._candidate_profit_model_key(row=row, ev_edges=ev_edges, dis_edges=dis_edges)
+            self._update_candidate_profit_model_aggregates(
+                candidate_name=str(candidate_name),
+                key=key,
+                row=row,
+            )
+        self._candidate_profit_model_observed_round_count += 1
+
     def candidate_expected_net_for_open_round(
         self,
         *,
@@ -470,26 +629,18 @@ class MlCandidateAdapter:
     ) -> float | None:
         """Return modeled EV for one baseline candidate under the current ML forecast."""
 
-        if str(candidate_signal.action) != "BET":
+        raw_expected_net = self._candidate_raw_expected_net_for_open_round(
+            round_t=round_t,
+            candidate_signal=candidate_signal,
+        )
+        if raw_expected_net is None:
             return None
-        side = str(candidate_signal.bet_side or "")
-        if side not in ("Bull", "Bear"):
-            return None
-        if float(candidate_signal.bet_size_bnb) <= 0.0:
-            return None
-
-        context, _skip_reason = self._open_round_context(round_t=round_t)
-        if context is None:
-            return None
-
+        if not bool(self._config.candidate_profit_model_enabled):
+            return float(raw_expected_net)
         return float(
-            _expected_net_from_predicted_final(
-                p_bull=float(context.p_bull),
-                side=str(side),
-                stake_bnb=float(candidate_signal.bet_size_bnb),
-                final_bull_bnb=float(context.final_bull_bnb),
-                final_bear_bnb=float(context.final_bear_bnb),
-                treasury_fee_fraction=float(self._wf_cfg.treasury_fee_fraction),
+            self._candidate_profit_model_estimate_for_signal(
+                candidate_signal=candidate_signal,
+                raw_expected_net_bnb=float(raw_expected_net),
             )
         )
 
@@ -513,6 +664,176 @@ class MlCandidateAdapter:
             return "ml_veto_candidate_expected_net_below_min"
         return None
 
+    def _candidate_raw_expected_net_for_open_round(
+        self,
+        *,
+        round_t: Round,
+        candidate_signal: StrategyCandidateSignal,
+    ) -> float | None:
+        if str(candidate_signal.action) != "BET":
+            return None
+        side = str(candidate_signal.bet_side or "")
+        if side not in _VALID_BET_SIDES:
+            return None
+        if float(candidate_signal.bet_size_bnb) <= 0.0:
+            return None
+
+        context, _skip_reason = self._open_round_context(round_t=round_t)
+        if context is None:
+            return None
+
+        return float(
+            _expected_net_from_predicted_final(
+                p_bull=float(context.p_bull),
+                side=str(side),
+                stake_bnb=float(candidate_signal.bet_size_bnb),
+                final_bull_bnb=float(context.final_bull_bnb),
+                final_bear_bnb=float(context.final_bear_bnb),
+                treasury_fee_fraction=float(self._wf_cfg.treasury_fee_fraction),
+            )
+        )
+
+    def _candidate_profit_model_estimate_for_signal(
+        self,
+        *,
+        candidate_signal: StrategyCandidateSignal,
+        raw_expected_net_bnb: float,
+    ) -> float:
+        if not bool(self._candidate_profit_model_ready):
+            return float(raw_expected_net_bnb)
+        if self._candidate_profit_model_edges_by_candidate is None:
+            raise InvariantError("ml_candidate_profit_model_edges_missing")
+        candidate_name = str(candidate_signal.candidate_name)
+        if str(candidate_name) not in self._candidate_profit_model_edges_by_candidate:
+            return float(raw_expected_net_bnb)
+        if candidate_signal.dislocation_bull is None:
+            return float(raw_expected_net_bnb)
+        side = str(candidate_signal.bet_side or "")
+        if side not in _VALID_BET_SIDES:
+            return float(raw_expected_net_bnb)
+
+        ev_edges, dis_edges = self._candidate_profit_model_edges_by_candidate[str(candidate_name)]
+        row = _CandidateProfitRow(
+            modeled_expected_net_bnb=float(raw_expected_net_bnb),
+            abs_dislocation_bull=abs(float(candidate_signal.dislocation_bull)),
+            side_idx=int(_side_idx(str(side))),
+            realized_profit_bnb=0.0,
+        )
+        key = self._candidate_profit_model_key(row=row, ev_edges=ev_edges, dis_edges=dis_edges)
+        counts = self._candidate_profit_model_count_by_candidate.get(str(candidate_name), {})
+        sums = self._candidate_profit_model_sum_by_candidate.get(str(candidate_name), {})
+        count = int(counts.get(key, 0))
+        if int(count) >= int(self._config.candidate_profit_model_min_cell_obs):
+            return float(sums.get(key, 0.0)) / float(count)
+
+        side_counts = self._candidate_profit_model_side_count_by_candidate.get(str(candidate_name), {})
+        side_sums = self._candidate_profit_model_side_sum_by_candidate.get(str(candidate_name), {})
+        side_count = int(side_counts.get(int(row.side_idx), 0))
+        if int(side_count) >= int(self._config.candidate_profit_model_min_cell_obs):
+            return float(side_sums.get(int(row.side_idx), 0.0)) / float(side_count)
+
+        total_count = int(self._candidate_profit_model_total_count_by_candidate.get(str(candidate_name), 0))
+        if int(total_count) >= int(self._config.candidate_profit_model_min_cell_obs):
+            total_sum = float(self._candidate_profit_model_total_sum_by_candidate.get(str(candidate_name), 0.0))
+            return float(total_sum) / float(total_count)
+
+        return float(raw_expected_net_bnb)
+
+    def _ensure_candidate_profit_model_candidate_tables(
+        self,
+        *,
+        candidate_signals: dict[str, StrategyCandidateSignal],
+    ) -> None:
+        for candidate_name in candidate_signals.keys():
+            key = str(candidate_name)
+            if key not in self._candidate_profit_model_warmup_rows_by_candidate:
+                self._candidate_profit_model_warmup_rows_by_candidate[key] = []
+            if key not in self._candidate_profit_model_sum_by_candidate:
+                self._candidate_profit_model_sum_by_candidate[key] = {}
+            if key not in self._candidate_profit_model_count_by_candidate:
+                self._candidate_profit_model_count_by_candidate[key] = {}
+            if key not in self._candidate_profit_model_side_sum_by_candidate:
+                self._candidate_profit_model_side_sum_by_candidate[key] = {}
+            if key not in self._candidate_profit_model_side_count_by_candidate:
+                self._candidate_profit_model_side_count_by_candidate[key] = {}
+            if key not in self._candidate_profit_model_total_sum_by_candidate:
+                self._candidate_profit_model_total_sum_by_candidate[key] = 0.0
+            if key not in self._candidate_profit_model_total_count_by_candidate:
+                self._candidate_profit_model_total_count_by_candidate[key] = 0
+
+    def _freeze_candidate_profit_model(self) -> None:
+        edges_by_candidate: dict[str, tuple[list[float], list[float]]] = {}
+        for candidate_name, rows in self._candidate_profit_model_warmup_rows_by_candidate.items():
+            ev_values = [float(r.modeled_expected_net_bnb) for r in rows]
+            dis_values = [float(r.abs_dislocation_bull) for r in rows]
+            edges_by_candidate[str(candidate_name)] = (
+                _quantile_edges(
+                    ev_values,
+                    int(self._config.candidate_profit_model_num_quantile_bins),
+                ),
+                _quantile_edges(
+                    dis_values,
+                    int(self._config.candidate_profit_model_num_quantile_bins),
+                ),
+            )
+
+        self._candidate_profit_model_edges_by_candidate = edges_by_candidate
+        for candidate_name, rows in self._candidate_profit_model_warmup_rows_by_candidate.items():
+            ev_edges, dis_edges = edges_by_candidate[str(candidate_name)]
+            for row in rows:
+                key = self._candidate_profit_model_key(
+                    row=row,
+                    ev_edges=ev_edges,
+                    dis_edges=dis_edges,
+                )
+                self._update_candidate_profit_model_aggregates(
+                    candidate_name=str(candidate_name),
+                    key=key,
+                    row=row,
+                )
+        self._candidate_profit_model_warmup_rows_by_candidate = {}
+        self._candidate_profit_model_ready = True
+
+    def _candidate_profit_model_key(
+        self,
+        *,
+        row: _CandidateProfitRow,
+        ev_edges: list[float],
+        dis_edges: list[float],
+    ) -> tuple[int, int, int]:
+        return (
+            int(_bin_index(float(row.modeled_expected_net_bnb), ev_edges)),
+            int(_bin_index(float(row.abs_dislocation_bull), dis_edges)),
+            int(row.side_idx),
+        )
+
+    def _update_candidate_profit_model_aggregates(
+        self,
+        *,
+        candidate_name: str,
+        key: tuple[int, int, int],
+        row: _CandidateProfitRow,
+    ) -> None:
+        sums = self._candidate_profit_model_sum_by_candidate[str(candidate_name)]
+        counts = self._candidate_profit_model_count_by_candidate[str(candidate_name)]
+        sums[key] = float(sums.get(key, 0.0) + float(row.realized_profit_bnb))
+        counts[key] = int(counts.get(key, 0) + 1)
+
+        side_sums = self._candidate_profit_model_side_sum_by_candidate[str(candidate_name)]
+        side_counts = self._candidate_profit_model_side_count_by_candidate[str(candidate_name)]
+        side_sums[int(row.side_idx)] = float(
+            side_sums.get(int(row.side_idx), 0.0) + float(row.realized_profit_bnb)
+        )
+        side_counts[int(row.side_idx)] = int(side_counts.get(int(row.side_idx), 0) + 1)
+
+        self._candidate_profit_model_total_sum_by_candidate[str(candidate_name)] = float(
+            self._candidate_profit_model_total_sum_by_candidate.get(str(candidate_name), 0.0)
+            + float(row.realized_profit_bnb)
+        )
+        self._candidate_profit_model_total_count_by_candidate[str(candidate_name)] = int(
+            self._candidate_profit_model_total_count_by_candidate.get(str(candidate_name), 0) + 1
+        )
+
     def _validate_config(self) -> None:
         if str(self._config.name).strip() == "":
             raise InvariantError("ml_candidate_name_empty")
@@ -528,6 +849,14 @@ class MlCandidateAdapter:
             raise InvariantError("ml_candidate_veto_candidate_expected_net_not_bool")
         if not isinstance(self._config.rescore_baseline_candidates_with_expected_net, bool):
             raise InvariantError("ml_candidate_rescore_baseline_candidates_not_bool")
+        if not isinstance(self._config.candidate_profit_model_enabled, bool):
+            raise InvariantError("ml_candidate_profit_model_enabled_not_bool")
+        if int(self._config.candidate_profit_model_warmup_rounds) <= 0:
+            raise InvariantError("ml_candidate_profit_model_warmup_rounds_nonpositive")
+        if int(self._config.candidate_profit_model_num_quantile_bins) <= 1:
+            raise InvariantError("ml_candidate_profit_model_num_quantile_bins_invalid")
+        if int(self._config.candidate_profit_model_min_cell_obs) <= 0:
+            raise InvariantError("ml_candidate_profit_model_min_cell_obs_nonpositive")
         if self._config.expected_net_max_bnb is not None:
             if float(self._config.expected_net_max_bnb) < 0.0:
                 raise InvariantError("ml_candidate_expected_net_max_negative")

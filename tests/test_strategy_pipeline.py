@@ -127,6 +127,7 @@ class _FakeMlAdapter:
         self._candidate_expected_net_by_name = {
             str(k): float(v) for k, v in (candidate_expected_net_by_name or {}).items()
         }
+        self.observed_settlements: list[tuple[int, dict[str, float]]] = []
 
     def candidate_signal_for_open_round(self, *, round_t: Round) -> StrategyCandidateSignal:
         return self._signal
@@ -142,6 +143,16 @@ class _FakeMlAdapter:
 
     def settle_closed_rounds(self, *, rounds: list[Round]) -> None:
         return None
+
+    def observe_baseline_candidate_settlement(
+        self,
+        *,
+        round_t: Round,
+        candidate_signals: dict[str, StrategyCandidateSignal],
+        realized_profit_by_candidate: dict[str, float],
+    ) -> None:
+        _ = candidate_signals
+        self.observed_settlements.append((int(round_t.epoch), dict(realized_profit_by_candidate)))
 
     def candidate_veto_skip_reason_for_open_round(
         self,
@@ -427,6 +438,60 @@ class StrategyPipelineMlCouplingTests(unittest.TestCase):
         self.assertEqual(0.01, float(signals["altA"].selector_score_bnb))
         self.assertEqual(0.09, float(signals["altB"].expected_profit_bnb))
         self.assertEqual(0.09, float(signals["altB"].selector_score_bnb))
+
+    def test_pipeline_feeds_realized_candidate_outcomes_back_to_ml_adapter(self) -> None:
+        ml_adapter = _FakeMlAdapter(
+            signal=_signal(
+                candidate_name="mlwf_bestset_adapt_v1",
+                action="SKIP",
+                bet_side=None,
+                bet_size_bnb=0.0,
+                expected_profit_bnb=None,
+                selector_score_bnb=None,
+                skip_reason="predictability_below_min",
+            ),
+            emit_candidate=False,
+            veto_opposite_side_candidates=False,
+            veto_untradeable_candidates=False,
+        )
+        pipeline = StrategyPipeline(
+            dislocation_engine=_FakeDislocationEngine(
+                signals={
+                    "altA": _signal(
+                        candidate_name="altA",
+                        action="BET",
+                        bet_side="Bull",
+                        bet_size_bnb=0.2,
+                        expected_profit_bnb=0.03,
+                        selector_score_bnb=0.08,
+                        skip_reason=None,
+                    )
+                }
+            ),
+            router=_FakeRouter(),
+            treasury_fee_fraction=0.03,
+            ml_candidate_adapter=ml_adapter,
+        )
+
+        closed_round = Round(
+            epoch=7,
+            start_at=1000,
+            lock_at=1300,
+            close_at=1600,
+            lock_price=600.0,
+            close_price=601.0,
+            position="Bull",
+            failed=False,
+            bets=(),
+        )
+
+        pipeline.candidate_signals_for_open_round(round_t=closed_round)
+        pipeline.settle_closed_rounds(rounds=[closed_round])
+
+        self.assertEqual(1, len(ml_adapter.observed_settlements))
+        epoch, realized = ml_adapter.observed_settlements[0]
+        self.assertEqual(7, int(epoch))
+        self.assertIn("altA", realized)
 
 
 if __name__ == "__main__":
