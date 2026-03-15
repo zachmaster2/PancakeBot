@@ -30,3 +30,5 @@ class StrategyCandidateSignal:
     skip_reason: str | None
     p_bull: float | None
     dislocation_bull: float | None
+    projected_late_ratio: float | None = None
+    projected_late_imbalance: float | None = None

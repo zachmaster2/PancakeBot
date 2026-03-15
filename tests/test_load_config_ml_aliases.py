@@ -131,6 +131,30 @@ class LoadConfigMlAliasTests(unittest.TestCase):
 
         self.assertTrue(bool(cfg.strategy.ml_candidate.rescore_baseline_candidates_with_expected_net))
 
+    def test_candidate_profit_model_settings_are_accepted(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            "rescore_baseline_candidates_with_expected_net = false",
+            (
+                "rescore_baseline_candidates_with_expected_net = false\n"
+                "candidate_profit_model_enabled = true\n"
+                "candidate_profit_model_warmup_rounds = 4000\n"
+                "candidate_profit_model_num_quantile_bins = 6\n"
+                "candidate_profit_model_min_cell_obs = 7"
+            ),
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_ml_candidate_profit_model.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            cfg = load_app_config(str(cfg_path))
+
+        self.assertTrue(bool(cfg.strategy.ml_candidate.candidate_profit_model_enabled))
+        self.assertEqual(4000, int(cfg.strategy.ml_candidate.candidate_profit_model_warmup_rounds))
+        self.assertEqual(6, int(cfg.strategy.ml_candidate.candidate_profit_model_num_quantile_bins))
+        self.assertEqual(7, int(cfg.strategy.ml_candidate.candidate_profit_model_min_cell_obs))
+
     def test_expected_net_max_below_min_is_rejected(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
         patched = str(base_text).replace(
@@ -169,6 +193,20 @@ class LoadConfigMlAliasTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             cfg_path = Path(td) / "config_ml_bad_label_mode.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
+    def test_candidate_profit_model_invalid_num_bins_is_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            "rescore_baseline_candidates_with_expected_net = false",
+            "rescore_baseline_candidates_with_expected_net = false\ncandidate_profit_model_num_quantile_bins = 1",
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_ml_candidate_profit_model_bad_bins.toml"
             cfg_path.write_text(patched, encoding="utf-8")
             with self.assertRaises(InvariantError):
                 load_app_config(str(cfg_path))

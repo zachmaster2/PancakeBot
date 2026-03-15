@@ -198,6 +198,16 @@ def _parse_strategy_router(router: dict[str, Any]) -> StrategyRouterConfig:
         "online_cellmean_side_gap",
         "online_cellmean_backoff",
         "online_cellmean_selector_fallback",
+        "online_cellmean_selector_gate",
+        "online_selector_score_fallback",
+        "online_selector_score_gate",
+        "online_selector_score_side_gap",
+        "online_selector_score_late_imb_fallback",
+        "online_selector_score_late_imb_gate",
+        "online_selector_score_side_late_fallback",
+        "online_selector_score_side_late_gate",
+        "online_selector_score_side_support_fallback",
+        "online_selector_score_side_support_gate",
     ):
         raise InvariantError("strategy_router_mode_invalid")
 
@@ -282,6 +292,10 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         "veto_untradeable_candidates",
         "veto_candidate_expected_net_below_min",
         "rescore_baseline_candidates_with_expected_net",
+        "candidate_profit_model_enabled",
+        "candidate_profit_model_warmup_rounds",
+        "candidate_profit_model_num_quantile_bins",
+        "candidate_profit_model_min_cell_obs",
         "random_seed",
     }
     _validate_unknown_keys("strategy_ml_candidate", candidate, allowed)
@@ -385,6 +399,32 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         "rescore_baseline_candidates_with_expected_net",
         bool(MlCandidateConfig.__dataclass_fields__["rescore_baseline_candidates_with_expected_net"].default),
     )
+    candidate_profit_model_enabled = _opt_bool(
+        candidate,
+        "candidate_profit_model_enabled",
+        bool(MlCandidateConfig.__dataclass_fields__["candidate_profit_model_enabled"].default),
+    )
+    candidate_profit_model_warmup_rounds = _opt_int(
+        candidate,
+        "candidate_profit_model_warmup_rounds",
+        int(MlCandidateConfig.__dataclass_fields__["candidate_profit_model_warmup_rounds"].default),
+    )
+    if int(candidate_profit_model_warmup_rounds) <= 0:
+        raise InvariantError("strategy_ml_candidate_profit_model_warmup_rounds_nonpositive")
+    candidate_profit_model_num_quantile_bins = _opt_int(
+        candidate,
+        "candidate_profit_model_num_quantile_bins",
+        int(MlCandidateConfig.__dataclass_fields__["candidate_profit_model_num_quantile_bins"].default),
+    )
+    if int(candidate_profit_model_num_quantile_bins) <= 1:
+        raise InvariantError("strategy_ml_candidate_profit_model_num_quantile_bins_invalid")
+    candidate_profit_model_min_cell_obs = _opt_int(
+        candidate,
+        "candidate_profit_model_min_cell_obs",
+        int(MlCandidateConfig.__dataclass_fields__["candidate_profit_model_min_cell_obs"].default),
+    )
+    if int(candidate_profit_model_min_cell_obs) <= 0:
+        raise InvariantError("strategy_ml_candidate_profit_model_min_cell_obs_nonpositive")
 
     random_seed = _req_int(candidate, "random_seed")
     if int(random_seed) < 0:
@@ -419,6 +459,10 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         veto_untradeable_candidates=bool(veto_untradeable_candidates),
         veto_candidate_expected_net_below_min=bool(veto_candidate_expected_net_below_min),
         rescore_baseline_candidates_with_expected_net=bool(rescore_baseline_candidates_with_expected_net),
+        candidate_profit_model_enabled=bool(candidate_profit_model_enabled),
+        candidate_profit_model_warmup_rounds=int(candidate_profit_model_warmup_rounds),
+        candidate_profit_model_num_quantile_bins=int(candidate_profit_model_num_quantile_bins),
+        candidate_profit_model_min_cell_obs=int(candidate_profit_model_min_cell_obs),
     )
 
 
@@ -441,7 +485,13 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
         "projected_final_pool_multiplier",
         "projected_final_pool_total_min_bnb",
         "expected_net_min_bnb",
+        "bull_expected_net_extra_min_bnb",
         "bear_expected_net_extra_min_bnb",
+        "bull_late_min_ratio",
+        "bull_late_min_imbalance",
+        "bear_late_min_ratio",
+        "bear_late_max_imbalance",
+        "late_support_ev_scale_bnb",
         "side_selection_mode",
         "allowed_sides",
         "market_extreme_min",
@@ -495,9 +545,13 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
         "shock_filter_min_window_total_bnb",
         "shock_filter_min_abs_imbalance",
         "shock_filter_min_surge_ratio",
+        "late_model_conflict_flip_enabled",
         "late_model_veto_enabled",
         "late_model_veto_min_late_ratio",
         "late_model_veto_min_abs_imbalance",
+        "late_model_neutral_filter_enabled",
+        "late_model_neutral_min_late_ratio",
+        "late_model_neutral_max_abs_imbalance",
     }
     _validate_unknown_keys(candidate_name, candidate, allowed)
 
@@ -560,9 +614,27 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
         raise InvariantError("dislocation_candidate_projected_final_pool_total_min_bnb_negative")
 
     expected_net_min_bnb = _req_float(candidate, "expected_net_min_bnb")
+    bull_expected_net_extra_min_bnb = _opt_float(candidate, "bull_expected_net_extra_min_bnb", 0.0)
+    if float(bull_expected_net_extra_min_bnb) < 0.0:
+        raise InvariantError("dislocation_candidate_bull_expected_net_extra_min_bnb_negative")
     bear_expected_net_extra_min_bnb = _opt_float(candidate, "bear_expected_net_extra_min_bnb", 0.0)
     if float(bear_expected_net_extra_min_bnb) < 0.0:
         raise InvariantError("dislocation_candidate_bear_expected_net_extra_min_bnb_negative")
+    bull_late_min_ratio = _opt_float(candidate, "bull_late_min_ratio", 0.0)
+    if not (0.0 <= float(bull_late_min_ratio) <= 1.0):
+        raise InvariantError("dislocation_candidate_bull_late_min_ratio_out_of_range")
+    bull_late_min_imbalance = _opt_float(candidate, "bull_late_min_imbalance", -1.0)
+    if not (-1.0 <= float(bull_late_min_imbalance) <= 1.0):
+        raise InvariantError("dislocation_candidate_bull_late_min_imbalance_out_of_range")
+    bear_late_min_ratio = _opt_float(candidate, "bear_late_min_ratio", 0.0)
+    if not (0.0 <= float(bear_late_min_ratio) <= 1.0):
+        raise InvariantError("dislocation_candidate_bear_late_min_ratio_out_of_range")
+    bear_late_max_imbalance = _opt_float(candidate, "bear_late_max_imbalance", 1.0)
+    if not (-1.0 <= float(bear_late_max_imbalance) <= 1.0):
+        raise InvariantError("dislocation_candidate_bear_late_max_imbalance_out_of_range")
+    late_support_ev_scale_bnb = _opt_float(candidate, "late_support_ev_scale_bnb", 0.0)
+    if float(late_support_ev_scale_bnb) < 0.0:
+        raise InvariantError("dislocation_candidate_late_support_ev_scale_bnb_negative")
 
     side_selection_mode = _req_str(candidate, "side_selection_mode")
     allowed_sides = _opt_str(candidate, "allowed_sides", "both")
@@ -769,6 +841,8 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
     if float(shock_filter_min_surge_ratio) < 0.0:
         raise InvariantError("dislocation_candidate_shock_filter_min_surge_ratio_negative")
 
+    late_model_conflict_flip_enabled = _opt_bool(candidate, "late_model_conflict_flip_enabled", False)
+
     late_model_veto_enabled = _opt_bool(candidate, "late_model_veto_enabled", False)
 
     late_model_veto_min_late_ratio = _opt_float(
@@ -787,6 +861,24 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
     if not (0.0 <= float(late_model_veto_min_abs_imbalance) <= 1.0):
         raise InvariantError("dislocation_candidate_late_model_veto_min_abs_imbalance_out_of_range")
 
+    late_model_neutral_filter_enabled = _opt_bool(candidate, "late_model_neutral_filter_enabled", False)
+
+    late_model_neutral_min_late_ratio = _opt_float(
+        candidate,
+        "late_model_neutral_min_late_ratio",
+        0.0,
+    )
+    if float(late_model_neutral_min_late_ratio) < 0.0:
+        raise InvariantError("dislocation_candidate_late_model_neutral_min_late_ratio_negative")
+
+    late_model_neutral_max_abs_imbalance = _opt_float(
+        candidate,
+        "late_model_neutral_max_abs_imbalance",
+        1.0,
+    )
+    if not (0.0 <= float(late_model_neutral_max_abs_imbalance) <= 1.0):
+        raise InvariantError("dislocation_candidate_late_model_neutral_max_abs_imbalance_out_of_range")
+
     return DislocationCandidateConfig(
         name=str(name),
         lookback1_seconds=int(lookback1_seconds),
@@ -804,7 +896,13 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
         projected_final_pool_multiplier=float(projected_final_pool_multiplier),
         projected_final_pool_total_min_bnb=float(projected_final_pool_total_min_bnb),
         expected_net_min_bnb=float(expected_net_min_bnb),
+        bull_expected_net_extra_min_bnb=float(bull_expected_net_extra_min_bnb),
         bear_expected_net_extra_min_bnb=float(bear_expected_net_extra_min_bnb),
+        bull_late_min_ratio=float(bull_late_min_ratio),
+        bull_late_min_imbalance=float(bull_late_min_imbalance),
+        bear_late_min_ratio=float(bear_late_min_ratio),
+        bear_late_max_imbalance=float(bear_late_max_imbalance),
+        late_support_ev_scale_bnb=float(late_support_ev_scale_bnb),
         side_selection_mode=str(side_selection_mode),
         allowed_sides=str(allowed_sides),
         market_extreme_min=float(market_extreme_min),
@@ -858,9 +956,13 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
         shock_filter_min_window_total_bnb=float(shock_filter_min_window_total_bnb),
         shock_filter_min_abs_imbalance=float(shock_filter_min_abs_imbalance),
         shock_filter_min_surge_ratio=float(shock_filter_min_surge_ratio),
+        late_model_conflict_flip_enabled=bool(late_model_conflict_flip_enabled),
         late_model_veto_enabled=bool(late_model_veto_enabled),
         late_model_veto_min_late_ratio=float(late_model_veto_min_late_ratio),
         late_model_veto_min_abs_imbalance=float(late_model_veto_min_abs_imbalance),
+        late_model_neutral_filter_enabled=bool(late_model_neutral_filter_enabled),
+        late_model_neutral_min_late_ratio=float(late_model_neutral_min_late_ratio),
+        late_model_neutral_max_abs_imbalance=float(late_model_neutral_max_abs_imbalance),
     )
 
 

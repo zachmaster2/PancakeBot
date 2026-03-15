@@ -18,6 +18,7 @@ def _signal(
     selector_score_bnb: float | None,
     skip_reason: str | None,
     p_bull: float | None = 0.5,
+    projected_late_imbalance: float | None = None,
 ) -> StrategyCandidateSignal:
     """Create one candidate signal fixture."""
 
@@ -35,6 +36,11 @@ def _signal(
         skip_reason=skip_reason,
         p_bull=float(p_bull) if p_bull is not None else None,
         dislocation_bull=0.0,
+        projected_late_imbalance=(
+            float(projected_late_imbalance)
+            if projected_late_imbalance is not None
+            else None
+        ),
     )
 
 
@@ -435,6 +441,622 @@ class StrategyRouterTests(unittest.TestCase):
         self.assertEqual("a", decision.selected_strategy)
         self.assertEqual("Bull", decision.bet_side)
         self.assertIsNone(decision.skip_reason)
+
+    def test_online_cellmean_selector_gate_ranks_by_selector_score_after_online_gate(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_cellmean_selector_gate",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=-1.0,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        warmup_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.05,
+                skip_reason=None,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+            ),
+        }
+        _ = router.route_round(
+            candidate_signals=warmup_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=warmup_signals,
+            realized_profit_by_candidate={"a": 0.05, "b": 0.02},
+        )
+
+        routed_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.04,
+                skip_reason=None,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.12,
+                skip_reason=None,
+            ),
+        }
+        decision = router.route_round(
+            candidate_signals=routed_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("b", decision.selected_strategy)
+        self.assertEqual("Bear", decision.bet_side)
+        self.assertAlmostEqual(0.12, float(decision.selector_score_bnb))
+
+    def test_online_selector_score_fallback_uses_selector_score_cells(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_selector_score_fallback",
+                online_warmup_rounds=3,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=0.02,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        warmup_low = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+            )
+        }
+        warmup_high = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.30,
+                skip_reason=None,
+            )
+        }
+        warmup_mid = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.20,
+                skip_reason=None,
+            )
+        }
+        _ = router.route_round(
+            candidate_signals=warmup_low,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=warmup_low,
+            realized_profit_by_candidate={"a": 0.04},
+        )
+        _ = router.route_round(
+            candidate_signals=warmup_high,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=warmup_high,
+            realized_profit_by_candidate={"a": -0.02},
+        )
+        _ = router.route_round(
+            candidate_signals=warmup_mid,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=warmup_mid,
+            realized_profit_by_candidate={"a": 0.0},
+        )
+
+        decision = router.route_round(
+            candidate_signals=warmup_low,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=False,
+        )
+
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("a", decision.selected_strategy)
+        self.assertEqual("Bull", decision.bet_side)
+
+    def test_online_selector_score_gate_ranks_by_selector_score_after_online_gate(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_selector_score_gate",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=-1.0,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        warmup_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.05,
+                skip_reason=None,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+            ),
+        }
+        _ = router.route_round(
+            candidate_signals=warmup_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=warmup_signals,
+            realized_profit_by_candidate={"a": 0.05, "b": 0.02},
+        )
+
+        routed_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.04,
+                skip_reason=None,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.12,
+                skip_reason=None,
+            ),
+        }
+        decision = router.route_round(
+            candidate_signals=routed_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("b", decision.selected_strategy)
+        self.assertEqual("Bear", decision.bet_side)
+        self.assertAlmostEqual(0.12, float(decision.selector_score_bnb))
+
+    def test_online_selector_score_side_gap_uses_selector_score_cells(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_selector_score_side_gap",
+                online_warmup_rounds=2,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=-1.0,
+                online_use_direction_split=True,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        bull_signal = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+            )
+        }
+        bear_signal = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+            )
+        }
+
+        _ = router.route_round(
+            candidate_signals=bull_signal,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=bull_signal,
+            realized_profit_by_candidate={"a": 0.03},
+        )
+        _ = router.route_round(
+            candidate_signals=bear_signal,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=bear_signal,
+            realized_profit_by_candidate={"a": -0.01},
+        )
+
+        decision = router.route_round(
+            candidate_signals=bull_signal,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("a", decision.selected_strategy)
+        self.assertEqual("Bull", decision.bet_side)
+        self.assertAlmostEqual(0.04, float(decision.selector_score_bnb))
+
+    def test_online_selector_score_late_imb_fallback_uses_late_context_cells(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_selector_score_late_imb_fallback",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=-1.0,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        warmup_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+                projected_late_imbalance=0.80,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+                projected_late_imbalance=-0.80,
+            ),
+        }
+        _ = router.route_round(
+            candidate_signals=warmup_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=warmup_signals,
+            realized_profit_by_candidate={"a": 0.05, "b": -0.03},
+        )
+
+        routed_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.11,
+                skip_reason=None,
+                projected_late_imbalance=0.75,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.11,
+                skip_reason=None,
+                projected_late_imbalance=-0.75,
+            ),
+        }
+        decision = router.route_round(
+            candidate_signals=routed_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("a", decision.selected_strategy)
+        self.assertEqual("Bull", decision.bet_side)
+
+    def test_online_selector_score_late_imb_gate_prefers_selector_score_after_gate(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_selector_score_late_imb_gate",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=-1.0,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        warmup_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.05,
+                skip_reason=None,
+                projected_late_imbalance=0.60,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.08,
+                skip_reason=None,
+                projected_late_imbalance=0.65,
+            ),
+        }
+        _ = router.route_round(
+            candidate_signals=warmup_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=warmup_signals,
+            realized_profit_by_candidate={"a": 0.04, "b": 0.03},
+        )
+
+        routed_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.04,
+                skip_reason=None,
+                projected_late_imbalance=0.62,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.12,
+                skip_reason=None,
+                projected_late_imbalance=0.67,
+            ),
+        }
+        decision = router.route_round(
+            candidate_signals=routed_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("b", decision.selected_strategy)
+        self.assertEqual("Bull", decision.bet_side)
+        self.assertAlmostEqual(0.12, float(decision.selector_score_bnb))
+
+    def test_online_selector_score_side_late_fallback_uses_side_aligned_context(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_selector_score_side_late_fallback",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=-1.0,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        warmup_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+                projected_late_imbalance=0.80,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.10,
+                skip_reason=None,
+                projected_late_imbalance=0.80,
+            ),
+        }
+        _ = router.route_round(
+            candidate_signals=warmup_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=warmup_signals,
+            realized_profit_by_candidate={"a": 0.05, "b": -0.03},
+        )
+
+        routed_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.11,
+                skip_reason=None,
+                projected_late_imbalance=0.75,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.11,
+                skip_reason=None,
+                projected_late_imbalance=0.75,
+            ),
+        }
+        decision = router.route_round(
+            candidate_signals=routed_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("a", decision.selected_strategy)
+        self.assertEqual("Bull", decision.bet_side)
+
+    def test_online_selector_score_side_support_gate_prefers_selector_score_after_gate(self) -> None:
+        router = StrategyRouter(
+            config=StrategyRouterConfig(
+                mode="online_selector_score_side_support_gate",
+                online_warmup_rounds=1,
+                online_num_quantile_bins=2,
+                online_min_cell_obs=1,
+                online_score_threshold_bnb=-1.0,
+                score_threshold_bnb=-1e9,
+            )
+        )
+        warmup_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.05,
+                skip_reason=None,
+                p_bull=0.70,
+                projected_late_imbalance=0.40,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.08,
+                skip_reason=None,
+                p_bull=0.20,
+                projected_late_imbalance=-0.60,
+            ),
+        }
+        _ = router.route_round(
+            candidate_signals=warmup_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+        router.observe_settlement(
+            candidate_signals=warmup_signals,
+            realized_profit_by_candidate={"a": 0.03, "b": 0.04},
+        )
+
+        routed_signals = {
+            "a": _signal(
+                candidate_name="a",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.04,
+                skip_reason=None,
+                p_bull=0.72,
+                projected_late_imbalance=0.38,
+            ),
+            "b": _signal(
+                candidate_name="b",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.2,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.12,
+                skip_reason=None,
+                p_bull=0.18,
+                projected_late_imbalance=-0.58,
+            ),
+        }
+        decision = router.route_round(
+            candidate_signals=routed_signals,
+            bankroll_bnb=1.0,
+            bet_gas_cost_bnb=0.001,
+            selector_ready=True,
+        )
+
+        self.assertEqual("BET", decision.action)
+        self.assertEqual("b", decision.selected_strategy)
+        self.assertEqual("Bear", decision.bet_side)
+        self.assertAlmostEqual(0.12, float(decision.selector_score_bnb))
 
     def test_online_cellmean_backoff_routes_when_cell_is_sparse(self) -> None:
         router = StrategyRouter(

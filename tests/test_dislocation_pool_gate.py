@@ -16,6 +16,10 @@ from pancakebot.domain.strategy.dislocation_engine import (
     _effective_ev_pools,
     _expected_net_min_for_side,
     _flow_gate_relaxed_for_dislocation,
+    _late_model_conflict_flip_side,
+    _late_model_neutral_filter_triggers,
+    _late_support_ev_adjustment,
+    _late_side_support_skip_reason,
     _late_model_veto_triggers,
     _pool_total_gate_skip_reason,
     _precutoff_shock_filter_triggers,
@@ -49,9 +53,13 @@ class DislocationPoolGateTests(unittest.TestCase):
         self.assertAlmostEqual(0.0, float(candidate.nowcast_market_gap_min))
         self.assertEqual("both", str(candidate.allowed_sides))
         self.assertAlmostEqual(1.0, float(candidate.flow_gate_relax_dislocation_min))
+        self.assertFalse(bool(candidate.late_model_conflict_flip_enabled))
         self.assertFalse(bool(candidate.late_model_veto_enabled))
         self.assertAlmostEqual(0.45, float(candidate.late_model_veto_min_late_ratio))
         self.assertAlmostEqual(0.35, float(candidate.late_model_veto_min_abs_imbalance))
+        self.assertFalse(bool(candidate.late_model_neutral_filter_enabled))
+        self.assertAlmostEqual(0.0, float(candidate.late_model_neutral_min_late_ratio))
+        self.assertAlmostEqual(1.0, float(candidate.late_model_neutral_max_abs_imbalance))
         self.assertFalse(bool(candidate.drawdown_stake_guard_enabled))
         self.assertAlmostEqual(0.0, float(candidate.drawdown_stake_guard_start_bnb))
         self.assertAlmostEqual(0.0, float(candidate.drawdown_stake_guard_full_bnb))
@@ -70,7 +78,13 @@ class DislocationPoolGateTests(unittest.TestCase):
         self.assertEqual(0, int(candidate.circuit_breaker_max_skip_rounds))
         self.assertEqual(0, int(candidate.circuit_breaker_reentry_rounds))
         self.assertAlmostEqual(1.0, float(candidate.circuit_breaker_reentry_scale))
+        self.assertAlmostEqual(0.0, float(candidate.bull_expected_net_extra_min_bnb))
         self.assertAlmostEqual(0.0, float(candidate.bear_expected_net_extra_min_bnb))
+        self.assertAlmostEqual(0.0, float(candidate.bull_late_min_ratio))
+        self.assertAlmostEqual(-1.0, float(candidate.bull_late_min_imbalance))
+        self.assertAlmostEqual(0.0, float(candidate.bear_late_min_ratio))
+        self.assertAlmostEqual(1.0, float(candidate.bear_late_max_imbalance))
+        self.assertAlmostEqual(0.0, float(candidate.late_support_ev_scale_bnb))
 
     def test_parse_projected_gate_fields(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
@@ -194,6 +208,74 @@ class DislocationPoolGateTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             cfg_path = Path(td) / "config_invalid_bear_expected_extra.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
+    def test_invalid_bull_expected_net_extra_min_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = base_text.replace(
+            'name = "disloc_altA_20260227_x80"\n',
+            (
+                'name = "disloc_altA_20260227_x80"\n'
+                "bull_expected_net_extra_min_bnb = -0.01\n"
+            ),
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_invalid_bull_expected_extra.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
+    def test_invalid_bull_late_min_ratio_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = base_text.replace(
+            'name = "disloc_altA_20260227_x80"\n',
+            (
+                'name = "disloc_altA_20260227_x80"\n'
+                "bull_late_min_ratio = 1.2\n"
+            ),
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_invalid_bull_late_ratio.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
+    def test_invalid_bear_late_max_imbalance_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = base_text.replace(
+            'name = "disloc_altA_20260227_x80"\n',
+            (
+                'name = "disloc_altA_20260227_x80"\n'
+                "bear_late_max_imbalance = 1.2\n"
+            ),
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_invalid_bear_late_imbalance.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
+    def test_invalid_late_support_ev_scale_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = base_text.replace(
+            'name = "disloc_altA_20260227_x80"\n',
+            (
+                'name = "disloc_altA_20260227_x80"\n'
+                "late_support_ev_scale_bnb = -0.01\n"
+            ),
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_invalid_late_support_scale.toml"
             cfg_path.write_text(patched, encoding="utf-8")
             with self.assertRaises(InvariantError):
                 load_app_config(str(cfg_path))
@@ -327,9 +409,10 @@ class DislocationPoolGateTests(unittest.TestCase):
         cfg = replace(
             engine_cfg,
             expected_net_min_bnb=0.04,
+            bull_expected_net_extra_min_bnb=0.02,
             bear_expected_net_extra_min_bnb=0.03,
         )
-        self.assertAlmostEqual(0.04, _expected_net_min_for_side(cfg=cfg, side="BULL"))
+        self.assertAlmostEqual(0.06, _expected_net_min_for_side(cfg=cfg, side="BULL"))
         self.assertAlmostEqual(0.07, _expected_net_min_for_side(cfg=cfg, side="BEAR"))
 
     def test_flow_gate_relaxed_for_large_dislocation(self) -> None:
@@ -585,6 +668,242 @@ class DislocationPoolGateTests(unittest.TestCase):
                 projected_final_pool_bull_bnb=1.1,
                 projected_final_pool_bear_bnb=2.5,
             )
+        )
+
+    def test_parse_late_model_neutral_fields(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = base_text.replace(
+            'name = "disloc_altA_20260227_x80"\n',
+            (
+                'name = "disloc_altA_20260227_x80"\n'
+                "late_model_conflict_flip_enabled = true\n"
+                "late_model_neutral_filter_enabled = true\n"
+                "late_model_neutral_min_late_ratio = 0.12\n"
+                "late_model_neutral_max_abs_imbalance = 0.18\n"
+            ),
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_late_neutral.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            cfg = load_app_config(str(cfg_path))
+
+        candidate = cfg.strategy.dislocation.candidates[0]
+        self.assertTrue(bool(candidate.late_model_conflict_flip_enabled))
+        self.assertTrue(bool(candidate.late_model_neutral_filter_enabled))
+        self.assertAlmostEqual(0.12, float(candidate.late_model_neutral_min_late_ratio))
+        self.assertAlmostEqual(0.18, float(candidate.late_model_neutral_max_abs_imbalance))
+
+    def test_invalid_late_model_neutral_abs_imbalance_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = base_text.replace(
+            'name = "disloc_altA_20260227_x80"\n',
+            (
+                'name = "disloc_altA_20260227_x80"\n'
+                "late_model_neutral_max_abs_imbalance = 1.5\n"
+            ),
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_invalid_late_neutral.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
+    def test_late_model_neutral_filter_triggers_only_for_balanced_late_flow(self) -> None:
+        app_cfg = load_app_config("config.toml")
+        candidate_cfg = app_cfg.strategy.dislocation.candidates[0]
+        engine_cfg = _to_candidate_config(
+            cfg=candidate_cfg,
+            cutoff_seconds=int(app_cfg.cutoff_seconds),
+        )
+        neutral_cfg = replace(
+            engine_cfg,
+            late_model_neutral_filter_enabled=True,
+            late_model_neutral_min_late_ratio=0.5,
+            late_model_neutral_max_abs_imbalance=0.2,
+        )
+
+        self.assertTrue(
+            _late_model_neutral_filter_triggers(
+                cfg=neutral_cfg,
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.8,
+                projected_final_pool_bear_bnb=1.6,
+            )
+        )
+        self.assertFalse(
+            _late_model_neutral_filter_triggers(
+                cfg=neutral_cfg,
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=2.6,
+                projected_final_pool_bear_bnb=1.2,
+            )
+        )
+
+    def test_late_model_conflict_flip_side_flips_only_on_strong_opposing_late_flow(self) -> None:
+        app_cfg = load_app_config("config.toml")
+        candidate_cfg = app_cfg.strategy.dislocation.candidates[0]
+        engine_cfg = _to_candidate_config(
+            cfg=candidate_cfg,
+            cutoff_seconds=int(app_cfg.cutoff_seconds),
+        )
+        cfg = replace(
+            engine_cfg,
+            late_model_conflict_flip_enabled=True,
+            late_model_veto_enabled=True,
+            late_model_veto_min_late_ratio=0.1,
+            late_model_veto_min_abs_imbalance=0.2,
+        )
+
+        self.assertEqual(
+            "BEAR",
+            _late_model_conflict_flip_side(
+                cfg=cfg,
+                side="BULL",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.1,
+                projected_final_pool_bear_bnb=1.3,
+            ),
+        )
+        self.assertEqual(
+            "BULL",
+            _late_model_conflict_flip_side(
+                cfg=cfg,
+                side="BULL",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.24,
+                projected_final_pool_bear_bnb=1.16,
+            ),
+        )
+
+    def test_late_side_support_skip_reason_respects_side_specific_thresholds(self) -> None:
+        app_cfg = load_app_config("config.toml")
+        candidate_cfg = app_cfg.strategy.dislocation.candidates[0]
+        engine_cfg = _to_candidate_config(
+            cfg=candidate_cfg,
+            cutoff_seconds=int(app_cfg.cutoff_seconds),
+        )
+        cfg = replace(
+            engine_cfg,
+            bull_late_min_ratio=0.2,
+            bull_late_min_imbalance=0.1,
+            bear_late_min_ratio=0.15,
+            bear_late_max_imbalance=-0.1,
+        )
+
+        self.assertEqual(
+            "projected_late_ratio_below_bull_min",
+            _late_side_support_skip_reason(
+                cfg=cfg,
+                side="BULL",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.2,
+                projected_final_pool_bear_bnb=1.1,
+            ),
+        )
+        self.assertEqual(
+            "projected_late_bull_imbalance_below_min",
+            _late_side_support_skip_reason(
+                cfg=cfg,
+                side="BULL",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.265,
+                projected_final_pool_bear_bnb=1.235,
+            ),
+        )
+        self.assertEqual(
+            "projected_late_ratio_below_bear_min",
+            _late_side_support_skip_reason(
+                cfg=cfg,
+                side="BEAR",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.05,
+                projected_final_pool_bear_bnb=1.15,
+            ),
+        )
+        self.assertEqual(
+            "projected_late_bear_imbalance_above_max",
+            _late_side_support_skip_reason(
+                cfg=cfg,
+                side="BEAR",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.22,
+                projected_final_pool_bear_bnb=1.18,
+            ),
+        )
+        self.assertIsNone(
+            _late_side_support_skip_reason(
+                cfg=cfg,
+                side="BULL",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.32,
+                projected_final_pool_bear_bnb=1.08,
+            )
+        )
+        self.assertIsNone(
+            _late_side_support_skip_reason(
+                cfg=cfg,
+                side="BEAR",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.06,
+                projected_final_pool_bear_bnb=1.34,
+            )
+        )
+
+    def test_late_support_ev_adjustment_tracks_side_aligned_late_flow(self) -> None:
+        app_cfg = load_app_config("config.toml")
+        candidate_cfg = app_cfg.strategy.dislocation.candidates[0]
+        engine_cfg = _to_candidate_config(
+            cfg=candidate_cfg,
+            cutoff_seconds=int(app_cfg.cutoff_seconds),
+        )
+        cfg = replace(engine_cfg, late_support_ev_scale_bnb=0.02)
+
+        self.assertAlmostEqual(
+            0.002,
+            _late_support_ev_adjustment(
+                cfg=cfg,
+                side="BULL",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.3,
+                projected_final_pool_bear_bnb=1.1,
+            ),
+        )
+        self.assertAlmostEqual(
+            -0.002,
+            _late_support_ev_adjustment(
+                cfg=cfg,
+                side="BEAR",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=1.3,
+                projected_final_pool_bear_bnb=1.1,
+            ),
+        )
+        self.assertAlmostEqual(
+            0.0,
+            _late_support_ev_adjustment(
+                cfg=cfg,
+                side="BULL",
+                bull_pool_cutoff_bnb=1.0,
+                bear_pool_cutoff_bnb=1.0,
+                projected_final_pool_bull_bnb=None,
+                projected_final_pool_bear_bnb=1.2,
+            ),
         )
 
 

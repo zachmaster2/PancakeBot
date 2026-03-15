@@ -367,6 +367,139 @@ class MlCandidateAdapterTests(unittest.TestCase):
 
         self.assertEqual("ml_veto_candidate_expected_net_below_min", skip_reason)
 
+    def test_candidate_profit_model_calibrates_baseline_candidate_score(self) -> None:
+        cfg = replace(
+            self._ml_cfg(enabled=True, name="ml_test"),
+            candidate_profit_model_enabled=True,
+            candidate_profit_model_warmup_rounds=1,
+            candidate_profit_model_num_quantile_bins=2,
+            candidate_profit_model_min_cell_obs=1,
+        )
+        adapter = MlCandidateAdapter(
+            config=cfg,
+            cutoff_seconds=17,
+            treasury_fee_fraction=0.03,
+            klines_store_like=object(),
+        )
+        round_t = Round(
+            epoch=123,
+            start_at=1_000_000,
+            lock_at=1_000_300,
+            close_at=1_000_600,
+            lock_price=600.0,
+            close_price=601.0,
+            position="Bull",
+            failed=False,
+            bets=(),
+        )
+        candidate_signal = StrategyCandidateSignal(
+            candidate_name="altA",
+            action="BET",
+            bet_side="Bull",
+            bet_size_bnb=0.2,
+            expected_profit_bnb=0.02,
+            selector_score_bnb=0.02,
+            skip_reason=None,
+            p_bull=None,
+            dislocation_bull=0.12,
+        )
+        context = SimpleNamespace(
+            p_bull=0.58,
+            p_tradeable=0.75,
+            dislocation_bull=0.08,
+            final_total_bnb=5.0,
+            final_bull_bnb=3.2,
+            final_bear_bnb=1.8,
+        )
+
+        with patch.object(MlCandidateAdapter, "_open_round_context", return_value=(context, None)):
+            raw_expected = adapter._candidate_raw_expected_net_for_open_round(  # noqa: SLF001
+                round_t=round_t,
+                candidate_signal=candidate_signal,
+            )
+            adapter.observe_baseline_candidate_settlement(
+                round_t=round_t,
+                candidate_signals={"altA": candidate_signal},
+                realized_profit_by_candidate={"altA": 0.12},
+            )
+            calibrated = adapter.candidate_expected_net_for_open_round(
+                round_t=round_t,
+                candidate_signal=candidate_signal,
+            )
+
+        self.assertIsNotNone(raw_expected)
+        self.assertNotEqual(float(raw_expected), float(calibrated))
+        self.assertEqual(0.12, float(calibrated))
+
+    def test_candidate_profit_model_state_round_trips_through_snapshot(self) -> None:
+        cfg = replace(
+            self._ml_cfg(enabled=True, name="ml_test"),
+            candidate_profit_model_enabled=True,
+            candidate_profit_model_warmup_rounds=1,
+            candidate_profit_model_num_quantile_bins=2,
+            candidate_profit_model_min_cell_obs=1,
+        )
+        adapter = MlCandidateAdapter(
+            config=cfg,
+            cutoff_seconds=17,
+            treasury_fee_fraction=0.03,
+            klines_store_like=object(),
+        )
+        round_t = Round(
+            epoch=123,
+            start_at=1_000_000,
+            lock_at=1_000_300,
+            close_at=1_000_600,
+            lock_price=600.0,
+            close_price=601.0,
+            position="Bull",
+            failed=False,
+            bets=(),
+        )
+        candidate_signal = StrategyCandidateSignal(
+            candidate_name="altA",
+            action="BET",
+            bet_side="Bull",
+            bet_size_bnb=0.2,
+            expected_profit_bnb=0.02,
+            selector_score_bnb=0.02,
+            skip_reason=None,
+            p_bull=None,
+            dislocation_bull=0.12,
+        )
+        context = SimpleNamespace(
+            p_bull=0.58,
+            p_tradeable=0.75,
+            dislocation_bull=0.08,
+            final_total_bnb=5.0,
+            final_bull_bnb=3.2,
+            final_bear_bnb=1.8,
+        )
+
+        with patch.object(MlCandidateAdapter, "_open_round_context", return_value=(context, None)):
+            adapter.observe_baseline_candidate_settlement(
+                round_t=round_t,
+                candidate_signals={"altA": candidate_signal},
+                realized_profit_by_candidate={"altA": 0.12},
+            )
+            snapshot = adapter.export_bootstrap_state()
+
+        restored = MlCandidateAdapter(
+            config=cfg,
+            cutoff_seconds=17,
+            treasury_fee_fraction=0.03,
+            klines_store_like=object(),
+        )
+        restored.import_bootstrap_state(state=snapshot)
+
+        with patch.object(MlCandidateAdapter, "_open_round_context", return_value=(context, None)):
+            calibrated = restored.candidate_expected_net_for_open_round(
+                round_t=round_t,
+                candidate_signal=candidate_signal,
+            )
+
+        self.assertEqual(0.12, float(calibrated))
+
 
 if __name__ == "__main__":
     unittest.main()
