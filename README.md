@@ -50,6 +50,7 @@ Current shared baseline:
             - `runtime/dry_bets.jsonl`
             - `runtime/dry_settled_epochs.txt`
             - `runtime/dry_audit_trades.csv`
+            - `runtime/dry_bankroll_state.json`
 
 ## Dry smoke
 

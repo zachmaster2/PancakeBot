@@ -124,6 +124,7 @@ class RuntimeConfig:
         dry_bets_path="var/runtime/dry_bets.jsonl",
         dry_settled_epochs_path="var/runtime/dry_settled_epochs.txt",
         dry_audit_trades_path="var/runtime/dry_audit_trades.csv",
+        dry_bankroll_state_path="var/runtime/dry_bankroll_state.json",
     )
 
 
@@ -137,6 +138,14 @@ class _ClosedState:
     simulated_bankroll_bnb: float | None = None
     dry_bets_by_epoch: dict[int, dict[str, object]] | None = None
     dry_settled_epochs: set[int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DryBankrollState:
+    simulated_bankroll_bnb: float
+    updated_ts: int
+    source: str
+    epoch: int | None = None
 
 
 def _build_context_klines(*, klines_cache: RollingKlinesCache, target_round: Round, cutoff_seconds: int) -> list[Kline]:
@@ -253,6 +262,17 @@ def _append_jsonl(path: str, record: dict[str, object]) -> None:
         f.write("\n")
 
 
+def _write_json_file_atomic(path: str, record: dict[str, object]) -> None:
+    out = Path(path)
+    _ensure_parent_dir(str(out))
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(record, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+    tmp.replace(out)
+
+
 def _mono_ms() -> float:
     return float(time.perf_counter() * 1000.0)
 
@@ -364,6 +384,181 @@ def _load_dry_settled_epochs(path: str) -> set[int]:
     return out
 
 
+def _load_dry_settled_epochs_from_audit(path: str) -> set[int]:
+    p = Path(path)
+    if not p.exists():
+        return set()
+    out: set[int] = set()
+    with p.open("r", newline="", encoding="utf-8") as f:
+        for lineno, row in enumerate(csv.DictReader(f), start=2):
+            settled_ts_raw = str(row.get("settled_ts", "")).strip()
+            if settled_ts_raw == "":
+                continue
+            epoch_raw = str(row.get("epoch", "")).strip()
+            if epoch_raw == "":
+                raise InvariantError(f"dry_audit_epoch_missing: path={path} line={lineno}")
+            try:
+                int(settled_ts_raw)
+                out.add(int(epoch_raw))
+            except ValueError as e:
+                raise InvariantError(f"dry_audit_row_invalid: path={path} line={lineno}") from e
+    return out
+
+
+def _load_dry_bankroll_state(path: str) -> _DryBankrollState | None:
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise InvariantError(f"dry_bankroll_state_json_invalid: path={path}") from e
+    if not isinstance(raw, dict):
+        raise InvariantError(f"dry_bankroll_state_not_object: path={path}")
+    bankroll_raw = raw.get("simulated_bankroll_bnb")
+    updated_ts_raw = raw.get("updated_ts")
+    source_raw = raw.get("source", "")
+    epoch_raw = raw.get("epoch")
+    if not isinstance(bankroll_raw, (int, float)):
+        raise InvariantError(f"dry_bankroll_state_bankroll_invalid: path={path}")
+    if not isinstance(updated_ts_raw, int):
+        raise InvariantError(f"dry_bankroll_state_updated_ts_invalid: path={path}")
+    if not isinstance(source_raw, str) or str(source_raw).strip() == "":
+        raise InvariantError(f"dry_bankroll_state_source_invalid: path={path}")
+    epoch: int | None = None
+    if epoch_raw is not None:
+        try:
+            epoch = int(epoch_raw)
+        except Exception as e:
+            raise InvariantError(f"dry_bankroll_state_epoch_invalid: path={path}") from e
+    bankroll_bnb = float(bankroll_raw)
+    if bankroll_bnb < 0.0:
+        raise InvariantError(f"dry_bankroll_state_bankroll_negative: path={path}")
+    if int(updated_ts_raw) < 0:
+        raise InvariantError(f"dry_bankroll_state_updated_ts_negative: path={path}")
+    return _DryBankrollState(
+        simulated_bankroll_bnb=float(bankroll_bnb),
+        updated_ts=int(updated_ts_raw),
+        source=str(source_raw).strip(),
+        epoch=epoch,
+    )
+
+
+def _save_dry_bankroll_state(
+    path: str,
+    *,
+    bankroll_bnb: float,
+    source: str,
+    epoch: int | None,
+    updated_ts: int,
+) -> _DryBankrollState:
+    if float(bankroll_bnb) < 0.0:
+        raise InvariantError("dry_bankroll_state_bankroll_negative")
+    if int(updated_ts) < 0:
+        raise InvariantError("dry_bankroll_state_updated_ts_negative")
+    source_name = str(source).strip()
+    if source_name == "":
+        raise InvariantError("dry_bankroll_state_source_empty")
+    state = _DryBankrollState(
+        simulated_bankroll_bnb=float(bankroll_bnb),
+        updated_ts=int(updated_ts),
+        source=str(source_name),
+        epoch=(None if epoch is None else int(epoch)),
+    )
+    _write_json_file_atomic(
+        path,
+        {
+            "simulated_bankroll_bnb": float(state.simulated_bankroll_bnb),
+            "updated_ts": int(state.updated_ts),
+            "source": str(state.source),
+            "epoch": (None if state.epoch is None else int(state.epoch)),
+        },
+    )
+    return state
+
+
+def _recover_dry_bankroll_state_from_logs(
+    *,
+    dry_bets_path: str,
+    dry_audit_trades_path: str,
+) -> _DryBankrollState | None:
+    latest_state: _DryBankrollState | None = None
+
+    for rec in _load_dry_bets(str(dry_bets_path)).values():
+        placed_ts_raw = rec.get("placed_ts")
+        bankroll_raw = rec.get("bankroll_after_bet_bnb")
+        epoch_raw = rec.get("epoch")
+        if not isinstance(placed_ts_raw, int):
+            continue
+        if not isinstance(bankroll_raw, (int, float)):
+            continue
+        epoch = None if epoch_raw is None else int(epoch_raw)
+        state = _DryBankrollState(
+            simulated_bankroll_bnb=float(bankroll_raw),
+            updated_ts=int(placed_ts_raw),
+            source="recover_from_dry_bet",
+            epoch=epoch,
+        )
+        if latest_state is None or int(state.updated_ts) > int(latest_state.updated_ts):
+            latest_state = state
+
+    audit_path = Path(str(dry_audit_trades_path))
+    if audit_path.exists():
+        with audit_path.open("r", newline="", encoding="utf-8") as f:
+            for lineno, row in enumerate(csv.DictReader(f), start=2):
+                settled_ts_raw = str(row.get("settled_ts", "")).strip()
+                bankroll_raw = str(row.get("bankroll_after_settle_bnb", "")).strip()
+                if settled_ts_raw == "" or bankroll_raw == "":
+                    continue
+                try:
+                    settled_ts = int(settled_ts_raw)
+                    bankroll_bnb = float(bankroll_raw)
+                except ValueError as e:
+                    raise InvariantError(
+                        f"dry_audit_row_invalid: path={dry_audit_trades_path} line={lineno}"
+                    ) from e
+                epoch_raw = str(row.get("epoch", "")).strip()
+                epoch = int(epoch_raw) if epoch_raw != "" else None
+                state = _DryBankrollState(
+                    simulated_bankroll_bnb=float(bankroll_bnb),
+                    updated_ts=int(settled_ts),
+                    source="recover_from_dry_settle",
+                    epoch=epoch,
+                )
+                if latest_state is None or int(state.updated_ts) > int(latest_state.updated_ts):
+                    latest_state = state
+
+    return latest_state
+
+
+def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState:
+    persisted = _load_dry_bankroll_state(str(cfg.runtime_state_paths.dry_bankroll_state_path))
+    recovered = _recover_dry_bankroll_state_from_logs(
+        dry_bets_path=str(cfg.runtime_state_paths.dry_bets_path),
+        dry_audit_trades_path=str(cfg.runtime_state_paths.dry_audit_trades_path),
+    )
+    if persisted is not None and (
+        recovered is None or int(persisted.updated_ts) >= int(recovered.updated_ts)
+    ):
+        return persisted
+    if recovered is not None:
+        return _save_dry_bankroll_state(
+            str(cfg.runtime_state_paths.dry_bankroll_state_path),
+            bankroll_bnb=float(recovered.simulated_bankroll_bnb),
+            source="recovered",
+            epoch=recovered.epoch,
+            updated_ts=int(recovered.updated_ts),
+        )
+    wallet_bnb = float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
+    return _save_dry_bankroll_state(
+        str(cfg.runtime_state_paths.dry_bankroll_state_path),
+        bankroll_bnb=float(wallet_bnb),
+        source="wallet_init",
+        epoch=None,
+        updated_ts=int(now_ts()),
+    )
+
+
 def _append_dry_settled_epoch(path: str, epoch: int) -> None:
     _ensure_parent_dir(path)
     with open(path, "a") as f:
@@ -385,9 +580,10 @@ def _dry_record_bet(
 ) -> None:
     if int(epoch) in closed.dry_bets_by_epoch:
         raise InvariantError(f"dry_bet_duplicate_epoch: epoch={int(epoch)}")
+    placed_ts = int(now_ts())
     rec = {
         "epoch": int(epoch),
-        "placed_ts": int(now_ts()),
+        "placed_ts": int(placed_ts),
         "bet_side": str(side),
         "bet_bnb": float(amount_bnb),
         "p_final": float(p_final),
@@ -398,6 +594,13 @@ def _dry_record_bet(
     }
     closed.dry_bets_by_epoch[int(epoch)] = rec
     _append_jsonl(str(cfg.runtime_state_paths.dry_bets_path), rec)
+    _save_dry_bankroll_state(
+        str(cfg.runtime_state_paths.dry_bankroll_state_path),
+        bankroll_bnb=float(bankroll_after_bet_bnb),
+        source="bet",
+        epoch=int(epoch),
+        updated_ts=int(placed_ts),
+    )
 
 
 def _ensure_dry_audit_csv(path: str) -> list[str]:
@@ -563,6 +766,13 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
 
         closed.dry_settled_epochs.add(e)
         _append_dry_settled_epoch(str(cfg.runtime_state_paths.dry_settled_epochs_path), e)
+        _save_dry_bankroll_state(
+            str(cfg.runtime_state_paths.dry_bankroll_state_path),
+            bankroll_bnb=float(bankroll_after_settle),
+            source="settle",
+            epoch=int(e),
+            updated_ts=int(settled_ts),
+        )
 
 
 def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
@@ -658,12 +868,25 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     )
 
     if cfg.dry:
-        closed.simulated_bankroll_bnb = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
+        bankroll_state = _resolve_initial_dry_bankroll_state(cfg)
+        closed.simulated_bankroll_bnb = float(bankroll_state.simulated_bankroll_bnb)
         closed.dry_bets_by_epoch = _load_dry_bets(str(cfg.runtime_state_paths.dry_bets_path))
-        closed.dry_settled_epochs = _load_dry_settled_epochs(
-            str(cfg.runtime_state_paths.dry_settled_epochs_path)
-        )
         _ensure_dry_audit_csv(str(cfg.runtime_state_paths.dry_audit_trades_path))
+        settled_epochs = _load_dry_settled_epochs(str(cfg.runtime_state_paths.dry_settled_epochs_path))
+        settled_epochs.update(
+            _load_dry_settled_epochs_from_audit(str(cfg.runtime_state_paths.dry_audit_trades_path))
+        )
+        closed.dry_settled_epochs = settled_epochs
+        info(
+            "RUN",
+            "DRY",
+            "STATE",
+            msg=(
+                f"Loaded dry bankroll {float(bankroll_state.simulated_bankroll_bnb):.6f} BNB "
+                f"source={str(bankroll_state.source)} "
+                f"path={str(cfg.runtime_state_paths.dry_bankroll_state_path)}"
+            ),
+        )
 
     return closed
 

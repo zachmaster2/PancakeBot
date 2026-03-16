@@ -80,6 +80,10 @@ def collect_preflight_checks(
             name="dry_audit_parent",
             path=str(cfg.runtime_state_paths.dry_audit_trades_path),
         ),
+        _parent_writable_check(
+            name="dry_bankroll_parent",
+            path=str(cfg.runtime_state_paths.dry_bankroll_state_path),
+        ),
         PreflightCheck(
             name="active_candidates_nonempty",
             passed=bool(len(cfg.strategy.dislocation.candidates) > 0),

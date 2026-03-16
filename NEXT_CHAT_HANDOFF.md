@@ -2833,3 +2833,13 @@ Updated best-known candidate from Stage Q+R:
      - invalid settled-epoch lines,
      - duplicate dry-bet epochs on load
    - runtime-state paths are now validated as distinct during config load.
+
+8. Dry bankroll persistence:
+   - new runtime path:
+     - `dry_bankroll_state_path = var/runtime/dry_bankroll_state.json`
+   - dry mode now persists simulated bankroll after every bet and settle.
+   - restart behavior:
+     - prefers the dedicated bankroll state file when current,
+     - falls back to recovering from `dry_bets.jsonl` / `dry_audit_trades.csv` when needed,
+     - unions settled epochs from both `dry_settled_epochs.txt` and the audit CSV to avoid
+       double-credit after mid-settlement interruptions.

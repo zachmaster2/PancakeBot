@@ -32,6 +32,10 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             "var/runtime/dry_audit_trades.csv",
             cfg.runtime_state_paths.dry_audit_trades_path,
         )
+        self.assertEqual(
+            "var/runtime/dry_bankroll_state.json",
+            cfg.runtime_state_paths.dry_bankroll_state_path,
+        )
 
         candidates = {str(c.name): c for c in cfg.strategy.dislocation.candidates}
         self.assertEqual([_ALT_A_NAME, _ALT_B_NAME], list(candidates.keys()))
@@ -78,6 +82,11 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
                 'dry_audit_trades_path = "var/custom/dry_audit_trades.csv"',
                 1,
             )
+            .replace(
+                'dry_bankroll_state_path = "var/runtime/dry_bankroll_state.json"',
+                'dry_bankroll_state_path = "var/custom/dry_bankroll_state.json"',
+                1,
+            )
         )
 
         with tempfile.TemporaryDirectory() as td:
@@ -94,6 +103,10 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertEqual(
             "var/custom/dry_audit_trades.csv",
             cfg.runtime_state_paths.dry_audit_trades_path,
+        )
+        self.assertEqual(
+            "var/custom/dry_bankroll_state.json",
+            cfg.runtime_state_paths.dry_bankroll_state_path,
         )
 
     def test_unknown_paths_key_is_rejected(self) -> None:

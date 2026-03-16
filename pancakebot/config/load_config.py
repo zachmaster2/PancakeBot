@@ -1104,6 +1104,7 @@ def load_app_config(path: str) -> AppConfig:
         "dry_bets_path",
         "dry_settled_epochs_path",
         "dry_audit_trades_path",
+        "dry_bankroll_state_path",
     }
     _validate_unknown_keys("paths", paths, allowed_path_keys)
 
@@ -1150,6 +1151,11 @@ def load_app_config(path: str) -> AppConfig:
         "dry_audit_trades_path",
         "var/runtime/dry_audit_trades.csv",
     )
+    dry_bankroll_state_path = _opt_str(
+        paths,
+        "dry_bankroll_state_path",
+        "var/runtime/dry_bankroll_state.json",
+    )
     _validate_distinct_paths(
         "runtime_state",
         {
@@ -1157,6 +1163,7 @@ def load_app_config(path: str) -> AppConfig:
             "dry_bets_path": str(dry_bets_path),
             "dry_settled_epochs_path": str(dry_settled_epochs_path),
             "dry_audit_trades_path": str(dry_audit_trades_path),
+            "dry_bankroll_state_path": str(dry_bankroll_state_path),
         },
     )
 
@@ -1254,6 +1261,7 @@ def load_app_config(path: str) -> AppConfig:
             dry_bets_path=str(dry_bets_path),
             dry_settled_epochs_path=str(dry_settled_epochs_path),
             dry_audit_trades_path=str(dry_audit_trades_path),
+            dry_bankroll_state_path=str(dry_bankroll_state_path),
         ),
         strategy=strategy_cfg,
         backtest=backtest_cfg,
