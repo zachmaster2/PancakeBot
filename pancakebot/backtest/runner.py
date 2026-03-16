@@ -75,8 +75,6 @@ def _build_dislocation_engine(
         cutoff_seconds=int(runtime_cfg.cutoff_seconds),
         projected_pool_provider=projected_pool_provider,
     )
-    if all_klines is not None:
-        engine.refresh_klines(list(all_klines))
     return engine
 
 

@@ -32,3 +32,6 @@ Desktop.ini
 
 # Local agent capability checks
 codex_write_test.txt
+
+# Local copied crash logs
+dry_mode_error.txt

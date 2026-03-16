@@ -84,6 +84,14 @@ def collect_preflight_checks(
             name="dry_bankroll_parent",
             path=str(cfg.runtime_state_paths.dry_bankroll_state_path),
         ),
+        _parent_writable_check(
+            name="dry_pipeline_snapshot_parent",
+            path=str(cfg.runtime_state_paths.dry_pipeline_bootstrap_state_path),
+        ),
+        _parent_writable_check(
+            name="live_pipeline_snapshot_parent",
+            path=str(cfg.runtime_state_paths.live_pipeline_bootstrap_state_path),
+        ),
         PreflightCheck(
             name="active_candidates_nonempty",
             passed=bool(len(cfg.strategy.dislocation.candidates) > 0),

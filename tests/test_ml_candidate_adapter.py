@@ -184,6 +184,42 @@ class MlCandidateAdapterTests(unittest.TestCase):
         self.assertIn(projection_key, cache)
         self.assertEqual((3.0, 1.8, 1.2), cache[projection_key])
 
+    def test_settle_closed_rounds_prunes_history_to_required_window(self) -> None:
+        cfg = replace(
+            self._ml_cfg(enabled=False, name="ml_test"),
+            train_size=4,
+            calibrate_size=2,
+        )
+        adapter = MlCandidateAdapter(
+            config=cfg,
+            cutoff_seconds=17,
+            treasury_fee_fraction=0.03,
+            klines_store_like=object(),
+        )
+        rounds = [
+            Round(
+                epoch=int(epoch),
+                start_at=1_000_000 + int(epoch) * 300,
+                lock_at=1_000_000 + int(epoch) * 300 + 300,
+                close_at=1_000_000 + int(epoch) * 300 + 600,
+                lock_price=600.0,
+                close_price=601.0,
+                position="Bull",
+                failed=False,
+                bets=(),
+            )
+            for epoch in range(1, 21)
+        ]
+
+        with patch(
+            "pancakebot.domain.strategy.ml_candidate_adapter.max_required_prior_context_rounds_size",
+            return_value=3,
+        ):
+            adapter.settle_closed_rounds(rounds=list(rounds))
+
+        history_epochs = [int(round_t.epoch) for round_t in adapter._history_rounds]  # noqa: SLF001
+        self.assertEqual(list(range(12, 21)), history_epochs)
+
     def test_expected_net_above_max_skips_candidate(self) -> None:
         cfg = self._ml_cfg(enabled=True, name="ml_test")
         cfg = replace(cfg, expected_net_max_bnb=0.01)

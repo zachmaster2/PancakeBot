@@ -45,6 +45,11 @@ from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
 from pancakebot.domain.strategy.pipeline import StrategyPipeline
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterConfig
 from pancakebot.runtime.claim_manager import claim_scan_cursor
+from pancakebot.runtime.bootstrap_snapshot import (
+    load_runtime_pipeline_snapshot,
+    runtime_pipeline_snapshot_compatibility_key,
+    save_runtime_pipeline_snapshot,
+)
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 from pancakebot.runtime.sleep import sleep_seconds
 from pancakebot.core.errors import InvariantError, TransientGraphError, TransientRpcError
@@ -125,6 +130,8 @@ class RuntimeConfig:
         dry_settled_epochs_path="var/runtime/dry_settled_epochs.txt",
         dry_audit_trades_path="var/runtime/dry_audit_trades.csv",
         dry_bankroll_state_path="var/runtime/dry_bankroll_state.json",
+        dry_pipeline_bootstrap_state_path="var/runtime/dry_pipeline_bootstrap_state.pkl.gz",
+        live_pipeline_bootstrap_state_path="var/runtime/live_pipeline_bootstrap_state.pkl.gz",
     )
 
 
@@ -138,6 +145,7 @@ class _ClosedState:
     simulated_bankroll_bnb: float | None = None
     dry_bets_by_epoch: dict[int, dict[str, object]] | None = None
     dry_settled_epochs: set[int] | None = None
+    pipeline_snapshot_saved_epoch: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,7 +203,10 @@ def run_live_loop(cfg: RuntimeConfig) -> None:
             raise InvariantError("dry_bankroll_uninitialized")
         bankroll_bnb = closed_state.simulated_bankroll_bnb
     else:
-        bankroll_bnb = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
+        bankroll_bnb = _fetch_wallet_balance_bnb_with_retries(
+            cfg=cfg,
+            reason="live_wallet_bootstrap",
+        )
     info(
         "CORE",
         "RUN",
@@ -275,6 +286,128 @@ def _write_json_file_atomic(path: str, record: dict[str, object]) -> None:
 
 def _mono_ms() -> float:
     return float(time.perf_counter() * 1000.0)
+
+
+def _runtime_pipeline_snapshot_path(cfg: RuntimeConfig) -> str:
+    if bool(cfg.dry):
+        return str(cfg.runtime_state_paths.dry_pipeline_bootstrap_state_path)
+    return str(cfg.runtime_state_paths.live_pipeline_bootstrap_state_path)
+
+
+def _runtime_pipeline_snapshot_last_saved_epoch(closed: _ClosedState) -> int | None:
+    return None if closed.pipeline_snapshot_saved_epoch is None else int(closed.pipeline_snapshot_saved_epoch)
+
+
+def _runtime_pipeline_snapshot_compatibility_key(cfg: RuntimeConfig) -> str:
+    return str(
+        runtime_pipeline_snapshot_compatibility_key(
+            strategy_cfg=cfg.strategy_cfg,
+            cutoff_seconds=int(cfg.cutoff_seconds),
+            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+            round_store_path=str(cfg.round_store.path_jsonl),
+            klines_store_path=str(cfg.klines_store.path),
+        )
+    )
+
+
+def _save_runtime_pipeline_snapshot(
+    *,
+    cfg: RuntimeConfig,
+    closed: _ClosedState,
+) -> int | None:
+    if closed.strategy_pipeline is None:
+        raise InvariantError("strategy_pipeline_missing")
+
+    pipeline_state = closed.strategy_pipeline.export_bootstrap_state()
+    last_settled_epoch_raw = pipeline_state.get("last_settled_epoch")
+    last_settled_epoch = None if last_settled_epoch_raw is None else int(last_settled_epoch_raw)
+    last_round = None if last_settled_epoch is None else closed.cache.get_round(int(last_settled_epoch))
+    save_runtime_pipeline_snapshot(
+        path=_runtime_pipeline_snapshot_path(cfg),
+        compatibility_key=_runtime_pipeline_snapshot_compatibility_key(cfg),
+        pipeline_state=pipeline_state,
+        last_settled_round=last_round,
+    )
+    closed.pipeline_snapshot_saved_epoch = last_settled_epoch
+    return None if last_settled_epoch is None else int(last_settled_epoch)
+
+
+def _bootstrap_strategy_pipeline_from_runtime_snapshot(
+    *,
+    cfg: RuntimeConfig,
+    closed: _ClosedState,
+    rounds_all: list[Round],
+    warmup_rounds: list[Round],
+) -> None:
+    if closed.strategy_pipeline is None:
+        raise InvariantError("strategy_pipeline_missing")
+    if not rounds_all:
+        raise InvariantError("closed_rounds_empty_for_runtime_bootstrap")
+    if not warmup_rounds:
+        raise InvariantError("warmup_rounds_empty_for_runtime_bootstrap")
+
+    rounds_by_epoch = {int(round_t.epoch): round_t for round_t in rounds_all}
+    snapshot_path = _runtime_pipeline_snapshot_path(cfg)
+    compatibility_key = _runtime_pipeline_snapshot_compatibility_key(cfg)
+    snapshot = load_runtime_pipeline_snapshot(
+        path=str(snapshot_path),
+        compatibility_key=str(compatibility_key),
+        rounds_by_epoch=rounds_by_epoch,
+    )
+
+    if isinstance(snapshot, dict):
+        pipeline_state = snapshot.get("pipeline_state")
+        if not isinstance(pipeline_state, dict):
+            raise InvariantError("runtime_pipeline_snapshot_state_missing")
+        closed.strategy_pipeline.import_bootstrap_state(state=pipeline_state)
+        restored_epoch = closed.strategy_pipeline.last_settled_epoch
+        if restored_epoch is None:
+            raise InvariantError("runtime_pipeline_snapshot_last_settled_epoch_missing")
+        delta_rounds = [
+            round_t
+            for round_t in rounds_all
+            if int(round_t.epoch) > int(restored_epoch)
+        ]
+        info(
+            "CORE",
+            "CACHE",
+            "HIT",
+            msg=(
+                f"path={str(snapshot_path)} restored_epoch={int(restored_epoch)} "
+                f"delta_rounds={int(len(delta_rounds))}"
+            ),
+        )
+        if delta_rounds:
+            closed.strategy_pipeline.bootstrap_from_closed_rounds(rounds=list(delta_rounds))
+            _save_runtime_pipeline_snapshot(cfg=cfg, closed=closed)
+        else:
+            closed.pipeline_snapshot_saved_epoch = int(restored_epoch)
+        return
+
+    info(
+        "CORE",
+        "CACHE",
+        "MISS",
+        msg=f"path={str(snapshot_path)} warmup_rounds={int(len(warmup_rounds))}",
+    )
+    closed.strategy_pipeline.bootstrap_from_closed_rounds(rounds=list(warmup_rounds))
+    _save_runtime_pipeline_snapshot(cfg=cfg, closed=closed)
+
+
+def _maybe_persist_runtime_pipeline_snapshot(
+    *,
+    cfg: RuntimeConfig,
+    closed: _ClosedState,
+) -> None:
+    if closed.strategy_pipeline is None:
+        raise InvariantError("strategy_pipeline_missing")
+    current_epoch = closed.strategy_pipeline.last_settled_epoch
+    if current_epoch is None:
+        return
+    saved_epoch = _runtime_pipeline_snapshot_last_saved_epoch(closed)
+    if saved_epoch is not None and int(current_epoch) <= int(saved_epoch):
+        return
+    _save_runtime_pipeline_snapshot(cfg=cfg, closed=closed)
 
 
 def _replace_open_round_bets_from_events(
@@ -549,7 +682,10 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
             epoch=recovered.epoch,
             updated_ts=int(recovered.updated_ts),
         )
-    wallet_bnb = float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
+    wallet_bnb = _fetch_wallet_balance_bnb_with_retries(
+        cfg=cfg,
+        reason="dry_wallet_bootstrap",
+    )
     return _save_dry_bankroll_state(
         str(cfg.runtime_state_paths.dry_bankroll_state_path),
         bankroll_bnb=float(wallet_bnb),
@@ -557,6 +693,37 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
         epoch=None,
         updated_ts=int(now_ts()),
     )
+
+
+def _fetch_wallet_balance_bnb_with_retries(
+    *,
+    cfg: RuntimeConfig,
+    reason: str,
+) -> float:
+    for delay_seconds in _BACKOFF_SECONDS:
+        try:
+            return float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
+        except TransientRpcError as e:
+            info(
+                "CORE",
+                "RUN",
+                "RETRY",
+                msg=(
+                    f"Caught TransientRpcError during {str(reason)}: "
+                    f"retrying after delay err={str(e)}"
+                ),
+            )
+            info(
+                "CORE",
+                "LOOP",
+                "SLEEP",
+                msg=(
+                    f"duration={int(delay_seconds)}s "
+                    "reason=delay_after_transient_network_error"
+                ),
+            )
+            sleep_seconds(int(delay_seconds))
+    return float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
 
 
 def _append_dry_settled_epoch(path: str, epoch: int) -> None:
@@ -858,13 +1025,18 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
 
     klines_cache = _init_klines_cache(cfg=cfg, closed_cache=cache)
     strategy_pipeline = _build_strategy_pipeline(cfg=cfg, klines_cache=klines_cache)
-    strategy_pipeline.bootstrap_from_closed_rounds(rounds=list(cache.rounds))
 
     closed = _ClosedState(
         cache=cache,
         disk_latest_epoch=disk_latest_epoch,
         klines_cache=klines_cache,
         strategy_pipeline=strategy_pipeline,
+    )
+    _bootstrap_strategy_pipeline_from_runtime_snapshot(
+        cfg=cfg,
+        closed=closed,
+        rounds_all=list(rounds_all),
+        warmup_rounds=list(cache.rounds),
     )
 
     if cfg.dry:
@@ -931,6 +1103,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             raise InvariantError("strategy_pipeline_missing")
         closed.strategy_pipeline.refresh_klines(klines=list(closed.klines_cache.klines))
         closed.strategy_pipeline.settle_closed_rounds(rounds=list(closed.cache.rounds))
+        _maybe_persist_runtime_pipeline_snapshot(cfg=cfg, closed=closed)
 
         # Step 4: Fetch lock_ts(t) (RPC) for open epoch.
         lock_ts_t = int(cfg.contract.lock_ts(int(current_epoch)))
@@ -1392,7 +1565,6 @@ def _build_strategy_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesC
         cutoff_seconds=int(cfg.cutoff_seconds),
         projected_pool_provider=ml_adapter,
     )
-    dislocation_engine.refresh_klines(list(klines_cache.klines))
 
     router_cfg = StrategyRouterConfig(
         mode=str(cfg.strategy_cfg.router.mode),
