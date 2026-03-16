@@ -67,6 +67,12 @@ class StrategyPipeline:
 
         return str(self._router.mode)
 
+    @property
+    def last_settled_epoch(self) -> int | None:
+        """Return the latest epoch incorporated into pipeline state."""
+
+        return None if self._last_settled_epoch is None else int(self._last_settled_epoch)
+
     def export_kline_index_state(self) -> dict[str, object]:
         """Export dislocation kline index state for backtest caching."""
 

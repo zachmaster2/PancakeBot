@@ -15,6 +15,8 @@ class RuntimeStatePathsConfig:
     dry_settled_epochs_path: str
     dry_audit_trades_path: str
     dry_bankroll_state_path: str
+    dry_pipeline_bootstrap_state_path: str
+    live_pipeline_bootstrap_state_path: str
 
 
 @dataclass(frozen=True, slots=True)

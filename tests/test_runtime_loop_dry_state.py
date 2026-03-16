@@ -6,9 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from pancakebot.config.app_config import RuntimeStatePathsConfig
-from pancakebot.core.errors import InvariantError
+from pancakebot.core.errors import InvariantError, TransientRpcError
 from pancakebot.runtime.runtime_loop import (
     _load_dry_bankroll_state,
     _load_dry_bets,
@@ -24,6 +25,20 @@ class _WalletStub:
         self._bankroll_bnb = float(bankroll_bnb)
 
     def wallet_balance_bnb(self, _wallet_address: str) -> float:
+        return float(self._bankroll_bnb)
+
+
+class _FlakyWalletStub:
+    def __init__(self, bankroll_bnb: float, *, failures_before_success: int) -> None:
+        self._bankroll_bnb = float(bankroll_bnb)
+        self._failures_before_success = int(failures_before_success)
+        self.calls = 0
+
+    def wallet_balance_bnb(self, _wallet_address: str) -> float:
+        self.calls += 1
+        if self._failures_before_success > 0:
+            self._failures_before_success -= 1
+            raise TransientRpcError("wallet_balance_bnb_failed: simulated_reset")
         return float(self._bankroll_bnb)
 
 
@@ -119,6 +134,8 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_settled_epochs_path=str(dry_settled_path),
                     dry_audit_trades_path=str(dry_audit_path),
                     dry_bankroll_state_path=str(bankroll_state_path),
+                    dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
+                    live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
                 ),
                 contract=_WalletStub(55.0),
                 wallet_address="0xabc",
@@ -140,6 +157,8 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_settled_epochs_path=str(root / "dry_settled.txt"),
                     dry_audit_trades_path=str(root / "dry_audit.csv"),
                     dry_bankroll_state_path=str(root / "dry_bankroll_state.json"),
+                    dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
+                    live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
                 ),
                 contract=_WalletStub(61.75),
                 wallet_address="0xabc",
@@ -149,6 +168,31 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
 
         self.assertAlmostEqual(61.75, float(state.simulated_bankroll_bnb))
         self.assertEqual("wallet_init", state.source)
+
+    def test_resolve_initial_dry_bankroll_state_retries_transient_wallet_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            wallet = _FlakyWalletStub(61.75, failures_before_success=1)
+            cfg = SimpleNamespace(
+                runtime_state_paths=RuntimeStatePathsConfig(
+                    claim_scan_cursor_path=str(root / "claim.txt"),
+                    dry_bets_path=str(root / "dry_bets.jsonl"),
+                    dry_settled_epochs_path=str(root / "dry_settled.txt"),
+                    dry_audit_trades_path=str(root / "dry_audit.csv"),
+                    dry_bankroll_state_path=str(root / "dry_bankroll_state.json"),
+                    dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
+                    live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
+                ),
+                contract=wallet,
+                wallet_address="0xabc",
+            )
+
+            with patch("pancakebot.runtime.runtime_loop.sleep_seconds", return_value=None):
+                state = _resolve_initial_dry_bankroll_state(cfg)
+
+        self.assertAlmostEqual(61.75, float(state.simulated_bankroll_bnb))
+        self.assertEqual("wallet_init", state.source)
+        self.assertEqual(2, wallet.calls)
 
 
 if __name__ == "__main__":

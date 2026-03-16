@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence, TypeVar
 
 from web3 import Web3
 from web3.exceptions import TimeExhausted
@@ -16,6 +16,8 @@ from pancakebot.core.constants import (
 )
 from pancakebot.infra.onchain.web3_contract_config import Web3ContractConfig
 from pancakebot.core.errors import InvariantError, TransientRpcError
+
+_T = TypeVar("_T")
 
 
 def _load_abi_list(path: str) -> list[dict[str, Any]]:
@@ -102,36 +104,48 @@ class Web3PredictionContract:
     def wallet_address(self) -> str:
         return str(self._account.address)
 
+    def _rpc_call(self, *, op: str, fn: Callable[[], _T]) -> _T:
+        try:
+            return fn()
+        except (InvariantError, TransientRpcError):
+            raise
+        except Exception as e:
+            raise TransientRpcError(f"{str(op)}_failed: {e}") from e
+
     def wallet_balance_bnb(self, wallet_address: str) -> float:
         """Return native BNB balance for a wallet address (as BNB float)."""
-        wei = Web3.to_int(self._w3.eth.get_balance(Web3.to_checksum_address(str(wallet_address))))
+        checksum_address = Web3.to_checksum_address(str(wallet_address))
+        wei = self._rpc_call(
+            op="wallet_balance_bnb",
+            fn=lambda: Web3.to_int(self._w3.eth.get_balance(checksum_address)),
+        )
         return float(wei) / float(BNB_WEI)
 
     # ---- Read calls ----
 
     def current_epoch(self) -> int:
-        return int(self._contract.functions.currentEpoch().call())
+        return int(self._rpc_call(op="current_epoch", fn=lambda: self._contract.functions.currentEpoch().call()))
 
     def min_bet_amount(self) -> int:
-        return int(self._contract.functions.minBetAmount().call())
+        return int(self._rpc_call(op="min_bet_amount", fn=lambda: self._contract.functions.minBetAmount().call()))
 
     def treasury_fee_rate(self) -> float:
-        fee_bps = int(self._contract.functions.treasuryFee().call())
+        fee_bps = int(self._rpc_call(op="treasury_fee_rate", fn=lambda: self._contract.functions.treasuryFee().call()))
         return float(fee_bps) / float(TREASURY_FEE_DIVISOR)
 
     def buffer_seconds(self) -> int:
         """Protocol bufferSeconds constant (seconds)."""
-        value = self._contract.functions.bufferSeconds().call()
+        value = self._rpc_call(op="buffer_seconds", fn=lambda: self._contract.functions.bufferSeconds().call())
         return int(value)
 
     def lock_ts(self, epoch: int) -> int:
-        r = self._contract.functions.rounds(int(epoch)).call()
+        r = self._rpc_call(op="lock_ts", fn=lambda: self._contract.functions.rounds(int(epoch)).call())
         # Indices stable for PredictionV2 rounds tuple:
         # (epoch, startTimestamp, lockTimestamp, closeTimestamp, ...)
         return int(r[2])
 
     def close_ts(self, epoch: int) -> int:
-        r = self._contract.functions.rounds(int(epoch)).call()
+        r = self._rpc_call(op="close_ts", fn=lambda: self._contract.functions.rounds(int(epoch)).call())
         return int(r[3])
 
     def latest_block_number(self) -> int:
@@ -210,28 +224,46 @@ class Web3PredictionContract:
 
     def suggest_gas_price_wei(self) -> int:
         """Return the node-suggested gas price (wei)."""
-        return Web3.to_int(self._w3.eth.gas_price)
+        return int(self._rpc_call(op="suggest_gas_price_wei", fn=lambda: Web3.to_int(self._w3.eth.gas_price)))
 
     def get_user_rounds_length(self, wallet_address: str) -> int:
-        return int(self._contract.functions.getUserRoundsLength(Web3.to_checksum_address(str(wallet_address))).call())
+        checksum_address = Web3.to_checksum_address(str(wallet_address))
+        return int(
+            self._rpc_call(
+                op="get_user_rounds_length",
+                fn=lambda: self._contract.functions.getUserRoundsLength(checksum_address).call(),
+            )
+        )
 
     def get_user_rounds(self, *, wallet_address: str, cursor: int, size: int) -> Sequence[int]:
-        values = self._contract.functions.getUserRounds(
-            Web3.to_checksum_address(str(wallet_address)),
-            int(cursor),
-            int(size),
-        ).call()
+        checksum_address = Web3.to_checksum_address(str(wallet_address))
+        values = self._rpc_call(
+            op="get_user_rounds",
+            fn=lambda: self._contract.functions.getUserRounds(
+                checksum_address,
+                int(cursor),
+                int(size),
+            ).call(),
+        )
         epochs = values[0]
         return [int(x) for x in epochs]
 
     def claimable(self, *, epoch: int, wallet_address: str) -> bool:
+        checksum_address = Web3.to_checksum_address(str(wallet_address))
         return bool(
-            self._contract.functions.claimable(int(epoch), Web3.to_checksum_address(str(wallet_address))).call()
+            self._rpc_call(
+                op="claimable",
+                fn=lambda: self._contract.functions.claimable(int(epoch), checksum_address).call(),
+            )
         )
 
     def refundable(self, *, epoch: int, wallet_address: str) -> bool:
+        checksum_address = Web3.to_checksum_address(str(wallet_address))
         return bool(
-            self._contract.functions.refundable(int(epoch), Web3.to_checksum_address(str(wallet_address))).call()
+            self._rpc_call(
+                op="refundable",
+                fn=lambda: self._contract.functions.refundable(int(epoch), checksum_address).call(),
+            )
         )
 
     # ---- Write calls ----
@@ -309,14 +341,17 @@ class Web3PredictionContract:
         else:
             raise InvariantError("bet_side_invalid")
 
-        return fn.build_transaction(
-            {
-                "from": self._account.address,
-                "value": int(amount_wei),
-                "nonce": Web3.to_int(self._w3.eth.get_transaction_count(self._account.address)),
-                "gas": int(gas_limit),
-                "gasPrice": int(gas_price_wei),
-            }
+        return self._rpc_call(
+            op="build_bet_tx",
+            fn=lambda: fn.build_transaction(
+                {
+                    "from": self._account.address,
+                    "value": int(amount_wei),
+                    "nonce": Web3.to_int(self._w3.eth.get_transaction_count(self._account.address)),
+                    "gas": int(gas_limit),
+                    "gasPrice": int(gas_price_wei),
+                }
+            ),
         )
 
     def bet_bull_timed(

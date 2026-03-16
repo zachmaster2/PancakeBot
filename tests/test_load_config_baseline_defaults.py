@@ -36,6 +36,14 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             "var/runtime/dry_bankroll_state.json",
             cfg.runtime_state_paths.dry_bankroll_state_path,
         )
+        self.assertEqual(
+            "var/runtime/dry_pipeline_bootstrap_state.pkl.gz",
+            cfg.runtime_state_paths.dry_pipeline_bootstrap_state_path,
+        )
+        self.assertEqual(
+            "var/runtime/live_pipeline_bootstrap_state.pkl.gz",
+            cfg.runtime_state_paths.live_pipeline_bootstrap_state_path,
+        )
 
         candidates = {str(c.name): c for c in cfg.strategy.dislocation.candidates}
         self.assertEqual([_ALT_A_NAME, _ALT_B_NAME], list(candidates.keys()))
@@ -87,6 +95,16 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
                 'dry_bankroll_state_path = "var/custom/dry_bankroll_state.json"',
                 1,
             )
+            .replace(
+                'dry_pipeline_bootstrap_state_path = "var/runtime/dry_pipeline_bootstrap_state.pkl.gz"',
+                'dry_pipeline_bootstrap_state_path = "var/custom/dry_pipeline_bootstrap_state.pkl.gz"',
+                1,
+            )
+            .replace(
+                'live_pipeline_bootstrap_state_path = "var/runtime/live_pipeline_bootstrap_state.pkl.gz"',
+                'live_pipeline_bootstrap_state_path = "var/custom/live_pipeline_bootstrap_state.pkl.gz"',
+                1,
+            )
         )
 
         with tempfile.TemporaryDirectory() as td:
@@ -107,6 +125,14 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertEqual(
             "var/custom/dry_bankroll_state.json",
             cfg.runtime_state_paths.dry_bankroll_state_path,
+        )
+        self.assertEqual(
+            "var/custom/dry_pipeline_bootstrap_state.pkl.gz",
+            cfg.runtime_state_paths.dry_pipeline_bootstrap_state_path,
+        )
+        self.assertEqual(
+            "var/custom/live_pipeline_bootstrap_state.pkl.gz",
+            cfg.runtime_state_paths.live_pipeline_bootstrap_state_path,
         )
 
     def test_unknown_paths_key_is_rejected(self) -> None:

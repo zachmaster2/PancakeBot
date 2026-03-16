@@ -33,6 +33,8 @@ dry_bets_path = "var/runtime/dry_bets.jsonl"
 dry_settled_epochs_path = "var/runtime/dry_settled_epochs.txt"
 dry_audit_trades_path = "var/runtime/dry_audit_trades.csv"
 dry_bankroll_state_path = "var/runtime/dry_bankroll_state.json"
+dry_pipeline_bootstrap_state_path = "var/runtime/dry_pipeline_bootstrap_state.pkl.gz"
+live_pipeline_bootstrap_state_path = "var/runtime/live_pipeline_bootstrap_state.pkl.gz"
 
 [graph]
 # ABI filepath (must contain ABI array JSON).

@@ -267,6 +267,7 @@ class MlCandidateAdapter:
             if self._history_rounds and int(round_t.epoch) <= int(self._history_rounds[-1].epoch):
                 continue
             self._history_rounds.append(round_t)
+        self._prune_history_rounds()
         latest_epoch = int(self._history_rounds[-1].epoch)
         self._prune_projection_cache(latest_closed_epoch=latest_epoch)
 
@@ -403,6 +404,7 @@ class MlCandidateAdapter:
                 continue
             deduped.append(round_t)
         self._history_rounds = list(deduped)
+        self._prune_history_rounds()
         self._state = state.get("walk_forward_state")
         self._final_pool_projection_cache = {}
         self._candidate_profit_model_ready = bool(state.get("candidate_profit_model_ready", False))
@@ -959,6 +961,21 @@ class MlCandidateAdapter:
         while len(self._final_pool_projection_cache) > int(self._MAX_PROJECTION_CACHE_ROWS):
             oldest_key = next(iter(self._final_pool_projection_cache))
             self._final_pool_projection_cache.pop(oldest_key, None)
+
+    def _prune_history_rounds(self) -> None:
+        keep = int(self._max_history_rounds_to_keep())
+        if int(keep) <= 0:
+            raise InvariantError("ml_history_keep_rounds_invalid")
+        if len(self._history_rounds) <= int(keep):
+            return
+        self._history_rounds = list(self._history_rounds[-int(keep):])
+
+    def _max_history_rounds_to_keep(self) -> int:
+        prior_context_rounds = int(max_required_prior_context_rounds_size())
+        train_size = int(self._wf_cfg.train_size)
+        calibrate_size = int(self._wf_cfg.calibrate_size)
+        keep = int(prior_context_rounds) + int(train_size) + int(calibrate_size)
+        return max(int(prior_context_rounds), int(keep))
 
     def _open_round_context(
         self,
