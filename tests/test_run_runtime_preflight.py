@@ -1,0 +1,32 @@
+from __future__ import annotations
+
+import unittest
+
+from inspection.run_runtime_preflight import collect_preflight_checks
+
+
+class RuntimePreflightTests(unittest.TestCase):
+    def test_collect_preflight_checks_passes_for_current_config_without_env(self) -> None:
+        cfg, checks = collect_preflight_checks(
+            config_path="config.toml",
+            check_env=False,
+            env={},
+        )
+
+        self.assertEqual("online_selector_score_fallback", cfg.strategy.router.mode)
+        self.assertTrue(all(bool(check.passed) for check in checks))
+
+    def test_collect_preflight_checks_reports_missing_env_when_requested(self) -> None:
+        _cfg, checks = collect_preflight_checks(
+            config_path="config.toml",
+            check_env=True,
+            env={},
+        )
+
+        env_checks = {check.name: check for check in checks if check.name.startswith("env:")}
+        self.assertEqual(False, bool(env_checks["env:THE_GRAPH_API_KEY"].passed))
+        self.assertEqual(False, bool(env_checks["env:BSC_WALLET_PRIVATE_KEY"].passed))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -62,5 +62,7 @@ Use the shared `config.toml` baseline directly:
 Recommended preflight before a long dry run:
 
 ```powershell
+.\.venv\Scripts\python.exe -m inspection.run_runtime_preflight --check-env
+
 .\.venv\Scripts\python.exe -m inspection.run_backtest_scenario --name smoke_promoted_baseline --sim-size 200 --reset-mode continuous
 ```

@@ -130,6 +130,18 @@ def _validate_unknown_keys(section_name: str, obj: dict[str, Any], allowed: set[
         raise InvariantError(f"unknown_{section_name}_config_keys: {unknown}")
 
 
+def _validate_distinct_paths(section_name: str, paths: dict[str, str]) -> None:
+    seen: dict[str, str] = {}
+    for key, raw_path in paths.items():
+        normalized = str(Path(str(raw_path))).replace("\\", "/").lower()
+        if normalized in seen:
+            other = seen[normalized]
+            raise InvariantError(
+                f"{section_name}_paths_must_be_distinct: {other} vs {key} -> {raw_path}"
+            )
+        seen[normalized] = str(key)
+
+
 def _parse_dislocation_selector(selector: dict[str, Any]) -> DislocationSelectorConfig:
     defaults = DislocationSelectorConfig()
     allowed = {
@@ -1137,6 +1149,15 @@ def load_app_config(path: str) -> AppConfig:
         paths,
         "dry_audit_trades_path",
         "var/runtime/dry_audit_trades.csv",
+    )
+    _validate_distinct_paths(
+        "runtime_state",
+        {
+            "claim_scan_cursor_path": str(claim_scan_cursor_path),
+            "dry_bets_path": str(dry_bets_path),
+            "dry_settled_epochs_path": str(dry_settled_epochs_path),
+            "dry_audit_trades_path": str(dry_audit_trades_path),
+        },
     )
 
     _validate_unknown_keys("graph", graph, {"abi_json_path"})

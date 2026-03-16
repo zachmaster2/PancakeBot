@@ -113,6 +113,20 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             with self.assertRaises(InvariantError):
                 load_app_config(str(cfg_path))
 
+    def test_runtime_state_paths_must_be_distinct(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            'dry_settled_epochs_path = "var/runtime/dry_settled_epochs.txt"',
+            'dry_settled_epochs_path = "var/runtime/dry_bets.jsonl"',
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_duplicate_runtime_paths.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
 
 if __name__ == "__main__":
     unittest.main()

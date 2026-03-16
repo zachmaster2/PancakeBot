@@ -328,12 +328,22 @@ def _load_dry_bets(path: str) -> dict[int, dict[str, object]]:
     p = Path(path)
     if not p.exists():
         return bets
-    for line in p.read_text().splitlines():
+    for lineno, line in enumerate(p.read_text(encoding="utf-8").splitlines(), start=1):
         line = line.strip()
         if not line:
             continue
-        rec = json.loads(line)
-        epoch = int(rec["epoch"])
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise InvariantError(f"dry_bets_json_invalid: path={path} line={lineno}") from e
+        if not isinstance(rec, dict):
+            raise InvariantError(f"dry_bets_record_not_object: path={path} line={lineno}")
+        try:
+            epoch = int(rec["epoch"])
+        except Exception as e:
+            raise InvariantError(f"dry_bets_epoch_invalid: path={path} line={lineno}") from e
+        if int(epoch) in bets:
+            raise InvariantError(f"dry_bets_epoch_duplicate_on_load: path={path} epoch={epoch}")
         bets[epoch] = rec
     return bets
 
@@ -343,11 +353,14 @@ def _load_dry_settled_epochs(path: str) -> set[int]:
     if not p.exists():
         return set()
     out: set[int] = set()
-    for line in p.read_text().splitlines():
+    for lineno, line in enumerate(p.read_text(encoding="utf-8").splitlines(), start=1):
         line = line.strip()
         if not line:
             continue
-        out.add(int(line))
+        try:
+            out.add(int(line))
+        except ValueError as e:
+            raise InvariantError(f"dry_settled_epoch_invalid: path={path} line={lineno}") from e
     return out
 
 
