@@ -2823,3 +2823,13 @@ Updated best-known candidate from Stage Q+R:
 6. Immediate next step after this cleanup:
    - run a short shared-pipeline smoke on the promoted baseline,
    - then start the real dry-mode smoke run from `config.toml`.
+
+7. Additional preflight hardening added after the baseline promotion:
+   - `inspection/run_runtime_preflight.py`:
+     - validates config load, required local files, runtime-state parent paths,
+       active-candidate presence, and optionally env vars
+   - runtime dry-state loading now fails explicitly on:
+     - malformed JSONL rows,
+     - invalid settled-epoch lines,
+     - duplicate dry-bet epochs on load
+   - runtime-state paths are now validated as distinct during config load.
