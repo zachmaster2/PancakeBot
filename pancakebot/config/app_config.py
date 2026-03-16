@@ -14,6 +14,7 @@ class RuntimeStatePathsConfig:
     dry_bets_path: str
     dry_settled_epochs_path: str
     dry_audit_trades_path: str
+    dry_bankroll_state_path: str
 
 
 @dataclass(frozen=True, slots=True)
