@@ -22,16 +22,16 @@ class LoadConfigMlAliasTests(unittest.TestCase):
             cfg_path.write_text(patched, encoding="utf-8")
             cfg = load_app_config(str(cfg_path))
 
-        self.assertEqual(8000, int(cfg.strategy.ml_candidate.train_size))
-        self.assertEqual(4000, int(cfg.strategy.ml_candidate.calibrate_size))
-        self.assertEqual(500, int(cfg.strategy.ml_candidate.retrain_interval))
-        self.assertEqual(250, int(cfg.strategy.ml_candidate.recalibrate_interval))
+        self.assertEqual(10000, int(cfg.strategy.ml_candidate.train_size))
+        self.assertEqual(5000, int(cfg.strategy.ml_candidate.calibrate_size))
+        self.assertEqual(5000, int(cfg.strategy.ml_candidate.retrain_interval))
+        self.assertEqual(2500, int(cfg.strategy.ml_candidate.recalibrate_interval))
 
     def test_ml_alias_conflict_is_rejected(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
         patched = str(base_text).replace(
-            "calibrate_size = 4000",
-            "calibrate_size = 4000\ncalibration_size = 3000",
+            "calibrate_size = 5000",
+            "calibrate_size = 5000\ncalibration_size = 3000",
             1,
         )
 

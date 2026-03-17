@@ -39,6 +39,7 @@ class AppConfig:
     use_onchain_event_bets: bool
     event_lookback_blocks: int
     latency_log_path: str
+    dry_initial_bankroll_bnb: float | None
     wait_for_bet_receipt: bool
     bet_receipt_timeout_seconds: int
 

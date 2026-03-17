@@ -139,6 +139,7 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                 ),
                 contract=_WalletStub(55.0),
                 wallet_address="0xabc",
+                dry_initial_bankroll_bnb=50.0,
             )
 
             state = _resolve_initial_dry_bankroll_state(cfg)
@@ -162,6 +163,7 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                 ),
                 contract=_WalletStub(61.75),
                 wallet_address="0xabc",
+                dry_initial_bankroll_bnb=None,
             )
 
             state = _resolve_initial_dry_bankroll_state(cfg)
@@ -185,6 +187,7 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                 ),
                 contract=wallet,
                 wallet_address="0xabc",
+                dry_initial_bankroll_bnb=None,
             )
 
             with patch("pancakebot.runtime.runtime_loop.sleep_seconds", return_value=None):
@@ -193,6 +196,60 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
         self.assertAlmostEqual(61.75, float(state.simulated_bankroll_bnb))
         self.assertEqual("wallet_init", state.source)
         self.assertEqual(2, wallet.calls)
+
+    def test_resolve_initial_dry_bankroll_state_uses_configured_seed_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = SimpleNamespace(
+                runtime_state_paths=RuntimeStatePathsConfig(
+                    claim_scan_cursor_path=str(root / "claim.txt"),
+                    dry_bets_path=str(root / "dry_bets.jsonl"),
+                    dry_settled_epochs_path=str(root / "dry_settled.txt"),
+                    dry_audit_trades_path=str(root / "dry_audit.csv"),
+                    dry_bankroll_state_path=str(root / "dry_bankroll_state.json"),
+                    dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
+                    live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
+                ),
+                contract=_WalletStub(0.2333411609),
+                wallet_address="0xabc",
+                dry_initial_bankroll_bnb=50.0,
+            )
+
+            state = _resolve_initial_dry_bankroll_state(cfg)
+
+        self.assertAlmostEqual(50.0, float(state.simulated_bankroll_bnb))
+        self.assertEqual("configured_init", state.source)
+
+    def test_resolve_initial_dry_bankroll_state_configured_seed_overrides_stale_wallet_init_without_history(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bankroll_state_path = root / "dry_bankroll_state.json"
+            _save_dry_bankroll_state(
+                str(bankroll_state_path),
+                bankroll_bnb=0.2333411609,
+                source="wallet_init",
+                epoch=None,
+                updated_ts=100,
+            )
+            cfg = SimpleNamespace(
+                runtime_state_paths=RuntimeStatePathsConfig(
+                    claim_scan_cursor_path=str(root / "claim.txt"),
+                    dry_bets_path=str(root / "dry_bets.jsonl"),
+                    dry_settled_epochs_path=str(root / "dry_settled.txt"),
+                    dry_audit_trades_path=str(root / "dry_audit.csv"),
+                    dry_bankroll_state_path=str(bankroll_state_path),
+                    dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
+                    live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
+                ),
+                contract=_WalletStub(0.2333411609),
+                wallet_address="0xabc",
+                dry_initial_bankroll_bnb=50.0,
+            )
+
+            state = _resolve_initial_dry_bankroll_state(cfg)
+
+        self.assertAlmostEqual(50.0, float(state.simulated_bankroll_bnb))
+        self.assertEqual("configured_init", state.source)
 
 
 if __name__ == "__main__":

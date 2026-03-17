@@ -44,6 +44,7 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             "var/runtime/live_pipeline_bootstrap_state.pkl.gz",
             cfg.runtime_state_paths.live_pipeline_bootstrap_state_path,
         )
+        self.assertAlmostEqual(50.0, float(cfg.dry_initial_bankroll_bnb or 0.0))
 
         candidates = {str(c.name): c for c in cfg.strategy.dislocation.candidates}
         self.assertEqual([_ALT_A_NAME, _ALT_B_NAME], list(candidates.keys()))
@@ -105,6 +106,11 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
                 'live_pipeline_bootstrap_state_path = "var/custom/live_pipeline_bootstrap_state.pkl.gz"',
                 1,
             )
+            .replace(
+                'dry_initial_bankroll_bnb = 50.0',
+                'dry_initial_bankroll_bnb = 42.5',
+                1,
+            )
         )
 
         with tempfile.TemporaryDirectory() as td:
@@ -134,6 +140,7 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             "var/custom/live_pipeline_bootstrap_state.pkl.gz",
             cfg.runtime_state_paths.live_pipeline_bootstrap_state_path,
         )
+        self.assertAlmostEqual(42.5, float(cfg.dry_initial_bankroll_bnb or 0.0))
 
     def test_unknown_paths_key_is_rejected(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
@@ -162,6 +169,20 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             cfg_path = Path(td) / "config_duplicate_runtime_paths.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
+    def test_negative_dry_initial_bankroll_is_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = str(base_text).replace(
+            'dry_initial_bankroll_bnb = 50.0',
+            'dry_initial_bankroll_bnb = -1.0',
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_negative_dry_bankroll.toml"
             cfg_path.write_text(patched, encoding="utf-8")
             with self.assertRaises(InvariantError):
                 load_app_config(str(cfg_path))

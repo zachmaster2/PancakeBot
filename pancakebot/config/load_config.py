@@ -82,6 +82,17 @@ def _opt_float(obj: dict[str, Any], key: str, default: float) -> float:
     return float(v)
 
 
+def _opt_float_or_none(obj: dict[str, Any], key: str) -> float | None:
+    if key not in obj:
+        return None
+    v = obj[key]
+    if v is None:
+        return None
+    if not isinstance(v, (int, float)):
+        raise InvariantError(f"config_key_not_number: {key}")
+    return float(v)
+
+
 def _opt_bool(obj: dict[str, Any], key: str, default: bool) -> bool:
     if key not in obj:
         return bool(default)
@@ -1190,6 +1201,7 @@ def load_app_config(path: str) -> AppConfig:
         "use_onchain_event_bets",
         "event_lookback_blocks",
         "latency_log_path",
+        "dry_initial_bankroll_bnb",
         "wait_for_bet_receipt",
         "bet_receipt_timeout_seconds",
     }
@@ -1210,6 +1222,10 @@ def load_app_config(path: str) -> AppConfig:
         raise InvariantError("event_lookback_blocks_must_be_positive")
 
     latency_log_path = _opt_str(runtime, "latency_log_path", "var/live_latency.jsonl")
+
+    dry_initial_bankroll_bnb = _opt_float_or_none(runtime, "dry_initial_bankroll_bnb")
+    if dry_initial_bankroll_bnb is not None and float(dry_initial_bankroll_bnb) <= 0.0:
+        raise InvariantError("dry_initial_bankroll_bnb_must_be_positive")
 
     wait_for_bet_receipt = _opt_bool(runtime, "wait_for_bet_receipt", True)
 
@@ -1268,6 +1284,9 @@ def load_app_config(path: str) -> AppConfig:
         use_onchain_event_bets=bool(use_onchain_event_bets),
         event_lookback_blocks=int(event_lookback_blocks),
         latency_log_path=str(latency_log_path),
+        dry_initial_bankroll_bnb=(
+            None if dry_initial_bankroll_bnb is None else float(dry_initial_bankroll_bnb)
+        ),
         wait_for_bet_receipt=bool(wait_for_bet_receipt),
         bet_receipt_timeout_seconds=int(bet_receipt_timeout_seconds),
         runtime_state_paths=RuntimeStatePathsConfig(
