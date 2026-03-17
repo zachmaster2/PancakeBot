@@ -102,6 +102,7 @@ class RuntimeConfig:
 
     # Runtime latency telemetry.
     latency_log_path: str
+    dry_initial_bankroll_bnb: float | None
     wait_for_bet_receipt: bool
     bet_receipt_timeout_seconds: int
 
@@ -670,8 +671,18 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
         dry_bets_path=str(cfg.runtime_state_paths.dry_bets_path),
         dry_audit_trades_path=str(cfg.runtime_state_paths.dry_audit_trades_path),
     )
-    if persisted is not None and (
-        recovered is None or int(persisted.updated_ts) >= int(recovered.updated_ts)
+    configured_init = None if cfg.dry_initial_bankroll_bnb is None else float(cfg.dry_initial_bankroll_bnb)
+    can_override_persisted_seed = (
+        configured_init is not None
+        and persisted is not None
+        and recovered is None
+        and persisted.epoch is None
+        and str(persisted.source) in {"wallet_init", "configured_init"}
+    )
+    if (
+        persisted is not None
+        and not bool(can_override_persisted_seed)
+        and (recovered is None or int(persisted.updated_ts) >= int(recovered.updated_ts))
     ):
         return persisted
     if recovered is not None:
@@ -681,6 +692,14 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
             source="recovered",
             epoch=recovered.epoch,
             updated_ts=int(recovered.updated_ts),
+        )
+    if configured_init is not None:
+        return _save_dry_bankroll_state(
+            str(cfg.runtime_state_paths.dry_bankroll_state_path),
+            bankroll_bnb=float(configured_init),
+            source="configured_init",
+            epoch=None,
+            updated_ts=int(now_ts()),
         )
     wallet_bnb = _fetch_wallet_balance_bnb_with_retries(
         cfg=cfg,
