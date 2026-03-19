@@ -168,6 +168,7 @@ def _runtime_cfg_from_app(*, cfg, strategy_cfg: StrategyConfig) -> RuntimeConfig
         use_onchain_event_bets=False,
         event_lookback_blocks=int(cfg.event_lookback_blocks),
         latency_log_path=str(cfg.latency_log_path),
+        dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
         wait_for_bet_receipt=False,
         bet_receipt_timeout_seconds=int(cfg.bet_receipt_timeout_seconds),
         dry=False,
