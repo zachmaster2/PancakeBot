@@ -11,6 +11,7 @@ from pancakebot.core.errors import InvariantError
 
 _ALT_A_NAME = "disloc_altA_20260227_x80"
 _ALT_B_NAME = "disloc_altB_20260227_x80"
+_ALT_C_NAME = "disloc_altC_20260319_recent"
 
 
 class LoadConfigBaselineDefaultTests(unittest.TestCase):
@@ -47,12 +48,13 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertAlmostEqual(50.0, float(cfg.dry_initial_bankroll_bnb or 0.0))
 
         candidates = {str(c.name): c for c in cfg.strategy.dislocation.candidates}
-        self.assertEqual([_ALT_A_NAME, _ALT_B_NAME], list(candidates.keys()))
+        self.assertEqual([_ALT_A_NAME, _ALT_B_NAME, _ALT_C_NAME], list(candidates.keys()))
 
         alt_a = candidates[_ALT_A_NAME]
         self.assertEqual("projected_final_model_only", alt_a.pool_total_gate_mode)
         self.assertAlmostEqual(0.5, float(alt_a.projected_final_pool_total_min_bnb))
         self.assertAlmostEqual(0.02, float(alt_a.market_extreme_min))
+        self.assertEqual("nowcast", str(alt_a.side_selection_mode))
         self.assertTrue(bool(alt_a.late_model_veto_enabled))
         self.assertAlmostEqual(0.05, float(alt_a.late_model_veto_min_late_ratio))
         self.assertAlmostEqual(0.10, float(alt_a.late_model_veto_min_abs_imbalance))
@@ -62,10 +64,23 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertEqual("projected_final_model_only", alt_b.pool_total_gate_mode)
         self.assertAlmostEqual(0.5, float(alt_b.projected_final_pool_total_min_bnb))
         self.assertAlmostEqual(0.02, float(alt_b.market_extreme_min))
+        self.assertEqual("adaptive_shadow", str(alt_b.side_selection_mode))
+        self.assertEqual(
+            ("nowcast_when_market_disagree", "nowcast"),
+            tuple(str(item) for item in alt_b.adaptive_candidate_modes),
+        )
+        self.assertEqual(80, int(alt_b.adaptive_window))
+        self.assertEqual(40, int(alt_b.adaptive_min_history))
         self.assertTrue(bool(alt_b.late_model_veto_enabled))
         self.assertAlmostEqual(0.05, float(alt_b.late_model_veto_min_late_ratio))
-        self.assertAlmostEqual(0.10, float(alt_b.late_model_veto_min_abs_imbalance))
+        self.assertAlmostEqual(0.15, float(alt_b.late_model_veto_min_abs_imbalance))
         self.assertAlmostEqual(0.0, float(alt_b.bear_expected_net_extra_min_bnb))
+
+        alt_c = candidates[_ALT_C_NAME]
+        self.assertEqual("dislocation", str(alt_c.side_selection_mode))
+        self.assertAlmostEqual(0.20, float(alt_c.dislocation_threshold_pp))
+        self.assertAlmostEqual(0.154, float(alt_c.expected_net_min_bnb))
+        self.assertAlmostEqual(0.15, float(alt_c.late_model_veto_min_abs_imbalance))
 
     def test_runtime_state_paths_can_be_overridden(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")

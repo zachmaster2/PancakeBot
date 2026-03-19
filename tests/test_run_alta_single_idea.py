@@ -19,7 +19,11 @@ class TestRunAltaSingleIdea(unittest.TestCase):
         out = _candidate_pool(cfg=cfg, config_path="config.toml", candidate_source="active")
 
         self.assertEqual(
-            ["disloc_altA_20260227_x80", "disloc_altB_20260227_x80"],
+            [
+                "disloc_altA_20260227_x80",
+                "disloc_altB_20260227_x80",
+                "disloc_altC_20260319_recent",
+            ],
             [str(c.name) for c in out],
         )
 
@@ -31,6 +35,7 @@ class TestRunAltaSingleIdea(unittest.TestCase):
 
         self.assertIn("disloc_altA_20260227_x80", names)
         self.assertIn("disloc_altB_20260227_x80", names)
+        self.assertIn("disloc_altC_20260319_recent", names)
         self.assertIn(
             "disloc_stageH_sidenowcast_when_market_disagree_perfflip_w80_h40_wr0p5_mnm0p001_x80",
             names,
