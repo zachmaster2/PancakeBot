@@ -81,6 +81,10 @@ def collect_preflight_checks(
             path=str(cfg.runtime_state_paths.dry_audit_trades_path),
         ),
         _parent_writable_check(
+            name="dry_cycle_audit_parent",
+            path=str(cfg.runtime_state_paths.dry_cycle_audit_path),
+        ),
+        _parent_writable_check(
             name="dry_bankroll_parent",
             path=str(cfg.runtime_state_paths.dry_bankroll_state_path),
         ),

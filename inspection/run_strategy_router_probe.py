@@ -103,7 +103,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-cell-obs", type=int, default=5)
     parser.add_argument("--score-threshold-bnb", type=float, default=0.0)
     parser.add_argument("--use-direction-split", action="store_true", default=False)
-    parser.add_argument("--output-dir", type=str, default="var/exp")
+    parser.add_argument("--output-dir", type=str, default="../PancakeBot_var_exp")
     parser.add_argument("--write-trades", action="store_true", default=False)
     return parser
 

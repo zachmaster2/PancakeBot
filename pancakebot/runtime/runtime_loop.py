@@ -41,8 +41,9 @@ from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionCont
 from pancakebot.domain.strategy.dislocation_engine import (
     build_dislocation_engine_from_config,
 )
+from pancakebot.domain.strategy.flow_candidate_adapter import FlowCandidateAdapter
 from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
-from pancakebot.domain.strategy.pipeline import StrategyPipeline
+from pancakebot.domain.strategy.pipeline import StrategyPipeline, required_pipeline_warmup_rounds
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterConfig
 from pancakebot.runtime.claim_manager import claim_scan_cursor
 from pancakebot.runtime.bootstrap_snapshot import (
@@ -130,6 +131,7 @@ class RuntimeConfig:
         dry_bets_path="var/runtime/dry_bets.jsonl",
         dry_settled_epochs_path="var/runtime/dry_settled_epochs.txt",
         dry_audit_trades_path="var/runtime/dry_audit_trades.csv",
+        dry_cycle_audit_path="var/runtime/dry_cycle_audit.csv",
         dry_bankroll_state_path="var/runtime/dry_bankroll_state.json",
         dry_pipeline_bootstrap_state_path="var/runtime/dry_pipeline_bootstrap_state.pkl.gz",
         live_pipeline_bootstrap_state_path="var/runtime/live_pipeline_bootstrap_state.pkl.gz",
@@ -827,6 +829,201 @@ def _append_dry_audit_row(path: str, row: dict[str, object]) -> None:
         w.writerow([row.get(c, "") for c in cols])
 
 
+def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
+    header_cols = [
+        "cycle_ts",
+        "current_epoch",
+        "locked_epoch",
+        "lock_ts",
+        "cutoff_ts",
+        "locked_price_bnbusd",
+        "bankroll_before_action_bnb",
+        "bankroll_after_action_bnb",
+        "open_total_pool_bnb",
+        "open_bull_pool_bnb",
+        "open_bear_pool_bnb",
+        "open_total_bets",
+        "open_bull_bets",
+        "open_bear_bets",
+        "router_mode",
+        "pipeline_last_settled_epoch",
+        "action",
+        "decision_stage",
+        "selected_strategy",
+        "bet_side",
+        "bet_size_bnb",
+        "p_bull",
+        "selected_side_probability",
+        "expected_profit_bnb",
+        "selector_score_bnb",
+        "decision_latency_ms",
+        "skip_reason",
+    ]
+    p = Path(path)
+    if bool(reset) or not p.exists():
+        _ensure_parent_dir(path)
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header_cols)
+    return header_cols
+
+
+def _append_dry_cycle_audit_row(path: str, row: dict[str, object]) -> None:
+    cols = _ensure_dry_cycle_audit_csv(path)
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([row.get(c, "") for c in cols])
+
+
+def _round_pool_snapshot(round_t: Round | None) -> dict[str, object]:
+    if round_t is None:
+        return {
+            "open_total_pool_bnb": "",
+            "open_bull_pool_bnb": "",
+            "open_bear_pool_bnb": "",
+            "open_total_bets": "",
+            "open_bull_bets": "",
+            "open_bear_bets": "",
+        }
+
+    bull_wei = 0
+    bear_wei = 0
+    bull_bets = 0
+    bear_bets = 0
+    for bet in round_t.bets:
+        if str(bet.position) == "Bull":
+            bull_wei += int(bet.amount_wei)
+            bull_bets += 1
+        elif str(bet.position) == "Bear":
+            bear_wei += int(bet.amount_wei)
+            bear_bets += 1
+        else:
+            raise InvariantError(f"unexpected_round_bet_side: {bet.position}")
+
+    bull_bnb = float(bull_wei) / float(BNB_WEI)
+    bear_bnb = float(bear_wei) / float(BNB_WEI)
+    return {
+        "open_total_pool_bnb": float(bull_bnb + bear_bnb),
+        "open_bull_pool_bnb": float(bull_bnb),
+        "open_bear_pool_bnb": float(bear_bnb),
+        "open_total_bets": int(bull_bets + bear_bets),
+        "open_bull_bets": int(bull_bets),
+        "open_bear_bets": int(bear_bets),
+    }
+
+
+def _selected_side_probability(*, p_bull: float | None, bet_side: str | None) -> float | str:
+    if p_bull is None or bet_side is None:
+        return ""
+    if str(bet_side) == "Bull":
+        return float(p_bull)
+    if str(bet_side) == "Bear":
+        return float(1.0 - float(p_bull))
+    return ""
+
+
+def _record_dry_cycle_audit(
+    cfg: RuntimeConfig,
+    closed: _ClosedState,
+    *,
+    current_epoch: int,
+    locked_epoch: int,
+    lock_ts: int,
+    cutoff_ts: int,
+    locked_price_bnbusd: float,
+    action: str,
+    decision_stage: str,
+    open_round: Round | None,
+    bankroll_before_action_bnb: float | None,
+    bankroll_after_action_bnb: float | None,
+    decision: object | None = None,
+    skip_reason: str | None = None,
+    decision_latency_ms: float | None = None,
+) -> None:
+    if not bool(cfg.dry):
+        return
+
+    pool = _round_pool_snapshot(open_round)
+    router_mode: str | object = ""
+    pipeline_last_settled_epoch: int | str = ""
+    if closed.strategy_pipeline is not None:
+        router_mode = str(closed.strategy_pipeline.router_mode)
+        if closed.strategy_pipeline.last_settled_epoch is not None:
+            pipeline_last_settled_epoch = int(closed.strategy_pipeline.last_settled_epoch)
+
+    selected_strategy: str | object = ""
+    bet_side: str | object = ""
+    bet_size_bnb: float | str = ""
+    p_bull: float | str = ""
+    expected_profit_bnb: float | str = ""
+    selector_score_bnb: float | str = ""
+    if decision is not None:
+        selected_strategy = getattr(decision, "selected_strategy", "") or ""
+        bet_side = getattr(decision, "bet_side", "") or ""
+        bet_size_raw = getattr(decision, "bet_size_bnb", "")
+        if isinstance(bet_size_raw, (int, float)):
+            bet_size_bnb = float(bet_size_raw)
+        p_bull_raw = getattr(decision, "p_bull", None)
+        if isinstance(p_bull_raw, (int, float)):
+            p_bull = float(p_bull_raw)
+        expected_profit_raw = getattr(decision, "expected_profit_bnb", None)
+        if isinstance(expected_profit_raw, (int, float)):
+            expected_profit_bnb = float(expected_profit_raw)
+        selector_score_raw = getattr(decision, "selector_score_bnb", None)
+        if isinstance(selector_score_raw, (int, float)):
+            selector_score_bnb = float(selector_score_raw)
+        if skip_reason is None:
+            skip_reason = getattr(decision, "skip_reason", None)
+
+    bankroll_before = (
+        ""
+        if bankroll_before_action_bnb is None
+        else float(bankroll_before_action_bnb)
+    )
+    bankroll_after = (
+        bankroll_before
+        if bankroll_after_action_bnb is None
+        else float(bankroll_after_action_bnb)
+    )
+    _append_dry_cycle_audit_row(
+        str(cfg.runtime_state_paths.dry_cycle_audit_path),
+        {
+            "cycle_ts": int(now_ts()),
+            "current_epoch": int(current_epoch),
+            "locked_epoch": int(locked_epoch),
+            "lock_ts": int(lock_ts),
+            "cutoff_ts": int(cutoff_ts),
+            "locked_price_bnbusd": float(locked_price_bnbusd),
+            "bankroll_before_action_bnb": bankroll_before,
+            "bankroll_after_action_bnb": bankroll_after,
+            "open_total_pool_bnb": pool["open_total_pool_bnb"],
+            "open_bull_pool_bnb": pool["open_bull_pool_bnb"],
+            "open_bear_pool_bnb": pool["open_bear_pool_bnb"],
+            "open_total_bets": pool["open_total_bets"],
+            "open_bull_bets": pool["open_bull_bets"],
+            "open_bear_bets": pool["open_bear_bets"],
+            "router_mode": router_mode,
+            "pipeline_last_settled_epoch": pipeline_last_settled_epoch,
+            "action": str(action),
+            "decision_stage": str(decision_stage),
+            "selected_strategy": selected_strategy,
+            "bet_side": bet_side,
+            "bet_size_bnb": bet_size_bnb,
+            "p_bull": p_bull,
+            "selected_side_probability": _selected_side_probability(
+                p_bull=None if p_bull == "" else float(p_bull),
+                bet_side=None if bet_side == "" else str(bet_side),
+            ),
+            "expected_profit_bnb": expected_profit_bnb,
+            "selector_score_bnb": selector_score_bnb,
+            "decision_latency_ms": (
+                "" if decision_latency_ms is None else float(decision_latency_ms)
+            ),
+            "skip_reason": "" if skip_reason is None else str(skip_reason),
+        },
+    )
+
+
 def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None:
     if not cfg.dry:
         return
@@ -964,9 +1161,9 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
 def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     """Startup-only closed rounds sync + in-memory cache load."""
     k = int(max_required_prior_context_rounds_size())
-    warmup_rounds = int(cfg.strategy_cfg.dislocation.selector.warmup_rounds)
+    warmup_rounds = int(required_pipeline_warmup_rounds(strategy_cfg=cfg.strategy_cfg))
     if warmup_rounds <= 0:
-        raise InvariantError("dislocation_warmup_rounds_nonpositive")
+        raise InvariantError("pipeline_warmup_rounds_nonpositive")
 
     if k <= 0:
         context_desc = "target_only"
@@ -981,7 +1178,7 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
         "SETUP",
         msg=(
             f"Core setup: prior_context_rounds_required={int(k)} context={context_desc} "
-            f"strategy=dislocation warmup_rounds={int(warmup_rounds)} "
+            f"strategy=shared_pipeline warmup_rounds={int(warmup_rounds)} "
             f"inference_closed_cache_needed={int(cache_n)}"
         ),
     )
@@ -1063,6 +1260,10 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
         closed.simulated_bankroll_bnb = float(bankroll_state.simulated_bankroll_bnb)
         closed.dry_bets_by_epoch = _load_dry_bets(str(cfg.runtime_state_paths.dry_bets_path))
         _ensure_dry_audit_csv(str(cfg.runtime_state_paths.dry_audit_trades_path))
+        _ensure_dry_cycle_audit_csv(
+            str(cfg.runtime_state_paths.dry_cycle_audit_path),
+            reset=True,
+        )
         settled_epochs = _load_dry_settled_epochs(str(cfg.runtime_state_paths.dry_settled_epochs_path))
         settled_epochs.update(
             _load_dry_settled_epochs_from_audit(str(cfg.runtime_state_paths.dry_audit_trades_path))
@@ -1075,7 +1276,8 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
             msg=(
                 f"Loaded dry bankroll {float(bankroll_state.simulated_bankroll_bnb):.6f} BNB "
                 f"source={str(bankroll_state.source)} "
-                f"path={str(cfg.runtime_state_paths.dry_bankroll_state_path)}"
+                f"path={str(cfg.runtime_state_paths.dry_bankroll_state_path)} "
+                f"cycle_audit_path={str(cfg.runtime_state_paths.dry_cycle_audit_path)}"
             ),
         )
 
@@ -1148,6 +1350,30 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # re-anchor before taking any action.
         locked_round2, _open_round2, current_epoch2 = _epoch_handshake(cfg, closed)
         if int(current_epoch2) != int(current_epoch):
+            _record_dry_cycle_audit(
+                cfg,
+                closed,
+                current_epoch=int(current_epoch),
+                locked_epoch=int(locked_epoch),
+                lock_ts=int(lock_ts_t),
+                cutoff_ts=int(cutoff_ts_t),
+                locked_price_bnbusd=float(bnbusd_price),
+                action="SKIP",
+                decision_stage="reanchor",
+                open_round=None,
+                bankroll_before_action_bnb=closed.simulated_bankroll_bnb,
+                bankroll_after_action_bnb=closed.simulated_bankroll_bnb,
+                skip_reason=f"epoch_shift_before_decision:new_epoch={int(current_epoch2)}",
+            )
+            info(
+                "RUN",
+                "ACT",
+                "SKIP",
+                msg=(
+                    f"Skip epoch {int(current_epoch)}: "
+                    f"epoch_shift_before_decision:new_epoch={int(current_epoch2)}"
+                ),
+            )
             continue
 
         locked_round = locked_round2
@@ -1202,6 +1428,21 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             cutoff_ts=int(cutoff_ts_t),
         )
         if event_skip is not None:
+            _record_dry_cycle_audit(
+                cfg,
+                closed,
+                current_epoch=int(current_epoch),
+                locked_epoch=int(locked_epoch),
+                lock_ts=int(lock_ts_t),
+                cutoff_ts=int(cutoff_ts_t),
+                locked_price_bnbusd=float(bnbusd_price),
+                action="SKIP",
+                decision_stage="event_gate",
+                open_round=open_round,
+                bankroll_before_action_bnb=closed.simulated_bankroll_bnb,
+                bankroll_after_action_bnb=closed.simulated_bankroll_bnb,
+                skip_reason=str(event_skip),
+            )
             info("RUN", "ACT", "SKIP", msg=f"Skip epoch {int(current_epoch)}: {str(event_skip)}")
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
@@ -1234,6 +1475,21 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             buffer_seconds=int(cfg.buffer_seconds),
         )
         if not rounds_ok:
+            _record_dry_cycle_audit(
+                cfg,
+                closed,
+                current_epoch=int(current_epoch),
+                locked_epoch=int(locked_epoch),
+                lock_ts=int(lock_ts_t),
+                cutoff_ts=int(cutoff_ts_t),
+                locked_price_bnbusd=float(bnbusd_price),
+                action="SKIP",
+                decision_stage="round_guard",
+                open_round=open_round,
+                bankroll_before_action_bnb=closed.simulated_bankroll_bnb,
+                bankroll_after_action_bnb=closed.simulated_bankroll_bnb,
+                skip_reason=str(rounds_reason),
+            )
             info("RUN", "ACT", "SKIP", msg=f"Skip epoch {int(current_epoch)}: {rounds_reason}")
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
@@ -1245,6 +1501,21 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         )
         klines_ok, klines_reason = check_klines_contiguous(context_klines=context_klines)
         if not klines_ok:
+            _record_dry_cycle_audit(
+                cfg,
+                closed,
+                current_epoch=int(current_epoch),
+                locked_epoch=int(locked_epoch),
+                lock_ts=int(lock_ts_t),
+                cutoff_ts=int(cutoff_ts_t),
+                locked_price_bnbusd=float(bnbusd_price),
+                action="SKIP",
+                decision_stage="kline_guard",
+                open_round=open_round,
+                bankroll_before_action_bnb=closed.simulated_bankroll_bnb,
+                bankroll_after_action_bnb=closed.simulated_bankroll_bnb,
+                skip_reason=str(klines_reason),
+            )
             info("RUN", "ACT", "SKIP", msg=f"Skip epoch {int(current_epoch)}: {klines_reason}")
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
@@ -1274,12 +1545,46 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             if reason == "":
                 raise InvariantError("policy_skip_missing_reason")
 
+            _record_dry_cycle_audit(
+                cfg,
+                closed,
+                current_epoch=int(current_epoch),
+                locked_epoch=int(locked_epoch),
+                lock_ts=int(lock_ts_t),
+                cutoff_ts=int(cutoff_ts_t),
+                locked_price_bnbusd=float(bnbusd_price),
+                action="SKIP",
+                decision_stage="pipeline",
+                open_round=open_round,
+                bankroll_before_action_bnb=float(bankroll_bnb),
+                bankroll_after_action_bnb=float(bankroll_bnb),
+                decision=decision,
+                skip_reason=str(reason),
+                decision_latency_ms=float(t_decision_ready_ms) - float(t_features_start_ms),
+            )
             info("RUN", "ACT", "SKIP", msg=f"Skip epoch {int(current_epoch)}: {reason}")
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
         # Step 11: Execution timing guard.
         if now_ts() >= lock_ts_t - _LOCK_SAFETY_MARGIN_SECONDS:
+            _record_dry_cycle_audit(
+                cfg,
+                closed,
+                current_epoch=int(current_epoch),
+                locked_epoch=int(locked_epoch),
+                lock_ts=int(lock_ts_t),
+                cutoff_ts=int(cutoff_ts_t),
+                locked_price_bnbusd=float(bnbusd_price),
+                action="SKIP",
+                decision_stage="timing_guard",
+                open_round=open_round,
+                bankroll_before_action_bnb=float(bankroll_bnb),
+                bankroll_after_action_bnb=float(bankroll_bnb),
+                decision=decision,
+                skip_reason="too_close_to_lock_for_bet",
+                decision_latency_ms=float(t_decision_ready_ms) - float(t_features_start_ms),
+            )
             info(
                 "RUN",
                 "ACT",
@@ -1401,6 +1706,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 expected_profit_bnb=float(decision.expected_profit_bnb),
                 bankroll_before_bet_bnb=float(bankroll_before_bet),
                 bankroll_after_bet_bnb=float(bankroll_after_bet),
+            )
+            _record_dry_cycle_audit(
+                cfg,
+                closed,
+                current_epoch=int(current_epoch),
+                locked_epoch=int(locked_epoch),
+                lock_ts=int(lock_ts_t),
+                cutoff_ts=int(cutoff_ts_t),
+                locked_price_bnbusd=float(bnbusd_price),
+                action="BET",
+                decision_stage="pipeline",
+                open_round=open_round,
+                bankroll_before_action_bnb=float(bankroll_before_bet),
+                bankroll_after_action_bnb=float(bankroll_after_bet),
+                decision=decision,
+                decision_latency_ms=float(t_decision_ready_ms) - float(t_features_start_ms),
             )
 
         # Step 15: Sleep until claim + claim scan.
@@ -1576,6 +1897,13 @@ def _build_strategy_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesC
             feature_cache_store=cfg.feature_cache_store,
             projection_cache_store=cfg.projection_cache_store,
         )
+    flow_adapter: FlowCandidateAdapter | None = None
+    if bool(cfg.strategy_cfg.flow_candidate.enabled):
+        flow_adapter = FlowCandidateAdapter(
+            config=cfg.strategy_cfg.flow_candidate,
+            cutoff_seconds=int(cfg.cutoff_seconds),
+            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+        )
 
     dislocation_engine = build_dislocation_engine_from_config(
         selector_cfg=cfg.strategy_cfg.dislocation.selector,
@@ -1601,6 +1929,7 @@ def _build_strategy_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesC
         router=router,
         treasury_fee_fraction=float(cfg.treasury_fee_fraction),
         ml_candidate_adapter=ml_adapter,
+        flow_candidate_adapter=flow_adapter,
     )
     pipeline.refresh_klines(klines=list(klines_cache.klines))
     return pipeline

@@ -7,16 +7,20 @@ Spec-driven, invariant-heavy runtime for PancakeSwap Prediction v2.
 Current shared baseline:
 
 - `1 gwei` accounting gas
-- router: `online_selector_score_fallback`
-- active candidates: `disloc_altA_20260227_x80`, `disloc_altB_20260227_x80`
-- baseline overlay:
-  - `pool_total_gate_mode = projected_final_model_only`
-  - `projected_final_pool_total_min_bnb = 0.5`
-  - `market_extreme_min = 0.02`
-  - `late_model_veto_enabled = true`
-  - `late_model_veto_min_late_ratio = 0.05`
-  - `late_model_veto_min_abs_imbalance = 0.10`
-  - `disloc_altA_20260227_x80.bear_expected_net_extra_min_bnb = 0.01`
+- router: `selector_max_score`
+- selector/router warmup: `10000`
+- active dislocation candidates:
+  - `disloc_stageB_bullonly_recent8pct_v1`
+- flow candidate:
+  - `flow_lgbm_recent_t12k_r1k_regime40_v1`
+  - `enabled = true` in the current promoted runtime profile
+  - `train_size = 12000`
+  - `retrain_interval = 1000`
+  - `ev_threshold = 0.0025`
+  - `min_total_pool_c = 1.0`
+  - `roll_window = 40`
+  - `roll_winrate_min = 0.48`
+  - `cooldown_trades = 40`
 
    1. #### Create a `.env` file at the repo root:
 
@@ -35,9 +39,9 @@ Current shared baseline:
 
       | mode      | command                    | description                                           |
       |-----------|----------------------------|-------------------------------------------------------|
-      | Backtest  | `python run.py --backtest` | simulates dry/live deterministically without sleeping |
-      | Dry       | `python run.py --dry`      | simulates bets/claims without broadcasting            |
-      | Live      | `python run.py`            | places real on-chain bets                             |
+      | Backtest  | `.\.venv\Scripts\python.exe run.py --backtest` | simulates dry/live deterministically without sleeping |
+      | Dry       | `.\.venv\Scripts\python.exe run.py --dry`      | simulates bets/claims without broadcasting            |
+      | Live      | `.\.venv\Scripts\python.exe run.py`            | places real on-chain bets                             |
 
       - Outputs (`var/`):
          - Backtest:
@@ -49,8 +53,13 @@ Current shared baseline:
             - `runtime/claim_scan_cursor.txt`
             - `runtime/dry_bets.jsonl`
             - `runtime/dry_settled_epochs.txt`
-            - `runtime/dry_audit_trades.csv`
+            - `runtime/dry_audit_trades.csv` for persistent dry bet/settlement audit
+            - `runtime/dry_cycle_audit.csv` for per-cycle dry decision audit
             - `runtime/dry_bankroll_state.json`
+
+`runtime/dry_cycle_audit.csv` is reset at dry startup so each run has a clean
+decision log. `runtime/dry_audit_trades.csv` remains the persistent dry
+bet/settlement ledger used by dry-state recovery.
 
 ## Dry smoke
 
@@ -65,5 +74,5 @@ Recommended preflight before a long dry run:
 ```powershell
 .\.venv\Scripts\python.exe -m inspection.run_runtime_preflight --check-env
 
-.\.venv\Scripts\python.exe -m inspection.run_backtest_scenario --name smoke_promoted_baseline --sim-size 200 --reset-mode continuous
+.\.venv\Scripts\python.exe -m inspection.run_backtest_scenario --name smoke_promoted_runtime_profile --sim-size 200 --reset-mode continuous
 ```

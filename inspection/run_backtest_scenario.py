@@ -38,6 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=str, default="config.toml")
     parser.add_argument("--name", type=str, required=True)
     parser.add_argument("--sim-size", type=int, default=None)
+    parser.add_argument("--tail-offset-rounds", type=int, default=None)
     parser.add_argument("--initial-bankroll-bnb", type=float, default=None)
     parser.add_argument("--reset-mode", type=str, choices=("continuous", "chunk_reset"), default=None)
     parser.add_argument("--reset-every-rounds", type=int, default=None)
@@ -66,6 +67,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--router-score-threshold-bnb", type=float, default=None)
+    parser.add_argument("--selector-warmup-rounds", type=int, default=None)
+    parser.add_argument("--router-online-warmup-rounds", type=int, default=None)
     parser.add_argument("--ml-enabled", type=str, default=None)
     parser.add_argument("--ml-min-tradeable-prob", type=float, default=None)
     parser.add_argument("--ml-min-prob-edge", type=float, default=None)
@@ -196,6 +199,11 @@ def _build_backtest_cfg(*, app_cfg, args: argparse.Namespace) -> BacktestConfig:
             if args.sim_size is None
             else int(args.sim_size)
         ),
+        tail_offset_rounds=(
+            int(app_cfg.backtest.tail_offset_rounds)
+            if args.tail_offset_rounds is None
+            else int(args.tail_offset_rounds)
+        ),
         initial_bankroll_bnb=(
             float(app_cfg.backtest.initial_bankroll_bnb)
             if args.initial_bankroll_bnb is None
@@ -223,6 +231,23 @@ def _strategy_cfg_with_router_overrides(
             router_cfg,
             score_threshold_bnb=float(args.router_score_threshold_bnb),
         )
+    if args.router_online_warmup_rounds is not None:
+        if int(args.router_online_warmup_rounds) <= 0:
+            raise InvariantError("scenario_router_online_warmup_rounds_nonpositive")
+        router_cfg = replace(
+            router_cfg,
+            online_warmup_rounds=int(args.router_online_warmup_rounds),
+        )
+    dislocation_cfg = strategy_cfg.dislocation
+    selector_cfg = dislocation_cfg.selector
+    if args.selector_warmup_rounds is not None:
+        if int(args.selector_warmup_rounds) <= 0:
+            raise InvariantError("scenario_selector_warmup_rounds_nonpositive")
+        selector_cfg = replace(
+            selector_cfg,
+            warmup_rounds=int(args.selector_warmup_rounds),
+        )
+    dislocation_cfg = replace(dislocation_cfg, selector=selector_cfg)
     ml_cfg = strategy_cfg.ml_candidate
     ml_enabled = _parse_optional_bool_token(args.ml_enabled)
     if ml_enabled is not None:
@@ -295,7 +320,7 @@ def _strategy_cfg_with_router_overrides(
     if ml_cfg.expected_net_max_bnb is not None and float(ml_cfg.expected_net_max_bnb) < float(ml_cfg.expected_net_min_bnb):
         raise InvariantError("scenario_ml_expected_net_max_below_min")
 
-    return replace(strategy_cfg, router=router_cfg, ml_candidate=ml_cfg)
+    return replace(strategy_cfg, router=router_cfg, dislocation=dislocation_cfg, ml_candidate=ml_cfg)
 
 
 def main() -> None:
@@ -345,6 +370,7 @@ def main() -> None:
         "name": str(args.name),
         "config_path": str(args.config),
         "sim_size": int(bt_cfg.simulation_size),
+        "tail_offset_rounds": int(bt_cfg.tail_offset_rounds),
         "initial_bankroll_bnb": float(bt_cfg.initial_bankroll_bnb),
         "reset_mode": str(bt_cfg.reset_mode),
         "reset_every_rounds": int(bt_cfg.reset_every_rounds),

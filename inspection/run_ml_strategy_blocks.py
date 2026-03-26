@@ -118,6 +118,14 @@ def _scenario_name(*, name_prefix: str, block_idx: int, num_blocks: int, offset:
     return f"{name_prefix}_b{int(block_idx)}of{int(num_blocks)}_off{int(offset)}"
 
 
+def _load_existing_block_summary(*, scenario_dir: Path) -> dict[str, Any] | None:
+    summary_path = Path(scenario_dir) / "dislocation_summary.json"
+    trades_path = Path(scenario_dir) / "dislocation_trades.csv"
+    if not summary_path.exists() or not trades_path.exists():
+        return None
+    return json.loads(summary_path.read_text(encoding="utf-8"))
+
+
 def _load_reference_block_epochs(*, scenario_dir: Path) -> list[int]:
     """Load epoch sequence from an existing block trade artifact."""
 
@@ -437,6 +445,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recency-weight-floor", type=float, default=0.7)
     parser.add_argument("--recency-weight-power", type=float, default=1.0)
     parser.add_argument("--predictability-baseline-bet-bnb", type=float, default=0.05)
+    parser.add_argument("--no-resume", action="store_true", default=False)
     parser.add_argument(
         "--predictability-feature-mode",
         type=str,
@@ -497,7 +506,7 @@ def main() -> None:
     k = int(max_required_prior_context_rounds_size())
     min_history = int(k + cfg.train_size + cfg.calibrate_size)
 
-    out_dir = Path("var/exp")
+    out_dir = Path("../PancakeBot_var_exp")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     block_rows: list[dict[str, Any]] = []
@@ -521,6 +530,34 @@ def main() -> None:
         )
         scenario_dir = out_dir / scenario_name
         scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        existing_summary = None if bool(args.no_resume) else _load_existing_block_summary(scenario_dir=scenario_dir)
+        if existing_summary is not None:
+            net_existing = float(existing_summary.get("net_profit_bnb", 0.0))
+            bets_existing = int(existing_summary.get("num_bets", 0))
+            wins_existing = int(existing_summary.get("num_wins", 0))
+            print(
+                "BLOCK_SKIP "
+                + f"block={int(block_idx)}/{int(args.num_blocks)} offset={int(offset)} "
+                + f"net={net_existing:.6f} bets={bets_existing} "
+                + f"win={float(_safe_rate(wins_existing, bets_existing)):.4f}"
+            )
+            block_rows.append(
+                {
+                    "scenario": str(scenario_name),
+                    "block_index": int(block_idx),
+                    "sim_offset_rounds": int(offset),
+                    "net": float(net_existing),
+                    "bets": int(bets_existing),
+                    "wins": int(wins_existing),
+                    "bet_rate": float(existing_summary.get("bet_rate", 0.0)),
+                    "win_rate": float(existing_summary.get("win_rate", 0.0)),
+                }
+            )
+            block_nets.append(float(net_existing))
+            bets_total += int(bets_existing)
+            wins_total += int(wins_existing)
+            continue
 
         if args.align_to_prefix is None:
             start, end = _tail_block_rounds(

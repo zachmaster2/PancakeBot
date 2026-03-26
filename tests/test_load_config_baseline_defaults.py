@@ -7,18 +7,27 @@ import unittest
 from pathlib import Path
 
 from pancakebot.config.load_config import load_app_config
+from pancakebot.config.strategy_config import (
+    DislocationSelectorConfig,
+    FlowCandidateConfig,
+    StrategyRouterConfig as StrategyConfigRouterConfig,
+)
 from pancakebot.core.errors import InvariantError
+from pancakebot.domain.strategy.pipeline import required_pipeline_warmup_rounds
+from pancakebot.domain.strategy.router import StrategyRouterConfig as DomainRouterConfig
 
-_ALT_A_NAME = "disloc_altA_20260227_x80"
-_ALT_B_NAME = "disloc_altB_20260227_x80"
-_ALT_C_NAME = "disloc_altC_20260319_recent"
+_STAGE_B_BULL_NAME = "disloc_stageB_bullonly_recent8pct_v1"
+_FLOW_NAME = "flow_lgbm_recent_t12k_r1k_regime40_v1"
 
 
 class LoadConfigBaselineDefaultTests(unittest.TestCase):
-    def test_current_config_matches_promoted_online_selector_baseline(self) -> None:
+    def test_current_config_matches_promoted_selector_max_hybrid_runtime(self) -> None:
         cfg = load_app_config("config.toml")
 
-        self.assertEqual("online_selector_score_fallback", cfg.strategy.router.mode)
+        self.assertEqual("selector_max_score", cfg.strategy.router.mode)
+        self.assertEqual(10000, int(cfg.strategy.dislocation.selector.warmup_rounds))
+        self.assertEqual(10000, int(cfg.strategy.router.online_warmup_rounds))
+        self.assertEqual(12000, int(required_pipeline_warmup_rounds(strategy_cfg=cfg.strategy)))
         self.assertAlmostEqual(0.008, float(cfg.strategy.router.online_score_threshold_bnb))
         self.assertEqual(
             "var/runtime/claim_scan_cursor.txt",
@@ -34,6 +43,10 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             cfg.runtime_state_paths.dry_audit_trades_path,
         )
         self.assertEqual(
+            "var/runtime/dry_cycle_audit.csv",
+            cfg.runtime_state_paths.dry_cycle_audit_path,
+        )
+        self.assertEqual(
             "var/runtime/dry_bankroll_state.json",
             cfg.runtime_state_paths.dry_bankroll_state_path,
         )
@@ -46,41 +59,60 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             cfg.runtime_state_paths.live_pipeline_bootstrap_state_path,
         )
         self.assertAlmostEqual(50.0, float(cfg.dry_initial_bankroll_bnb or 0.0))
+        self.assertEqual(True, bool(cfg.strategy.flow_candidate.enabled))
+        self.assertEqual(_FLOW_NAME, cfg.strategy.flow_candidate.name)
+        self.assertEqual(12000, int(cfg.strategy.flow_candidate.train_size))
+        self.assertEqual(1000, int(cfg.strategy.flow_candidate.retrain_interval))
+        self.assertAlmostEqual(0.0025, float(cfg.strategy.flow_candidate.ev_threshold))
+        self.assertAlmostEqual(1.0, float(cfg.strategy.flow_candidate.min_total_pool_c))
+        self.assertEqual(40, int(cfg.strategy.flow_candidate.roll_window))
+        self.assertAlmostEqual(0.48, float(cfg.strategy.flow_candidate.roll_winrate_min))
+        self.assertEqual(40, int(cfg.strategy.flow_candidate.cooldown_trades))
 
         candidates = {str(c.name): c for c in cfg.strategy.dislocation.candidates}
-        self.assertEqual([_ALT_A_NAME, _ALT_B_NAME, _ALT_C_NAME], list(candidates.keys()))
+        self.assertEqual([_STAGE_B_BULL_NAME], list(candidates.keys()))
 
-        alt_a = candidates[_ALT_A_NAME]
-        self.assertEqual("projected_final_model_only", alt_a.pool_total_gate_mode)
-        self.assertAlmostEqual(0.5, float(alt_a.projected_final_pool_total_min_bnb))
-        self.assertAlmostEqual(0.02, float(alt_a.market_extreme_min))
-        self.assertEqual("nowcast", str(alt_a.side_selection_mode))
-        self.assertTrue(bool(alt_a.late_model_veto_enabled))
-        self.assertAlmostEqual(0.05, float(alt_a.late_model_veto_min_late_ratio))
-        self.assertAlmostEqual(0.10, float(alt_a.late_model_veto_min_abs_imbalance))
-        self.assertAlmostEqual(0.01, float(alt_a.bear_expected_net_extra_min_bnb))
-
-        alt_b = candidates[_ALT_B_NAME]
-        self.assertEqual("projected_final_model_only", alt_b.pool_total_gate_mode)
-        self.assertAlmostEqual(0.5, float(alt_b.projected_final_pool_total_min_bnb))
-        self.assertAlmostEqual(0.02, float(alt_b.market_extreme_min))
-        self.assertEqual("adaptive_shadow", str(alt_b.side_selection_mode))
+        stage_b_bull = candidates[_STAGE_B_BULL_NAME]
+        self.assertEqual("cutoff_only", stage_b_bull.pool_total_gate_mode)
+        self.assertAlmostEqual(0.02, float(stage_b_bull.expected_net_min_bnb))
+        self.assertAlmostEqual(0.01, float(stage_b_bull.bull_expected_net_extra_min_bnb))
+        self.assertEqual("adaptive_shadow", str(stage_b_bull.side_selection_mode))
+        self.assertEqual("bull_only", str(stage_b_bull.allowed_sides))
+        self.assertAlmostEqual(0.6, float(stage_b_bull.cutoff_pool_total_min_bnb))
         self.assertEqual(
-            ("nowcast_when_market_disagree", "nowcast"),
-            tuple(str(item) for item in alt_b.adaptive_candidate_modes),
+            ("nowcast_when_market_disagree", "ev_max", "nowcast_contra"),
+            tuple(str(item) for item in stage_b_bull.adaptive_candidate_modes),
         )
-        self.assertEqual(80, int(alt_b.adaptive_window))
-        self.assertEqual(40, int(alt_b.adaptive_min_history))
-        self.assertTrue(bool(alt_b.late_model_veto_enabled))
-        self.assertAlmostEqual(0.05, float(alt_b.late_model_veto_min_late_ratio))
-        self.assertAlmostEqual(0.15, float(alt_b.late_model_veto_min_abs_imbalance))
-        self.assertAlmostEqual(0.0, float(alt_b.bear_expected_net_extra_min_bnb))
+        self.assertEqual("off", str(stage_b_bull.perf_adapt_mode))
+        self.assertAlmostEqual(0.1, float(stage_b_bull.fixed_bet_bnb))
 
-        alt_c = candidates[_ALT_C_NAME]
-        self.assertEqual("dislocation", str(alt_c.side_selection_mode))
-        self.assertAlmostEqual(0.20, float(alt_c.dislocation_threshold_pp))
-        self.assertAlmostEqual(0.154, float(alt_c.expected_net_min_bnb))
-        self.assertAlmostEqual(0.15, float(alt_c.late_model_veto_min_abs_imbalance))
+    def test_code_defaults_match_promoted_hybrid_runtime(self) -> None:
+        selector_defaults = DislocationSelectorConfig()
+        config_router_defaults = StrategyConfigRouterConfig()
+        domain_router_defaults = DomainRouterConfig()
+        flow_defaults = FlowCandidateConfig()
+
+        self.assertEqual(10000, int(selector_defaults.warmup_rounds))
+
+        self.assertEqual("selector_max_score", str(config_router_defaults.mode))
+        self.assertEqual(10000, int(config_router_defaults.online_warmup_rounds))
+        self.assertAlmostEqual(0.008, float(config_router_defaults.online_score_threshold_bnb))
+        self.assertEqual(False, bool(config_router_defaults.online_use_direction_split))
+
+        self.assertEqual("selector_max_score", str(domain_router_defaults.mode))
+        self.assertEqual(10000, int(domain_router_defaults.online_warmup_rounds))
+        self.assertAlmostEqual(0.008, float(domain_router_defaults.online_score_threshold_bnb))
+        self.assertEqual(False, bool(domain_router_defaults.online_use_direction_split))
+
+        self.assertEqual(True, bool(flow_defaults.enabled))
+        self.assertEqual(_FLOW_NAME, str(flow_defaults.name))
+        self.assertEqual(12000, int(flow_defaults.train_size))
+        self.assertEqual(1000, int(flow_defaults.retrain_interval))
+        self.assertAlmostEqual(0.0025, float(flow_defaults.ev_threshold))
+        self.assertAlmostEqual(1.0, float(flow_defaults.min_total_pool_c))
+        self.assertEqual(40, int(flow_defaults.roll_window))
+        self.assertAlmostEqual(0.48, float(flow_defaults.roll_winrate_min))
+        self.assertEqual(40, int(flow_defaults.cooldown_trades))
 
     def test_runtime_state_paths_can_be_overridden(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
@@ -104,6 +136,11 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             .replace(
                 'dry_audit_trades_path = "var/runtime/dry_audit_trades.csv"',
                 'dry_audit_trades_path = "var/custom/dry_audit_trades.csv"',
+                1,
+            )
+            .replace(
+                'dry_cycle_audit_path = "var/runtime/dry_cycle_audit.csv"',
+                'dry_cycle_audit_path = "var/custom/dry_cycle_audit.csv"',
                 1,
             )
             .replace(
@@ -142,6 +179,10 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertEqual(
             "var/custom/dry_audit_trades.csv",
             cfg.runtime_state_paths.dry_audit_trades_path,
+        )
+        self.assertEqual(
+            "var/custom/dry_cycle_audit.csv",
+            cfg.runtime_state_paths.dry_cycle_audit_path,
         )
         self.assertEqual(
             "var/custom/dry_bankroll_state.json",

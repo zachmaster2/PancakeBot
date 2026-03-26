@@ -42,8 +42,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block-size", type=int, default=500)
     parser.add_argument("--num-blocks", type=int, default=80)
     parser.add_argument("--skip-most-recent-blocks", type=int, default=0)
-    parser.add_argument("--base-dir", type=str, default="var/exp")
-    parser.add_argument("--output-dir", type=str, default="var/exp")
+    parser.add_argument("--base-dir", type=str, default="../PancakeBot_var_exp")
+    parser.add_argument("--output-dir", type=str, default="../PancakeBot_var_exp")
     parser.add_argument("--trades-filename", type=str, default="dislocation_trades.csv")
     return parser
 

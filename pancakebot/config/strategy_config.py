@@ -9,18 +9,18 @@ class StrategyRouterConfig:
 
     mode: str = "selector_max_score"
     score_threshold_bnb: float = -1e9
-    online_warmup_rounds: int = 50_000
+    online_warmup_rounds: int = 10_000
     online_num_quantile_bins: int = 12
     online_min_cell_obs: int = 5
-    online_score_threshold_bnb: float = 0.0
-    online_use_direction_split: bool = True
+    online_score_threshold_bnb: float = 0.008
+    online_use_direction_split: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class DislocationSelectorConfig:
     """Selector controls shared across all dislocation candidate profiles."""
 
-    warmup_rounds: int = 20_000
+    warmup_rounds: int = 10_000
     num_quantile_bins: int = 12
     min_cell_obs: int = 5
     score_threshold: float = -0.01
@@ -162,9 +162,46 @@ class MlCandidateConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class FlowCandidateConfig:
+    """Simple flow/LGBM candidate configuration used by the shared router."""
+
+    enabled: bool = True
+    name: str = "flow_lgbm_recent_t12k_r1k_regime40_v1"
+    shadow_initial_bankroll_bnb: float = 50.0
+    train_size: int = 12_000
+    retrain_interval: int = 1_000
+    n_estimators: int = 500
+    learning_rate: float = 0.05
+    num_leaves: int = 63
+    subsample: float = 0.9
+    colsample_bytree: float = 0.9
+    random_seed: int = 42
+    ev_threshold: float = 0.0025
+    kelly_fraction: float = 0.10
+    max_fraction: float = 0.25
+    max_bet_abs: float = 0.50
+    min_bet_size: float = 0.05
+    round_to: float = 0.01
+    min_total_pool_c: float = 1.0
+    max_total_pool_share: float = 0.05
+    max_side_pool_share: float = 0.50
+    min_bull_ratio: float = 0.05
+    max_bull_ratio: float = 0.95
+    vol_mid: float = 0.030
+    drawdown_stop_pct: float = 0.75
+    drawdown_throttle_start_pct: float = 0.35
+    drawdown_throttle_min_scale: float = 0.35
+    roll_window: int = 40
+    roll_edge_min: float = -0.002
+    roll_winrate_min: float = 0.48
+    cooldown_trades: int = 40
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyConfig:
     """Top-level strategy configuration root."""
 
     dislocation: DislocationStrategyConfig
     ml_candidate: MlCandidateConfig
+    flow_candidate: FlowCandidateConfig = FlowCandidateConfig()
     router: StrategyRouterConfig = StrategyRouterConfig()

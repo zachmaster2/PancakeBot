@@ -11,6 +11,7 @@ from unittest.mock import patch
 from pancakebot.config.app_config import RuntimeStatePathsConfig
 from pancakebot.core.errors import InvariantError, TransientRpcError
 from pancakebot.runtime.runtime_loop import (
+    _ensure_dry_cycle_audit_csv,
     _load_dry_bankroll_state,
     _load_dry_bets,
     _load_dry_settled_epochs,
@@ -43,6 +44,17 @@ class _FlakyWalletStub:
 
 
 class RuntimeLoopDryStateTests(unittest.TestCase):
+    def test_ensure_dry_cycle_audit_csv_resets_stale_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "dry_cycle_audit.csv"
+            path.write_text("stale\nrow\n", encoding="utf-8")
+
+            cols = _ensure_dry_cycle_audit_csv(str(path), reset=True)
+            written = path.read_text(encoding="utf-8").strip().splitlines()
+
+        self.assertEqual(1, len(written))
+        self.assertEqual(",".join(cols), written[0])
+
     def test_load_dry_bets_rejects_duplicate_epoch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "dry_bets.jsonl"
@@ -133,6 +145,7 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_bets_path=str(dry_bets_path),
                     dry_settled_epochs_path=str(dry_settled_path),
                     dry_audit_trades_path=str(dry_audit_path),
+                    dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                     dry_bankroll_state_path=str(bankroll_state_path),
                     dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
                     live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
@@ -157,6 +170,7 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_bets_path=str(root / "dry_bets.jsonl"),
                     dry_settled_epochs_path=str(root / "dry_settled.txt"),
                     dry_audit_trades_path=str(root / "dry_audit.csv"),
+                    dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                     dry_bankroll_state_path=str(root / "dry_bankroll_state.json"),
                     dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
                     live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
@@ -181,6 +195,7 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_bets_path=str(root / "dry_bets.jsonl"),
                     dry_settled_epochs_path=str(root / "dry_settled.txt"),
                     dry_audit_trades_path=str(root / "dry_audit.csv"),
+                    dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                     dry_bankroll_state_path=str(root / "dry_bankroll_state.json"),
                     dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
                     live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
@@ -206,6 +221,7 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_bets_path=str(root / "dry_bets.jsonl"),
                     dry_settled_epochs_path=str(root / "dry_settled.txt"),
                     dry_audit_trades_path=str(root / "dry_audit.csv"),
+                    dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                     dry_bankroll_state_path=str(root / "dry_bankroll_state.json"),
                     dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
                     live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
@@ -237,6 +253,7 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_bets_path=str(root / "dry_bets.jsonl"),
                     dry_settled_epochs_path=str(root / "dry_settled.txt"),
                     dry_audit_trades_path=str(root / "dry_audit.csv"),
+                    dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                     dry_bankroll_state_path=str(bankroll_state_path),
                     dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
                     live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),

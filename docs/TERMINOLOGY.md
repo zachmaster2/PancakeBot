@@ -8,8 +8,8 @@ Canonical vocabulary for code, config, docs, and logs.
    live, dry, and backtest modes.
 2. `probe pipeline`: inspection tooling that orchestrates experiments by
    invoking the production pipeline and analyzing artifacts.
-3. `legacy probe`: any historical inspection tool moved under
-   `inspection/legacy`.
+3. `legacy probe`: any archived historical inspection tool moved out of the
+   active repo archive.
 
 ## Mode Terms
 
@@ -36,7 +36,7 @@ Canonical vocabulary for code, config, docs, and logs.
 
 1. `trades artifact`: per-round backtest/probe execution output CSV.
 2. `summary artifact`: aggregate result JSON output.
-3. `experiment directory`: `var/exp/<scenario_name>/`.
+3. `experiment directory`: `../PancakeBot_var_exp/<scenario_name>/`.
 
 ## Forbidden Ambiguity
 
