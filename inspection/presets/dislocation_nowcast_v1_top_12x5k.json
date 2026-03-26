@@ -44,9 +44,9 @@
     "klines_path": "var/klines.jsonl"
   },
   "benchmark_snapshot": {
-    "aggregate_json": "var/exp/dislocation_nowcast_v1_top_12x5k_aggregate.json",
-    "blocks_csv": "var/exp/dislocation_nowcast_v1_top_12x5k_blocks.csv",
-    "aggregate_csv": "var/exp/dislocation_nowcast_v1_top_12x5k_aggregate.csv",
+    "aggregate_json": "../PancakeBot_var_exp/dislocation_nowcast_v1_top_12x5k_aggregate.json",
+    "blocks_csv": "../PancakeBot_var_exp/dislocation_nowcast_v1_top_12x5k_blocks.csv",
+    "aggregate_csv": "../PancakeBot_var_exp/dislocation_nowcast_v1_top_12x5k_aggregate.csv",
     "blocks": 12,
     "bets_total": 1011,
     "wins_total": 545,

@@ -13,8 +13,10 @@ class RuntimePreflightTests(unittest.TestCase):
             env={},
         )
 
-        self.assertEqual("online_selector_score_fallback", cfg.strategy.router.mode)
+        self.assertEqual("selector_max_score", cfg.strategy.router.mode)
         self.assertTrue(all(bool(check.passed) for check in checks))
+        check_names = {check.name for check in checks}
+        self.assertIn("dry_cycle_audit_parent", check_names)
 
     def test_collect_preflight_checks_reports_missing_env_when_requested(self) -> None:
         _cfg, checks = collect_preflight_checks(

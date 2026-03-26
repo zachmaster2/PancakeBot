@@ -23,9 +23,6 @@ var/
 *.out
 *.tmp
 
-# External comparison sandbox
-good-results-codebase/
-
 # OS noise
 Thumbs.db
 Desktop.ini
@@ -35,3 +32,4 @@ codex_write_test.txt
 
 # Local copied crash logs
 dry_mode_error.txt
+proposed_plan.txt

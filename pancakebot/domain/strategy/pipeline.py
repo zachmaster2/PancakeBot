@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from pancakebot.config.strategy_config import StrategyConfig
 from pancakebot.core.constants import GAS_COST_BET_BNB
 from pancakebot.core.errors import InvariantError
+from pancakebot.domain.features.schema import max_required_prior_context_rounds_size
 from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 from pancakebot.domain.strategy.dislocation_engine import DislocationEngine
+from pancakebot.domain.strategy.flow_candidate_adapter import FlowCandidateAdapter
 from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterDecision
 from pancakebot.domain.types import Kline, Round
@@ -25,6 +28,40 @@ _ML_UNTRADEABLE_SKIP_REASONS = frozenset(
     }
 )
 _VALID_BET_SIDES = frozenset({"Bull", "Bear"})
+
+
+def required_pipeline_warmup_rounds(*, strategy_cfg: StrategyConfig) -> int:
+    """Return the minimum closed-round warmup needed for active shared providers."""
+
+    required = [
+        int(strategy_cfg.dislocation.selector.warmup_rounds),
+        int(strategy_cfg.router.online_warmup_rounds),
+    ]
+    if bool(strategy_cfg.flow_candidate.enabled):
+        required.append(int(strategy_cfg.flow_candidate.train_size))
+
+    needs_ml_history = bool(strategy_cfg.ml_candidate.enabled) or any(
+        str(c.pool_total_gate_mode) == "projected_final_model_only"
+        or str(c.stake_mode) in ("ev_scaled_projected", "ev_optimal_projected")
+        or bool(c.late_model_veto_enabled)
+        for c in strategy_cfg.dislocation.candidates
+    )
+    if bool(needs_ml_history):
+        required.append(
+            int(max_required_prior_context_rounds_size())
+            + int(strategy_cfg.ml_candidate.train_size)
+            + int(strategy_cfg.ml_candidate.calibrate_size)
+        )
+        if bool(strategy_cfg.ml_candidate.candidate_profit_model_enabled):
+            required.append(
+                int(max_required_prior_context_rounds_size())
+                + int(strategy_cfg.ml_candidate.candidate_profit_model_warmup_rounds)
+            )
+
+    warmup_rounds = max(required)
+    if int(warmup_rounds) <= 0:
+        raise InvariantError("pipeline_warmup_rounds_nonpositive")
+    return int(warmup_rounds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +88,7 @@ class StrategyPipeline:
         router: StrategyRouter,
         treasury_fee_fraction: float,
         ml_candidate_adapter: MlCandidateAdapter | None = None,
+        flow_candidate_adapter: FlowCandidateAdapter | None = None,
     ) -> None:
         if not (0.0 <= float(treasury_fee_fraction) < 1.0):
             raise InvariantError("strategy_pipeline_treasury_fee_fraction_out_of_range")
@@ -58,6 +96,7 @@ class StrategyPipeline:
         self._router = router
         self._treasury_fee_fraction = float(treasury_fee_fraction)
         self._ml_candidate_adapter = ml_candidate_adapter
+        self._flow_candidate_adapter = flow_candidate_adapter
         self._pending_candidate_signals_by_epoch: dict[int, dict[str, StrategyCandidateSignal]] = {}
         self._last_settled_epoch: int | None = None
 
@@ -95,6 +134,11 @@ class StrategyPipeline:
                 if self._ml_candidate_adapter is not None
                 else None
             ),
+            "flow_state": (
+                self._flow_candidate_adapter.export_bootstrap_state()
+                if self._flow_candidate_adapter is not None
+                else None
+            ),
         }
 
     def import_bootstrap_state(self, *, state: dict[str, object]) -> None:
@@ -118,6 +162,14 @@ class StrategyPipeline:
                 raise InvariantError("pipeline_snapshot_ml_state_invalid")
             self._ml_candidate_adapter.import_bootstrap_state(state=ml_state)
 
+        flow_state = state.get("flow_state")
+        if flow_state is not None:
+            if self._flow_candidate_adapter is None:
+                raise InvariantError("pipeline_snapshot_flow_state_without_adapter")
+            if not isinstance(flow_state, dict):
+                raise InvariantError("pipeline_snapshot_flow_state_invalid")
+            self._flow_candidate_adapter.import_bootstrap_state(state=flow_state)
+
         last_settled_epoch = state.get("last_settled_epoch")
         if last_settled_epoch is None:
             self._last_settled_epoch = None
@@ -131,6 +183,8 @@ class StrategyPipeline:
         self._dislocation_engine.refresh_klines(list(klines))
         if self._ml_candidate_adapter is not None:
             self._ml_candidate_adapter.refresh_klines(klines=list(klines))
+        if self._flow_candidate_adapter is not None:
+            self._flow_candidate_adapter.refresh_klines(klines=list(klines))
 
     def bootstrap_from_closed_rounds(self, *, rounds: list[Round]) -> None:
         """Bootstrap providers and router from historical closed rounds."""
@@ -239,6 +293,12 @@ class StrategyPipeline:
                 if ml_name in signals:
                     raise InvariantError("strategy_pipeline_candidate_name_duplicate")
                 signals[ml_name] = ml_signal
+        if self._flow_candidate_adapter is not None and bool(self._flow_candidate_adapter.enabled):
+            flow_signal = self._flow_candidate_adapter.candidate_signal_for_open_round(round_t=round_t)
+            flow_name = str(flow_signal.candidate_name)
+            if flow_name in signals:
+                raise InvariantError("strategy_pipeline_candidate_name_duplicate")
+            signals[flow_name] = flow_signal
         return dict(signals)
 
     def _apply_ml_signal_coupling(
@@ -359,6 +419,8 @@ class StrategyPipeline:
         self._dislocation_engine.settle_closed_rounds(list(rounds))
         if self._ml_candidate_adapter is not None:
             self._ml_candidate_adapter.settle_closed_rounds(rounds=list(rounds))
+        if self._flow_candidate_adapter is not None:
+            self._flow_candidate_adapter.settle_closed_rounds(rounds=list(rounds))
 
     def _realized_profit_by_candidate(
         self,

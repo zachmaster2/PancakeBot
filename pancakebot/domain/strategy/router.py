@@ -85,11 +85,11 @@ class StrategyRouterConfig:
 
     mode: str = "selector_max_score"
     score_threshold_bnb: float = -1e9
-    online_warmup_rounds: int = 50_000
+    online_warmup_rounds: int = 10_000
     online_num_quantile_bins: int = 12
     online_min_cell_obs: int = 5
-    online_score_threshold_bnb: float = 0.0
-    online_use_direction_split: bool = True
+    online_score_threshold_bnb: float = 0.008
+    online_use_direction_split: bool = False
 
     def __post_init__(self) -> None:
         self.validate()

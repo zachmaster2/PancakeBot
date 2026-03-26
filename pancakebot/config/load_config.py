@@ -11,6 +11,7 @@ from pancakebot.config.strategy_config import (
     DislocationCandidateConfig,
     DislocationSelectorConfig,
     DislocationStrategyConfig,
+    FlowCandidateConfig,
     MlCandidateConfig,
     StrategyConfig,
     StrategyRouterConfig,
@@ -486,6 +487,182 @@ def _parse_ml_candidate(candidate: dict[str, Any]) -> MlCandidateConfig:
         candidate_profit_model_warmup_rounds=int(candidate_profit_model_warmup_rounds),
         candidate_profit_model_num_quantile_bins=int(candidate_profit_model_num_quantile_bins),
         candidate_profit_model_min_cell_obs=int(candidate_profit_model_min_cell_obs),
+    )
+
+def _parse_flow_candidate(candidate: dict[str, Any]) -> FlowCandidateConfig:
+    defaults = FlowCandidateConfig()
+    allowed = {
+        "enabled",
+        "name",
+        "shadow_initial_bankroll_bnb",
+        "train_size",
+        "retrain_interval",
+        "n_estimators",
+        "learning_rate",
+        "num_leaves",
+        "subsample",
+        "colsample_bytree",
+        "random_seed",
+        "ev_threshold",
+        "kelly_fraction",
+        "max_fraction",
+        "max_bet_abs",
+        "min_bet_size",
+        "round_to",
+        "min_total_pool_c",
+        "max_total_pool_share",
+        "max_side_pool_share",
+        "min_bull_ratio",
+        "max_bull_ratio",
+        "vol_mid",
+        "drawdown_stop_pct",
+        "drawdown_throttle_start_pct",
+        "drawdown_throttle_min_scale",
+        "roll_window",
+        "roll_edge_min",
+        "roll_winrate_min",
+        "cooldown_trades",
+    }
+    _validate_unknown_keys("flow_candidate", candidate, allowed)
+
+    enabled = _opt_bool(candidate, "enabled", bool(defaults.enabled))
+    name = _opt_str(candidate, "name", str(defaults.name))
+    shadow_initial_bankroll_bnb = _opt_float(
+        candidate,
+        "shadow_initial_bankroll_bnb",
+        float(defaults.shadow_initial_bankroll_bnb),
+    )
+    if float(shadow_initial_bankroll_bnb) <= 0.0:
+        raise InvariantError("strategy_flow_candidate_shadow_initial_bankroll_bnb_must_be_positive")
+    train_size = _opt_int(candidate, "train_size", int(defaults.train_size))
+    if int(train_size) <= 0:
+        raise InvariantError("strategy_flow_candidate_train_size_nonpositive")
+    retrain_interval = _opt_int(candidate, "retrain_interval", int(defaults.retrain_interval))
+    if int(retrain_interval) <= 0:
+        raise InvariantError("strategy_flow_candidate_retrain_interval_nonpositive")
+    n_estimators = _opt_int(candidate, "n_estimators", int(defaults.n_estimators))
+    if int(n_estimators) <= 0:
+        raise InvariantError("strategy_flow_candidate_n_estimators_nonpositive")
+    learning_rate = _opt_float(candidate, "learning_rate", float(defaults.learning_rate))
+    if float(learning_rate) <= 0.0:
+        raise InvariantError("strategy_flow_candidate_learning_rate_nonpositive")
+    num_leaves = _opt_int(candidate, "num_leaves", int(defaults.num_leaves))
+    if int(num_leaves) <= 1:
+        raise InvariantError("strategy_flow_candidate_num_leaves_invalid")
+    subsample = _opt_float(candidate, "subsample", float(defaults.subsample))
+    if not (0.0 < float(subsample) <= 1.0):
+        raise InvariantError("strategy_flow_candidate_subsample_out_of_range")
+    colsample_bytree = _opt_float(candidate, "colsample_bytree", float(defaults.colsample_bytree))
+    if not (0.0 < float(colsample_bytree) <= 1.0):
+        raise InvariantError("strategy_flow_candidate_colsample_bytree_out_of_range")
+    random_seed = _opt_int(candidate, "random_seed", int(defaults.random_seed))
+    if int(random_seed) < 0:
+        raise InvariantError("strategy_flow_candidate_random_seed_negative")
+    ev_threshold = _opt_float(candidate, "ev_threshold", float(defaults.ev_threshold))
+    if float(ev_threshold) < 0.0:
+        raise InvariantError("strategy_flow_candidate_ev_threshold_negative")
+    kelly_fraction = _opt_float(candidate, "kelly_fraction", float(defaults.kelly_fraction))
+    if float(kelly_fraction) < 0.0:
+        raise InvariantError("strategy_flow_candidate_kelly_fraction_negative")
+    max_fraction = _opt_float(candidate, "max_fraction", float(defaults.max_fraction))
+    if not (0.0 <= float(max_fraction) <= 1.0):
+        raise InvariantError("strategy_flow_candidate_max_fraction_out_of_range")
+    max_bet_abs = _opt_float(candidate, "max_bet_abs", float(defaults.max_bet_abs))
+    if float(max_bet_abs) <= 0.0:
+        raise InvariantError("strategy_flow_candidate_max_bet_abs_nonpositive")
+    min_bet_size = _opt_float(candidate, "min_bet_size", float(defaults.min_bet_size))
+    if float(min_bet_size) <= 0.0:
+        raise InvariantError("strategy_flow_candidate_min_bet_size_nonpositive")
+    round_to = _opt_float(candidate, "round_to", float(defaults.round_to))
+    if float(round_to) <= 0.0:
+        raise InvariantError("strategy_flow_candidate_round_to_nonpositive")
+    min_total_pool_c = _opt_float(candidate, "min_total_pool_c", float(defaults.min_total_pool_c))
+    if float(min_total_pool_c) < 0.0:
+        raise InvariantError("strategy_flow_candidate_min_total_pool_c_negative")
+    max_total_pool_share = _opt_float(
+        candidate,
+        "max_total_pool_share",
+        float(defaults.max_total_pool_share),
+    )
+    if not (0.0 < float(max_total_pool_share) <= 1.0):
+        raise InvariantError("strategy_flow_candidate_max_total_pool_share_out_of_range")
+    max_side_pool_share = _opt_float(
+        candidate,
+        "max_side_pool_share",
+        float(defaults.max_side_pool_share),
+    )
+    if not (0.0 < float(max_side_pool_share) <= 1.0):
+        raise InvariantError("strategy_flow_candidate_max_side_pool_share_out_of_range")
+    min_bull_ratio = _opt_float(candidate, "min_bull_ratio", float(defaults.min_bull_ratio))
+    max_bull_ratio = _opt_float(candidate, "max_bull_ratio", float(defaults.max_bull_ratio))
+    if not (0.0 <= float(min_bull_ratio) <= float(max_bull_ratio) <= 1.0):
+        raise InvariantError("strategy_flow_candidate_bull_ratio_out_of_range")
+    vol_mid = _opt_float(candidate, "vol_mid", float(defaults.vol_mid))
+    if float(vol_mid) < 0.0:
+        raise InvariantError("strategy_flow_candidate_vol_mid_negative")
+    drawdown_stop_pct = _opt_float(
+        candidate,
+        "drawdown_stop_pct",
+        float(defaults.drawdown_stop_pct),
+    )
+    if not (0.0 < float(drawdown_stop_pct) <= 1.0):
+        raise InvariantError("strategy_flow_candidate_drawdown_stop_pct_out_of_range")
+    drawdown_throttle_start_pct = _opt_float(
+        candidate,
+        "drawdown_throttle_start_pct",
+        float(defaults.drawdown_throttle_start_pct),
+    )
+    if not (0.0 <= float(drawdown_throttle_start_pct) <= float(drawdown_stop_pct)):
+        raise InvariantError("strategy_flow_candidate_drawdown_throttle_start_pct_out_of_range")
+    drawdown_throttle_min_scale = _opt_float(
+        candidate,
+        "drawdown_throttle_min_scale",
+        float(defaults.drawdown_throttle_min_scale),
+    )
+    if not (0.0 < float(drawdown_throttle_min_scale) <= 1.0):
+        raise InvariantError("strategy_flow_candidate_drawdown_throttle_min_scale_out_of_range")
+    roll_window = _opt_int(candidate, "roll_window", int(defaults.roll_window))
+    if int(roll_window) <= 0:
+        raise InvariantError("strategy_flow_candidate_roll_window_nonpositive")
+    roll_edge_min = _opt_float(candidate, "roll_edge_min", float(defaults.roll_edge_min))
+    roll_winrate_min = _opt_float(candidate, "roll_winrate_min", float(defaults.roll_winrate_min))
+    if not (0.0 <= float(roll_winrate_min) <= 1.0):
+        raise InvariantError("strategy_flow_candidate_roll_winrate_min_out_of_range")
+    cooldown_trades = _opt_int(candidate, "cooldown_trades", int(defaults.cooldown_trades))
+    if int(cooldown_trades) < 0:
+        raise InvariantError("strategy_flow_candidate_cooldown_trades_negative")
+
+    return FlowCandidateConfig(
+        enabled=bool(enabled),
+        name=str(name),
+        shadow_initial_bankroll_bnb=float(shadow_initial_bankroll_bnb),
+        train_size=int(train_size),
+        retrain_interval=int(retrain_interval),
+        n_estimators=int(n_estimators),
+        learning_rate=float(learning_rate),
+        num_leaves=int(num_leaves),
+        subsample=float(subsample),
+        colsample_bytree=float(colsample_bytree),
+        random_seed=int(random_seed),
+        ev_threshold=float(ev_threshold),
+        kelly_fraction=float(kelly_fraction),
+        max_fraction=float(max_fraction),
+        max_bet_abs=float(max_bet_abs),
+        min_bet_size=float(min_bet_size),
+        round_to=float(round_to),
+        min_total_pool_c=float(min_total_pool_c),
+        max_total_pool_share=float(max_total_pool_share),
+        max_side_pool_share=float(max_side_pool_share),
+        min_bull_ratio=float(min_bull_ratio),
+        max_bull_ratio=float(max_bull_ratio),
+        vol_mid=float(vol_mid),
+        drawdown_stop_pct=float(drawdown_stop_pct),
+        drawdown_throttle_start_pct=float(drawdown_throttle_start_pct),
+        drawdown_throttle_min_scale=float(drawdown_throttle_min_scale),
+        roll_window=int(roll_window),
+        roll_edge_min=float(roll_edge_min),
+        roll_winrate_min=float(roll_winrate_min),
+        cooldown_trades=int(cooldown_trades),
     )
 
 
@@ -990,7 +1167,7 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
 
 
 def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
-    _validate_unknown_keys("strategy", strategy, {"dislocation", "router", "ml_candidate"})
+    _validate_unknown_keys("strategy", strategy, {"dislocation", "router", "ml_candidate", "flow_candidate"})
 
     dislocation = strategy.get("dislocation", {})
     if dislocation is None:
@@ -1015,6 +1192,13 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
     if not isinstance(ml_candidate_obj, dict):
         raise InvariantError("config_section_not_dict: strategy.ml_candidate")
     ml_candidate_cfg = _parse_ml_candidate(ml_candidate_obj)
+
+    flow_candidate_obj = strategy.get("flow_candidate", {})
+    if flow_candidate_obj is None:
+        flow_candidate_obj = {}
+    if not isinstance(flow_candidate_obj, dict):
+        raise InvariantError("config_section_not_dict: strategy.flow_candidate")
+    flow_candidate_cfg = _parse_flow_candidate(flow_candidate_obj)
 
     selector_obj = dislocation.get("selector", {})
     if selector_obj is None:
@@ -1066,6 +1250,7 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
         ),
         router=router_cfg,
         ml_candidate=ml_candidate_cfg,
+        flow_candidate=flow_candidate_cfg,
     )
 
 
@@ -1115,6 +1300,7 @@ def load_app_config(path: str) -> AppConfig:
         "dry_bets_path",
         "dry_settled_epochs_path",
         "dry_audit_trades_path",
+        "dry_cycle_audit_path",
         "dry_bankroll_state_path",
         "dry_pipeline_bootstrap_state_path",
         "live_pipeline_bootstrap_state_path",
@@ -1164,6 +1350,11 @@ def load_app_config(path: str) -> AppConfig:
         "dry_audit_trades_path",
         "var/runtime/dry_audit_trades.csv",
     )
+    dry_cycle_audit_path = _opt_str(
+        paths,
+        "dry_cycle_audit_path",
+        "var/runtime/dry_cycle_audit.csv",
+    )
     dry_bankroll_state_path = _opt_str(
         paths,
         "dry_bankroll_state_path",
@@ -1186,6 +1377,7 @@ def load_app_config(path: str) -> AppConfig:
             "dry_bets_path": str(dry_bets_path),
             "dry_settled_epochs_path": str(dry_settled_epochs_path),
             "dry_audit_trades_path": str(dry_audit_trades_path),
+            "dry_cycle_audit_path": str(dry_cycle_audit_path),
             "dry_bankroll_state_path": str(dry_bankroll_state_path),
             "dry_pipeline_bootstrap_state_path": str(dry_pipeline_bootstrap_state_path),
             "live_pipeline_bootstrap_state_path": str(live_pipeline_bootstrap_state_path),
@@ -1294,6 +1486,7 @@ def load_app_config(path: str) -> AppConfig:
             dry_bets_path=str(dry_bets_path),
             dry_settled_epochs_path=str(dry_settled_epochs_path),
             dry_audit_trades_path=str(dry_audit_trades_path),
+            dry_cycle_audit_path=str(dry_cycle_audit_path),
             dry_bankroll_state_path=str(dry_bankroll_state_path),
             dry_pipeline_bootstrap_state_path=str(dry_pipeline_bootstrap_state_path),
             live_pipeline_bootstrap_state_path=str(live_pipeline_bootstrap_state_path),

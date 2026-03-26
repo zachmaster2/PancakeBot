@@ -16,8 +16,9 @@ from pancakebot.core.logging import info, warn
 from pancakebot.domain.strategy.dislocation_engine import (
     build_dislocation_engine_from_config,
 )
+from pancakebot.domain.strategy.flow_candidate_adapter import FlowCandidateAdapter
 from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
-from pancakebot.domain.strategy.pipeline import StrategyPipeline
+from pancakebot.domain.strategy.pipeline import StrategyPipeline, required_pipeline_warmup_rounds
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterConfig
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
@@ -126,6 +127,13 @@ def _build_strategy_pipeline(*, runtime_cfg, all_klines: list[Kline] | None) -> 
         runtime_cfg=runtime_cfg,
         force_create=bool(needs_pool_projection_model),
     )
+    flow_adapter: FlowCandidateAdapter | None = None
+    if bool(runtime_cfg.strategy_cfg.flow_candidate.enabled):
+        flow_adapter = FlowCandidateAdapter(
+            config=runtime_cfg.strategy_cfg.flow_candidate,
+            cutoff_seconds=int(runtime_cfg.cutoff_seconds),
+            treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
+        )
     dislocation_engine = _build_dislocation_engine(
         runtime_cfg=runtime_cfg,
         all_klines=all_klines,
@@ -137,6 +145,7 @@ def _build_strategy_pipeline(*, runtime_cfg, all_klines: list[Kline] | None) -> 
         router=router,
         treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
         ml_candidate_adapter=ml_adapter,
+        flow_candidate_adapter=flow_adapter,
     )
     if all_klines is not None:
         pipeline.refresh_klines(klines=list(all_klines))
@@ -506,9 +515,9 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
     state_cache_root_dir = getattr(runtime_cfg, "backtest_state_cache_dir", _DEFAULT_STATE_CACHE_ROOT_DIR)
     state_cache = BacktestStateCache(root_dir=str(state_cache_root_dir))
 
-    warmup_rounds = int(runtime_cfg.strategy_cfg.dislocation.selector.warmup_rounds)
+    warmup_rounds = int(required_pipeline_warmup_rounds(strategy_cfg=runtime_cfg.strategy_cfg))
     if int(warmup_rounds) <= 0:
-        raise InvariantError("dislocation_warmup_rounds_nonpositive")
+        raise InvariantError("pipeline_warmup_rounds_nonpositive")
 
     tail_offset_rounds = int(backtest_cfg.tail_offset_rounds)
     total_n = int(warmup_rounds) + int(simulation_size) + int(tail_offset_rounds)

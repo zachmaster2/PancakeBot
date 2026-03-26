@@ -70,6 +70,7 @@ class RuntimePipelineSnapshotTests(unittest.TestCase):
                 dry_bets_path=str(root / "dry_bets.jsonl"),
                 dry_settled_epochs_path=str(root / "dry_settled.txt"),
                 dry_audit_trades_path=str(root / "dry_audit.csv"),
+                dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                 dry_bankroll_state_path=str(root / "dry_bankroll_state.json"),
                 dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
                 live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
