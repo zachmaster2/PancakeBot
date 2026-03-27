@@ -13,7 +13,8 @@ Current shared baseline:
   - `disloc_stageB_bullonly_recent8pct_v1`
 - flow candidate:
   - `flow_lgbm_recent_t12k_r1k_regime40_v1`
-  - `enabled = true` in the current promoted runtime profile
+  - `enabled = false` in the current contained runtime profile
+  - retained for re-qualification research, not active in dry/live by default
   - `train_size = 12000`
   - `retrain_interval = 1000`
   - `ev_threshold = 0.0025`

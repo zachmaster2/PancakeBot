@@ -165,7 +165,7 @@ class MlCandidateConfig:
 class FlowCandidateConfig:
     """Simple flow/LGBM candidate configuration used by the shared router."""
 
-    enabled: bool = True
+    enabled: bool = False
     name: str = "flow_lgbm_recent_t12k_r1k_regime40_v1"
     shadow_initial_bankroll_bnb: float = 50.0
     train_size: int = 12_000

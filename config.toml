@@ -578,8 +578,9 @@ rescore_baseline_candidates_with_expected_net = false
 random_seed = 1337
 
 [strategy.flow_candidate]
-# Promoted recent-window flow/LGBM overlay paired with stageB bull-only.
-enabled = true
+# Flow overlay is temporarily demoted from dry/live while it is re-qualified.
+# Keep the knob set here for research and later shadow/controlled re-promotion.
+enabled = false
 name = "flow_lgbm_recent_t12k_r1k_regime40_v1"
 shadow_initial_bankroll_bnb = 50.0
 train_size = 12000

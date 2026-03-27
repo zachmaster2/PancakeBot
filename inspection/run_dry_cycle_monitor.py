@@ -23,9 +23,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expected-strategies",
         type=str,
-        default="disloc_stageB_bullonly_recent8pct_v1,flow_lgbm_recent_t12k_r1k_regime40_v1",
+        default="disloc_stageB_bullonly_recent8pct_v1",
     )
-    parser.add_argument("--expected-bet-sides", type=str, default="Bull,Bear")
+    parser.add_argument("--expected-bet-sides", type=str, default="Bull")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--duration-seconds", type=int, default=43_200)
     parser.add_argument("--warn-idle-streak-cycles", type=int, default=240)
