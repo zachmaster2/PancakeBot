@@ -187,6 +187,8 @@ class FlowCandidateConfig:
     max_side_pool_share: float = 0.50
     min_bull_ratio: float = 0.05
     max_bull_ratio: float = 0.95
+    allowed_sides: str = "both"
+    selector_score_penalty_bnb: float = 0.0
     vol_mid: float = 0.030
     drawdown_stop_pct: float = 0.75
     drawdown_throttle_start_pct: float = 0.35

@@ -66,6 +66,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--roll-edge-mins", type=str, default="-0.01,-0.005,-0.002")
     parser.add_argument("--roll-winrate-mins", type=str, default="0.45,0.47,0.49")
     parser.add_argument("--cooldown-trades-list", type=str, default="20,60,120")
+    parser.add_argument("--allowed-sides", type=str, choices=("both", "bull_only", "bear_only"), default="both")
     parser.add_argument("--min-bet-rate", type=float, default=0.05)
     parser.add_argument("--top-k", type=int, default=25)
     parser.add_argument("--cutoff-seconds", type=int, default=None)
@@ -244,10 +245,17 @@ def main() -> None:
             drawdown_stop_pct=float(args.drawdown_stop_pct),
             drawdown_throttle_start_pct=float(args.drawdown_throttle_start_pct),
             drawdown_throttle_min_scale=float(args.drawdown_throttle_min_scale),
+            allowed_sides=str(args.allowed_sides),
             roll_window=int(roll_window),
             roll_edge_min=float(roll_edge_min),
             roll_winrate_min=float(roll_winrate_min),
             cooldown_trades=int(cooldown_trades),
+            bull_roll_edge_min=float(roll_edge_min),
+            bear_roll_edge_min=float(roll_edge_min),
+            bull_roll_winrate_min=float(roll_winrate_min),
+            bear_roll_winrate_min=float(roll_winrate_min),
+            bull_cooldown_trades=int(cooldown_trades),
+            bear_cooldown_trades=int(cooldown_trades),
         )
         source_windows: list[dict[str, object]] = []
         probe_windows: list[dict[str, object]] = []
@@ -287,6 +295,7 @@ def main() -> None:
             "roll_edge_min": float(roll_edge_min),
             "roll_winrate_min": float(roll_winrate_min),
             "cooldown_trades": int(cooldown_trades),
+            "allowed_sides": str(args.allowed_sides),
             "source_mean_per_500": float(np.mean(np.asarray(source_per500, dtype=float))),
             "source_min_per_500": float(np.min(np.asarray(source_per500, dtype=float))),
             "source_positive_windows": int(sum(1 for x in source_per500 if float(x) > 0.0)),
@@ -333,6 +342,7 @@ def main() -> None:
                 "roll_edge_min": float(row["roll_edge_min"]),
                 "roll_winrate_min": float(row["roll_winrate_min"]),
                 "cooldown_trades": int(row["cooldown_trades"]),
+                "allowed_sides": str(row["allowed_sides"]),
                 "meets_min_bet_rate": bool(row["meets_min_bet_rate"]),
                 "source_mean_per_500": float(row["source_mean_per_500"]),
                 "source_min_per_500": float(row["source_min_per_500"]),

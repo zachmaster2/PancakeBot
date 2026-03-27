@@ -602,6 +602,7 @@ max_total_pool_share = 0.05
 max_side_pool_share = 0.50
 min_bull_ratio = 0.05
 max_bull_ratio = 0.95
+selector_score_penalty_bnb = 0.0
 vol_mid = 0.03
 drawdown_stop_pct = 0.75
 drawdown_throttle_start_pct = 0.35

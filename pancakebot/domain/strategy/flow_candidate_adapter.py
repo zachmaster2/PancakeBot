@@ -41,6 +41,17 @@ _FEATURE_DROP_COLS = frozenset(
 )
 
 
+def _side_allowed(*, side: str, allowed_sides: str) -> bool:
+    mode = str(allowed_sides)
+    if mode == "both":
+        return True
+    if mode == "bull_only":
+        return str(side) == "Bull"
+    if mode == "bear_only":
+        return str(side) == "Bear"
+    raise InvariantError("flow_candidate_allowed_sides_invalid")
+
+
 def _topk_share(amounts: list[float], k: int) -> float:
     if not amounts:
         return float("nan")
@@ -473,6 +484,8 @@ class FlowCandidateAdapter:
         ev_bull, ev_bear = self._current_odds_ev(row=row, p_bull=float(p_bull))
         choose_bull = float(ev_bull) >= float(ev_bear)
         bet_side = "Bull" if bool(choose_bull) else "Bear"
+        if not _side_allowed(side=str(bet_side), allowed_sides=str(self._config.allowed_sides)):
+            return self._skip_signal(skip_reason="flow_candidate_side_not_allowed", p_bull=float(p_bull))
         p_win = float(p_bull) if bool(choose_bull) else float(1.0 - float(p_bull))
         side_c = float(row.get("bull_amt_c", 0.0) or 0.0) if bool(choose_bull) else float(
             row.get("bear_amt_c", 0.0) or 0.0
@@ -556,6 +569,12 @@ class FlowCandidateAdapter:
         expected_profit_bnb = float(ev_unit) * float(bet_bnb)
         if float(expected_profit_bnb) <= 0.0:
             return self._skip_signal(skip_reason="flow_candidate_expected_profit_nonpositive", p_bull=float(p_bull))
+        selector_score_bnb = float(expected_profit_bnb) - float(self._config.selector_score_penalty_bnb)
+        if float(selector_score_bnb) <= 0.0:
+            return self._skip_signal(
+                skip_reason="flow_candidate_selector_score_below_penalty",
+                p_bull=float(p_bull),
+            )
 
         signal = StrategyCandidateSignal(
             candidate_name=str(self._config.name),
@@ -563,7 +582,7 @@ class FlowCandidateAdapter:
             bet_side=str(bet_side),
             bet_size_bnb=float(bet_bnb),
             expected_profit_bnb=float(expected_profit_bnb),
-            selector_score_bnb=float(expected_profit_bnb),
+            selector_score_bnb=float(selector_score_bnb),
             skip_reason=None,
             p_bull=float(p_bull),
             dislocation_bull=float(row.get("log_imbalance_c", 0.0) or 0.0),
@@ -683,3 +702,7 @@ class FlowCandidateAdapter:
             raise InvariantError("flow_candidate_min_bet_size_nonpositive")
         if float(self._config.round_to) <= 0.0:
             raise InvariantError("flow_candidate_round_to_nonpositive")
+        if str(self._config.allowed_sides) not in ("both", "bull_only", "bear_only"):
+            raise InvariantError("flow_candidate_allowed_sides_invalid")
+        if float(self._config.selector_score_penalty_bnb) < 0.0:
+            raise InvariantError("flow_candidate_selector_score_penalty_negative")
