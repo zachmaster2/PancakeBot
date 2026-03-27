@@ -19,6 +19,7 @@ Current shared baseline:
   - `retrain_interval = 1000`
   - `ev_threshold = 0.0025`
   - `min_total_pool_c = 1.0`
+  - `selector_score_penalty_bnb = 0.0`
   - `roll_window = 40`
   - `roll_winrate_min = 0.48`
   - `cooldown_trades = 40`

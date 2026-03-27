@@ -54,6 +54,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-total-pool-c", type=float, default=None)
     parser.add_argument("--max-total-pool-share", type=float, default=None)
     parser.add_argument("--max-side-pool-share", type=float, default=None)
+    parser.add_argument("--allowed-sides", type=str, choices=("both", "bull_only", "bear_only"), default=None)
+    parser.add_argument("--bull-roll-edge-min", type=float, default=None)
+    parser.add_argument("--bear-roll-edge-min", type=float, default=None)
+    parser.add_argument("--bull-roll-winrate-min", type=float, default=None)
+    parser.add_argument("--bear-roll-winrate-min", type=float, default=None)
+    parser.add_argument("--bull-cooldown-trades", type=int, default=None)
+    parser.add_argument("--bear-cooldown-trades", type=int, default=None)
     return parser
 
 
@@ -93,6 +100,26 @@ def _first_numeric_column_value(df: pd.DataFrame, column_name: str, *, first: bo
 
 
 def _standardized_backtest_trades(*, raw_df: pd.DataFrame, strategy_name: str) -> pd.DataFrame:
+    if raw_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "epoch",
+                "action",
+                "skip_reason",
+                "direction",
+                "bet_size_bnb",
+                "p_final",
+                "final_total_bnb",
+                "final_bull_bnb",
+                "final_bear_bnb",
+                "ev_bnb",
+                "profit_bnb",
+                "bankroll_bnb",
+                "selected_strategy",
+                "router_mode",
+                "selector_score_bnb",
+            ]
+        )
     direction = np.where(raw_df["action"].astype(str).eq("BULL"), "Bull", np.where(raw_df["action"].astype(str).eq("BEAR"), "Bear", ""))
     action = np.where(direction != "", "BET", "SKIP")
     skip_reason = np.where(action == "BET", "", raw_df["action"].astype(str).str.lower())
@@ -191,6 +218,17 @@ def main() -> None:
         max_side_pool_share=float(
             flow_cfg.max_side_pool_share if args.max_side_pool_share is None else args.max_side_pool_share
         ),
+        allowed_sides=str("both" if args.allowed_sides is None else args.allowed_sides),
+        roll_window=int(flow_cfg.roll_window),
+        roll_edge_min=float(flow_cfg.roll_edge_min),
+        roll_winrate_min=float(flow_cfg.roll_winrate_min),
+        cooldown_trades=int(flow_cfg.cooldown_trades),
+        bull_roll_edge_min=float(flow_cfg.roll_edge_min if args.bull_roll_edge_min is None else args.bull_roll_edge_min),
+        bear_roll_edge_min=float(flow_cfg.roll_edge_min if args.bear_roll_edge_min is None else args.bear_roll_edge_min),
+        bull_roll_winrate_min=float(flow_cfg.roll_winrate_min if args.bull_roll_winrate_min is None else args.bull_roll_winrate_min),
+        bear_roll_winrate_min=float(flow_cfg.roll_winrate_min if args.bear_roll_winrate_min is None else args.bear_roll_winrate_min),
+        bull_cooldown_trades=int(flow_cfg.cooldown_trades if args.bull_cooldown_trades is None else args.bull_cooldown_trades),
+        bear_cooldown_trades=int(flow_cfg.cooldown_trades if args.bear_cooldown_trades is None else args.bear_cooldown_trades),
     )
     policy_metrics, raw_trades = simulate_flow_policy(df=eval_df, cfg=policy_cfg)
 
@@ -231,19 +269,30 @@ def main() -> None:
         "max_drawdown_bnb": float(-policy_metrics["max_drawdown"]),
         "min_bankroll_bnb": float(min_bankroll),
         "loss_from_initial_to_min_bnb": float(float(initial_bankroll_bnb) - float(min_bankroll)),
+        "bull_bets": int(policy_metrics.get("bull_bets", 0)),
+        "bear_bets": int(policy_metrics.get("bear_bets", 0)),
+        "bull_net_profit_bnb": float(policy_metrics.get("bull_net_profit_bnb", 0.0)),
+        "bear_net_profit_bnb": float(policy_metrics.get("bear_net_profit_bnb", 0.0)),
         "policy": {
-            "treasury_fee_rate": float(args.treasury_fee_rate),
-            "tx_fee_per_unit": float(args.tx_fee_per_unit),
-            "gas_bet_abs": float(args.gas_bet_abs),
-            "gas_claim_abs": float(args.gas_claim_abs),
-            "ev_threshold": float(args.ev_threshold),
-            "kelly_fraction": float(args.kelly_fraction),
-            "max_fraction": float(args.max_fraction),
-            "max_bet_abs": float(args.max_bet_abs),
-            "min_bet_size": float(args.min_bet_size),
-            "min_total_pool_c": float(args.min_total_pool_c),
-            "max_total_pool_share": float(args.max_total_pool_share),
-            "max_side_pool_share": float(args.max_side_pool_share),
+            "treasury_fee_rate": float(policy_cfg.treasury_fee_rate),
+            "tx_fee_per_unit": float(policy_cfg.fee_per_unit),
+            "gas_bet_abs": float(policy_cfg.gas_bet_abs),
+            "gas_claim_abs": float(policy_cfg.gas_claim_abs),
+            "ev_threshold": float(policy_cfg.ev_threshold),
+            "kelly_fraction": float(policy_cfg.kelly_fraction),
+            "max_fraction": float(policy_cfg.max_fraction),
+            "max_bet_abs": float(policy_cfg.max_bet_abs),
+            "min_bet_size": float(policy_cfg.min_bet_size),
+            "min_total_pool_c": float(policy_cfg.min_total_pool_c),
+            "max_total_pool_share": float(policy_cfg.max_total_pool_share),
+            "max_side_pool_share": float(policy_cfg.max_side_pool_share),
+            "allowed_sides": str(policy_cfg.allowed_sides),
+            "bull_roll_edge_min": float(policy_cfg.bull_roll_edge_min),
+            "bear_roll_edge_min": float(policy_cfg.bear_roll_edge_min),
+            "bull_roll_winrate_min": float(policy_cfg.bull_roll_winrate_min),
+            "bear_roll_winrate_min": float(policy_cfg.bear_roll_winrate_min),
+            "bull_cooldown_trades": int(policy_cfg.bull_cooldown_trades),
+            "bear_cooldown_trades": int(policy_cfg.bear_cooldown_trades),
         },
     }
 

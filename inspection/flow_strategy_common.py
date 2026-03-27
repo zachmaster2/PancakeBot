@@ -60,11 +60,46 @@ class FlowPolicyConfig:
     drawdown_stop_pct: float = 0.75
     drawdown_throttle_start_pct: float = 0.35
     drawdown_throttle_min_scale: float = 0.35
+    allowed_sides: str = "both"
     roll_window: int = 40
     roll_edge_min: float = -0.002
     roll_winrate_min: float = 0.48
     cooldown_trades: int = 40
+    bull_roll_edge_min: float = -0.002
+    bear_roll_edge_min: float = -0.002
+    bull_roll_winrate_min: float = 0.48
+    bear_roll_winrate_min: float = 0.48
+    bull_cooldown_trades: int = 40
+    bear_cooldown_trades: int = 40
     impact_iters: int = 3
+
+
+def _allowed_side_set(mode: str) -> set[str]:
+    token = str(mode).strip().lower()
+    if token == "both":
+        return {"BULL", "BEAR"}
+    if token == "bull_only":
+        return {"BULL"}
+    if token == "bear_only":
+        return {"BEAR"}
+    raise ValueError(f"flow_allowed_sides_invalid: {mode}")
+
+
+def _side_specific_thresholds(cfg: FlowPolicyConfig, side: str) -> tuple[float, float, int]:
+    token = str(side).strip().upper()
+    if token == "BULL":
+        return (
+            float(cfg.bull_roll_edge_min),
+            float(cfg.bull_roll_winrate_min),
+            int(cfg.bull_cooldown_trades),
+        )
+    if token == "BEAR":
+        return (
+            float(cfg.bear_roll_edge_min),
+            float(cfg.bear_roll_winrate_min),
+            int(cfg.bear_cooldown_trades),
+        )
+    raise ValueError(f"flow_side_invalid: {side}")
 
 
 def auto_window_sizes(n_rows: int) -> tuple[int, int, int]:
@@ -525,9 +560,10 @@ def simulate_flow_policy(*, df: pd.DataFrame, cfg: FlowPolicyConfig | None = Non
     cfg_obj = cfg or FlowPolicyConfig()
     bankroll = float(cfg_obj.initial_bankroll)
     peak = float(cfg_obj.initial_bankroll)
-    cooldown = 0
-    realized_unit_pnls: list[float] = []
-    realized_wins: list[int] = []
+    allowed_sides = _allowed_side_set(str(cfg_obj.allowed_sides))
+    cooldown_by_side = {"BULL": 0, "BEAR": 0}
+    realized_unit_pnls_by_side: dict[str, list[float]] = {"BULL": [], "BEAR": []}
+    realized_wins_by_side: dict[str, list[int]] = {"BULL": [], "BEAR": []}
     records: list[dict[str, Any]] = []
     for _, row in df.reset_index(drop=True).iterrows():
         peak = max(float(peak), float(bankroll))
@@ -538,10 +574,6 @@ def simulate_flow_policy(*, df: pd.DataFrame, cfg: FlowPolicyConfig | None = Non
         if float(dd_pct) <= -abs(float(cfg_obj.drawdown_stop_pct)):
             records.append({**row, "action": "STOP_DRAWDOWN", "bet_size": 0.0, "bankroll": bankroll, "dd_pct": dd_pct})
             break
-        if int(cooldown) > 0:
-            cooldown -= 1
-            records.append({**row, "action": "COOLDOWN", "bet_size": 0.0, "bankroll": bankroll, "dd_pct": dd_pct})
-            continue
         bull_c = float(row.get("bull_amt_c", np.nan))
         bear_c = float(row.get("bear_amt_c", np.nan))
         total_c = float(bull_c) + float(bear_c)
@@ -565,21 +597,55 @@ def simulate_flow_policy(*, df: pd.DataFrame, cfg: FlowPolicyConfig | None = Non
         ev_bull = float(row.get("pred_ev_bull", np.nan))
         ev_bear = float(row.get("pred_ev_bear", np.nan))
         p_bull = float(row.get("pred_p_bull", np.nan))
-        choose_bull = float(ev_bull) >= float(ev_bear) if np.isfinite(ev_bull) and np.isfinite(ev_bear) else True
-        side = "BULL" if bool(choose_bull) else "BEAR"
-        p_win = float(p_bull) if bool(choose_bull) else (1.0 - float(p_bull) if np.isfinite(p_bull) else np.nan)
-        side_c = float(bull_c) if bool(choose_bull) else float(bear_c)
+        if "BULL" in allowed_sides and "BEAR" in allowed_sides:
+            choose_bull = float(ev_bull) >= float(ev_bear) if np.isfinite(ev_bull) and np.isfinite(ev_bear) else True
+            side = "BULL" if bool(choose_bull) else "BEAR"
+        elif "BULL" in allowed_sides:
+            side = "BULL"
+        elif "BEAR" in allowed_sides:
+            side = "BEAR"
+        else:
+            raise ValueError("flow_allowed_sides_empty")
+        p_win = float(p_bull) if str(side) == "BULL" else (1.0 - float(p_bull) if np.isfinite(p_bull) else np.nan)
+        side_c = float(bull_c) if str(side) == "BULL" else float(bear_c)
         if not np.isfinite(p_win):
             records.append({**row, "action": "SKIP_NAN", "bet_size": 0.0, "bankroll": bankroll, "dd_pct": dd_pct})
             continue
-        if len(realized_unit_pnls) >= max(50, int(cfg_obj.roll_window * 0.5)):
-            recent = np.asarray(realized_unit_pnls[-int(cfg_obj.roll_window):], dtype=float)
-            recent_wins = np.asarray(realized_wins[-int(cfg_obj.roll_window):], dtype=int)
+        roll_edge_min, roll_winrate_min, side_cooldown_trades = _side_specific_thresholds(cfg_obj, str(side))
+        if int(cooldown_by_side[str(side)]) > 0:
+            cooldown_by_side[str(side)] -= 1
+            records.append(
+                {
+                    **row,
+                    "action": "COOLDOWN",
+                    "bet_size": 0.0,
+                    "bankroll": bankroll,
+                    "dd_pct": dd_pct,
+                    "candidate_side": str(side),
+                }
+            )
+            continue
+        side_history = realized_unit_pnls_by_side[str(side)]
+        side_wins = realized_wins_by_side[str(side)]
+        if len(side_history) >= max(50, int(cfg_obj.roll_window * 0.5)):
+            recent = np.asarray(side_history[-int(cfg_obj.roll_window):], dtype=float)
+            recent_wins = np.asarray(side_wins[-int(cfg_obj.roll_window):], dtype=int)
             roll_edge = float(np.nanmean(recent)) if recent.size else 0.0
             roll_wr = float(np.mean(recent_wins)) if recent_wins.size else 0.0
-            if float(roll_edge) < float(cfg_obj.roll_edge_min) or float(roll_wr) < float(cfg_obj.roll_winrate_min):
-                cooldown = int(cfg_obj.cooldown_trades)
-                records.append({**row, "action": "SKIP_REGIME", "bet_size": 0.0, "bankroll": bankroll, "roll_edge": roll_edge, "roll_wr": roll_wr, "dd_pct": dd_pct})
+            if float(roll_edge) < float(roll_edge_min) or float(roll_wr) < float(roll_winrate_min):
+                cooldown_by_side[str(side)] = int(side_cooldown_trades)
+                records.append(
+                    {
+                        **row,
+                        "action": "SKIP_REGIME",
+                        "bet_size": 0.0,
+                        "bankroll": bankroll,
+                        "roll_edge": roll_edge,
+                        "roll_wr": roll_wr,
+                        "dd_pct": dd_pct,
+                        "candidate_side": str(side),
+                    }
+                )
                 continue
         bet = max(float(cfg_obj.min_bet_size), min(float(cfg_obj.max_bet_abs), float(bankroll)))
         for _ in range(int(cfg_obj.impact_iters)):
@@ -634,19 +700,22 @@ def simulate_flow_policy(*, df: pd.DataFrame, cfg: FlowPolicyConfig | None = Non
         pnl = float(unit_realized) * float(bet)
         bankroll = float(max(0.0, float(bankroll) + float(pnl)))
         peak = max(float(peak), float(bankroll))
-        realized_unit_pnls.append(float(unit_realized))
-        realized_wins.append(1 if float(pnl) > 0.0 else 0)
+        realized_unit_pnls_by_side[str(side)].append(float(unit_realized))
+        realized_wins_by_side[str(side)].append(1 if float(pnl) > 0.0 else 0)
         records.append({**row, "action": str(side), "bet_size": float(bet), "p_win": float(p_win), "impact_win_profit_unit": float(win_profit), "impact_ev_unit": float(ev_unit), "pnl": float(pnl), "bankroll": float(bankroll), "dd_pct": float(dd_pct), "pool_total_c": float(total_c), "pool_side_c": float(side_c), "pool_share_total": float(bet / max(float(total_c), EPS)), "pool_share_side": float(bet / max(float(side_c), EPS))})
     out = pd.DataFrame(records)
     bankroll_series = pd.to_numeric(out.get("bankroll", pd.Series([float(cfg_obj.initial_bankroll)])), errors="coerce").ffill().fillna(float(cfg_obj.initial_bankroll))
     end_bankroll = float(bankroll_series.iloc[-1]) if len(bankroll_series) else float(cfg_obj.initial_bankroll)
-    bet_sizes = pd.to_numeric(out.get("bet_size", 0.0), errors="coerce").fillna(0.0)
-    pnls = pd.to_numeric(out.get("pnl", 0.0), errors="coerce").fillna(0.0)
+    bet_sizes = pd.to_numeric(out.get("bet_size", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    pnls = pd.to_numeric(out.get("pnl", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
     bets = int((bet_sizes > 0.0).sum())
     wins = int((pnls > 0.0).sum())
     losses = int((pnls < 0.0).sum())
     skips = int(out.get("action", pd.Series(dtype=str)).astype(str).str.startswith("SKIP").sum())
     max_dd, max_dd_pct = _compute_drawdown(bankroll_series, float(cfg_obj.initial_bankroll))
+    actions = out.get("action", pd.Series(dtype=str)).astype(str)
+    bull_mask = actions == "BULL"
+    bear_mask = actions == "BEAR"
     metrics = {
         "start_bankroll": float(cfg_obj.initial_bankroll),
         "end_bankroll": float(end_bankroll),
@@ -658,5 +727,9 @@ def simulate_flow_policy(*, df: pd.DataFrame, cfg: FlowPolicyConfig | None = Non
         "skips": int(skips),
         "max_drawdown": float(max_dd),
         "max_drawdown_pct": float(max_dd_pct),
+        "bull_bets": int(bull_mask.sum()),
+        "bear_bets": int(bear_mask.sum()),
+        "bull_net_profit_bnb": float(pnls[bull_mask].sum()) if len(pnls) else 0.0,
+        "bear_net_profit_bnb": float(pnls[bear_mask].sum()) if len(pnls) else 0.0,
     }
     return metrics, out

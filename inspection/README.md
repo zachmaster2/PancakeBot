@@ -50,24 +50,30 @@ Additional inspection probes for strategy-routing experiments:
    runs a chunkable flow-family robustness sweep over rolling recent windows
    and a latest-tail probe window, exporting sorted aggregate tables plus
    per-config JSON detail under `../PancakeBot_var_exp/`.
-10. `inspection/run_dry_cycle_monitor.py`:
+10. `inspection/run_flow_overlay_offline.py`:
+   combines aligned `backtest_trades.csv` series from a primary strategy and a
+   flow overlay candidate, then simulates constrained combine rules offline
+   (`fallback_only`, `margin_override`, `max_effective_score`) using a flow
+   score penalty instead of re-running the full shared pipeline for every
+   variant.
+11. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
    and flags obvious anomalies during long dry-mode runs.
-11. `inspection/run_backtest_cache_perf.py`:
+12. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
-12. `inspection/run_backtest_warm_matrix.py`:
+13. `inspection/run_backtest_warm_matrix.py`:
    warm-cache matrix runner that prints and exports a consolidated table with:
    mode, reset interval, net profit, profit per 500 rounds, max drawdown,
    num bets, and top skip reasons.
-13. `inspection/run_backtest_router_matrix.py`:
+14. `inspection/run_backtest_router_matrix.py`:
    router sweep runner over `selector_max_score` and/or `online_cellmean`
    knobs, exporting a sorted table with profitability, drawdown, bet count,
    skip reasons, selected-strategy mix, and warm-run time.
-14. `inspection/run_final_model_gate_window_sweep.py`:
+15. `inspection/run_final_model_gate_window_sweep.py`:
    long-window gate/profile sweep with resume support and optional
    multiprocessing (`--max-workers`) for independent runs.
-15. `inspection/cleanup_experiment_artifacts.py`:
+16. `inspection/cleanup_experiment_artifacts.py`:
    retention/cleanup helper for state-cache files, failed-run directories, and
    optional SQLite `VACUUM` on cache/registry DBs.
 
@@ -182,6 +188,13 @@ Quick usage (do not execute automatically in agent workflows):
   --step-sizes "1000" `
   --ev-thresholds "0.0025,0.005" `
   --min-total-pool-cs "1.0,1.2"
+
+.\.venv\Scripts\python.exe -m inspection.run_flow_overlay_offline `
+  --name overlay_fallback_pen0p10_latest216 `
+  --primary-trades ../PancakeBot_var_exp/stageb_only_tail20k_recent216_20260327/backtest_trades.csv `
+  --overlay-trades ../PancakeBot_var_exp/flow_bear_train15k_eval216_cfgB_tail20k_20260327/backtest_trades.csv `
+  --mode fallback_only `
+  --overlay-score-penalty-bnb 0.10
 
 .\.venv\Scripts\python.exe -m inspection.run_dry_cycle_monitor `
   --cycle-audit-csv var/runtime/dry_cycle_audit.csv `

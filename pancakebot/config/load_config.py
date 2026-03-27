@@ -514,6 +514,8 @@ def _parse_flow_candidate(candidate: dict[str, Any]) -> FlowCandidateConfig:
         "max_side_pool_share",
         "min_bull_ratio",
         "max_bull_ratio",
+        "allowed_sides",
+        "selector_score_penalty_bnb",
         "vol_mid",
         "drawdown_stop_pct",
         "drawdown_throttle_start_pct",
@@ -597,6 +599,16 @@ def _parse_flow_candidate(candidate: dict[str, Any]) -> FlowCandidateConfig:
     max_bull_ratio = _opt_float(candidate, "max_bull_ratio", float(defaults.max_bull_ratio))
     if not (0.0 <= float(min_bull_ratio) <= float(max_bull_ratio) <= 1.0):
         raise InvariantError("strategy_flow_candidate_bull_ratio_out_of_range")
+    allowed_sides = _opt_str(candidate, "allowed_sides", str(defaults.allowed_sides))
+    if str(allowed_sides) not in ("both", "bull_only", "bear_only"):
+        raise InvariantError("strategy_flow_candidate_allowed_sides_invalid")
+    selector_score_penalty_bnb = _opt_float(
+        candidate,
+        "selector_score_penalty_bnb",
+        float(defaults.selector_score_penalty_bnb),
+    )
+    if float(selector_score_penalty_bnb) < 0.0:
+        raise InvariantError("strategy_flow_candidate_selector_score_penalty_negative")
     vol_mid = _opt_float(candidate, "vol_mid", float(defaults.vol_mid))
     if float(vol_mid) < 0.0:
         raise InvariantError("strategy_flow_candidate_vol_mid_negative")
@@ -655,6 +667,8 @@ def _parse_flow_candidate(candidate: dict[str, Any]) -> FlowCandidateConfig:
         max_side_pool_share=float(max_side_pool_share),
         min_bull_ratio=float(min_bull_ratio),
         max_bull_ratio=float(max_bull_ratio),
+        allowed_sides=str(allowed_sides),
+        selector_score_penalty_bnb=float(selector_score_penalty_bnb),
         vol_mid=float(vol_mid),
         drawdown_stop_pct=float(drawdown_stop_pct),
         drawdown_throttle_start_pct=float(drawdown_throttle_start_pct),

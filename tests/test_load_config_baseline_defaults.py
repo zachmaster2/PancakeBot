@@ -61,6 +61,8 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertAlmostEqual(50.0, float(cfg.dry_initial_bankroll_bnb or 0.0))
         self.assertEqual(False, bool(cfg.strategy.flow_candidate.enabled))
         self.assertEqual(_FLOW_NAME, cfg.strategy.flow_candidate.name)
+        self.assertEqual("both", str(cfg.strategy.flow_candidate.allowed_sides))
+        self.assertAlmostEqual(0.0, float(cfg.strategy.flow_candidate.selector_score_penalty_bnb))
         self.assertEqual(12000, int(cfg.strategy.flow_candidate.train_size))
         self.assertEqual(1000, int(cfg.strategy.flow_candidate.retrain_interval))
         self.assertAlmostEqual(0.0025, float(cfg.strategy.flow_candidate.ev_threshold))
@@ -106,6 +108,8 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
 
         self.assertEqual(False, bool(flow_defaults.enabled))
         self.assertEqual(_FLOW_NAME, str(flow_defaults.name))
+        self.assertEqual("both", str(flow_defaults.allowed_sides))
+        self.assertAlmostEqual(0.0, float(flow_defaults.selector_score_penalty_bnb))
         self.assertEqual(12000, int(flow_defaults.train_size))
         self.assertEqual(1000, int(flow_defaults.retrain_interval))
         self.assertAlmostEqual(0.0025, float(flow_defaults.ev_threshold))

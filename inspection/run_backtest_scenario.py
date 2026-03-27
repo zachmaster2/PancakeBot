@@ -99,6 +99,17 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=ALLOWED_PREDICTABILITY_LABEL_MODES,
         default=None,
     )
+    parser.add_argument("--flow-enabled", type=str, default=None)
+    parser.add_argument("--flow-allowed-sides", type=str, choices=("both", "bull_only", "bear_only"), default=None)
+    parser.add_argument("--flow-train-size", type=int, default=None)
+    parser.add_argument("--flow-retrain-interval", type=int, default=None)
+    parser.add_argument("--flow-ev-threshold", type=float, default=None)
+    parser.add_argument("--flow-min-total-pool-c", type=float, default=None)
+    parser.add_argument("--flow-roll-window", type=int, default=None)
+    parser.add_argument("--flow-roll-edge-min", type=float, default=None)
+    parser.add_argument("--flow-roll-winrate-min", type=float, default=None)
+    parser.add_argument("--flow-cooldown-trades", type=int, default=None)
+    parser.add_argument("--flow-selector-score-penalty-bnb", type=float, default=None)
     return parser
 
 
@@ -320,7 +331,57 @@ def _strategy_cfg_with_router_overrides(
     if ml_cfg.expected_net_max_bnb is not None and float(ml_cfg.expected_net_max_bnb) < float(ml_cfg.expected_net_min_bnb):
         raise InvariantError("scenario_ml_expected_net_max_below_min")
 
-    return replace(strategy_cfg, router=router_cfg, dislocation=dislocation_cfg, ml_candidate=ml_cfg)
+    flow_cfg = strategy_cfg.flow_candidate
+    flow_enabled = _parse_optional_bool_token(args.flow_enabled)
+    if flow_enabled is not None:
+        flow_cfg = replace(flow_cfg, enabled=bool(flow_enabled))
+    if args.flow_allowed_sides is not None:
+        flow_cfg = replace(flow_cfg, allowed_sides=str(args.flow_allowed_sides))
+    if args.flow_train_size is not None:
+        if int(args.flow_train_size) <= 0:
+            raise InvariantError("scenario_flow_train_size_nonpositive")
+        flow_cfg = replace(flow_cfg, train_size=int(args.flow_train_size))
+    if args.flow_retrain_interval is not None:
+        if int(args.flow_retrain_interval) <= 0:
+            raise InvariantError("scenario_flow_retrain_interval_nonpositive")
+        flow_cfg = replace(flow_cfg, retrain_interval=int(args.flow_retrain_interval))
+    if args.flow_ev_threshold is not None:
+        if float(args.flow_ev_threshold) < 0.0:
+            raise InvariantError("scenario_flow_ev_threshold_negative")
+        flow_cfg = replace(flow_cfg, ev_threshold=float(args.flow_ev_threshold))
+    if args.flow_min_total_pool_c is not None:
+        if float(args.flow_min_total_pool_c) < 0.0:
+            raise InvariantError("scenario_flow_min_total_pool_c_negative")
+        flow_cfg = replace(flow_cfg, min_total_pool_c=float(args.flow_min_total_pool_c))
+    if args.flow_roll_window is not None:
+        if int(args.flow_roll_window) <= 0:
+            raise InvariantError("scenario_flow_roll_window_nonpositive")
+        flow_cfg = replace(flow_cfg, roll_window=int(args.flow_roll_window))
+    if args.flow_roll_edge_min is not None:
+        flow_cfg = replace(flow_cfg, roll_edge_min=float(args.flow_roll_edge_min))
+    if args.flow_roll_winrate_min is not None:
+        if not (0.0 <= float(args.flow_roll_winrate_min) <= 1.0):
+            raise InvariantError("scenario_flow_roll_winrate_min_out_of_range")
+        flow_cfg = replace(flow_cfg, roll_winrate_min=float(args.flow_roll_winrate_min))
+    if args.flow_cooldown_trades is not None:
+        if int(args.flow_cooldown_trades) < 0:
+            raise InvariantError("scenario_flow_cooldown_trades_negative")
+        flow_cfg = replace(flow_cfg, cooldown_trades=int(args.flow_cooldown_trades))
+    if args.flow_selector_score_penalty_bnb is not None:
+        if float(args.flow_selector_score_penalty_bnb) < 0.0:
+            raise InvariantError("scenario_flow_selector_score_penalty_negative")
+        flow_cfg = replace(
+            flow_cfg,
+            selector_score_penalty_bnb=float(args.flow_selector_score_penalty_bnb),
+        )
+
+    return replace(
+        strategy_cfg,
+        router=router_cfg,
+        dislocation=dislocation_cfg,
+        ml_candidate=ml_cfg,
+        flow_candidate=flow_cfg,
+    )
 
 
 def main() -> None:
@@ -398,6 +459,19 @@ def main() -> None:
         "ml_recalibrate_interval": int(runtime_cfg.strategy_cfg.ml_candidate.recalibrate_interval),
         "ml_predictability_feature_mode": str(runtime_cfg.strategy_cfg.ml_candidate.predictability_feature_mode),
         "ml_predictability_label_mode": str(runtime_cfg.strategy_cfg.ml_candidate.predictability_label_mode),
+        "flow_enabled": bool(runtime_cfg.strategy_cfg.flow_candidate.enabled),
+        "flow_allowed_sides": str(runtime_cfg.strategy_cfg.flow_candidate.allowed_sides),
+        "flow_train_size": int(runtime_cfg.strategy_cfg.flow_candidate.train_size),
+        "flow_retrain_interval": int(runtime_cfg.strategy_cfg.flow_candidate.retrain_interval),
+        "flow_ev_threshold": float(runtime_cfg.strategy_cfg.flow_candidate.ev_threshold),
+        "flow_min_total_pool_c": float(runtime_cfg.strategy_cfg.flow_candidate.min_total_pool_c),
+        "flow_roll_window": int(runtime_cfg.strategy_cfg.flow_candidate.roll_window),
+        "flow_roll_edge_min": float(runtime_cfg.strategy_cfg.flow_candidate.roll_edge_min),
+        "flow_roll_winrate_min": float(runtime_cfg.strategy_cfg.flow_candidate.roll_winrate_min),
+        "flow_cooldown_trades": int(runtime_cfg.strategy_cfg.flow_candidate.cooldown_trades),
+        "flow_selector_score_penalty_bnb": float(
+            runtime_cfg.strategy_cfg.flow_candidate.selector_score_penalty_bnb
+        ),
     }
     summary["risk"] = {"max_drawdown_bnb": float(_max_drawdown_bnb(trades_path))}
     summary["skip_reason_groups"] = _skip_reason_groups(summary)

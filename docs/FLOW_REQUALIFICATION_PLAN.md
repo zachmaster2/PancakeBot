@@ -18,6 +18,20 @@ flow overlay, especially on `Bear`.
 That means the current profile is not robust enough to remain promoted without
 re-qualification.
 
+As of `2026-03-27`, the first re-qualification pass has tightened this
+conclusion:
+
+- standalone `flow Bull` is currently not useful on the latest recent tails
+- standalone `flow Bear` can still be locally positive
+- but direct shared-pipeline reintegration of `flow Bear` is still materially
+  worse than the contained `stageB` runtime on the exact recent failure pocket
+- and a later offline score-penalized combine check showed only mixed relief:
+  a high `0.10 BNB` penalty can help one exact failure pocket, but the same
+  direct overlay lane is still not robust across rolling recent windows
+
+So the plan now pivots from "re-qualify direct flow overlay" to
+"keep runtime contained and only test flow through explicit constrained lanes."
+
 ## Execution Plan
 
 1. Demote the current hybrid from dry/live.
@@ -35,20 +49,40 @@ re-qualification.
    - stronger override threshold before flow can beat `stageB`
    - emergency disable path after recent realized underperformance
 
-4. Re-run rolling-window qualification.
+4. Pivoted qualification lanes.
+   - Lane A: shadow-only / research-only flow
+     - do not let flow affect dry/live bankroll
+     - keep collecting side-split quality and calibration evidence
+   - Lane B: constrained direct overlay
+     - allow only explicitly score-penalized or threshold-penalized flow
+       candidates to compete with `stageB`
+     - default target is `flow Bear` only
+     - free-running `flow both` is no longer an approved test lane
+   - Lane C: flow-as-signal research
+     - if direct overlay remains weak, test whether flow is more useful as a
+       veto, confirmer, or shadow regime feature for other candidates
+   - Lane D: offline combination simulation
+     - if full shared-pipeline reruns are too slow for broad sweeps, use
+       aligned stageB/flow trade outputs to test combine rules offline first
+     - only re-run the full shared pipeline for the small number of combine
+       rules that look promising offline
+
+5. Re-run rolling-window qualification.
    - `flow Bull only`
    - `flow Bear only`
-   - `stageB + flow Bull only`
+   - `stageB + score-penalized flow Bear only`
    - `stageB + flow shadowed Bear`
    - use rolling recent windows, not a single favorable tail
 
-5. Promotion standard.
+6. Promotion standard.
    A flow variant should not be re-promoted unless it clears all of:
    - positive mean recent `BNB / 500`
    - acceptable worst rolling window
    - no catastrophic drag by side
    - activity that still meets the current practical target
    - dry-shadow behavior consistent with backtest expectations
+   - no evidence that the direct overlay simply overwhelms `stageB` in bad
+     pockets
 
 ## Operator / Observability Requirement
 
@@ -66,3 +100,5 @@ the strategy logic.
 - Do not start broad V2 work.
 - Do not promote another hybrid from a single short tail.
 - Do not assume a good `15k` slice implies robustness.
+- Do not re-enable direct flow in the shared runtime until one of the pivoted
+  constrained lanes clears the promotion standard.
