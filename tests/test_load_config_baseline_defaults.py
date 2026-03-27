@@ -21,13 +21,13 @@ _FLOW_NAME = "flow_lgbm_recent_t12k_r1k_regime40_v1"
 
 
 class LoadConfigBaselineDefaultTests(unittest.TestCase):
-    def test_current_config_matches_promoted_selector_max_hybrid_runtime(self) -> None:
+    def test_current_config_matches_contained_selector_max_stageb_runtime(self) -> None:
         cfg = load_app_config("config.toml")
 
         self.assertEqual("selector_max_score", cfg.strategy.router.mode)
         self.assertEqual(10000, int(cfg.strategy.dislocation.selector.warmup_rounds))
         self.assertEqual(10000, int(cfg.strategy.router.online_warmup_rounds))
-        self.assertEqual(12000, int(required_pipeline_warmup_rounds(strategy_cfg=cfg.strategy)))
+        self.assertEqual(10000, int(required_pipeline_warmup_rounds(strategy_cfg=cfg.strategy)))
         self.assertAlmostEqual(0.008, float(cfg.strategy.router.online_score_threshold_bnb))
         self.assertEqual(
             "var/runtime/claim_scan_cursor.txt",
@@ -59,7 +59,7 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             cfg.runtime_state_paths.live_pipeline_bootstrap_state_path,
         )
         self.assertAlmostEqual(50.0, float(cfg.dry_initial_bankroll_bnb or 0.0))
-        self.assertEqual(True, bool(cfg.strategy.flow_candidate.enabled))
+        self.assertEqual(False, bool(cfg.strategy.flow_candidate.enabled))
         self.assertEqual(_FLOW_NAME, cfg.strategy.flow_candidate.name)
         self.assertEqual(12000, int(cfg.strategy.flow_candidate.train_size))
         self.assertEqual(1000, int(cfg.strategy.flow_candidate.retrain_interval))
@@ -86,7 +86,7 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertEqual("off", str(stage_b_bull.perf_adapt_mode))
         self.assertAlmostEqual(0.1, float(stage_b_bull.fixed_bet_bnb))
 
-    def test_code_defaults_match_promoted_hybrid_runtime(self) -> None:
+    def test_code_defaults_match_contained_stageb_runtime(self) -> None:
         selector_defaults = DislocationSelectorConfig()
         config_router_defaults = StrategyConfigRouterConfig()
         domain_router_defaults = DomainRouterConfig()
@@ -104,7 +104,7 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertAlmostEqual(0.008, float(domain_router_defaults.online_score_threshold_bnb))
         self.assertEqual(False, bool(domain_router_defaults.online_use_direction_split))
 
-        self.assertEqual(True, bool(flow_defaults.enabled))
+        self.assertEqual(False, bool(flow_defaults.enabled))
         self.assertEqual(_FLOW_NAME, str(flow_defaults.name))
         self.assertEqual(12000, int(flow_defaults.train_size))
         self.assertEqual(1000, int(flow_defaults.retrain_interval))

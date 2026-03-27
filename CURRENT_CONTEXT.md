@@ -38,10 +38,10 @@ Short version:
 17. The same corrected flow setup does not generalize well to the broader recent-`40,000` x80 meta window. An aligned run using a `55,000`-round source window plus `tail_offset_rounds=104` (to match the current recent-40k block universe exactly) was slightly negative at about `-0.000784 / 500` with `0.375%` bet rate. When added to the current recent-40k meta dataset as an extra series, the flow candidate won only `1` oracle block and increased oracle value only marginally (about `+0.000618 / 500`). So, at the moment, the flow family looks like a localized latest-tail candidate, not a strong recent-40k pocket source.
 18. Dry-mode observability was upgraded on `2026-03-26` and refined again on `2026-03-27`. In addition to the persistent dry bet/settlement files (`dry_bets.jsonl`, `dry_audit_trades.csv`, `dry_bankroll_state.json`), dry startup now resets and writes `var/runtime/dry_cycle_audit.csv`, a per-cycle decision audit with epoch state, router mode, selected strategy, skip reason, bankroll-before/after-action fields, and both raw observed pool fields (`observed_*`) plus cutoff-filtered decision pool fields (`cutoff_used_*`). This is the primary artifact to inspect when terminal output is repetitive or sparse.
 19. The shared runtime/backtest warmup calculation was corrected on `2026-03-26` to include the most demanding active provider instead of only the dislocation selector. The helper lives in [pipeline.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/strategy/pipeline.py) as `required_pipeline_warmup_rounds(...)`. This fixed a real integration gap where a live flow overlay can be enabled without silently staying unready.
-20. The current promoted runtime profile changed again on `2026-03-26` after isolating the real source of recent-window lift. The active `config.toml` profile now uses:
+20. The runtime profile promoted on `2026-03-26` was later demoted for containment on `2026-03-27`. The active `config.toml` profile now uses:
    - router mode `selector_max_score`
    - only `disloc_stageB_bullonly_recent8pct_v1` on the dislocation side
-   - flow overlay `flow_lgbm_recent_t12k_r1k_regime40_v1`
+   - flow candidate config `flow_lgbm_recent_t12k_r1k_regime40_v1`, but `enabled = false` in the contained runtime
    - `flow.train_size = 12000`
    - `flow.retrain_interval = 1000`
    - `flow.ev_threshold = 0.0025`
@@ -49,17 +49,18 @@ Short version:
    - `flow.roll_window = 40`
    - `flow.roll_winrate_min = 0.48`
    - `flow.cooldown_trades = 40`
-   Shared-pipeline verification on `2026-03-26` showed:
+   The earlier shared-pipeline verification on `2026-03-26` showed:
    - previous promoted runtime (`stageB` only, `online_selector_score_fallback`) latest `10000`: `-0.130542 BNB`, `8.21%` bet rate
    - `stageB` only with `selector_max_score` latest `10000`: `+0.119605 BNB`, `9.67%` bet rate
    - new promoted hybrid (`stageB + tuned flow`, `selector_max_score`) latest `10000`: `+3.094839 BNB`, `9.38%` bet rate
    - previous promoted runtime latest `6000`: `+1.291108 BNB`, `8.02%` bet rate
    - `stageB` only with `selector_max_score` latest `6000`: `+0.724201 BNB`, `9.90%` bet rate
    - new promoted hybrid latest `6000`: `+1.635637 BNB`, `10.20%` bet rate
-   On the latest `10000`, the hybrid is not just a router improvement; the tuned flow overlay materially improves the selected trade set.
-21. A background dry monitor now exists in [run_dry_cycle_monitor.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_dry_cycle_monitor.py). It tails `var/runtime/dry_cycle_audit.csv`, writes periodic summaries to `../PancakeBot_var_exp/*.jsonl`, and flags obvious anomalies such as unexpected strategy selection, unexpected bet side, zero bets for too long, or prolonged idle streaks. Its default allowlists now match the promoted hybrid runtime: `disloc_stageB_bullonly_recent8pct_v1` plus `flow_lgbm_recent_t12k_r1k_regime40_v1`, with both `Bull` and `Bear` sides allowed.
+   Those earlier hybrid numbers are now treated as insufficiently robust for promotion after the later dry/backtest failure pocket.
+21. A background dry monitor now exists in [run_dry_cycle_monitor.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_dry_cycle_monitor.py). It tails `var/runtime/dry_cycle_audit.csv`, writes periodic summaries to `../PancakeBot_var_exp/*.jsonl`, and flags obvious anomalies such as unexpected strategy selection, unexpected bet side, zero bets for too long, or prolonged idle streaks. Its current default allowlist matches the contained runtime: `disloc_stageB_bullonly_recent8pct_v1`, with `Bull` as the only expected side.
 22. The promoted hybrid runtime should now be treated as unqualified pending rework. A long dry run on `2026-03-27` and its matched recent-window backtest both lost about `1.5 BNB`, with losses concentrated in the flow overlay, especially `flow Bear`. The next approved execution plan is recorded in [FLOW_REQUALIFICATION_PLAN.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/FLOW_REQUALIFICATION_PLAN.md), but it should not be started until the user explicitly says `GO`.
 23. `dry_cycle_audit.csv` now distinguishes raw observed pool fields (`observed_*`) from the cutoff-filtered pool actually used by strategy logic (`cutoff_used_*`). Future dry analyses should use `cutoff_used_*` as the decision-input truth source.
+24. Containment was applied on `2026-03-27` by disabling the promoted flow overlay in the shared runtime and reverting dry/live/backtest to the contained `stageB`-only profile under `selector_max_score`. On the exact recent `216`-round failure pocket that previously lost about `-1.540476 BNB` with the hybrid, the contained profile reduced the loss to about `-0.291759 BNB` with `12` bets (`5.56%` bet rate). This is the current safe point to restart dry mode before the broader flow requalification work begins.
 
 ## Operational Rules
 

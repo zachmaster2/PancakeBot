@@ -187,8 +187,8 @@ Quick usage (do not execute automatically in agent workflows):
   --cycle-audit-csv var/runtime/dry_cycle_audit.csv `
   --output-jsonl ../PancakeBot_var_exp/dry_hybrid_monitor_20260326.jsonl `
   --summary-json ../PancakeBot_var_exp/dry_hybrid_monitor_20260326_summary.json `
-  --expected-strategies "disloc_stageB_bullonly_recent8pct_v1,flow_lgbm_recent_t12k_r1k_regime40_v1" `
-  --expected-bet-sides "Bull,Bear" `
+  --expected-strategies "disloc_stageB_bullonly_recent8pct_v1" `
+  --expected-bet-sides "Bull" `
   --poll-seconds 60 `
   --warn-idle-streak-cycles 240 `
   --warn-min-cycles-for-rate-check 240 `
