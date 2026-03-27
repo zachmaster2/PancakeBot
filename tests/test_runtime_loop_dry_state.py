@@ -10,12 +10,14 @@ from unittest.mock import patch
 
 from pancakebot.config.app_config import RuntimeStatePathsConfig
 from pancakebot.core.errors import InvariantError, TransientRpcError
+from pancakebot.domain.types import Bet, Round
 from pancakebot.runtime.runtime_loop import (
     _ensure_dry_cycle_audit_csv,
     _load_dry_bankroll_state,
     _load_dry_bets,
     _load_dry_settled_epochs,
     _load_dry_settled_epochs_from_audit,
+    _round_pool_snapshot,
     _resolve_initial_dry_bankroll_state,
     _save_dry_bankroll_state,
 )
@@ -54,6 +56,33 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
 
         self.assertEqual(1, len(written))
         self.assertEqual(",".join(cols), written[0])
+
+    def test_round_pool_snapshot_reports_observed_and_cutoff_used_values(self) -> None:
+        round_t = Round(
+            epoch=1,
+            start_at=100,
+            lock_at=200,
+            close_at=None,
+            lock_price=None,
+            close_price=None,
+            position=None,
+            failed=None,
+            bets=(
+                Bet(wallet_address="0x1", amount_wei=10**17, position="Bull", created_at=180),
+                Bet(wallet_address="0x2", amount_wei=2 * 10**17, position="Bear", created_at=183),
+                Bet(wallet_address="0x3", amount_wei=3 * 10**17, position="Bull", created_at=185),
+            ),
+        )
+
+        observed = _round_pool_snapshot(round_t, prefix="observed")
+        cutoff_used = _round_pool_snapshot(round_t, prefix="cutoff_used", cutoff_ts=183)
+
+        self.assertAlmostEqual(0.6, float(observed["observed_total_pool_bnb"]))
+        self.assertEqual(3, int(observed["observed_total_bets"]))
+        self.assertAlmostEqual(0.3, float(cutoff_used["cutoff_used_total_pool_bnb"]))
+        self.assertAlmostEqual(0.1, float(cutoff_used["cutoff_used_bull_pool_bnb"]))
+        self.assertAlmostEqual(0.2, float(cutoff_used["cutoff_used_bear_pool_bnb"]))
+        self.assertEqual(2, int(cutoff_used["cutoff_used_total_bets"]))
 
     def test_load_dry_bets_rejects_duplicate_epoch(self) -> None:
         with tempfile.TemporaryDirectory() as td:

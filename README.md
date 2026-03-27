@@ -58,8 +58,13 @@ Current shared baseline:
             - `runtime/dry_bankroll_state.json`
 
 `runtime/dry_cycle_audit.csv` is reset at dry startup so each run has a clean
-decision log. `runtime/dry_audit_trades.csv` remains the persistent dry
-bet/settlement ledger used by dry-state recovery.
+decision log. It now records both:
+- `observed_*` pool fields: the raw open-round snapshot seen by dry mode
+- `cutoff_used_*` pool fields: the cutoff-filtered pool actually used by the
+  strategy logic
+
+`runtime/dry_audit_trades.csv` remains the persistent dry bet/settlement ledger
+used by dry-state recovery.
 
 ## Dry smoke
 

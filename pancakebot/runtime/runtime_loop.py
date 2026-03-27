@@ -839,12 +839,18 @@ def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         "locked_price_bnbusd",
         "bankroll_before_action_bnb",
         "bankroll_after_action_bnb",
-        "open_total_pool_bnb",
-        "open_bull_pool_bnb",
-        "open_bear_pool_bnb",
-        "open_total_bets",
-        "open_bull_bets",
-        "open_bear_bets",
+        "observed_total_pool_bnb",
+        "observed_bull_pool_bnb",
+        "observed_bear_pool_bnb",
+        "observed_total_bets",
+        "observed_bull_bets",
+        "observed_bear_bets",
+        "cutoff_used_total_pool_bnb",
+        "cutoff_used_bull_pool_bnb",
+        "cutoff_used_bear_pool_bnb",
+        "cutoff_used_total_bets",
+        "cutoff_used_bull_bets",
+        "cutoff_used_bear_bets",
         "router_mode",
         "pipeline_last_settled_epoch",
         "action",
@@ -875,15 +881,20 @@ def _append_dry_cycle_audit_row(path: str, row: dict[str, object]) -> None:
         w.writerow([row.get(c, "") for c in cols])
 
 
-def _round_pool_snapshot(round_t: Round | None) -> dict[str, object]:
+def _round_pool_snapshot(
+    round_t: Round | None,
+    *,
+    prefix: str,
+    cutoff_ts: int | None = None,
+) -> dict[str, object]:
     if round_t is None:
         return {
-            "open_total_pool_bnb": "",
-            "open_bull_pool_bnb": "",
-            "open_bear_pool_bnb": "",
-            "open_total_bets": "",
-            "open_bull_bets": "",
-            "open_bear_bets": "",
+            f"{prefix}_total_pool_bnb": "",
+            f"{prefix}_bull_pool_bnb": "",
+            f"{prefix}_bear_pool_bnb": "",
+            f"{prefix}_total_bets": "",
+            f"{prefix}_bull_bets": "",
+            f"{prefix}_bear_bets": "",
         }
 
     bull_wei = 0
@@ -891,6 +902,8 @@ def _round_pool_snapshot(round_t: Round | None) -> dict[str, object]:
     bull_bets = 0
     bear_bets = 0
     for bet in round_t.bets:
+        if cutoff_ts is not None and int(bet.created_at) > int(cutoff_ts):
+            continue
         if str(bet.position) == "Bull":
             bull_wei += int(bet.amount_wei)
             bull_bets += 1
@@ -903,12 +916,12 @@ def _round_pool_snapshot(round_t: Round | None) -> dict[str, object]:
     bull_bnb = float(bull_wei) / float(BNB_WEI)
     bear_bnb = float(bear_wei) / float(BNB_WEI)
     return {
-        "open_total_pool_bnb": float(bull_bnb + bear_bnb),
-        "open_bull_pool_bnb": float(bull_bnb),
-        "open_bear_pool_bnb": float(bear_bnb),
-        "open_total_bets": int(bull_bets + bear_bets),
-        "open_bull_bets": int(bull_bets),
-        "open_bear_bets": int(bear_bets),
+        f"{prefix}_total_pool_bnb": float(bull_bnb + bear_bnb),
+        f"{prefix}_bull_pool_bnb": float(bull_bnb),
+        f"{prefix}_bear_pool_bnb": float(bear_bnb),
+        f"{prefix}_total_bets": int(bull_bets + bear_bets),
+        f"{prefix}_bull_bets": int(bull_bets),
+        f"{prefix}_bear_bets": int(bear_bets),
     }
 
 
@@ -943,7 +956,12 @@ def _record_dry_cycle_audit(
     if not bool(cfg.dry):
         return
 
-    pool = _round_pool_snapshot(open_round)
+    observed_pool = _round_pool_snapshot(open_round, prefix="observed")
+    cutoff_used_pool = _round_pool_snapshot(
+        open_round,
+        prefix="cutoff_used",
+        cutoff_ts=int(cutoff_ts),
+    )
     router_mode: str | object = ""
     pipeline_last_settled_epoch: int | str = ""
     if closed.strategy_pipeline is not None:
@@ -996,12 +1014,18 @@ def _record_dry_cycle_audit(
             "locked_price_bnbusd": float(locked_price_bnbusd),
             "bankroll_before_action_bnb": bankroll_before,
             "bankroll_after_action_bnb": bankroll_after,
-            "open_total_pool_bnb": pool["open_total_pool_bnb"],
-            "open_bull_pool_bnb": pool["open_bull_pool_bnb"],
-            "open_bear_pool_bnb": pool["open_bear_pool_bnb"],
-            "open_total_bets": pool["open_total_bets"],
-            "open_bull_bets": pool["open_bull_bets"],
-            "open_bear_bets": pool["open_bear_bets"],
+            "observed_total_pool_bnb": observed_pool["observed_total_pool_bnb"],
+            "observed_bull_pool_bnb": observed_pool["observed_bull_pool_bnb"],
+            "observed_bear_pool_bnb": observed_pool["observed_bear_pool_bnb"],
+            "observed_total_bets": observed_pool["observed_total_bets"],
+            "observed_bull_bets": observed_pool["observed_bull_bets"],
+            "observed_bear_bets": observed_pool["observed_bear_bets"],
+            "cutoff_used_total_pool_bnb": cutoff_used_pool["cutoff_used_total_pool_bnb"],
+            "cutoff_used_bull_pool_bnb": cutoff_used_pool["cutoff_used_bull_pool_bnb"],
+            "cutoff_used_bear_pool_bnb": cutoff_used_pool["cutoff_used_bear_pool_bnb"],
+            "cutoff_used_total_bets": cutoff_used_pool["cutoff_used_total_bets"],
+            "cutoff_used_bull_bets": cutoff_used_pool["cutoff_used_bull_bets"],
+            "cutoff_used_bear_bets": cutoff_used_pool["cutoff_used_bear_bets"],
             "router_mode": router_mode,
             "pipeline_last_settled_epoch": pipeline_last_settled_epoch,
             "action": str(action),
