@@ -60,6 +60,9 @@ Additional inspection probes for strategy-routing experiments:
    runs rolling-window profile comparisons between the contained `stageB`
    runtime and a configured `flow` variant, then evaluates simple causal
    selectors such as `prev_winner` and `trailing_delta` over those windows.
+   It also supports explicit `skip`-aware selector modes and exports the
+   effective selected bet rate so controller studies can enforce the current
+   practical floor.
    This is the current preferred tool for the "stageB vs flow Bear as alternate
    short-window profiles" research lane.
 12. `inspection/run_dry_cycle_monitor.py`:
@@ -213,7 +216,9 @@ Quick usage (do not execute automatically in agent workflows):
   --flow-min-total-pool-c 1.2 `
   --flow-allowed-sides bear_only `
   --selector-lookbacks 1,2,3,4,5 `
-  --selector-margins-per-500=-0.2,0.0,0.2,0.5
+  --selector-margins-per-500=-0.2,0.0,0.2,0.5 `
+  --selector-skip-thresholds-per-500=0.0,0.05,0.1 `
+  --min-selected-bet-rate 0.05
 
 .\.venv\Scripts\python.exe -m inspection.run_dry_cycle_monitor `
   --cycle-audit-csv var/runtime/dry_cycle_audit.csv `

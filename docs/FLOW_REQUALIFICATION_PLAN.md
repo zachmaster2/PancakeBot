@@ -73,6 +73,9 @@ So the plan now pivots from "re-qualify direct flow overlay" to
    - `stageB + score-penalized flow Bear only`
    - `stageB + flow shadowed Bear`
    - use rolling recent windows, not a single favorable tail
+   - if constrained direct overlay still looks weak, prefer explicit
+     profile/window controllers with `stageB`, `flow Bear`, and `skip`
+     as separate actions
 
 6. Promotion standard.
    A flow variant should not be re-promoted unless it clears all of:
@@ -102,3 +105,18 @@ the strategy logic.
 - Do not assume a good `15k` slice implies robustness.
 - Do not re-enable direct flow in the shared runtime until one of the pivoted
   constrained lanes clears the promotion standard.
+
+## Current Direction
+
+As of the latest rolling-window offline study, the strongest active lane is no
+longer direct flow overlay. It is a skip-aware profile/window controller over
+`stageB` and `flow Bear`.
+
+That controller lane is still offline-only, but it is now strong enough to
+justify expanding the profile universe around it before any runtime promotion:
+
+- best causal `216`-round controller: about `+0.320889 / 500`
+- best causal `300`-round controller: about `+0.221581 / 500`
+- best causal `500`-round controller: about `+0.213429 / 500`
+
+Each of those also cleared the current `>= 5%` selected-bet-rate requirement.
