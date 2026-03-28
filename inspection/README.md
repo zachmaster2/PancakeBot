@@ -65,24 +65,29 @@ Additional inspection probes for strategy-routing experiments:
    practical floor.
    This is the current preferred tool for the "stageB vs flow Bear as alternate
    short-window profiles" research lane.
-12. `inspection/run_dry_cycle_monitor.py`:
+12. `inspection/run_profile_set_window_selector.py`:
+   expands the same profile-window controller idea to a small set of alternate
+   profiles, currently `stageB` plus multiple nearby `flow Bear` variants. It
+   reuses the canonical stageB/flow inspection runners per window, then
+   evaluates skip-aware causal controllers over the resulting profile set.
+13. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
    and flags obvious anomalies during long dry-mode runs.
-13. `inspection/run_backtest_cache_perf.py`:
+14. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
-14. `inspection/run_backtest_warm_matrix.py`:
+15. `inspection/run_backtest_warm_matrix.py`:
    warm-cache matrix runner that prints and exports a consolidated table with:
    mode, reset interval, net profit, profit per 500 rounds, max drawdown,
    num bets, and top skip reasons.
-15. `inspection/run_backtest_router_matrix.py`:
+16. `inspection/run_backtest_router_matrix.py`:
    router sweep runner over `selector_max_score` and/or `online_cellmean`
    knobs, exporting a sorted table with profitability, drawdown, bet count,
    skip reasons, selected-strategy mix, and warm-run time.
-16. `inspection/run_final_model_gate_window_sweep.py`:
+17. `inspection/run_final_model_gate_window_sweep.py`:
    long-window gate/profile sweep with resume support and optional
    multiprocessing (`--max-workers`) for independent runs.
-17. `inspection/cleanup_experiment_artifacts.py`:
+18. `inspection/cleanup_experiment_artifacts.py`:
    retention/cleanup helper for state-cache files, failed-run directories, and
    optional SQLite `VACUUM` on cache/registry DBs.
 
@@ -215,6 +220,19 @@ Quick usage (do not execute automatically in agent workflows):
   --flow-ev-threshold 0.006 `
   --flow-min-total-pool-c 1.2 `
   --flow-allowed-sides bear_only `
+  --selector-lookbacks 1,2,3,4,5 `
+  --selector-margins-per-500=-0.2,0.0,0.2,0.5 `
+  --selector-skip-thresholds-per-500=0.0,0.05,0.1 `
+  --min-selected-bet-rate 0.05
+
+.\.venv\Scripts\python.exe -m inspection.run_profile_set_window_selector `
+  --config config.toml `
+  --name-prefix profileset216_stageb_flowbear4 `
+  --window-size-rounds 216 `
+  --num-windows 20 `
+  --source-tail-rounds 30000 `
+  --flow-profile "name=flow_bear_base,train_size=15000,ev_threshold=0.006,min_total_pool_c=1.2,allowed_sides=bear_only,bull_roll_edge_min=0.0,bear_roll_edge_min=0.0,bull_roll_winrate_min=0.5,bear_roll_winrate_min=0.5,bull_cooldown_trades=80,bear_cooldown_trades=80" `
+  --flow-profile "name=flow_bear_loose12,train_size=15000,ev_threshold=0.005,min_total_pool_c=1.2,allowed_sides=bear_only,bull_roll_edge_min=0.0,bear_roll_edge_min=-0.002,bull_roll_winrate_min=0.5,bear_roll_winrate_min=0.47,bull_cooldown_trades=80,bear_cooldown_trades=120" `
   --selector-lookbacks 1,2,3,4,5 `
   --selector-margins-per-500=-0.2,0.0,0.2,0.5 `
   --selector-skip-thresholds-per-500=0.0,0.05,0.1 `

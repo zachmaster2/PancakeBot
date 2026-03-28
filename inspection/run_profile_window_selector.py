@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
 from pancakebot.core.errors import InvariantError
 
@@ -129,18 +130,27 @@ def _materialize_tail_config(
 
 
 def _run_subprocess(*, args: list[str], cwd: Path) -> None:
-    proc = subprocess.run(
-        args,
-        cwd=str(cwd),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if int(proc.returncode) != 0:
-        raise InvariantError(
-            "profile_window_selector_subprocess_failed: "
-            f"cmd={' '.join(args)} stdout={proc.stdout[-4000:]} stderr={proc.stderr[-4000:]}"
-        )
+    with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", suffix=".log", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        with tmp_path.open("w", encoding="utf-8") as log_file:
+            proc = subprocess.run(
+                args,
+                cwd=str(cwd),
+                text=True,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        if int(proc.returncode) != 0:
+            log_tail = tmp_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+            raise InvariantError(
+                "profile_window_selector_subprocess_failed: "
+                f"cmd={' '.join(args)} output={log_tail}"
+            )
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def _load_json(path: Path) -> dict[str, object]:
