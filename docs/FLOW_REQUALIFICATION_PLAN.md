@@ -168,3 +168,10 @@ That shadow-only lane is now tooled in
 `inspection/run_profile_set_shadow_recommender.py`, which writes a current
 next-window recommendation JSON from a completed mixed-profile compare set
 without touching runtime control.
+
+For operational convenience, `inspection/run_profile_set_shadow_refresh.py`
+now wraps the whole shadow refresh path into one command:
+
+1. resume or rebuild the mixed profile-set compare set
+2. emit the current shadow recommendation JSON
+3. write a small summary JSON with the chosen profile and predicted strength
