@@ -84,24 +84,29 @@ Additional inspection probes for strategy-routing experiments:
    and then writes the current shadow recommendation JSON plus a small summary
    JSON. This is the easiest operational entrypoint for the current
    mixed-profile shadow lane.
-16. `inspection/run_dry_cycle_monitor.py`:
+16. `inspection/run_profile_candidate_miner.py`:
+   replays older dislocation profiles on the current non-overlapping
+   `216`-window framing, then ranks them by controller-set value against an
+   existing mixed-pool compare CSV. This is the preferred entrypoint for
+   "skip-displacing older profile" mining.
+17. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
    and flags obvious anomalies during long dry-mode runs.
-17. `inspection/run_backtest_cache_perf.py`:
+18. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
-18. `inspection/run_backtest_warm_matrix.py`:
+19. `inspection/run_backtest_warm_matrix.py`:
    warm-cache matrix runner that prints and exports a consolidated table with:
    mode, reset interval, net profit, profit per 500 rounds, max drawdown,
    num bets, and top skip reasons.
-19. `inspection/run_backtest_router_matrix.py`:
+20. `inspection/run_backtest_router_matrix.py`:
    router sweep runner over `selector_max_score` and/or `online_cellmean`
    knobs, exporting a sorted table with profitability, drawdown, bet count,
    skip reasons, selected-strategy mix, and warm-run time.
-20. `inspection/run_final_model_gate_window_sweep.py`:
+21. `inspection/run_final_model_gate_window_sweep.py`:
    long-window gate/profile sweep with resume support and optional
    multiprocessing (`--max-workers`) for independent runs.
-21. `inspection/cleanup_experiment_artifacts.py`:
+22. `inspection/cleanup_experiment_artifacts.py`:
    retention/cleanup helper for state-cache files, failed-run directories, and
    optional SQLite `VACUUM` on cache/registry DBs.
 
@@ -273,6 +278,10 @@ Quick usage (do not execute automatically in agent workflows):
 
 .\.venv\Scripts\python.exe -m inspection.run_profile_set_shadow_refresh `
   --name-prefix profileset216_stageb_stageg2_flowbear4_20260328
+
+.\.venv\Scripts\python.exe -m inspection.run_profile_candidate_miner `
+  --current-pool-compare-csv ../PancakeBot_var_exp/profileset216_stageb_stageg2_flowbear4_20260328_profile_set_window_compare.csv `
+  --name-prefix profileset216_stageb_stageg2_flowbear4_mine_20260328
 
 .\.venv\Scripts\python.exe -m inspection.run_dry_cycle_monitor `
   --cycle-audit-csv var/runtime/dry_cycle_audit.csv `
