@@ -30,9 +30,13 @@ class SelectorResult:
     mode: str
     lookback: int
     margin_per_500: float
+    skip_threshold_per_500: float
     mean_per_500: float
+    mean_selected_bet_rate: float
     stageb_picks: int
     flow_picks: int
+    skip_picks: int
+    meets_min_selected_bet_rate: bool
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -58,6 +62,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flow-bear-cooldown-trades", type=int, default=80)
     parser.add_argument("--selector-lookbacks", type=str, default="1,2,3,4")
     parser.add_argument("--selector-margins-per-500", type=str, default="-0.2,0.0,0.2,0.5")
+    parser.add_argument("--selector-skip-thresholds-per-500", type=str, default="0.0")
+    parser.add_argument("--min-selected-bet-rate", type=float, default=0.05)
     parser.add_argument("--no-resume", action="store_true")
     return parser
 
@@ -254,31 +260,68 @@ def _select_window_value(
     mode: str,
     lookback: int,
     margin_per_500: float,
-) -> tuple[str, float]:
+    skip_threshold_per_500: float,
+) -> tuple[str, float, float]:
     if str(mode) == "stageb_only":
-        return "stageb", float(rows[idx].stageb_per_500)
+        return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
     if str(mode) == "flow_only":
-        return "flow", float(rows[idx].flow_per_500)
+        return "flow", float(rows[idx].flow_per_500), float(rows[idx].flow_bet_rate)
+    if str(mode) == "skip_only":
+        return "skip", 0.0, 0.0
     if str(mode) == "oracle":
         if float(rows[idx].flow_per_500) > float(rows[idx].stageb_per_500):
-            return "flow", float(rows[idx].flow_per_500)
-        return "stageb", float(rows[idx].stageb_per_500)
+            return "flow", float(rows[idx].flow_per_500), float(rows[idx].flow_bet_rate)
+        return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
+    if str(mode) == "oracle_with_skip":
+        if float(rows[idx].stageb_per_500) <= float(skip_threshold_per_500) and float(rows[idx].flow_per_500) <= float(
+            skip_threshold_per_500
+        ):
+            return "skip", 0.0, 0.0
+        if float(rows[idx].flow_per_500) > float(rows[idx].stageb_per_500):
+            return "flow", float(rows[idx].flow_per_500), float(rows[idx].flow_bet_rate)
+        return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
     if str(mode) == "prev_winner":
         if int(idx) == 0:
-            return "stageb", float(rows[idx].stageb_per_500)
+            return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
         prev = rows[int(idx) - 1]
         if float(prev.flow_per_500) > float(prev.stageb_per_500):
-            return "flow", float(rows[idx].flow_per_500)
-        return "stageb", float(rows[idx].stageb_per_500)
+            return "flow", float(rows[idx].flow_per_500), float(rows[idx].flow_bet_rate)
+        return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
+    if str(mode) == "prev_winner_with_skip":
+        if int(idx) == 0:
+            if float(rows[idx].stageb_per_500) <= float(skip_threshold_per_500):
+                return "skip", 0.0, 0.0
+            return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
+        prev = rows[int(idx) - 1]
+        if float(prev.stageb_per_500) <= float(skip_threshold_per_500) and float(prev.flow_per_500) <= float(
+            skip_threshold_per_500
+        ):
+            return "skip", 0.0, 0.0
+        if float(prev.flow_per_500) > float(prev.stageb_per_500):
+            return "flow", float(rows[idx].flow_per_500), float(rows[idx].flow_bet_rate)
+        return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
     if str(mode) == "trailing_delta":
         if int(idx) < int(lookback):
-            return "stageb", float(rows[idx].stageb_per_500)
+            return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
         hist = rows[int(idx) - int(lookback) : int(idx)]
         mean_flow = sum(float(row.flow_per_500) for row in hist) / float(len(hist))
         mean_stageb = sum(float(row.stageb_per_500) for row in hist) / float(len(hist))
         if float(mean_flow - mean_stageb) > float(margin_per_500):
-            return "flow", float(rows[idx].flow_per_500)
-        return "stageb", float(rows[idx].stageb_per_500)
+            return "flow", float(rows[idx].flow_per_500), float(rows[idx].flow_bet_rate)
+        return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
+    if str(mode) == "trailing_delta_with_skip":
+        if int(idx) < int(lookback):
+            if float(rows[idx].stageb_per_500) <= float(skip_threshold_per_500):
+                return "skip", 0.0, 0.0
+            return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
+        hist = rows[int(idx) - int(lookback) : int(idx)]
+        mean_flow = sum(float(row.flow_per_500) for row in hist) / float(len(hist))
+        mean_stageb = sum(float(row.stageb_per_500) for row in hist) / float(len(hist))
+        if max(float(mean_flow), float(mean_stageb)) <= float(skip_threshold_per_500):
+            return "skip", 0.0, 0.0
+        if float(mean_flow - mean_stageb) > float(margin_per_500):
+            return "flow", float(rows[idx].flow_per_500), float(rows[idx].flow_bet_rate)
+        return "stageb", float(rows[idx].stageb_per_500), float(rows[idx].stageb_bet_rate)
     raise InvariantError("profile_window_selector_mode_invalid")
 
 
@@ -287,33 +330,55 @@ def _evaluate_selectors(
     rows: list[WindowComparison],
     lookbacks: list[int],
     margins_per_500: list[float],
+    skip_thresholds_per_500: list[float],
+    min_selected_bet_rate: float,
 ) -> list[SelectorResult]:
     ordered = _window_comparisons(rows=rows)
-    modes: list[tuple[str, int, float]] = [
-        ("stageb_only", 0, 0.0),
-        ("flow_only", 0, 0.0),
-        ("oracle", 0, 0.0),
-        ("prev_winner", 0, 0.0),
+    modes: list[tuple[str, int, float, float]] = [
+        ("stageb_only", 0, 0.0, 0.0),
+        ("flow_only", 0, 0.0, 0.0),
+        ("skip_only", 0, 0.0, 0.0),
+        ("oracle", 0, 0.0, 0.0),
+        ("prev_winner", 0, 0.0, 0.0),
     ]
     for lookback in lookbacks:
         for margin in margins_per_500:
-            modes.append(("trailing_delta", int(lookback), float(margin)))
+            modes.append(("trailing_delta", int(lookback), float(margin), 0.0))
+    for skip_threshold in skip_thresholds_per_500:
+        modes.append(("oracle_with_skip", 0, 0.0, float(skip_threshold)))
+        modes.append(("prev_winner_with_skip", 0, 0.0, float(skip_threshold)))
+        for lookback in lookbacks:
+            for margin in margins_per_500:
+                modes.append(
+                    (
+                        "trailing_delta_with_skip",
+                        int(lookback),
+                        float(margin),
+                        float(skip_threshold),
+                    )
+                )
     results: list[SelectorResult] = []
-    for mode, lookback, margin in modes:
+    for mode, lookback, margin, skip_threshold in modes:
         total = 0.0
+        total_selected_bet_rate = 0.0
         stageb_picks = 0
         flow_picks = 0
+        skip_picks = 0
         for idx in range(len(ordered)):
-            pick, value = _select_window_value(
+            pick, value, bet_rate = _select_window_value(
                 rows=ordered,
                 idx=int(idx),
                 mode=str(mode),
                 lookback=int(lookback),
                 margin_per_500=float(margin),
+                skip_threshold_per_500=float(skip_threshold),
             )
             total += float(value)
+            total_selected_bet_rate += float(bet_rate)
             if str(pick) == "flow":
                 flow_picks += 1
+            elif str(pick) == "skip":
+                skip_picks += 1
             else:
                 stageb_picks += 1
         results.append(
@@ -321,12 +386,28 @@ def _evaluate_selectors(
                 mode=str(mode),
                 lookback=int(lookback),
                 margin_per_500=float(margin),
+                skip_threshold_per_500=float(skip_threshold),
                 mean_per_500=float(total / float(len(ordered))) if ordered else 0.0,
+                mean_selected_bet_rate=float(total_selected_bet_rate / float(len(ordered))) if ordered else 0.0,
                 stageb_picks=int(stageb_picks),
                 flow_picks=int(flow_picks),
+                skip_picks=int(skip_picks),
+                meets_min_selected_bet_rate=(
+                    float(total_selected_bet_rate / float(len(ordered))) >= float(min_selected_bet_rate)
+                    if ordered
+                    else False
+                ),
             )
         )
-    return sorted(results, key=lambda row: float(row.mean_per_500), reverse=True)
+    return sorted(
+        results,
+        key=lambda row: (
+            1 if bool(row.meets_min_selected_bet_rate) else 0,
+            float(row.mean_per_500),
+            float(row.mean_selected_bet_rate),
+        ),
+        reverse=True,
+    )
 
 
 def main() -> None:
@@ -351,8 +432,11 @@ def main() -> None:
         raise InvariantError("profile_window_selector_tail_offset_negative")
     lookbacks = _parse_positive_int_list(args.selector_lookbacks)
     margins_per_500 = _parse_float_list(args.selector_margins_per_500)
+    skip_thresholds_per_500 = _parse_float_list(args.selector_skip_thresholds_per_500)
     flow_val_size = int(args.window_size_rounds if args.flow_val_size is None else args.flow_val_size)
     flow_step_size = int(args.window_size_rounds if args.flow_step_size is None else args.flow_step_size)
+    if float(args.min_selected_bet_rate) < 0.0:
+        raise InvariantError("profile_window_selector_min_selected_bet_rate_negative")
 
     config_path = Path(str(args.config)).resolve()
     active_config_path = config_path
@@ -419,6 +503,8 @@ def main() -> None:
         rows=ordered_rows,
         lookbacks=lookbacks,
         margins_per_500=margins_per_500,
+        skip_thresholds_per_500=skip_thresholds_per_500,
+        min_selected_bet_rate=float(args.min_selected_bet_rate),
     )
 
     compare_csv = exp_root / f"{args.name_prefix}_profile_window_compare.csv"
@@ -442,11 +528,15 @@ def main() -> None:
 
     selector_csv.write_text("", encoding="utf-8")
     with selector_csv.open("w", encoding="utf-8", newline="") as f:
-        f.write("mode,lookback,margin_per_500,mean_per_500,stageb_picks,flow_picks\n")
+        f.write(
+            "mode,lookback,margin_per_500,skip_threshold_per_500,mean_per_500,"
+            "mean_selected_bet_rate,meets_min_selected_bet_rate,stageb_picks,flow_picks,skip_picks\n"
+        )
         for row in selector_rows:
             f.write(
-                f"{row.mode},{int(row.lookback)},{float(row.margin_per_500)},{float(row.mean_per_500)},"
-                f"{int(row.stageb_picks)},{int(row.flow_picks)}\n"
+                f"{row.mode},{int(row.lookback)},{float(row.margin_per_500)},{float(row.skip_threshold_per_500)},"
+                f"{float(row.mean_per_500)},{float(row.mean_selected_bet_rate)},{bool(row.meets_min_selected_bet_rate)},"
+                f"{int(row.stageb_picks)},{int(row.flow_picks)},{int(row.skip_picks)}\n"
             )
     selector_json.write_text(
         json.dumps([asdict(row) for row in selector_rows], indent=2, sort_keys=True),
