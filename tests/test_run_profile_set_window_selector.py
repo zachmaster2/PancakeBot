@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from inspection.run_profile_set_window_selector import (
+    DislocationProfileSpec,
     FlowProfileSpec,
     ProfileMetric,
     SelectorResult,
     WindowRow,
     _evaluate_selectors,
+    _materialize_active_candidate_config,
     _ordered_window_rows,
+    _parse_dislocation_profile_spec,
     _parse_flow_profile_spec,
     _pick_window,
+    _summary_per_500,
 )
 
 
@@ -86,6 +92,37 @@ class ProfileSetWindowSelectorTests(unittest.TestCase):
         self.assertIsNone(spec.step_size)
         self.assertEqual("bear_only", spec.allowed_sides)
 
+    def test_parse_dislocation_profile_spec(self) -> None:
+        spec = _parse_dislocation_profile_spec(
+            "name=stageg2_bullonly,active_candidate_name=disloc_stageG2_bullonly_recent5pct_v1"
+        )
+        self.assertIsInstance(spec, DislocationProfileSpec)
+        self.assertEqual("stageg2_bullonly", spec.name)
+        self.assertEqual("disloc_stageG2_bullonly_recent5pct_v1", spec.active_candidate_name)
+
+    def test_materialize_active_candidate_config_rewrites_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = root / "config.toml"
+            base.write_text(
+                "[strategy.dislocation]\nactive_candidate_names = [\n  \"disloc_stageB_bullonly_recent8pct_v1\",\n]\n",
+                encoding="utf-8",
+            )
+            out = _materialize_active_candidate_config(
+                base_config_path=base,
+                active_candidate_name="disloc_stageG2_bullonly_recent5pct_v1",
+                exp_root=root,
+                name_prefix="test",
+            )
+            text = out.read_text(encoding="utf-8")
+        self.assertIn('"disloc_stageG2_bullonly_recent5pct_v1"', text)
+        self.assertNotIn('"disloc_stageB_bullonly_recent8pct_v1"', text)
+
+    def test_summary_per_500_accepts_backtest_and_flow_shapes(self) -> None:
+        self.assertAlmostEqual(0.25, _summary_per_500({"per_500": 0.25}))
+        self.assertAlmostEqual(0.5, _summary_per_500({"net_profit_per_500_rounds": 0.5}))
+        self.assertAlmostEqual(0.75, _summary_per_500({"net_profit_bnb": 0.324, "num_rounds": 216}))
+
     def test_prev_winner_generalizes_to_multi_profile(self) -> None:
         ordered = _ordered_window_rows(self.rows)
         pick0, value0, bet_rate0 = _pick_window(
@@ -148,7 +185,7 @@ class ProfileSetWindowSelectorTests(unittest.TestCase):
     def test_evaluate_selectors_includes_static_and_skip_modes(self) -> None:
         results = _evaluate_selectors(
             rows=self.rows,
-            flow_profiles=self.flow_profiles,
+            profile_names=["stageb", "flow_a", "flow_b"],
             lookbacks=[1, 2],
             margins_per_500=[0.0],
             skip_thresholds_per_500=[0.0],
