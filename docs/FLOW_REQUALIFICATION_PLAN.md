@@ -175,3 +175,48 @@ now wraps the whole shadow refresh path into one command:
 1. resume or rebuild the mixed profile-set compare set
 2. emit the current shadow recommendation JSON
 3. write a small summary JSON with the chosen profile and predicted strength
+
+## Next-Phase Roadmap
+
+The next full branch after the current shadow-only lane is:
+
+1. Candidate-mining pass over older profiles.
+   - Replay older or previously rejected profiles on the current
+     non-overlapping `216`-window framing.
+   - Score them by controller-set value, not standalone mean.
+   - Focus on:
+     - replacing current `skip` windows
+     - distinct wins versus the current mixed pool
+     - multi-window persistence
+
+2. Small expanded-pool validation.
+   - Add only the best `2-5` mined profiles to the current mixed pool.
+   - Rebuild the compare set.
+   - Re-run the model controller and compare against the current bar:
+     about `+0.578433 / 500` at about `7.29%` selected bet rate.
+
+3. Shadow validation.
+   - If the expanded-pool controller improves materially, keep runtime
+     contained and validate it as a shadow-only recommender over time.
+   - Compare shadow recommendations to actual contained dry behavior.
+
+4. Runtime-controller gate.
+   - Only if shadow behavior remains strong should the next step become a
+     written runtime-controller spec and later a controlled dry rollout.
+
+5. Fallback path if expansion fails.
+   - If added profiles raise oracle but not the model controller, prune the
+     pool and pivot toward stronger feature/controller work instead of simply
+     adding more profiles.
+
+That fallback is now active:
+
+- the mining pass over older dislocation profiles is implemented in
+  `inspection/run_profile_candidate_miner.py`
+- on the current mixed `216`-window framing, mined additions did not replace
+  the current oracle skip windows
+- adding the best mined profiles (`stageG2_r37_x80` or `altB_20260227_x80`)
+  made the best model controller worse than the current mixed-pool leader
+
+So the next improvement lane should revert to stronger feature/controller work,
+not broader profile expansion.
