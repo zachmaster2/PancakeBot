@@ -120,3 +120,16 @@ justify expanding the profile universe around it before any runtime promotion:
 - best causal `500`-round controller: about `+0.213429 / 500`
 
 Each of those also cleared the current `>= 5%` selected-bet-rate requirement.
+
+The next approved pivot follows from the first broader flow-only profile-set
+expansion:
+
+- adding several nearby `flow Bear` variants raised the `216`-window oracle
+  materially
+- but the best causal controller dropped to about `+0.201732 / 500`
+- and the best causal row chose only `stageB` plus `skip`, with no flow picks
+
+So the next branch should not be "more nearby flow variants." It should be
+"broader profile-family expansion" using other already-defined candidate
+families, starting with the existing dislocation-side `stageG2` bull-only
+profile.
