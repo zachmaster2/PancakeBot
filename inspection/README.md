@@ -56,24 +56,30 @@ Additional inspection probes for strategy-routing experiments:
    (`fallback_only`, `margin_override`, `max_effective_score`) using a flow
    score penalty instead of re-running the full shared pipeline for every
    variant.
-11. `inspection/run_dry_cycle_monitor.py`:
+11. `inspection/run_profile_window_selector.py`:
+   runs rolling-window profile comparisons between the contained `stageB`
+   runtime and a configured `flow` variant, then evaluates simple causal
+   selectors such as `prev_winner` and `trailing_delta` over those windows.
+   This is the current preferred tool for the "stageB vs flow Bear as alternate
+   short-window profiles" research lane.
+12. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
    and flags obvious anomalies during long dry-mode runs.
-12. `inspection/run_backtest_cache_perf.py`:
+13. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
-13. `inspection/run_backtest_warm_matrix.py`:
+14. `inspection/run_backtest_warm_matrix.py`:
    warm-cache matrix runner that prints and exports a consolidated table with:
    mode, reset interval, net profit, profit per 500 rounds, max drawdown,
    num bets, and top skip reasons.
-14. `inspection/run_backtest_router_matrix.py`:
+15. `inspection/run_backtest_router_matrix.py`:
    router sweep runner over `selector_max_score` and/or `online_cellmean`
    knobs, exporting a sorted table with profitability, drawdown, bet count,
    skip reasons, selected-strategy mix, and warm-run time.
-15. `inspection/run_final_model_gate_window_sweep.py`:
+16. `inspection/run_final_model_gate_window_sweep.py`:
    long-window gate/profile sweep with resume support and optional
    multiprocessing (`--max-workers`) for independent runs.
-16. `inspection/cleanup_experiment_artifacts.py`:
+17. `inspection/cleanup_experiment_artifacts.py`:
    retention/cleanup helper for state-cache files, failed-run directories, and
    optional SQLite `VACUUM` on cache/registry DBs.
 
@@ -195,6 +201,19 @@ Quick usage (do not execute automatically in agent workflows):
   --overlay-trades ../PancakeBot_var_exp/flow_bear_train15k_eval216_cfgB_tail20k_20260327/backtest_trades.csv `
   --mode fallback_only `
   --overlay-score-penalty-bnb 0.10
+
+.\.venv\Scripts\python.exe -m inspection.run_profile_window_selector `
+  --config config.toml `
+  --name-prefix profilewin216_stageb_flowbear `
+  --window-size-rounds 216 `
+  --num-windows 12 `
+  --source-tail-rounds 20000 `
+  --flow-train-size 15000 `
+  --flow-ev-threshold 0.006 `
+  --flow-min-total-pool-c 1.2 `
+  --flow-allowed-sides bear_only `
+  --selector-lookbacks 1,2,3,4,5 `
+  --selector-margins-per-500=-0.2,0.0,0.2,0.5
 
 .\.venv\Scripts\python.exe -m inspection.run_dry_cycle_monitor `
   --cycle-audit-csv var/runtime/dry_cycle_audit.csv `
