@@ -133,3 +133,33 @@ So the next branch should not be "more nearby flow variants." It should be
 "broader profile-family expansion" using other already-defined candidate
 families, starting with the existing dislocation-side `stageG2` bull-only
 profile.
+
+If that broader-family expansion still raises oracle much faster than it raises
+the best causal heuristic, the next approved pivot is:
+
+- keep runtime contained
+- stop adding more heuristic-only controller rules as the main lane
+- build a past-only, feature-based profile-window controller instead
+- predict profile choice relative to `stageB`, with explicit `skip`
+- judge it on the same window-level metrics:
+  - mean `BNB / 500`
+  - selected bet rate
+  - switches
+  - comparison against the best heuristic controller on the same window set
+
+That pivot is now active and materially better than the heuristic lane:
+
+- on the `stageB + stageG2` `216`-window set, the best model controller reached
+  about `+0.361798 / 500`, versus heuristic control that stayed near flat
+- on the mixed non-overlapping `216`-window set (`stageB`, `stageG2`, and
+  selected `flow Bear` variants), the best current model controller reached
+  about `+0.578433 / 500` at selected bet rate about `7.29%`
+- the best heuristic controller on that same mixed set was only about
+  `+0.270527 / 500`
+
+The current next step is therefore not runtime promotion. It is:
+
+- keep runtime contained on `stageB` only
+- treat the mixed-profile model controller as the strongest offline lane
+- validate whether it remains strong enough to become a shadow-only
+  recommender before any live/dry control change

@@ -70,24 +70,30 @@ Additional inspection probes for strategy-routing experiments:
    profiles, currently `stageB` plus multiple nearby `flow Bear` variants. It
    reuses the canonical stageB/flow inspection runners per window, then
    evaluates skip-aware causal controllers over the resulting profile set.
-13. `inspection/run_dry_cycle_monitor.py`:
+13. `inspection/run_profile_set_model_selector.py`:
+   consumes a profile-set compare CSV, builds past-only window features, and
+   evaluates baseline-relative model controllers (`delta_ridge`,
+   `delta_logistic`) with explicit `skip`, selected-bet-rate accounting, and
+   optional minimum window holds. This is now the preferred next step after a
+   profile-set compare run when heuristic controllers plateau.
+14. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
    and flags obvious anomalies during long dry-mode runs.
-14. `inspection/run_backtest_cache_perf.py`:
+15. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
-15. `inspection/run_backtest_warm_matrix.py`:
+16. `inspection/run_backtest_warm_matrix.py`:
    warm-cache matrix runner that prints and exports a consolidated table with:
    mode, reset interval, net profit, profit per 500 rounds, max drawdown,
    num bets, and top skip reasons.
-16. `inspection/run_backtest_router_matrix.py`:
+17. `inspection/run_backtest_router_matrix.py`:
    router sweep runner over `selector_max_score` and/or `online_cellmean`
    knobs, exporting a sorted table with profitability, drawdown, bet count,
    skip reasons, selected-strategy mix, and warm-run time.
-17. `inspection/run_final_model_gate_window_sweep.py`:
+18. `inspection/run_final_model_gate_window_sweep.py`:
    long-window gate/profile sweep with resume support and optional
    multiprocessing (`--max-workers`) for independent runs.
-18. `inspection/cleanup_experiment_artifacts.py`:
+19. `inspection/cleanup_experiment_artifacts.py`:
    retention/cleanup helper for state-cache files, failed-run directories, and
    optional SQLite `VACUUM` on cache/registry DBs.
 
@@ -237,6 +243,14 @@ Quick usage (do not execute automatically in agent workflows):
   --selector-margins-per-500=-0.2,0.0,0.2,0.5 `
   --selector-skip-thresholds-per-500=0.0,0.05,0.1 `
   --min-selected-bet-rate 0.05
+
+.\.venv\Scripts\python.exe -m inspection.run_profile_set_model_selector `
+  --compare-csv ../PancakeBot_var_exp/profileset216_stageb_stageg2_flowbear4_20260328_profile_set_window_compare.csv `
+  --name-prefix profileset216_stageb_stageg2_flowbear4_model `
+  --feature-lookbacks 1,3,5,8 `
+  --min-train-windows 6,8,10,12 `
+  --min-hold-windows 1,2,3,4 `
+  --ridge-alphas 0.25,0.5,1.0,2.0,5.0,10.0
 
 .\.venv\Scripts\python.exe -m inspection.run_dry_cycle_monitor `
   --cycle-audit-csv var/runtime/dry_cycle_audit.csv `
