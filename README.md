@@ -59,14 +59,18 @@ Current shared baseline:
             - `runtime/dry_cycle_audit.csv` for per-cycle dry decision audit
             - `runtime/dry_bankroll_state.json`
 
+At dry startup, any existing `var/runtime` dry-state files are first archived to
+`../PancakeBot_var_exp/dry_run_archive_*_startup_fresh_reset/`, then the new
+run starts fresh. On dry shutdown, the current state is also snapshotted to
+`../PancakeBot_var_exp/dry_run_archive_*_shutdown_snapshot/`.
+
 `runtime/dry_cycle_audit.csv` is reset at dry startup so each run has a clean
 decision log. It now records both:
 - `observed_*` pool fields: the raw open-round snapshot seen by dry mode
 - `cutoff_used_*` pool fields: the cutoff-filtered pool actually used by the
   strategy logic
 
-`runtime/dry_audit_trades.csv` remains the persistent dry bet/settlement ledger
-used by dry-state recovery.
+`runtime/dry_audit_trades.csv` remains the per-run dry bet/settlement ledger.
 
 ## Dry smoke
 

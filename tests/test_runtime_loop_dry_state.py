@@ -12,6 +12,7 @@ from pancakebot.config.app_config import RuntimeStatePathsConfig
 from pancakebot.core.errors import InvariantError, TransientRpcError
 from pancakebot.domain.types import Bet, Round
 from pancakebot.runtime.runtime_loop import (
+    _archive_dry_runtime_state,
     _ensure_dry_cycle_audit_csv,
     _load_dry_bankroll_state,
     _load_dry_bets,
@@ -46,6 +47,63 @@ class _FlakyWalletStub:
 
 
 class RuntimeLoopDryStateTests(unittest.TestCase):
+    def test_archive_dry_runtime_state_moves_files_and_writes_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime_dir = root / "var" / "runtime"
+            archive_root = root / "exp"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "dry_bets.jsonl").write_text('{"epoch":1}\n', encoding="utf-8")
+            (runtime_dir / "dry_cycle_audit.csv").write_text("h\n", encoding="utf-8")
+            paths = RuntimeStatePathsConfig(
+                claim_scan_cursor_path=str(runtime_dir / "claim.txt"),
+                dry_bets_path=str(runtime_dir / "dry_bets.jsonl"),
+                dry_settled_epochs_path=str(runtime_dir / "dry_settled_epochs.txt"),
+                dry_audit_trades_path=str(runtime_dir / "dry_audit_trades.csv"),
+                dry_cycle_audit_path=str(runtime_dir / "dry_cycle_audit.csv"),
+                dry_bankroll_state_path=str(runtime_dir / "dry_bankroll_state.json"),
+                dry_pipeline_bootstrap_state_path=str(runtime_dir / "dry_pipeline.pkl.gz"),
+                live_pipeline_bootstrap_state_path=str(runtime_dir / "live_pipeline.pkl.gz"),
+            )
+
+            with patch("pancakebot.runtime.runtime_loop._DRY_RUNTIME_ARCHIVE_ROOT", archive_root):
+                archive_dir = _archive_dry_runtime_state(paths, reason="startup_fresh_reset", move_files=True)
+
+            self.assertIsNotNone(archive_dir)
+            assert archive_dir is not None
+            self.assertFalse((runtime_dir / "dry_bets.jsonl").exists())
+            self.assertFalse((runtime_dir / "dry_cycle_audit.csv").exists())
+            self.assertTrue((archive_dir / "dry_bets.jsonl").exists())
+            self.assertTrue((archive_dir / "dry_cycle_audit.csv").exists())
+            meta = (archive_dir / "archive_meta.json").read_text(encoding="utf-8")
+            self.assertIn('"reason": "startup_fresh_reset"', meta)
+
+    def test_archive_dry_runtime_state_can_copy_without_removing_source(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime_dir = root / "var" / "runtime"
+            archive_root = root / "exp"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "dry_bankroll_state.json").write_text("{}", encoding="utf-8")
+            paths = RuntimeStatePathsConfig(
+                claim_scan_cursor_path=str(runtime_dir / "claim.txt"),
+                dry_bets_path=str(runtime_dir / "dry_bets.jsonl"),
+                dry_settled_epochs_path=str(runtime_dir / "dry_settled_epochs.txt"),
+                dry_audit_trades_path=str(runtime_dir / "dry_audit_trades.csv"),
+                dry_cycle_audit_path=str(runtime_dir / "dry_cycle_audit.csv"),
+                dry_bankroll_state_path=str(runtime_dir / "dry_bankroll_state.json"),
+                dry_pipeline_bootstrap_state_path=str(runtime_dir / "dry_pipeline.pkl.gz"),
+                live_pipeline_bootstrap_state_path=str(runtime_dir / "live_pipeline.pkl.gz"),
+            )
+
+            with patch("pancakebot.runtime.runtime_loop._DRY_RUNTIME_ARCHIVE_ROOT", archive_root):
+                archive_dir = _archive_dry_runtime_state(paths, reason="shutdown_snapshot", move_files=False)
+
+            self.assertIsNotNone(archive_dir)
+            assert archive_dir is not None
+            self.assertTrue((runtime_dir / "dry_bankroll_state.json").exists())
+            self.assertTrue((archive_dir / "dry_bankroll_state.json").exists())
+
     def test_ensure_dry_cycle_audit_csv_resets_stale_rows(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "dry_cycle_audit.csv"

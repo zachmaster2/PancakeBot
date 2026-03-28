@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,6 +70,7 @@ _BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 _ONE_MINUTE_MS = 60_000
 _KLINE_WARMUP_MARGIN_MINUTES = 5
+_DRY_RUNTIME_ARCHIVE_ROOT = Path(__file__).resolve().parents[2].parent / "PancakeBot_var_exp"
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +161,79 @@ class _DryBankrollState:
     epoch: int | None = None
 
 
+def _dry_runtime_state_files(paths: RuntimeStatePathsConfig) -> list[Path]:
+    return [
+        Path(str(paths.claim_scan_cursor_path)),
+        Path(str(paths.dry_bets_path)),
+        Path(str(paths.dry_settled_epochs_path)),
+        Path(str(paths.dry_audit_trades_path)),
+        Path(str(paths.dry_cycle_audit_path)),
+        Path(str(paths.dry_bankroll_state_path)),
+        Path(str(paths.dry_pipeline_bootstrap_state_path)),
+    ]
+
+
+def _unique_archive_dir(root: Path, *, ts: int, reason: str) -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(int(ts)))
+    base = root / f"dry_run_archive_{stamp}_{str(reason)}"
+    if not base.exists():
+        return base
+    suffix = 1
+    while True:
+        cand = root / f"dry_run_archive_{stamp}_{str(reason)}_{int(suffix)}"
+        if not cand.exists():
+            return cand
+        suffix += 1
+
+
+def _archive_dry_runtime_state(
+    paths: RuntimeStatePathsConfig,
+    *,
+    reason: str,
+    move_files: bool,
+) -> Path | None:
+    existing = [path.resolve() for path in _dry_runtime_state_files(paths) if path.exists()]
+    if not existing:
+        return None
+    archive_root = _DRY_RUNTIME_ARCHIVE_ROOT.resolve()
+    archive_root.mkdir(parents=True, exist_ok=True)
+    ts_now = int(now_ts())
+    archive_dir = _unique_archive_dir(archive_root, ts=ts_now, reason=str(reason))
+    archive_dir.mkdir(parents=True, exist_ok=False)
+    file_meta: list[dict[str, object]] = []
+    for src in existing:
+        dest = archive_dir / src.name
+        stat = src.stat()
+        if bool(move_files):
+            shutil.move(str(src), str(dest))
+        else:
+            shutil.copy2(str(src), str(dest))
+        file_meta.append(
+            {
+                "name": str(src.name),
+                "source_path": str(src),
+                "archive_path": str(dest),
+                "size_bytes": int(stat.st_size),
+                "source_mtime_ts": int(stat.st_mtime),
+            }
+        )
+    (archive_dir / "archive_meta.json").write_text(
+        json.dumps(
+            {
+                "reason": str(reason),
+                "created_ts": int(ts_now),
+                "move_files": bool(move_files),
+                "file_count": int(len(file_meta)),
+                "files": file_meta,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return archive_dir
+
+
 def _build_context_klines(*, klines_cache: RollingKlinesCache, target_round: Round, cutoff_seconds: int) -> list[Kline]:
     kk = int(max_required_context_klines_size())
     if target_round.lock_at is None:
@@ -197,69 +272,84 @@ def run_live_loop(cfg: RuntimeConfig) -> None:
         raise InvariantError("wallet_address_required")
     if float(cfg.min_bet_amount_bnb) <= 0.0:
         raise InvariantError("runtime_min_bet_amount_nonpositive")
-    closed_state = _init_closed_state(cfg)
+    try:
+        closed_state = _init_closed_state(cfg)
 
-    # After sync, USD conversion uses the latest closed round close_price.
-    bnbusd_price = closed_state.cache.rounds[-1].close_price
-    if cfg.dry:
-        if closed_state.simulated_bankroll_bnb is None:
-            raise InvariantError("dry_bankroll_uninitialized")
-        bankroll_bnb = closed_state.simulated_bankroll_bnb
-    else:
-        bankroll_bnb = _fetch_wallet_balance_bnb_with_retries(
-            cfg=cfg,
-            reason="live_wallet_bootstrap",
+        # After sync, USD conversion uses the latest closed round close_price.
+        bnbusd_price = closed_state.cache.rounds[-1].close_price
+        if cfg.dry:
+            if closed_state.simulated_bankroll_bnb is None:
+                raise InvariantError("dry_bankroll_uninitialized")
+            bankroll_bnb = closed_state.simulated_bankroll_bnb
+        else:
+            bankroll_bnb = _fetch_wallet_balance_bnb_with_retries(
+                cfg=cfg,
+                reason="live_wallet_bootstrap",
+            )
+        info(
+            "CORE",
+            "RUN",
+            "BANKROLL",
+            msg=f"Starting bankroll: {format_bankroll(bankroll_bnb=bankroll_bnb, bnbusd_price=bnbusd_price)}",
         )
-    info(
-        "CORE",
-        "RUN",
-        "BANKROLL",
-        msg=f"Starting bankroll: {format_bankroll(bankroll_bnb=bankroll_bnb, bnbusd_price=bnbusd_price)}",
-    )
 
-    while True:
-        try:
-            _run_one_iteration(cfg, closed_state)
-        except TransientGraphError as e:
-            info(
-                "CORE",
-                "RUN",
-                "RETRY",
-                msg=(
-                    "Caught TransientGraphError during runtime loop: "
-                    f"retrying after delay err={str(e)}"
-                ),
+        while True:
+            try:
+                _run_one_iteration(cfg, closed_state)
+            except TransientGraphError as e:
+                info(
+                    "CORE",
+                    "RUN",
+                    "RETRY",
+                    msg=(
+                        "Caught TransientGraphError during runtime loop: "
+                        f"retrying after delay err={str(e)}"
+                    ),
+                )
+                info(
+                    "CORE",
+                    "LOOP",
+                    "SLEEP",
+                    msg=(
+                        f"duration={int(_TRANSIENT_NETWORK_DELAY_SECONDS)}s "
+                        "reason=delay_after_transient_network_error"
+                    ),
+                )
+                sleep_seconds(int(_TRANSIENT_NETWORK_DELAY_SECONDS))
+            except TransientRpcError as e:
+                info(
+                    "CORE",
+                    "RUN",
+                    "RETRY",
+                    msg=(
+                        "Caught TransientRpcError during runtime loop: "
+                        f"retrying after delay err={str(e)}"
+                    ),
+                )
+                info(
+                    "CORE",
+                    "LOOP",
+                    "SLEEP",
+                    msg=(
+                        f"duration={int(_TRANSIENT_NETWORK_DELAY_SECONDS)}s "
+                        "reason=delay_after_transient_network_error"
+                    ),
+                )
+                sleep_seconds(int(_TRANSIENT_NETWORK_DELAY_SECONDS))
+    finally:
+        if bool(cfg.dry):
+            archived = _archive_dry_runtime_state(
+                cfg.runtime_state_paths,
+                reason="shutdown_snapshot",
+                move_files=False,
             )
-            info(
-                "CORE",
-                "LOOP",
-                "SLEEP",
-                msg=(
-                    f"duration={int(_TRANSIENT_NETWORK_DELAY_SECONDS)}s "
-                    "reason=delay_after_transient_network_error"
-                ),
-            )
-            sleep_seconds(int(_TRANSIENT_NETWORK_DELAY_SECONDS))
-        except TransientRpcError as e:
-            info(
-                "CORE",
-                "RUN",
-                "RETRY",
-                msg=(
-                    "Caught TransientRpcError during runtime loop: "
-                    f"retrying after delay err={str(e)}"
-                ),
-            )
-            info(
-                "CORE",
-                "LOOP",
-                "SLEEP",
-                msg=(
-                    f"duration={int(_TRANSIENT_NETWORK_DELAY_SECONDS)}s "
-                    "reason=delay_after_transient_network_error"
-                ),
-            )
-            sleep_seconds(int(_TRANSIENT_NETWORK_DELAY_SECONDS))
+            if archived is not None:
+                info(
+                    "RUN",
+                    "DRY",
+                    "ARCHIVE",
+                    msg=f"Saved shutdown dry-state snapshot to {str(archived)}",
+                )
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -1280,6 +1370,18 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     )
 
     if cfg.dry:
+        archived = _archive_dry_runtime_state(
+            cfg.runtime_state_paths,
+            reason="startup_fresh_reset",
+            move_files=True,
+        )
+        if archived is not None:
+            info(
+                "RUN",
+                "DRY",
+                "ARCHIVE",
+                msg=f"Archived previous dry runtime state to {str(archived)}",
+            )
         bankroll_state = _resolve_initial_dry_bankroll_state(cfg)
         closed.simulated_bankroll_bnb = float(bankroll_state.simulated_bankroll_bnb)
         closed.dry_bets_by_epoch = _load_dry_bets(str(cfg.runtime_state_paths.dry_bets_path))
