@@ -45,6 +45,25 @@ class ModelSelectorResult:
     pick_counts_json: str
 
 
+@dataclass(frozen=True, slots=True)
+class NextRecommendation:
+    mode: str
+    baseline_profile_name: str
+    feature_lookbacks_json: str
+    min_train_windows: int
+    min_hold_windows: int
+    margin_per_500: float
+    skip_threshold_per_500: float
+    ridge_alpha: float
+    logistic_c: float
+    training_window_count: int
+    chosen_profile: str
+    chosen_predicted_per_500: float
+    predicted_baseline_per_500: float
+    estimated_selected_bet_rate: float
+    predicted_delta_json: str
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compare-csv", type=str, required=True)
@@ -309,6 +328,16 @@ def _predicted_stageb_per_500(
     return float(feature_row[f"feat_{str(baseline_profile_name)}_mean_per500_l{int(longest)}"])
 
 
+def _estimated_profile_bet_rate(
+    *,
+    feature_row: dict[str, float],
+    profile_name: str,
+    feature_lookbacks: list[int],
+) -> float:
+    longest = max(int(x) for x in feature_lookbacks)
+    return float(feature_row[f"feat_{str(profile_name)}_mean_betrate_l{int(longest)}"])
+
+
 def _pick_model_window(
     *,
     mode: str,
@@ -402,6 +431,154 @@ def _pick_model_window(
         str(chosen_profile),
         float(row.per_500[str(chosen_profile)]),
         float(row.bet_rate[str(chosen_profile)]),
+    )
+
+
+def _predict_next_recommendation(
+    *,
+    mode: str,
+    rows: list[CompareWindowRow],
+    profiles: list[str],
+    baseline_profile_name: str,
+    feature_lookbacks: list[int],
+    min_train_windows: int,
+    min_hold_windows: int,
+    ridge_alpha: float,
+    logistic_c: float,
+    margin_per_500: float,
+    skip_threshold_per_500: float,
+) -> NextRecommendation:
+    feature_rows = [
+        _feature_dict(
+            rows=rows,
+            idx=int(idx),
+            profiles=profiles,
+            baseline_profile_name=str(baseline_profile_name),
+            feature_lookbacks=feature_lookbacks,
+        )
+        for idx in range(len(rows))
+    ]
+    current_feature_row = _feature_dict(
+        rows=rows,
+        idx=len(rows),
+        profiles=profiles,
+        baseline_profile_name=str(baseline_profile_name),
+        feature_lookbacks=feature_lookbacks,
+    )
+    feature_rows_plus = list(feature_rows) + [current_feature_row]
+    feature_names = _feature_names(
+        profiles=profiles,
+        baseline_profile_name=str(baseline_profile_name),
+        feature_lookbacks=feature_lookbacks,
+    )
+    train_indices = [
+        int(idx)
+        for idx in range(len(rows))
+        if feature_rows[int(idx)] and int(idx) >= 1
+    ]
+    if len(train_indices) < int(min_train_windows):
+        predicted_baseline = _predicted_stageb_per_500(
+            feature_row=current_feature_row,
+            baseline_profile_name=str(baseline_profile_name),
+            feature_lookbacks=feature_lookbacks,
+        )
+        chosen_profile = "skip" if float(predicted_baseline) <= float(skip_threshold_per_500) else str(baseline_profile_name)
+        return NextRecommendation(
+            mode=str(mode),
+            baseline_profile_name=str(baseline_profile_name),
+            feature_lookbacks_json=json.dumps(list(feature_lookbacks), separators=(",", ":")),
+            min_train_windows=int(min_train_windows),
+            min_hold_windows=int(min_hold_windows),
+            margin_per_500=float(margin_per_500),
+            skip_threshold_per_500=float(skip_threshold_per_500),
+            ridge_alpha=float(ridge_alpha),
+            logistic_c=float(logistic_c),
+            training_window_count=int(len(train_indices)),
+            chosen_profile=str(chosen_profile),
+            chosen_predicted_per_500=(0.0 if str(chosen_profile) == "skip" else float(predicted_baseline)),
+            predicted_baseline_per_500=float(predicted_baseline),
+            estimated_selected_bet_rate=(
+                0.0
+                if str(chosen_profile) == "skip"
+                else _estimated_profile_bet_rate(
+                    feature_row=current_feature_row,
+                    profile_name=str(chosen_profile),
+                    feature_lookbacks=feature_lookbacks,
+                )
+            ),
+            predicted_delta_json=json.dumps({}, sort_keys=True, separators=(",", ":")),
+        )
+    if str(mode) == "delta_ridge":
+        predictions = _predict_delta_ridge(
+            rows=rows,
+            feature_rows=feature_rows_plus,
+            feature_names=feature_names,
+            train_indices=train_indices,
+            current_idx=int(len(rows)),
+            baseline_profile_name=str(baseline_profile_name),
+            profiles=profiles,
+            ridge_alpha=float(ridge_alpha),
+        )
+    elif str(mode) == "delta_logistic":
+        predictions = _predict_delta_logistic(
+            rows=rows,
+            feature_rows=feature_rows_plus,
+            feature_names=feature_names,
+            train_indices=train_indices,
+            current_idx=int(len(rows)),
+            baseline_profile_name=str(baseline_profile_name),
+            profiles=profiles,
+            logistic_c=float(logistic_c),
+        )
+    else:
+        raise InvariantError("profile_set_model_recommend_mode_invalid")
+    predicted_baseline = _predicted_stageb_per_500(
+        feature_row=current_feature_row,
+        baseline_profile_name=str(baseline_profile_name),
+        feature_lookbacks=feature_lookbacks,
+    )
+    chosen_profile = str(baseline_profile_name)
+    chosen_predicted = float(predicted_baseline)
+    best_delta = 0.0
+    for profile, predicted_delta in predictions.items():
+        if float(predicted_delta) > float(best_delta):
+            best_delta = float(predicted_delta)
+            chosen_profile = str(profile)
+            chosen_predicted = float(predicted_baseline + float(predicted_delta))
+    if str(chosen_profile) != str(baseline_profile_name) and float(best_delta) <= float(margin_per_500):
+        chosen_profile = str(baseline_profile_name)
+        chosen_predicted = float(predicted_baseline)
+    if float(chosen_predicted) <= float(skip_threshold_per_500):
+        chosen_profile = "skip"
+        chosen_predicted = 0.0
+    return NextRecommendation(
+        mode=str(mode),
+        baseline_profile_name=str(baseline_profile_name),
+        feature_lookbacks_json=json.dumps(list(feature_lookbacks), separators=(",", ":")),
+        min_train_windows=int(min_train_windows),
+        min_hold_windows=int(min_hold_windows),
+        margin_per_500=float(margin_per_500),
+        skip_threshold_per_500=float(skip_threshold_per_500),
+        ridge_alpha=float(ridge_alpha),
+        logistic_c=float(logistic_c),
+        training_window_count=int(len(train_indices)),
+        chosen_profile=str(chosen_profile),
+        chosen_predicted_per_500=float(chosen_predicted),
+        predicted_baseline_per_500=float(predicted_baseline),
+        estimated_selected_bet_rate=(
+            0.0
+            if str(chosen_profile) == "skip"
+            else _estimated_profile_bet_rate(
+                feature_row=current_feature_row,
+                profile_name=str(chosen_profile),
+                feature_lookbacks=feature_lookbacks,
+            )
+        ),
+        predicted_delta_json=json.dumps(
+            {str(k): float(v) for k, v in sorted(predictions.items())},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
     )
 
 

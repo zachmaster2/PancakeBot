@@ -163,3 +163,8 @@ The current next step is therefore not runtime promotion. It is:
 - treat the mixed-profile model controller as the strongest offline lane
 - validate whether it remains strong enough to become a shadow-only
   recommender before any live/dry control change
+
+That shadow-only lane is now tooled in
+`inspection/run_profile_set_shadow_recommender.py`, which writes a current
+next-window recommendation JSON from a completed mixed-profile compare set
+without touching runtime control.

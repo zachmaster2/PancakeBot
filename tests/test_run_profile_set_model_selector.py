@@ -10,6 +10,7 @@ from inspection.run_profile_set_model_selector import (
     _feature_dict,
     _feature_names,
     _load_compare_rows,
+    _predict_next_recommendation,
 )
 
 
@@ -113,6 +114,25 @@ class ProfileSetModelSelectorTests(unittest.TestCase):
         top = results[0]
         self.assertGreaterEqual(float(top.mean_selected_bet_rate), 0.05)
         self.assertIn(int(top.min_hold_windows), {1, 2})
+
+    def test_predict_next_recommendation_returns_valid_profile(self) -> None:
+        compare_csv = self._write_compare_csv()
+        profiles, rows = _load_compare_rows(compare_csv)
+        recommendation = _predict_next_recommendation(
+            mode="delta_ridge",
+            rows=rows,
+            profiles=profiles,
+            baseline_profile_name="stageb",
+            feature_lookbacks=[1, 2],
+            min_train_windows=2,
+            min_hold_windows=1,
+            ridge_alpha=1.0,
+            logistic_c=1.0,
+            margin_per_500=0.0,
+            skip_threshold_per_500=0.0,
+        )
+        self.assertIn(recommendation.chosen_profile, {"stageb", "stageg2_bullonly", "skip"})
+        self.assertGreaterEqual(recommendation.training_window_count, 2)
 
 
 if __name__ == "__main__":
