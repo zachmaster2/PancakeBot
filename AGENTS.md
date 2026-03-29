@@ -40,6 +40,7 @@
    - semantically named
    - emitted at a cadence a human can follow while the bot runs
 8. When a new thread starts, catch up from this file, [PROJECT_GOALS_AND_WORKFLOW.md](/C:/Users/zking/Documents/GitHub/PancakeBot/PROJECT_GOALS_AND_WORKFLOW.md), and [CURRENT_CONTEXT.md](/C:/Users/zking/Documents/GitHub/PancakeBot/CURRENT_CONTEXT.md), then move directly to the task.
+9. For profile/controller research, use rolling causal backtests as the primary evidence source. Treat shadow recommendations as a secondary, final sanity check before any runtime-control rollout, not as the main comparison method.
 
 ## Decision Standard
 
