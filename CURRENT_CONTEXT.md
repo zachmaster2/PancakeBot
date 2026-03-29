@@ -131,6 +131,7 @@ Current interpretation: the runtime-controller branch is alive, but it is not ro
    - controller-aware dry monitor: [run_dry_cycle_monitor.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_dry_cycle_monitor.py)
    - runbook: [WINDOW_CONTROLLER_DRY_TEST_RUNBOOK.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/WINDOW_CONTROLLER_DRY_TEST_RUNBOOK.md)
    Current blocker is now just rollout judgment, not missing plumbing.
+65. Dry-launch operator policy changed on `2026-03-29`: when the user explicitly asks for a dry run, the default should be a single foreground terminal showing the normal human runtime logs. Detached dry plus tailed logs/monitor files is still useful for agent-owned unattended research, but it is not the default interactive operator experience.
 
 ## Operational Rules
 
