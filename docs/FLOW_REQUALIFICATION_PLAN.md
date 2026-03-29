@@ -302,3 +302,13 @@ So the current next step remains:
 - keep the calibrated controller shadow-only
 - accumulate more shadow-vs-contained observations over time before writing a
   runtime-controller spec
+
+That longitudinal shadow observation lane is now explicitly tooled in
+`inspection/run_profile_set_penalty_shadow_monitor.py`, which:
+
+1. watches the contained dry cycle audit for advancement
+2. reruns the calibrated shadow refresh/validation only when dry advances
+3. appends timestamped shadow-vs-dry snapshots to JSONL
+
+This is now the preferred operational path for building up real shadow
+evidence while keeping runtime control unchanged.
