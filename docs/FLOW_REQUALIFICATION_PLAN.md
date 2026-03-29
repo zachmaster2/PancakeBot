@@ -231,6 +231,34 @@ That stronger feature/controller branch is now partly explored too:
 So the next pivot should not be "more generic features" or "more nonlinear
 model families" on this small mixed-window set.
 
+## Current Runtime-Controller Status
+
+The `stageB` vs `stageG2` window-controller path now exists experimentally in
+shared backtest/dry/live code, but it remains disabled by default.
+
+Current continuous shared-harness status on synced data (`epoch 468136`):
+
+- best current no-skip candidate:
+  - mode `trailing_best_vs_baseline`
+  - lookback `2`
+  - margin `1.0 / 500`
+- latest-tail results:
+  - `6480`: about `+0.044224 / 500`
+  - `8640`: about `+0.083013 / 500`
+  - `10800`: about `+0.019785 / 500`
+- multi-offset check for that same setting:
+  - `6480`: beat static `stageB` on `5/5`
+  - `8640`: beat static `stageB` on `2/5`
+  - `10800`: beat static `stageB` on `5/5`
+
+Interpretation:
+
+- the controller is no longer a dead branch
+- but it is still too mixed for rollout, because one medium-horizon band
+  (`8640`) remains unstable across offsets
+- runtime must stay contained on static `stageB` until broader continuous-run
+  evidence is stronger
+
 ## Current Controller Pivot
 
 Use the existing best simple-feature mixed controller as the calibration base.

@@ -208,8 +208,8 @@ class WindowControllerConfig:
     baseline_profile_name: str = "disloc_stageB_bullonly_recent8pct_v1"
     alternate_profile_name: str = "disloc_stageG2_bullonly_recent5pct_v1"
     window_rounds: int = 216
-    lookback_windows: int = 1
-    margin_per_500: float = 0.5
+    lookback_windows: int = 2
+    margin_per_500: float = 1.0
     skip_threshold_per_500: float = 0.0
 
 

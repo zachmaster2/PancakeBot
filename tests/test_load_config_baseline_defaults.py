@@ -79,8 +79,8 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             str(cfg.strategy.window_controller.alternate_profile_name),
         )
         self.assertEqual(216, int(cfg.strategy.window_controller.window_rounds))
-        self.assertEqual(1, int(cfg.strategy.window_controller.lookback_windows))
-        self.assertAlmostEqual(0.5, float(cfg.strategy.window_controller.margin_per_500))
+        self.assertEqual(2, int(cfg.strategy.window_controller.lookback_windows))
+        self.assertAlmostEqual(1.0, float(cfg.strategy.window_controller.margin_per_500))
         self.assertAlmostEqual(0.0, float(cfg.strategy.window_controller.skip_threshold_per_500))
 
         candidates = {str(c.name): c for c in cfg.strategy.dislocation.candidates}
@@ -138,8 +138,8 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
             str(window_controller_defaults.alternate_profile_name),
         )
         self.assertEqual(216, int(window_controller_defaults.window_rounds))
-        self.assertEqual(1, int(window_controller_defaults.lookback_windows))
-        self.assertAlmostEqual(0.5, float(window_controller_defaults.margin_per_500))
+        self.assertEqual(2, int(window_controller_defaults.lookback_windows))
+        self.assertAlmostEqual(1.0, float(window_controller_defaults.margin_per_500))
         self.assertAlmostEqual(0.0, float(window_controller_defaults.skip_threshold_per_500))
 
     def test_runtime_state_paths_can_be_overridden(self) -> None:

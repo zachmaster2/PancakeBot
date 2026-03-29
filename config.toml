@@ -620,8 +620,9 @@ mode = "trailing_best_vs_baseline"
 baseline_profile_name = "disloc_stageB_bullonly_recent8pct_v1"
 alternate_profile_name = "disloc_stageG2_bullonly_recent5pct_v1"
 window_rounds = 216
-lookback_windows = 1
-margin_per_500 = 0.5
+# Current best continuous shared-harness candidate. Still experimental.
+lookback_windows = 2
+margin_per_500 = 1.0
 skip_threshold_per_500 = 0.0
 
 [backtest]
