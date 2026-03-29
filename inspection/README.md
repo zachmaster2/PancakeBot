@@ -73,9 +73,10 @@ Additional inspection probes for strategy-routing experiments:
 13. `inspection/run_profile_set_model_selector.py`:
    consumes a profile-set compare CSV, builds past-only window features, and
    evaluates baseline-relative model controllers (`delta_ridge`,
-   `delta_logistic`) with explicit `skip`, selected-bet-rate accounting, and
-   optional minimum window holds. This is now the preferred next step after a
-   profile-set compare run when heuristic controllers plateau.
+   `delta_logistic`, `delta_hgb`) with explicit `skip`, selected-bet-rate
+   accounting, optional minimum window holds, and configurable cold-start
+   behavior. This is now the preferred next step after a profile-set compare
+   run when heuristic controllers plateau.
 14. `inspection/run_profile_set_shadow_recommender.py`:
    consumes an existing profile-set compare CSV plus fixed model parameters and
    writes a current next-window recommendation JSON for shadow-only tracking.
@@ -89,24 +90,32 @@ Additional inspection probes for strategy-routing experiments:
    `216`-window framing, then ranks them by controller-set value against an
    existing mixed-pool compare CSV. This is the preferred entrypoint for
    "skip-displacing older profile" mining.
-17. `inspection/run_dry_cycle_monitor.py`:
+17. `inspection/run_profile_set_penalty_selector.py`:
+   runs a narrower calibration search on top of the proven simple-feature
+   ridge controller, adding grouped flow and `stageG2` entry penalties plus
+   cold-start heuristics. This is the current best offline lane after richer
+   generic features and broader profile mining both plateaued.
+18. `inspection/run_profile_set_penalty_shadow_recommender.py`:
+   writes a shadow-only next-window recommendation JSON for the calibrated
+   penalty selector, without touching runtime control.
+19. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
    and flags obvious anomalies during long dry-mode runs.
-18. `inspection/run_backtest_cache_perf.py`:
+20. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
-19. `inspection/run_backtest_warm_matrix.py`:
+21. `inspection/run_backtest_warm_matrix.py`:
    warm-cache matrix runner that prints and exports a consolidated table with:
    mode, reset interval, net profit, profit per 500 rounds, max drawdown,
    num bets, and top skip reasons.
-20. `inspection/run_backtest_router_matrix.py`:
+22. `inspection/run_backtest_router_matrix.py`:
    router sweep runner over `selector_max_score` and/or `online_cellmean`
    knobs, exporting a sorted table with profitability, drawdown, bet count,
    skip reasons, selected-strategy mix, and warm-run time.
-21. `inspection/run_final_model_gate_window_sweep.py`:
+23. `inspection/run_final_model_gate_window_sweep.py`:
    long-window gate/profile sweep with resume support and optional
    multiprocessing (`--max-workers`) for independent runs.
-22. `inspection/cleanup_experiment_artifacts.py`:
+24. `inspection/cleanup_experiment_artifacts.py`:
    retention/cleanup helper for state-cache files, failed-run directories, and
    optional SQLite `VACUUM` on cache/registry DBs.
 
@@ -278,6 +287,33 @@ Quick usage (do not execute automatically in agent workflows):
 
 .\.venv\Scripts\python.exe -m inspection.run_profile_set_shadow_refresh `
   --name-prefix profileset216_stageb_stageg2_flowbear4_20260328
+
+.\.venv\Scripts\python.exe -m inspection.run_profile_set_penalty_selector `
+  --compare-csv ../PancakeBot_var_exp/profileset216_stageb_stageg2_flowbear4_20260328_profile_set_window_compare.csv `
+  --name-prefix profileset216_stageb_stageg2_flowbear4_penalty_focus_20260328 `
+  --feature-lookbacks 1,3,5,8 `
+  --min-train-windows 10 `
+  --min-hold-windows 1 `
+  --cold-start-modes trailing_best_vs_stageb_with_skip `
+  --cold-start-lookbacks 5 `
+  --selector-margins-per-500=-0.2,0.0 `
+  --selector-skip-thresholds-per-500=0.0,0.05,0.1 `
+  --ridge-alphas 1.0,2.0,5.0 `
+  --flow-penalties-per-500 0.2,0.25,0.3,0.4 `
+  --stageg2-penalties-per-500 0.0,0.05,0.1
+
+.\.venv\Scripts\python.exe -m inspection.run_profile_set_penalty_shadow_recommender `
+  --compare-csv ../PancakeBot_var_exp/profileset216_stageb_stageg2_flowbear4_20260328_profile_set_window_compare.csv `
+  --name-prefix profileset216_stageb_stageg2_flowbear4_penaltybest_20260328 `
+  --feature-lookbacks 1,3,5,8 `
+  --min-train-windows 10 `
+  --cold-start-mode trailing_best_vs_stageb_with_skip `
+  --cold-start-lookback 5 `
+  --margin-per-500 -0.2 `
+  --skip-threshold-per-500 0.0 `
+  --ridge-alpha 1.0 `
+  --flow-penalty-per-500 0.2 `
+  --stageg2-penalty-per-500 0.0
 
 .\.venv\Scripts\python.exe -m inspection.run_profile_candidate_miner `
   --current-pool-compare-csv ../PancakeBot_var_exp/profileset216_stageb_stageg2_flowbear4_20260328_profile_set_window_compare.csv `

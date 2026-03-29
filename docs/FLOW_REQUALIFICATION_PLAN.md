@@ -220,3 +220,47 @@ That fallback is now active:
 
 So the next improvement lane should revert to stronger feature/controller work,
 not broader profile expansion.
+
+That stronger feature/controller branch is now partly explored too:
+
+- richer generic window features plus the existing linear family dropped the
+  best result to about `+0.356034 / 500`
+- adding cold-start heuristics to that richer ridge lane recovered only to
+  about `+0.421560 / 500`
+- a focused HGB lane reached only about `+0.178725 / 500`
+
+So the next pivot should not be "more generic features" or "more nonlinear
+model families" on this small mixed-window set.
+
+## Current Controller Pivot
+
+Use the existing best simple-feature mixed controller as the calibration base.
+
+1. Keep the current mixed profile set fixed.
+2. Keep the current simple-feature `delta_ridge` controller at about
+   `+0.578433 / 500` as the reference bar.
+3. Add profile-specific entry penalties and stricter skip calibration on top
+   of that controller.
+4. Search whether those penalties can remove the concentrated bad
+   alternate-profile entries without killing the good pockets.
+5. Only if that calibration beats the current bar should it move into the
+   shadow recommendation lane.
+
+That calibration branch is now positive:
+
+- [profileset216_stageb_stageg2_flowbear4_penalty_focus_20260328_profile_set_penalty_selectors.csv](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/profileset216_stageb_stageg2_flowbear4_penalty_focus_20260328_profile_set_penalty_selectors.csv)
+  raised the best mixed `216`-window controller from about `+0.578433 / 500`
+  to about `+0.643959 / 500`
+- selected bet rate stayed about `7.50%`
+- the strongest stable zone uses:
+  - legacy/simple feature set
+  - `min_train_windows=10`
+  - cold-start `trailing_best_vs_stageb_with_skip`, lookback `5`
+  - `ridge_alpha` around `1.0-5.0`
+  - flow penalty around `0.2-0.4`
+  - no meaningful `stageG2` penalty
+
+The next step is therefore shadow validation of this calibrated controller,
+not runtime promotion. A shadow-only recommender now exists in
+`inspection/run_profile_set_penalty_shadow_recommender.py`, and the current
+materialized recommendation is `skip`.

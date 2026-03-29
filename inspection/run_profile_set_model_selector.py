@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.pipeline import make_pipeline
@@ -18,7 +19,8 @@ from pancakebot.core.errors import InvariantError
 from inspection.run_profile_window_selector import _parse_float_list, _parse_positive_int_list
 
 _DEFAULT_EXP_ROOT = "../PancakeBot_var_exp"
-_MODEL_MODES = ("delta_ridge", "delta_logistic")
+_MODEL_MODES = ("delta_ridge", "delta_logistic", "delta_hgb")
+_COLD_START_MODES = ("baseline_or_skip", "prev_winner_with_skip", "trailing_best_vs_stageb_with_skip")
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,10 +36,16 @@ class ModelSelectorResult:
     feature_lookbacks_json: str
     min_train_windows: int
     min_hold_windows: int
+    cold_start_mode: str
+    cold_start_lookback: int
     margin_per_500: float
     skip_threshold_per_500: float
     ridge_alpha: float
     logistic_c: float
+    hgb_learning_rate: float
+    hgb_max_depth: int
+    hgb_max_leaf_nodes: int
+    hgb_min_samples_leaf: int
     mean_per_500: float
     mean_selected_bet_rate: float
     meets_min_selected_bet_rate: bool
@@ -52,10 +60,16 @@ class NextRecommendation:
     feature_lookbacks_json: str
     min_train_windows: int
     min_hold_windows: int
+    cold_start_mode: str
+    cold_start_lookback: int
     margin_per_500: float
     skip_threshold_per_500: float
     ridge_alpha: float
     logistic_c: float
+    hgb_learning_rate: float
+    hgb_max_depth: int
+    hgb_max_leaf_nodes: int
+    hgb_min_samples_leaf: int
     training_window_count: int
     chosen_profile: str
     chosen_predicted_per_500: float
@@ -72,10 +86,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature-lookbacks", type=str, default="1,2,3,5")
     parser.add_argument("--min-train-windows", type=str, default="4,5,6,8")
     parser.add_argument("--min-hold-windows", type=str, default="1,2,3")
+    parser.add_argument("--cold-start-modes", type=str, default="baseline_or_skip,prev_winner_with_skip,trailing_best_vs_stageb_with_skip")
+    parser.add_argument("--cold-start-lookbacks", type=str, default="1,3,5")
     parser.add_argument("--selector-margins-per-500", type=str, default="-0.2,0.0,0.2,0.5")
     parser.add_argument("--selector-skip-thresholds-per-500", type=str, default="0.0,0.05,0.1")
+    parser.add_argument("--modes", type=str, default="delta_ridge,delta_logistic,delta_hgb")
     parser.add_argument("--ridge-alphas", type=str, default="0.5,1.0,5.0,10.0")
     parser.add_argument("--logistic-c-values", type=str, default="0.25,0.5,1.0,2.0")
+    parser.add_argument("--hgb-learning-rates", type=str, default="0.1")
+    parser.add_argument("--hgb-max-depths", type=str, default="2")
+    parser.add_argument("--hgb-max-leaf-nodes", type=str, default="15")
+    parser.add_argument("--hgb-min-samples-leaf", type=str, default="2")
     parser.add_argument("--min-selected-bet-rate", type=float, default=0.05)
     parser.add_argument("--output-dir", type=str, default=_DEFAULT_EXP_ROOT)
     return parser
@@ -89,6 +110,26 @@ def _safe_float(raw: str | None) -> float:
     if not math.isfinite(value):
         raise InvariantError("profile_set_model_float_nonfinite")
     return float(value)
+
+
+def _parse_mode_list(raw: str) -> list[str]:
+    values = [str(token).strip() for token in str(raw).split(",") if str(token).strip() != ""]
+    if not values:
+        raise InvariantError("profile_set_model_modes_empty")
+    invalid = [str(value) for value in values if str(value) not in _MODEL_MODES]
+    if invalid:
+        raise InvariantError(f"profile_set_model_modes_invalid: {','.join(invalid)}")
+    return values
+
+
+def _parse_cold_start_mode_list(raw: str) -> list[str]:
+    values = [str(token).strip() for token in str(raw).split(",") if str(token).strip() != ""]
+    if not values:
+        raise InvariantError("profile_set_model_cold_start_modes_empty")
+    invalid = [str(value) for value in values if str(value) not in _COLD_START_MODES]
+    if invalid:
+        raise InvariantError(f"profile_set_model_cold_start_modes_invalid: {','.join(invalid)}")
+    return values
 
 
 def _load_compare_rows(compare_csv: Path) -> tuple[list[str], list[CompareWindowRow]]:
@@ -139,19 +180,82 @@ def _feature_dict(
         hist = rows[max(0, int(idx) - int(lookback)) : int(idx)]
         if not hist:
             continue
+        per_window_best_values = [max(float(value) for value in row.per_500.values()) for row in hist]
+        per_window_sorted_values = [
+            sorted((float(value) for value in row.per_500.values()), reverse=True)
+            for row in hist
+        ]
+        per_window_best_gaps = [
+            float(values[0] - values[1]) if len(values) > 1 else float(values[0])
+            for values in per_window_sorted_values
+        ]
+        per_window_positive_profile_frac = [
+            float(sum(1 for value in row.per_500.values() if float(value) > 0.0) / len(row.per_500))
+            for row in hist
+        ]
+        winner_names = [
+            max(row.per_500.items(), key=lambda item: float(item[1]))[0]
+            for row in hist
+        ]
+        winner_flip_count = sum(
+            1
+            for left, right in zip(winner_names, winner_names[1:])
+            if str(left) != str(right)
+        )
+        out[f"feat_pool_mean_best_per500_l{int(lookback)}"] = float(sum(per_window_best_values) / len(per_window_best_values))
+        out[f"feat_pool_mean_best_gap_per500_l{int(lookback)}"] = float(sum(per_window_best_gaps) / len(per_window_best_gaps))
+        out[f"feat_pool_mean_positive_profile_frac_l{int(lookback)}"] = float(
+            sum(per_window_positive_profile_frac) / len(per_window_positive_profile_frac)
+        )
+        out[f"feat_pool_skipworthy_frac_l{int(lookback)}"] = float(
+            sum(1 for value in per_window_best_values if float(value) <= 0.0) / len(per_window_best_values)
+        )
+        out[f"feat_pool_winner_flip_frac_l{int(lookback)}"] = float(
+            0.0 if len(winner_names) <= 1 else float(winner_flip_count / (len(winner_names) - 1))
+        )
         for profile in profiles:
             values = [float(row.per_500[str(profile)]) for row in hist]
             bet_rates = [float(row.bet_rate[str(profile)]) for row in hist]
             mean_value = float(sum(values) / len(values))
             variance = float(sum((value - mean_value) ** 2 for value in values) / len(values))
             std_value = math.sqrt(variance)
+            positive_values = [float(value) for value in values if float(value) > 0.0]
+            nonpositive_values = [float(value) for value in values if float(value) <= 0.0]
+            x_values = list(range(len(values)))
+            x_mean = float(sum(x_values) / len(x_values))
+            denominator = float(sum((float(x) - x_mean) ** 2 for x in x_values))
+            slope = 0.0
+            if float(denominator) > 0.0:
+                slope = float(
+                    sum(
+                        (float(x) - x_mean) * (float(value) - mean_value)
+                        for x, value in zip(x_values, values)
+                    )
+                    / denominator
+                )
             out[f"feat_{profile}_mean_per500_l{int(lookback)}"] = float(mean_value)
             out[f"feat_{profile}_std_per500_l{int(lookback)}"] = float(std_value)
+            out[f"feat_{profile}_min_per500_l{int(lookback)}"] = float(min(values))
+            out[f"feat_{profile}_max_per500_l{int(lookback)}"] = float(max(values))
             out[f"feat_{profile}_last_per500_l{int(lookback)}"] = float(values[-1])
+            out[f"feat_{profile}_last_minus_mean_per500_l{int(lookback)}"] = float(values[-1] - mean_value)
+            out[f"feat_{profile}_trend_slope_per500_l{int(lookback)}"] = float(slope)
+            out[f"feat_{profile}_mean_positive_per500_l{int(lookback)}"] = float(
+                sum(positive_values) / len(positive_values)
+            ) if positive_values else 0.0
+            out[f"feat_{profile}_mean_nonpositive_per500_l{int(lookback)}"] = float(
+                sum(nonpositive_values) / len(nonpositive_values)
+            ) if nonpositive_values else 0.0
             out[f"feat_{profile}_mean_betrate_l{int(lookback)}"] = float(sum(bet_rates) / len(bet_rates))
             out[f"feat_{profile}_last_betrate_l{int(lookback)}"] = float(bet_rates[-1])
             out[f"feat_{profile}_pos_frac_l{int(lookback)}"] = float(
                 sum(1 for value in values if float(value) > 0.0) / len(values)
+            )
+            out[f"feat_{profile}_nonpositive_frac_l{int(lookback)}"] = float(
+                sum(1 for value in values if float(value) <= 0.0) / len(values)
+            )
+            out[f"feat_{profile}_win_frac_l{int(lookback)}"] = float(
+                sum(1 for name in winner_names if str(name) == str(profile)) / len(winner_names)
             )
         baseline_mean = float(out[f"feat_{baseline_name}_mean_per500_l{int(lookback)}"])
         baseline_last = float(out[f"feat_{baseline_name}_last_per500_l{int(lookback)}"])
@@ -163,6 +267,14 @@ def _feature_dict(
             )
             out[f"feat_{profile}_delta_last_vs_{baseline_name}_l{int(lookback)}"] = float(
                 out[f"feat_{profile}_last_per500_l{int(lookback)}"] - baseline_last
+            )
+            out[f"feat_{profile}_beat_{baseline_name}_frac_l{int(lookback)}"] = float(
+                sum(
+                    1
+                    for row in hist
+                    if float(row.per_500[str(profile)]) > float(row.per_500[str(baseline_name)])
+                )
+                / len(hist)
             )
     return out
 
@@ -176,15 +288,32 @@ def _feature_names(
     names: list[str] = []
     baseline_name = str(baseline_profile_name)
     for lookback in feature_lookbacks:
+        names.extend(
+            [
+                f"feat_pool_mean_best_per500_l{int(lookback)}",
+                f"feat_pool_mean_best_gap_per500_l{int(lookback)}",
+                f"feat_pool_mean_positive_profile_frac_l{int(lookback)}",
+                f"feat_pool_skipworthy_frac_l{int(lookback)}",
+                f"feat_pool_winner_flip_frac_l{int(lookback)}",
+            ]
+        )
         for profile in profiles:
             names.extend(
                 [
                     f"feat_{profile}_mean_per500_l{int(lookback)}",
                     f"feat_{profile}_std_per500_l{int(lookback)}",
+                    f"feat_{profile}_min_per500_l{int(lookback)}",
+                    f"feat_{profile}_max_per500_l{int(lookback)}",
                     f"feat_{profile}_last_per500_l{int(lookback)}",
+                    f"feat_{profile}_last_minus_mean_per500_l{int(lookback)}",
+                    f"feat_{profile}_trend_slope_per500_l{int(lookback)}",
+                    f"feat_{profile}_mean_positive_per500_l{int(lookback)}",
+                    f"feat_{profile}_mean_nonpositive_per500_l{int(lookback)}",
                     f"feat_{profile}_mean_betrate_l{int(lookback)}",
                     f"feat_{profile}_last_betrate_l{int(lookback)}",
                     f"feat_{profile}_pos_frac_l{int(lookback)}",
+                    f"feat_{profile}_nonpositive_frac_l{int(lookback)}",
+                    f"feat_{profile}_win_frac_l{int(lookback)}",
                 ]
             )
         for profile in profiles:
@@ -194,6 +323,7 @@ def _feature_names(
                 [
                     f"feat_{profile}_delta_mean_vs_{baseline_name}_l{int(lookback)}",
                     f"feat_{profile}_delta_last_vs_{baseline_name}_l{int(lookback)}",
+                    f"feat_{profile}_beat_{baseline_name}_frac_l{int(lookback)}",
                 ]
             )
     return names
@@ -318,6 +448,55 @@ def _predict_delta_logistic(
     return out
 
 
+def _predict_delta_hgb(
+    *,
+    rows: list[CompareWindowRow],
+    feature_rows: list[dict[str, float]],
+    feature_names: list[str],
+    train_indices: list[int],
+    current_idx: int,
+    baseline_profile_name: str,
+    profiles: list[str],
+    hgb_learning_rate: float,
+    hgb_max_depth: int,
+    hgb_max_leaf_nodes: int,
+    hgb_min_samples_leaf: int,
+) -> dict[str, float]:
+    x_train, x_current = _feature_matrix(
+        feature_rows=feature_rows,
+        indices=train_indices,
+        current_idx=int(current_idx),
+        feature_names=feature_names,
+    )
+    if int(x_train.shape[1]) <= 0:
+        return {}
+    out: dict[str, float] = {}
+    baseline_name = str(baseline_profile_name)
+    for profile in profiles:
+        if str(profile) == str(baseline_name):
+            continue
+        y_train = np.asarray(
+            [
+                float(rows[int(idx)].per_500[str(profile)]) - float(rows[int(idx)].per_500[str(baseline_name)])
+                for idx in train_indices
+            ],
+            dtype=float,
+        )
+        model = make_pipeline(
+            SimpleImputer(strategy="mean"),
+            HistGradientBoostingRegressor(
+                learning_rate=float(hgb_learning_rate),
+                max_depth=int(hgb_max_depth),
+                max_leaf_nodes=int(hgb_max_leaf_nodes),
+                min_samples_leaf=int(hgb_min_samples_leaf),
+                random_state=0,
+            ),
+        )
+        model.fit(x_train, y_train)
+        out[str(profile)] = float(model.predict(x_current)[0])
+    return out
+
+
 def _predicted_stageb_per_500(
     *,
     feature_row: dict[str, float],
@@ -338,6 +517,63 @@ def _estimated_profile_bet_rate(
     return float(feature_row[f"feat_{str(profile_name)}_mean_betrate_l{int(longest)}"])
 
 
+def _cold_start_pick(
+    *,
+    rows: list[CompareWindowRow],
+    current_idx: int,
+    profiles: list[str],
+    baseline_profile_name: str,
+    cold_start_mode: str,
+    cold_start_lookback: int,
+    margin_per_500: float,
+    skip_threshold_per_500: float,
+) -> tuple[str, float, float]:
+    row = rows[int(current_idx)]
+    baseline_name = str(baseline_profile_name)
+    baseline_value = float(row.per_500[str(baseline_name)])
+    baseline_bet_rate = float(row.bet_rate[str(baseline_name)])
+    if str(cold_start_mode) == "baseline_or_skip":
+        if float(baseline_value) <= float(skip_threshold_per_500):
+            return "skip", 0.0, 0.0
+        return str(baseline_name), float(baseline_value), float(baseline_bet_rate)
+    if str(cold_start_mode) == "prev_winner_with_skip":
+        if int(current_idx) <= 0:
+            if float(baseline_value) <= float(skip_threshold_per_500):
+                return "skip", 0.0, 0.0
+            return str(baseline_name), float(baseline_value), float(baseline_bet_rate)
+        prev_row = rows[int(current_idx) - 1]
+        prev_winner, prev_value = max(prev_row.per_500.items(), key=lambda item: float(item[1]))
+        if float(prev_value) <= float(skip_threshold_per_500):
+            return "skip", 0.0, 0.0
+        return str(prev_winner), float(row.per_500[str(prev_winner)]), float(row.bet_rate[str(prev_winner)])
+    if str(cold_start_mode) == "trailing_best_vs_stageb_with_skip":
+        if int(current_idx) < int(cold_start_lookback):
+            if float(baseline_value) <= float(skip_threshold_per_500):
+                return "skip", 0.0, 0.0
+            return str(baseline_name), float(baseline_value), float(baseline_bet_rate)
+        hist = rows[int(current_idx) - int(cold_start_lookback) : int(current_idx)]
+        stageb_mean = float(sum(float(x.per_500[str(baseline_name)]) for x in hist) / len(hist))
+        best_profile_name = str(baseline_name)
+        best_profile_mean = float(stageb_mean)
+        for profile in profiles:
+            if str(profile) == str(baseline_name):
+                continue
+            candidate_mean = float(sum(float(x.per_500[str(profile)]) for x in hist) / len(hist))
+            if float(candidate_mean) > float(best_profile_mean):
+                best_profile_name = str(profile)
+                best_profile_mean = float(candidate_mean)
+        if max(float(stageb_mean), float(best_profile_mean)) <= float(skip_threshold_per_500):
+            return "skip", 0.0, 0.0
+        if str(best_profile_name) != str(baseline_name) and float(best_profile_mean - stageb_mean) > float(margin_per_500):
+            return (
+                str(best_profile_name),
+                float(row.per_500[str(best_profile_name)]),
+                float(row.bet_rate[str(best_profile_name)]),
+            )
+        return str(baseline_name), float(baseline_value), float(baseline_bet_rate)
+    raise InvariantError("profile_set_model_cold_start_mode_invalid")
+
+
 def _pick_model_window(
     *,
     mode: str,
@@ -351,6 +587,12 @@ def _pick_model_window(
     min_train_windows: int,
     ridge_alpha: float,
     logistic_c: float,
+    hgb_learning_rate: float,
+    hgb_max_depth: int,
+    hgb_max_leaf_nodes: int,
+    hgb_min_samples_leaf: int,
+    cold_start_mode: str,
+    cold_start_lookback: int,
     margin_per_500: float,
     skip_threshold_per_500: float,
 ) -> tuple[str, float, float]:
@@ -379,10 +621,16 @@ def _pick_model_window(
         if feature_rows[int(idx)] and int(idx) >= 1
     ]
     if len(train_indices) < int(min_train_windows):
-        metric = float(row.per_500[str(baseline_profile_name)])
-        if float(metric) <= float(skip_threshold_per_500):
-            return "skip", 0.0, 0.0
-        return str(baseline_profile_name), float(metric), float(row.bet_rate[str(baseline_profile_name)])
+        return _cold_start_pick(
+            rows=rows,
+            current_idx=int(current_idx),
+            profiles=profiles,
+            baseline_profile_name=str(baseline_profile_name),
+            cold_start_mode=str(cold_start_mode),
+            cold_start_lookback=int(cold_start_lookback),
+            margin_per_500=float(margin_per_500),
+            skip_threshold_per_500=float(skip_threshold_per_500),
+        )
 
     if str(mode) == "delta_ridge":
         predictions = _predict_delta_ridge(
@@ -405,6 +653,20 @@ def _pick_model_window(
             baseline_profile_name=str(baseline_profile_name),
             profiles=profiles,
             logistic_c=float(logistic_c),
+        )
+    elif str(mode) == "delta_hgb":
+        predictions = _predict_delta_hgb(
+            rows=rows,
+            feature_rows=feature_rows,
+            feature_names=feature_names,
+            train_indices=train_indices,
+            current_idx=int(current_idx),
+            baseline_profile_name=str(baseline_profile_name),
+            profiles=profiles,
+            hgb_learning_rate=float(hgb_learning_rate),
+            hgb_max_depth=int(hgb_max_depth),
+            hgb_max_leaf_nodes=int(hgb_max_leaf_nodes),
+            hgb_min_samples_leaf=int(hgb_min_samples_leaf),
         )
     else:
         raise InvariantError("profile_set_model_mode_invalid")
@@ -445,6 +707,12 @@ def _predict_next_recommendation(
     min_hold_windows: int,
     ridge_alpha: float,
     logistic_c: float,
+    hgb_learning_rate: float,
+    hgb_max_depth: int,
+    hgb_max_leaf_nodes: int,
+    hgb_min_samples_leaf: int,
+    cold_start_mode: str,
+    cold_start_lookback: int,
     margin_per_500: float,
     skip_threshold_per_500: float,
 ) -> NextRecommendation:
@@ -489,10 +757,16 @@ def _predict_next_recommendation(
             feature_lookbacks_json=json.dumps(list(feature_lookbacks), separators=(",", ":")),
             min_train_windows=int(min_train_windows),
             min_hold_windows=int(min_hold_windows),
+            cold_start_mode=str(cold_start_mode),
+            cold_start_lookback=int(cold_start_lookback),
             margin_per_500=float(margin_per_500),
             skip_threshold_per_500=float(skip_threshold_per_500),
             ridge_alpha=float(ridge_alpha),
             logistic_c=float(logistic_c),
+            hgb_learning_rate=float(hgb_learning_rate),
+            hgb_max_depth=int(hgb_max_depth),
+            hgb_max_leaf_nodes=int(hgb_max_leaf_nodes),
+            hgb_min_samples_leaf=int(hgb_min_samples_leaf),
             training_window_count=int(len(train_indices)),
             chosen_profile=str(chosen_profile),
             chosen_predicted_per_500=(0.0 if str(chosen_profile) == "skip" else float(predicted_baseline)),
@@ -530,6 +804,20 @@ def _predict_next_recommendation(
             profiles=profiles,
             logistic_c=float(logistic_c),
         )
+    elif str(mode) == "delta_hgb":
+        predictions = _predict_delta_hgb(
+            rows=rows,
+            feature_rows=feature_rows_plus,
+            feature_names=feature_names,
+            train_indices=train_indices,
+            current_idx=int(len(rows)),
+            baseline_profile_name=str(baseline_profile_name),
+            profiles=profiles,
+            hgb_learning_rate=float(hgb_learning_rate),
+            hgb_max_depth=int(hgb_max_depth),
+            hgb_max_leaf_nodes=int(hgb_max_leaf_nodes),
+            hgb_min_samples_leaf=int(hgb_min_samples_leaf),
+        )
     else:
         raise InvariantError("profile_set_model_recommend_mode_invalid")
     predicted_baseline = _predicted_stageb_per_500(
@@ -557,10 +845,16 @@ def _predict_next_recommendation(
         feature_lookbacks_json=json.dumps(list(feature_lookbacks), separators=(",", ":")),
         min_train_windows=int(min_train_windows),
         min_hold_windows=int(min_hold_windows),
+        cold_start_mode=str(cold_start_mode),
+        cold_start_lookback=int(cold_start_lookback),
         margin_per_500=float(margin_per_500),
         skip_threshold_per_500=float(skip_threshold_per_500),
         ridge_alpha=float(ridge_alpha),
         logistic_c=float(logistic_c),
+        hgb_learning_rate=float(hgb_learning_rate),
+        hgb_max_depth=int(hgb_max_depth),
+        hgb_max_leaf_nodes=int(hgb_max_leaf_nodes),
+        hgb_min_samples_leaf=int(hgb_min_samples_leaf),
         training_window_count=int(len(train_indices)),
         chosen_profile=str(chosen_profile),
         chosen_predicted_per_500=float(chosen_predicted),
@@ -590,10 +884,17 @@ def _evaluate_model_selectors(
     feature_lookbacks: list[int],
     min_train_windows_list: list[int],
     min_hold_windows_list: list[int],
+    cold_start_modes: list[str],
+    cold_start_lookbacks: list[int],
     margins_per_500: list[float],
     skip_thresholds_per_500: list[float],
+    modes: list[str],
     ridge_alphas: list[float],
     logistic_c_values: list[float],
+    hgb_learning_rates: list[float],
+    hgb_max_depths: list[int],
+    hgb_max_leaf_nodes_list: list[int],
+    hgb_min_samples_leaf_list: list[int],
     min_selected_bet_rate: float,
 ) -> list[ModelSelectorResult]:
     feature_rows = [
@@ -618,10 +919,16 @@ def _evaluate_model_selectors(
         mode: str,
         min_train_windows: int,
         min_hold_windows: int,
+        cold_start_mode: str,
+        cold_start_lookback: int,
         margin_per_500: float,
         skip_threshold_per_500: float,
         ridge_alpha: float,
         logistic_c: float,
+        hgb_learning_rate: float,
+        hgb_max_depth: int,
+        hgb_max_leaf_nodes: int,
+        hgb_min_samples_leaf: int,
     ) -> None:
         total = 0.0
         total_bet_rate = 0.0
@@ -649,6 +956,12 @@ def _evaluate_model_selectors(
                     min_train_windows=int(min_train_windows),
                     ridge_alpha=float(ridge_alpha),
                     logistic_c=float(logistic_c),
+                    hgb_learning_rate=float(hgb_learning_rate),
+                    hgb_max_depth=int(hgb_max_depth),
+                    hgb_max_leaf_nodes=int(hgb_max_leaf_nodes),
+                    hgb_min_samples_leaf=int(hgb_min_samples_leaf),
+                    cold_start_mode=str(cold_start_mode),
+                    cold_start_lookback=int(cold_start_lookback),
                     margin_per_500=float(margin_per_500),
                     skip_threshold_per_500=float(skip_threshold_per_500),
                 )
@@ -671,10 +984,16 @@ def _evaluate_model_selectors(
                 feature_lookbacks_json=json.dumps(list(feature_lookbacks), separators=(",", ":")),
                 min_train_windows=int(min_train_windows),
                 min_hold_windows=int(min_hold_windows),
+                cold_start_mode=str(cold_start_mode),
+                cold_start_lookback=int(cold_start_lookback),
                 margin_per_500=float(margin_per_500),
                 skip_threshold_per_500=float(skip_threshold_per_500),
                 ridge_alpha=float(ridge_alpha),
                 logistic_c=float(logistic_c),
+                hgb_learning_rate=float(hgb_learning_rate),
+                hgb_max_depth=int(hgb_max_depth),
+                hgb_max_leaf_nodes=int(hgb_max_leaf_nodes),
+                hgb_min_samples_leaf=int(hgb_min_samples_leaf),
                 mean_per_500=float(total / len(rows)),
                 mean_selected_bet_rate=float(mean_bet_rate),
                 meets_min_selected_bet_rate=float(mean_bet_rate) >= float(min_selected_bet_rate),
@@ -688,44 +1007,93 @@ def _evaluate_model_selectors(
             mode="oracle_with_skip",
             min_train_windows=0,
             min_hold_windows=1,
+            cold_start_mode="baseline_or_skip",
+            cold_start_lookback=0,
             margin_per_500=0.0,
             skip_threshold_per_500=float(skip_threshold),
             ridge_alpha=0.0,
             logistic_c=0.0,
+            hgb_learning_rate=0.0,
+            hgb_max_depth=0,
+            hgb_max_leaf_nodes=0,
+            hgb_min_samples_leaf=0,
         )
     append_mode_result(
         mode="static_profile",
         min_train_windows=0,
         min_hold_windows=1,
+        cold_start_mode="baseline_or_skip",
+        cold_start_lookback=0,
         margin_per_500=0.0,
         skip_threshold_per_500=0.0,
         ridge_alpha=0.0,
         logistic_c=0.0,
+        hgb_learning_rate=0.0,
+        hgb_max_depth=0,
+        hgb_max_leaf_nodes=0,
+        hgb_min_samples_leaf=0,
     )
     for min_train_windows in min_train_windows_list:
         for min_hold_windows in min_hold_windows_list:
-            for margin in margins_per_500:
-                for skip_threshold in skip_thresholds_per_500:
-                    for ridge_alpha in ridge_alphas:
-                        append_mode_result(
-                            mode="delta_ridge",
-                            min_train_windows=int(min_train_windows),
-                            min_hold_windows=int(min_hold_windows),
-                            margin_per_500=float(margin),
-                            skip_threshold_per_500=float(skip_threshold),
-                            ridge_alpha=float(ridge_alpha),
-                            logistic_c=0.0,
-                        )
-                    for logistic_c in logistic_c_values:
-                        append_mode_result(
-                            mode="delta_logistic",
-                            min_train_windows=int(min_train_windows),
-                            min_hold_windows=int(min_hold_windows),
-                            margin_per_500=float(margin),
-                            skip_threshold_per_500=float(skip_threshold),
-                            ridge_alpha=0.0,
-                            logistic_c=float(logistic_c),
-                        )
+            for cold_start_mode in cold_start_modes:
+                active_cold_start_lookbacks = [0] if str(cold_start_mode) != "trailing_best_vs_stageb_with_skip" else cold_start_lookbacks
+                for cold_start_lookback in active_cold_start_lookbacks:
+                    for margin in margins_per_500:
+                        for skip_threshold in skip_thresholds_per_500:
+                            for ridge_alpha in ridge_alphas:
+                                if "delta_ridge" in modes:
+                                    append_mode_result(
+                                        mode="delta_ridge",
+                                        min_train_windows=int(min_train_windows),
+                                        min_hold_windows=int(min_hold_windows),
+                                        cold_start_mode=str(cold_start_mode),
+                                        cold_start_lookback=int(cold_start_lookback),
+                                        margin_per_500=float(margin),
+                                        skip_threshold_per_500=float(skip_threshold),
+                                        ridge_alpha=float(ridge_alpha),
+                                        logistic_c=0.0,
+                                        hgb_learning_rate=0.0,
+                                        hgb_max_depth=0,
+                                        hgb_max_leaf_nodes=0,
+                                        hgb_min_samples_leaf=0,
+                                    )
+                            for logistic_c in logistic_c_values:
+                                if "delta_logistic" in modes:
+                                    append_mode_result(
+                                        mode="delta_logistic",
+                                        min_train_windows=int(min_train_windows),
+                                        min_hold_windows=int(min_hold_windows),
+                                        cold_start_mode=str(cold_start_mode),
+                                        cold_start_lookback=int(cold_start_lookback),
+                                        margin_per_500=float(margin),
+                                        skip_threshold_per_500=float(skip_threshold),
+                                        ridge_alpha=0.0,
+                                        logistic_c=float(logistic_c),
+                                        hgb_learning_rate=0.0,
+                                        hgb_max_depth=0,
+                                        hgb_max_leaf_nodes=0,
+                                        hgb_min_samples_leaf=0,
+                                    )
+                            for hgb_learning_rate in hgb_learning_rates:
+                                for hgb_max_depth in hgb_max_depths:
+                                    for hgb_max_leaf_nodes in hgb_max_leaf_nodes_list:
+                                        for hgb_min_samples_leaf in hgb_min_samples_leaf_list:
+                                            if "delta_hgb" in modes:
+                                                append_mode_result(
+                                                    mode="delta_hgb",
+                                                    min_train_windows=int(min_train_windows),
+                                                    min_hold_windows=int(min_hold_windows),
+                                                    cold_start_mode=str(cold_start_mode),
+                                                    cold_start_lookback=int(cold_start_lookback),
+                                                    margin_per_500=float(margin),
+                                                    skip_threshold_per_500=float(skip_threshold),
+                                                    ridge_alpha=0.0,
+                                                    logistic_c=0.0,
+                                                    hgb_learning_rate=float(hgb_learning_rate),
+                                                    hgb_max_depth=int(hgb_max_depth),
+                                                    hgb_max_leaf_nodes=int(hgb_max_leaf_nodes),
+                                                    hgb_min_samples_leaf=int(hgb_min_samples_leaf),
+                                                )
     return sorted(
         results,
         key=lambda row: (
@@ -736,7 +1104,7 @@ def _evaluate_model_selectors(
         ),
         reverse=True,
     )
-
+ 
 
 def main() -> None:
     args = _build_parser().parse_args()
@@ -749,10 +1117,17 @@ def main() -> None:
     feature_lookbacks = _parse_positive_int_list(str(args.feature_lookbacks))
     min_train_windows_list = _parse_positive_int_list(str(args.min_train_windows))
     min_hold_windows_list = _parse_positive_int_list(str(args.min_hold_windows))
+    cold_start_modes = _parse_cold_start_mode_list(str(args.cold_start_modes))
+    cold_start_lookbacks = _parse_positive_int_list(str(args.cold_start_lookbacks))
     margins_per_500 = _parse_float_list(str(args.selector_margins_per_500))
     skip_thresholds_per_500 = _parse_float_list(str(args.selector_skip_thresholds_per_500))
+    modes = _parse_mode_list(str(args.modes))
     ridge_alphas = _parse_float_list(str(args.ridge_alphas))
     logistic_c_values = _parse_float_list(str(args.logistic_c_values))
+    hgb_learning_rates = _parse_float_list(str(args.hgb_learning_rates))
+    hgb_max_depths = _parse_positive_int_list(str(args.hgb_max_depths))
+    hgb_max_leaf_nodes_list = _parse_positive_int_list(str(args.hgb_max_leaf_nodes))
+    hgb_min_samples_leaf_list = _parse_positive_int_list(str(args.hgb_min_samples_leaf))
     output_dir = Path(str(args.output_dir)).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -763,10 +1138,17 @@ def main() -> None:
         feature_lookbacks=feature_lookbacks,
         min_train_windows_list=min_train_windows_list,
         min_hold_windows_list=min_hold_windows_list,
+        cold_start_modes=cold_start_modes,
+        cold_start_lookbacks=cold_start_lookbacks,
         margins_per_500=margins_per_500,
         skip_thresholds_per_500=skip_thresholds_per_500,
+        modes=modes,
         ridge_alphas=ridge_alphas,
         logistic_c_values=logistic_c_values,
+        hgb_learning_rates=hgb_learning_rates,
+        hgb_max_depths=hgb_max_depths,
+        hgb_max_leaf_nodes_list=hgb_max_leaf_nodes_list,
+        hgb_min_samples_leaf_list=hgb_min_samples_leaf_list,
         min_selected_bet_rate=float(args.min_selected_bet_rate),
     )
 

@@ -6,12 +6,9 @@ import json
 from pathlib import Path
 
 from pancakebot.core.errors import InvariantError
-from inspection.run_profile_set_model_selector import (
-    _load_compare_rows,
-    _parse_float_list,
-    _parse_positive_int_list,
-    _predict_next_recommendation,
-)
+from inspection.run_profile_set_model_selector import _load_compare_rows
+from inspection.run_profile_set_penalty_selector import predict_next_penalty_recommendation
+from inspection.run_profile_window_selector import _parse_positive_int_list
 
 _DEFAULT_EXP_ROOT = "../PancakeBot_var_exp"
 
@@ -20,21 +17,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compare-csv", type=str, required=True)
     parser.add_argument("--name-prefix", type=str, required=True)
-    parser.add_argument("--mode", type=str, choices=("delta_ridge", "delta_logistic", "delta_hgb"), default="delta_ridge")
     parser.add_argument("--baseline-profile-name", type=str, default="stageb")
     parser.add_argument("--feature-lookbacks", type=str, default="1,3,5,8")
     parser.add_argument("--min-train-windows", type=int, default=10)
     parser.add_argument("--min-hold-windows", type=int, default=1)
-    parser.add_argument("--cold-start-mode", type=str, default="baseline_or_skip")
-    parser.add_argument("--cold-start-lookback", type=int, default=0)
+    parser.add_argument("--cold-start-mode", type=str, default="trailing_best_vs_stageb_with_skip")
+    parser.add_argument("--cold-start-lookback", type=int, default=5)
     parser.add_argument("--margin-per-500", type=float, default=-0.2)
     parser.add_argument("--skip-threshold-per-500", type=float, default=0.0)
-    parser.add_argument("--ridge-alpha", type=float, default=2.0)
-    parser.add_argument("--logistic-c", type=float, default=1.0)
-    parser.add_argument("--hgb-learning-rate", type=float, default=0.1)
-    parser.add_argument("--hgb-max-depth", type=int, default=2)
-    parser.add_argument("--hgb-max-leaf-nodes", type=int, default=15)
-    parser.add_argument("--hgb-min-samples-leaf", type=int, default=2)
+    parser.add_argument("--ridge-alpha", type=float, default=1.0)
+    parser.add_argument("--flow-penalty-per-500", type=float, default=0.2)
+    parser.add_argument("--stageg2-penalty-per-500", type=float, default=0.0)
     parser.add_argument("--output-dir", type=str, default=_DEFAULT_EXP_ROOT)
     return parser
 
@@ -42,21 +35,20 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
     if int(args.min_train_windows) <= 0:
-        raise InvariantError("profile_set_shadow_min_train_windows_nonpositive")
+        raise InvariantError("profile_set_penalty_shadow_min_train_nonpositive")
     if int(args.min_hold_windows) <= 0:
-        raise InvariantError("profile_set_shadow_min_hold_windows_nonpositive")
+        raise InvariantError("profile_set_penalty_shadow_min_hold_nonpositive")
     if int(args.cold_start_lookback) < 0:
-        raise InvariantError("profile_set_shadow_cold_start_lookback_negative")
+        raise InvariantError("profile_set_penalty_shadow_cold_start_lookback_negative")
     profiles, rows = _load_compare_rows(Path(str(args.compare_csv)).resolve())
     baseline_profile_name = str(args.baseline_profile_name).strip()
     if baseline_profile_name == "" or str(baseline_profile_name) not in profiles:
-        raise InvariantError("profile_set_shadow_baseline_profile_invalid")
+        raise InvariantError("profile_set_penalty_shadow_baseline_invalid")
     feature_lookbacks = _parse_positive_int_list(str(args.feature_lookbacks))
     output_dir = Path(str(args.output_dir)).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    recommendation = _predict_next_recommendation(
-        mode=str(args.mode),
+    recommendation = predict_next_penalty_recommendation(
         rows=rows,
         profiles=profiles,
         baseline_profile_name=str(baseline_profile_name),
@@ -66,11 +58,8 @@ def main() -> None:
         cold_start_mode=str(args.cold_start_mode),
         cold_start_lookback=int(args.cold_start_lookback),
         ridge_alpha=float(args.ridge_alpha),
-        logistic_c=float(args.logistic_c),
-        hgb_learning_rate=float(args.hgb_learning_rate),
-        hgb_max_depth=int(args.hgb_max_depth),
-        hgb_max_leaf_nodes=int(args.hgb_max_leaf_nodes),
-        hgb_min_samples_leaf=int(args.hgb_min_samples_leaf),
+        flow_penalty_per_500=float(args.flow_penalty_per_500),
+        stageg2_penalty_per_500=float(args.stageg2_penalty_per_500),
         margin_per_500=float(args.margin_per_500),
         skip_threshold_per_500=float(args.skip_threshold_per_500),
     )
@@ -88,7 +77,7 @@ def main() -> None:
         sort_keys=True,
         separators=(",", ":"),
     )
-    json_path = output_dir / f"{args.name_prefix}_profile_set_shadow_recommendation.json"
+    json_path = output_dir / f"{args.name_prefix}_profile_set_penalty_shadow_recommendation.json"
     json_path.write_text(json.dumps(out, indent=2, sort_keys=True), encoding="utf-8", newline="\n")
 
 
