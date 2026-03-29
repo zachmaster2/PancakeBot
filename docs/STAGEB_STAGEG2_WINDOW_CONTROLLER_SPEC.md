@@ -1,4 +1,4 @@
-# StageB StageG2 Window Controller Spec
+# StageB Cons Window Controller Spec
 
 ## Status
 
@@ -17,10 +17,9 @@ enough to understand operationally:
 ## Action Set
 
 1. `stageB`
-2. `stageG2_bullonly`
-3. optional `skip`
+2. `cons`
 
-The current primary lane is the two-profile controller plus optional skip.
+The current primary lane is the two-profile no-skip controller.
 
 ## Decision Cadence
 
@@ -33,47 +32,41 @@ The current primary lane is the two-profile controller plus optional skip.
 ### Practical no-skip controller
 
 - mode: `trailing_best_vs_stageb`
-- lookback: `2`
+- lookback: `3`
 - margin: `1.0 / 500`
-- actions: `stageB` or `stageG2_bullonly`
+- actions: `stageB` or `cons`
 
 Current shared-harness evidence:
 
-- latest `6480`-round tail:
-  about `+0.044224 / 500`, bet rate about `8.92%`
-- latest `8640`-round tail:
-  about `+0.083013 / 500`, bet rate about `8.31%`
-- latest `10800`-round tail:
-  about `+0.019785 / 500`, bet rate about `9.06%`
-- multi-offset shared check:
-  - `6480`: mean about `+0.180962 / 500`, beat static `stageB` on `5/5`
-  - `8640`: mean about `-0.005180 / 500`, beat static `stageB` on `2/5`
-  - `10800`: mean about `+0.019460 / 500`, beat static `stageB` on `5/5`
-
-### Safer skip-aware controller
-
-- mode: `trailing_best_vs_stageb_with_skip`
-- lookback: `5`
-- margin: `1.0 / 500`
-- skip threshold: `0.0`
-
-Current shared-harness evidence:
-
-- latest `6480`-round tail:
-  about `+0.009785 / 500`, bet rate about `6.67%`
-- latest `8640`-round tail:
-  about `+0.105242 / 500`, bet rate about `4.76%`
-- latest `10800`-round tail:
-  about `+0.012678 / 500`, bet rate about `4.88%`
+- `6480` over `20` offsets:
+  mean about `+0.087450 / 500` vs static `stageB` about `+0.062812 / 500`
+  mean lift about `+0.024638 / 500`
+  beat static `stageB` on `13/20`
+  worst lift about `-0.007128 / 500`
+- `8640` over `20` offsets:
+  mean about `+0.087028 / 500` vs static `stageB` about `+0.046927 / 500`
+  mean lift about `+0.040101 / 500`
+  beat static `stageB` on `18/20`
+  worst lift about `-0.016351 / 500`
+- `10800` over `20` offsets:
+  mean about `+0.124054 / 500` vs static `stageB` about `+0.093709 / 500`
+  mean lift about `+0.030345 / 500`
+  beat static `stageB` on `18/20`
+  worst lift about `-0.013081 / 500`
+- `12960` over `10` offsets:
+  mean about `+0.121509 / 500` vs static `stageB` about `+0.103206 / 500`
+  mean lift about `+0.018303 / 500`
+  beat static `stageB` on `9/10`
+  worst lift about `-0.001841 / 500`
 
 Interpretation:
 
-- the skip-aware variant can still be stronger on isolated tails
-- but it currently falls below the practical `5%` floor too often in the
-  continuous shared harness
-- the no-skip variant is the stronger runtime-controller candidate right now,
-  but it is still not rollout-safe because the `8640` multi-offset slice
-  remains mixed
+- this is the first shared-harness controller branch that is positive across
+  all major recent horizons after broader offset expansion
+- bet rate stays safely above the practical `5%` floor
+- the branch is now a serious controller dry-test candidate, but it still
+  needs explicit runtime smoke validation and a controlled dry rollout before
+  any live-money consideration
 
 ## Profile Definitions
 
@@ -83,7 +76,7 @@ Interpretation:
 
 ### Alternate profile
 
-- `disloc_stageG2_bullonly_recent5pct_v1`
+- `disloc_cons_20260227_x80`
 
 Flow is not part of the primary controller spec right now. It remains a
 secondary rehabilitation branch.
@@ -111,11 +104,11 @@ not use current-window realized data when choosing.
 
 ## Recommended Rollout Sequence
 
-1. Keep runtime contained on `stageB` only.
-2. Refresh the compare set on current data.
-3. Emit the current heuristic recommendation offline.
-4. Compare refreshed recommendations over time.
-5. Only then implement the runtime-controller path.
+1. Keep runtime contained on `stageB` only by default.
+2. Refresh the compare set on current synced data.
+3. Re-run the shared qualification on the current controller setting.
+4. Use the controller-specific dry runbook for a real dry test.
+5. Only after a clean controller dry run should live consideration begin.
 
 This implementation step is now done experimentally. The controller path exists
 in shared backtest/dry/live code, but it remains disabled by default and should

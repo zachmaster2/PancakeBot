@@ -8,6 +8,15 @@ under a stricter promotion standard.
 This plan is approved as the next execution sequence, but it is not to be
 started until the user explicitly says `GO`.
 
+## Latest Status
+
+As of `2026-03-29`, flow overlay is no longer the main path to the next real
+dry test. The stronger current rollout candidate is a no-skip window
+controller over `stageB` and `disloc_cons_20260227_x80`. This document remains
+the retained flow-specific rehabilitation plan, but controller dry-test
+readiness should now be judged primarily from the window-controller runbook and
+current-context notes.
+
 ## Why This Is Needed
 
 The currently promoted hybrid runtime (`stageB + flow`) was recently promoted

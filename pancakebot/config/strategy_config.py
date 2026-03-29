@@ -206,9 +206,9 @@ class WindowControllerConfig:
     enabled: bool = False
     mode: str = "trailing_best_vs_baseline"
     baseline_profile_name: str = "disloc_stageB_bullonly_recent8pct_v1"
-    alternate_profile_name: str = "disloc_stageG2_bullonly_recent5pct_v1"
+    alternate_profile_name: str = "disloc_cons_20260227_x80"
     window_rounds: int = 216
-    lookback_windows: int = 2
+    lookback_windows: int = 3
     margin_per_500: float = 1.0
     skip_threshold_per_500: float = 0.0
 

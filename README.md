@@ -95,3 +95,18 @@ without starting the dry/live loop, use:
 ```powershell
 .\.venv\Scripts\python.exe run.py --sync-only
 ```
+
+Experimental controller dry tests should not edit `config.toml` directly.
+Use the runbook in [WINDOW_CONTROLLER_DRY_TEST_RUNBOOK.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/WINDOW_CONTROLLER_DRY_TEST_RUNBOOK.md) together with:
+
+```powershell
+.\.venv\Scripts\python.exe -m inspection.write_window_controller_runtime_config ...
+```
+
+Current best experimental controller dry-test candidate:
+- baseline: `disloc_stageB_bullonly_recent8pct_v1`
+- alternate: `disloc_cons_20260227_x80`
+- mode: `trailing_best_vs_baseline`
+- `window_rounds = 216`
+- `lookback_windows = 3`
+- `margin_per_500 = 1.0`

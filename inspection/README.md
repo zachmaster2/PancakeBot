@@ -130,22 +130,37 @@ Additional inspection probes for strategy-routing experiments:
    JSON. Keep this secondary to the rolling causal backtest lane.
 25. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
-   and flags obvious anomalies during long dry-mode runs.
-26. `inspection/run_backtest_cache_perf.py`:
+   and flags obvious anomalies during long dry-mode runs. It now also supports
+   controller-specific allowlists for `controller_selected_profile` and
+   `controller_selected_action`.
+26. `inspection/run_window_controller_shared_eval.py`:
+   runs sequential shared-harness backtests for one fixed window-controller
+   setting versus static `stageB` across multiple tail sizes and offsets,
+   exporting both per-run rows and aggregate summary JSON. Use this as the
+   main qualification gate before any controller-driven dry test. The current
+   best branch is `stageB` vs `disloc_cons_20260227_x80`, no-skip
+   `lookback=3`, `margin=1.0`.
+27. `inspection/write_window_controller_runtime_config.py`:
+   materializes a dedicated runtime config for a controller dry test under
+   `../PancakeBot_var_exp/`, patching both `active_candidate_names` and the
+   `[strategy.window_controller]` section so `run.py --dry --config ...` can
+   use the controller without editing `config.toml`. Its defaults now match
+   the current `stageB` vs `disloc_cons_20260227_x80` dry-test candidate.
+28. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
-27. `inspection/run_backtest_warm_matrix.py`:
+29. `inspection/run_backtest_warm_matrix.py`:
    warm-cache matrix runner that prints and exports a consolidated table with:
    mode, reset interval, net profit, profit per 500 rounds, max drawdown,
    num bets, and top skip reasons.
-28. `inspection/run_backtest_router_matrix.py`:
+30. `inspection/run_backtest_router_matrix.py`:
    router sweep runner over `selector_max_score` and/or `online_cellmean`
    knobs, exporting a sorted table with profitability, drawdown, bet count,
    skip reasons, selected-strategy mix, and warm-run time.
-29. `inspection/run_final_model_gate_window_sweep.py`:
+31. `inspection/run_final_model_gate_window_sweep.py`:
    long-window gate/profile sweep with resume support and optional
    multiprocessing (`--max-workers`) for independent runs.
-30. `inspection/cleanup_experiment_artifacts.py`:
+32. `inspection/cleanup_experiment_artifacts.py`:
    retention/cleanup helper for state-cache files, failed-run directories, and
    optional SQLite `VACUUM` on cache/registry DBs.
 
