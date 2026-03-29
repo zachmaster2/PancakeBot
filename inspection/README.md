@@ -76,15 +76,17 @@ Additional inspection probes for strategy-routing experiments:
    `delta_logistic`, `delta_hgb`) with explicit `skip`, selected-bet-rate
    accounting, optional minimum window holds, and configurable cold-start
    behavior. This is now the preferred next step after a profile-set compare
-   run when heuristic controllers plateau.
+   run when heuristic controllers plateau, and the main evidence lane for
+   controller research.
 14. `inspection/run_profile_set_shadow_recommender.py`:
    consumes an existing profile-set compare CSV plus fixed model parameters and
    writes a current next-window recommendation JSON for shadow-only tracking.
+   This is now secondary tooling, not the main controller-evaluation path.
 15. `inspection/run_profile_set_shadow_refresh.py`:
    one-command wrapper that rebuilds/resumes the mixed profile-set compare run
    and then writes the current shadow recommendation JSON plus a small summary
-   JSON. This is the easiest operational entrypoint for the current
-   mixed-profile shadow lane.
+   JSON. Use this only for final sanity checks, not as the primary research
+   workflow.
 16. `inspection/run_profile_candidate_miner.py`:
    replays older dislocation profiles on the current non-overlapping
    `216`-window framing, then ranks them by controller-set value against an
@@ -97,7 +99,8 @@ Additional inspection probes for strategy-routing experiments:
    generic features and broader profile mining both plateaued.
 18. `inspection/run_profile_set_penalty_shadow_recommender.py`:
    writes a shadow-only next-window recommendation JSON for the calibrated
-   penalty selector, without touching runtime control.
+   penalty selector, without touching runtime control. This is secondary to
+   the completed-window causal evaluation path.
 19. `inspection/run_profile_set_penalty_shadow_refresh.py`:
    one-command wrapper that rebuilds/resumes the calibrated mixed profile-set
    compare, then emits the current penalty-shadow recommendation JSON plus a
@@ -109,12 +112,12 @@ Additional inspection probes for strategy-routing experiments:
 21. `inspection/run_profile_set_penalty_shadow_validate_refresh.py`:
    convenience wrapper that refreshes the calibrated penalty-shadow
    recommendation and immediately validates it against the current contained
-   dry run.
+   dry run. Use only as a final sanity check.
 22. `inspection/run_profile_set_penalty_shadow_monitor.py`:
    longitudinal monitor that reruns the calibrated
    refresh-and-validate path only when the contained dry run advances, then
    appends timestamped shadow-vs-dry snapshots to JSONL plus a latest summary
-   JSON.
+   JSON. Keep this secondary to the rolling causal backtest lane.
 23. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
    and flags obvious anomalies during long dry-mode runs.

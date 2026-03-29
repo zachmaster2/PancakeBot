@@ -164,17 +164,11 @@ The current next step is therefore not runtime promotion. It is:
 - validate whether it remains strong enough to become a shadow-only
   recommender before any live/dry control change
 
-That shadow-only lane is now tooled in
-`inspection/run_profile_set_shadow_recommender.py`, which writes a current
-next-window recommendation JSON from a completed mixed-profile compare set
-without touching runtime control.
-
-For operational convenience, `inspection/run_profile_set_shadow_refresh.py`
-now wraps the whole shadow refresh path into one command:
-
-1. resume or rebuild the mixed profile-set compare set
-2. emit the current shadow recommendation JSON
-3. write a small summary JSON with the chosen profile and predicted strength
+That shadow-only lane is still available in
+`inspection/run_profile_set_shadow_recommender.py`, but it is no longer the
+primary research lane. The primary evaluation path is now causal rolling
+backtests on completed windows. Shadow recommendation tooling remains useful
+only as a final sanity check before any runtime-controller rollout.
 
 ## Next-Phase Roadmap
 
@@ -195,14 +189,19 @@ The next full branch after the current shadow-only lane is:
    - Re-run the model controller and compare against the current bar:
      about `+0.578433 / 500` at about `7.29%` selected bet rate.
 
-3. Shadow validation.
+3. Causal rolling validation.
    - If the expanded-pool controller improves materially, keep runtime
-     contained and validate it as a shadow-only recommender over time.
-   - Compare shadow recommendations to actual contained dry behavior.
+     contained and validate it first through rolling causal backtests on
+     completed windows.
+   - Compare realized controller picks against realized `stageB`, oracle, and
+     regret.
 
 4. Runtime-controller gate.
-   - Only if shadow behavior remains strong should the next step become a
-     written runtime-controller spec and later a controlled dry rollout.
+   - Only if rolling causal behavior remains strong should the next step
+     become a written runtime-controller spec and later a controlled dry
+     rollout.
+   - Shadow may be used at the very end as a final sanity check, but not as
+     the main evidence lane.
 
 5. Fallback path if expansion fails.
    - If added profiles raise oracle but not the model controller, prune the
@@ -260,19 +259,9 @@ That calibration branch is now positive:
   - flow penalty around `0.2-0.4`
   - no meaningful `stageG2` penalty
 
-The next step is therefore shadow validation of this calibrated controller,
-not runtime promotion. A shadow-only recommender now exists in
-`inspection/run_profile_set_penalty_shadow_recommender.py`, and the current
-materialized recommendation is `skip`.
-
-That shadow lane is now upgraded with validation tooling:
-
-- `inspection/run_profile_set_penalty_shadow_refresh.py` refreshes the
-  calibrated mixed compare and emits the current recommendation
-- `inspection/run_profile_set_shadow_validation.py` compares that
-  recommendation against the contained dry run
-- `inspection/run_profile_set_penalty_shadow_validate_refresh.py` wraps both
-  steps into one command
+The next step is therefore not runtime promotion. It is stronger rolling
+causal validation of this calibrated controller on completed windows.
+Shadow-only tooling still exists, but it is secondary.
 
 On the refreshed current-data compare set (`2026-03-29`), the calibrated
 controller is still positive but weaker than the older frozen result:
@@ -282,33 +271,24 @@ controller is still positive but weaker than the older frozen result:
 - static `stageB` on that same refreshed compare:
   about `+0.115151 / 500`
 
-The refreshed shadow recommendation is now materially different from the
-older `skip` recommendation:
+The current high-signal completed-window comparison is:
 
-- chosen profile: `flow_bear_loose10`
-- predicted next-window strength: about `+1.148784 / 500`
+- refreshed calibrated controller:
+  about `+0.284473 / 500`
+- static `stageB` on that same refreshed compare:
+  about `+0.115151 / 500`
+- on the latest completed refreshed `216`-round window, the calibrated
+  controller would have chosen `skip`, realizing `0.0 / 500`
+- on that same window, realized `stageB` was about `-0.693855 / 500`
+- hindsight best profile on that same window was `flow_bear_loose10` at about
+  `+1.304968 / 500`
 
-Against the current contained dry run, this validates as
-`divergent_by_design`, not as a runtime bug:
+So the controller is still beating contained `stageB` on current completed
+windows, but not extracting the full oracle.
 
-- contained dry is still `stageB`-only and currently all-skip
-- the refreshed shadow lane wants a flow-bear window
-- the resulting divergence is exactly the thing to observe before any runtime
-  controller promotion
-
-So the current next step remains:
+The current next step remains:
 
 - keep runtime contained
-- keep the calibrated controller shadow-only
-- accumulate more shadow-vs-contained observations over time before writing a
-  runtime-controller spec
-
-That longitudinal shadow observation lane is now explicitly tooled in
-`inspection/run_profile_set_penalty_shadow_monitor.py`, which:
-
-1. watches the contained dry cycle audit for advancement
-2. reruns the calibrated shadow refresh/validation only when dry advances
-3. appends timestamped shadow-vs-dry snapshots to JSONL
-
-This is now the preferred operational path for building up real shadow
-evidence while keeping runtime control unchanged.
+- keep using rolling causal backtests as the primary evidence source
+- use shadow only as a thin final sanity check before any runtime-controller
+  spec or rollout
