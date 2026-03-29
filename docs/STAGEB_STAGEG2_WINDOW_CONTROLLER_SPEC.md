@@ -33,39 +33,47 @@ The current primary lane is the two-profile controller plus optional skip.
 ### Practical no-skip controller
 
 - mode: `trailing_best_vs_stageb`
-- lookback: `1`
-- margin: `0.5 / 500`
+- lookback: `2`
+- margin: `1.0 / 500`
 - actions: `stageB` or `stageG2_bullonly`
 
-Current completed-window evidence:
+Current shared-harness evidence:
 
-- latest `30k` / `30` windows:
-  about `+0.302818 / 500`, selected bet rate about `7.28%`
-- recent `40k` / `40` windows:
-  about `+0.262321 / 500`, selected bet rate about `7.34%`
-- latest `50k` / `50` windows:
-  about `+0.216263 / 500`, selected bet rate about `7.62%`
+- latest `6480`-round tail:
+  about `+0.044224 / 500`, bet rate about `8.92%`
+- latest `8640`-round tail:
+  about `+0.083013 / 500`, bet rate about `8.31%`
+- latest `10800`-round tail:
+  about `+0.019785 / 500`, bet rate about `9.06%`
+- multi-offset shared check:
+  - `6480`: mean about `+0.180962 / 500`, beat static `stageB` on `5/5`
+  - `8640`: mean about `-0.005180 / 500`, beat static `stageB` on `2/5`
+  - `10800`: mean about `+0.019460 / 500`, beat static `stageB` on `5/5`
 
 ### Safer skip-aware controller
 
 - mode: `trailing_best_vs_stageb_with_skip`
-- lookback: `1`
-- margin: `0.5 / 500`
+- lookback: `5`
+- margin: `1.0 / 500`
 - skip threshold: `0.0`
 
-Current completed-window evidence:
+Current shared-harness evidence:
 
-- latest `30k` / `30` windows:
-  about `+0.314530 / 500`, selected bet rate about `4.97%`
-- recent `40k` / `40` windows:
-  about `+0.284033 / 500`, selected bet rate about `5.22%`
-- latest `50k` / `50` windows:
-  about `+0.273838 / 500`, selected bet rate about `5.06%`
+- latest `6480`-round tail:
+  about `+0.009785 / 500`, bet rate about `6.67%`
+- latest `8640`-round tail:
+  about `+0.105242 / 500`, bet rate about `4.76%`
+- latest `10800`-round tail:
+  about `+0.012678 / 500`, bet rate about `4.88%`
 
 Interpretation:
 
-- the skip-aware variant is slightly stronger on `BNB / 500`
-- the no-skip variant is safer against falling below the practical `5%` floor
+- the skip-aware variant can still be stronger on isolated tails
+- but it currently falls below the practical `5%` floor too often in the
+  continuous shared harness
+- the no-skip variant is the stronger runtime-controller candidate right now,
+  but it is still not rollout-safe because the `8640` multi-offset slice
+  remains mixed
 
 ## Profile Definitions
 
@@ -108,6 +116,11 @@ not use current-window realized data when choosing.
 3. Emit the current heuristic recommendation offline.
 4. Compare refreshed recommendations over time.
 5. Only then implement the runtime-controller path.
+
+This implementation step is now done experimentally. The controller path exists
+in shared backtest/dry/live code, but it remains disabled by default and should
+still be treated as research-only until broader continuous-run evidence is
+stronger than static `stageB`.
 
 ## Non-Goals
 
