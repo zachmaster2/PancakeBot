@@ -17,6 +17,7 @@ from pancakebot.domain.strategy.dislocation_engine import DislocationEngine
 from pancakebot.domain.strategy.flow_candidate_adapter import FlowCandidateAdapter
 from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterDecision
+from pancakebot.domain.strategy.window_controller import WindowController, WindowControllerDecision
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
@@ -76,6 +77,12 @@ class StrategyPipelineDecision:
     selector_score_bnb: float | None
     skip_reason: str | None
     p_bull: float | None
+    controller_mode: str | None = None
+    controller_window_index: int | None = None
+    controller_selected_profile: str | None = None
+    controller_selected_action: str | None = None
+    controller_estimated_per_500: float | None = None
+    controller_estimated_selected_bet_rate: float | None = None
 
 
 class StrategyPipeline:
@@ -89,6 +96,7 @@ class StrategyPipeline:
         treasury_fee_fraction: float,
         ml_candidate_adapter: MlCandidateAdapter | None = None,
         flow_candidate_adapter: FlowCandidateAdapter | None = None,
+        window_controller: WindowController | None = None,
     ) -> None:
         if not (0.0 <= float(treasury_fee_fraction) < 1.0):
             raise InvariantError("strategy_pipeline_treasury_fee_fraction_out_of_range")
@@ -97,6 +105,7 @@ class StrategyPipeline:
         self._treasury_fee_fraction = float(treasury_fee_fraction)
         self._ml_candidate_adapter = ml_candidate_adapter
         self._flow_candidate_adapter = flow_candidate_adapter
+        self._window_controller = window_controller
         self._pending_candidate_signals_by_epoch: dict[int, dict[str, StrategyCandidateSignal]] = {}
         self._last_settled_epoch: int | None = None
 
@@ -139,6 +148,11 @@ class StrategyPipeline:
                 if self._flow_candidate_adapter is not None
                 else None
             ),
+            "window_controller_state": (
+                self._window_controller.export_bootstrap_state()
+                if self._window_controller is not None
+                else None
+            ),
         }
 
     def import_bootstrap_state(self, *, state: dict[str, object]) -> None:
@@ -169,6 +183,14 @@ class StrategyPipeline:
             if not isinstance(flow_state, dict):
                 raise InvariantError("pipeline_snapshot_flow_state_invalid")
             self._flow_candidate_adapter.import_bootstrap_state(state=flow_state)
+
+        window_controller_state = state.get("window_controller_state")
+        if window_controller_state is not None:
+            if self._window_controller is None:
+                raise InvariantError("pipeline_snapshot_window_controller_state_without_controller")
+            if not isinstance(window_controller_state, dict):
+                raise InvariantError("pipeline_snapshot_window_controller_state_invalid")
+            self._window_controller.import_bootstrap_state(state=window_controller_state)
 
         last_settled_epoch = state.get("last_settled_epoch")
         if last_settled_epoch is None:
@@ -241,13 +263,22 @@ class StrategyPipeline:
             )
 
         routed = self._router.route_round(
-            candidate_signals=signals,
+            candidate_signals=self._routed_candidate_signals(
+                round_t=round_t,
+                candidate_signals=signals,
+            ),
             bankroll_bnb=float(bankroll_bnb),
             bet_gas_cost_bnb=float(GAS_COST_BET_BNB),
             selector_ready=bool(self._dislocation_engine.selector_ready()),
             realized_profit_by_candidate=realized,
         )
-        return self._to_pipeline_decision(routed=routed)
+        return self._to_pipeline_decision(
+            routed=routed,
+            controller_decision=self._window_controller_decision_for_round(
+                round_t=round_t,
+                candidate_signals=signals,
+            ),
+        )
 
     def settle_closed_rounds(self, *, rounds: list[Round]) -> None:
         """Advance provider/router state from newly closed rounds."""
@@ -266,6 +297,12 @@ class StrategyPipeline:
                 candidate_signals=signals,
                 round_closed=round_t,
             )
+            if self._window_controller is not None and bool(self._window_controller.enabled):
+                self._window_controller.observe_round_settlement(
+                    round_t=round_t,
+                    candidate_signals=signals,
+                    realized_profit_by_candidate=realized,
+                )
             self._router.observe_settlement(
                 candidate_signals=signals,
                 realized_profit_by_candidate=realized,
@@ -451,8 +488,42 @@ class StrategyPipeline:
             out[str(candidate_name)] = float(profit)
         return out
 
+    def _window_controller_decision_for_round(
+        self,
+        *,
+        round_t: Round,
+        candidate_signals: dict[str, StrategyCandidateSignal],
+    ) -> WindowControllerDecision | None:
+        if self._window_controller is None:
+            return None
+        return self._window_controller.decision_for_round(
+            round_t=round_t,
+            candidate_signals=candidate_signals,
+        )
+
+    def _routed_candidate_signals(
+        self,
+        *,
+        round_t: Round,
+        candidate_signals: dict[str, StrategyCandidateSignal],
+    ) -> dict[str, StrategyCandidateSignal]:
+        decision = self._window_controller_decision_for_round(
+            round_t=round_t,
+            candidate_signals=candidate_signals,
+        )
+        if decision is None:
+            return dict(candidate_signals)
+        return self._window_controller.apply_to_candidate_signals(
+            candidate_signals=candidate_signals,
+            decision=decision,
+        )
+
     @staticmethod
-    def _to_pipeline_decision(*, routed: StrategyRouterDecision) -> StrategyPipelineDecision:
+    def _to_pipeline_decision(
+        *,
+        routed: StrategyRouterDecision,
+        controller_decision: WindowControllerDecision | None,
+    ) -> StrategyPipelineDecision:
         return StrategyPipelineDecision(
             action=str(routed.action),
             selected_strategy=(
@@ -466,4 +537,28 @@ class StrategyPipeline:
             ),
             skip_reason=str(routed.skip_reason) if routed.skip_reason is not None else None,
             p_bull=float(routed.p_bull) if routed.p_bull is not None else None,
+            controller_mode=(
+                None if controller_decision is None or controller_decision.mode is None else str(controller_decision.mode)
+            ),
+            controller_window_index=(
+                None if controller_decision is None or controller_decision.window_index is None else int(controller_decision.window_index)
+            ),
+            controller_selected_profile=(
+                None
+                if controller_decision is None or controller_decision.selected_profile_name is None
+                else str(controller_decision.selected_profile_name)
+            ),
+            controller_selected_action=(
+                None if controller_decision is None else str(controller_decision.selected_action)
+            ),
+            controller_estimated_per_500=(
+                None
+                if controller_decision is None or controller_decision.estimated_selected_per_500 is None
+                else float(controller_decision.estimated_selected_per_500)
+            ),
+            controller_estimated_selected_bet_rate=(
+                None
+                if controller_decision is None or controller_decision.estimated_selected_bet_rate is None
+                else float(controller_decision.estimated_selected_bet_rate)
+            ),
         )

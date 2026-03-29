@@ -11,6 +11,7 @@ from pancakebot.config.strategy_config import (
     DislocationSelectorConfig,
     FlowCandidateConfig,
     StrategyRouterConfig as StrategyConfigRouterConfig,
+    WindowControllerConfig,
 )
 from pancakebot.core.errors import InvariantError
 from pancakebot.domain.strategy.pipeline import required_pipeline_warmup_rounds
@@ -70,6 +71,17 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertEqual(40, int(cfg.strategy.flow_candidate.roll_window))
         self.assertAlmostEqual(0.48, float(cfg.strategy.flow_candidate.roll_winrate_min))
         self.assertEqual(40, int(cfg.strategy.flow_candidate.cooldown_trades))
+        self.assertEqual(False, bool(cfg.strategy.window_controller.enabled))
+        self.assertEqual("trailing_best_vs_baseline", str(cfg.strategy.window_controller.mode))
+        self.assertEqual(_STAGE_B_BULL_NAME, str(cfg.strategy.window_controller.baseline_profile_name))
+        self.assertEqual(
+            "disloc_stageG2_bullonly_recent5pct_v1",
+            str(cfg.strategy.window_controller.alternate_profile_name),
+        )
+        self.assertEqual(216, int(cfg.strategy.window_controller.window_rounds))
+        self.assertEqual(1, int(cfg.strategy.window_controller.lookback_windows))
+        self.assertAlmostEqual(0.5, float(cfg.strategy.window_controller.margin_per_500))
+        self.assertAlmostEqual(0.0, float(cfg.strategy.window_controller.skip_threshold_per_500))
 
         candidates = {str(c.name): c for c in cfg.strategy.dislocation.candidates}
         self.assertEqual([_STAGE_B_BULL_NAME], list(candidates.keys()))
@@ -93,6 +105,7 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         config_router_defaults = StrategyConfigRouterConfig()
         domain_router_defaults = DomainRouterConfig()
         flow_defaults = FlowCandidateConfig()
+        window_controller_defaults = WindowControllerConfig()
 
         self.assertEqual(10000, int(selector_defaults.warmup_rounds))
 
@@ -117,6 +130,17 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertEqual(40, int(flow_defaults.roll_window))
         self.assertAlmostEqual(0.48, float(flow_defaults.roll_winrate_min))
         self.assertEqual(40, int(flow_defaults.cooldown_trades))
+        self.assertEqual(False, bool(window_controller_defaults.enabled))
+        self.assertEqual("trailing_best_vs_baseline", str(window_controller_defaults.mode))
+        self.assertEqual(_STAGE_B_BULL_NAME, str(window_controller_defaults.baseline_profile_name))
+        self.assertEqual(
+            "disloc_stageG2_bullonly_recent5pct_v1",
+            str(window_controller_defaults.alternate_profile_name),
+        )
+        self.assertEqual(216, int(window_controller_defaults.window_rounds))
+        self.assertEqual(1, int(window_controller_defaults.lookback_windows))
+        self.assertAlmostEqual(0.5, float(window_controller_defaults.margin_per_500))
+        self.assertAlmostEqual(0.0, float(window_controller_defaults.skip_threshold_per_500))
 
     def test_runtime_state_paths_can_be_overridden(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")
