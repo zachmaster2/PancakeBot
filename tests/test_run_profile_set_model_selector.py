@@ -11,6 +11,7 @@ from inspection.run_profile_set_model_selector import (
     _feature_names,
     _load_compare_rows,
     _predict_next_recommendation,
+    _cold_start_pick,
 )
 
 
@@ -89,6 +90,9 @@ class ProfileSetModelSelectorTests(unittest.TestCase):
         self.assertIn("feat_stageb_mean_per500_l1", features)
         self.assertIn("feat_stageg2_bullonly_delta_mean_vs_stageb_l2", features)
         self.assertIn("feat_stageg2_bullonly_delta_last_vs_stageb_l1", names)
+        self.assertIn("feat_pool_mean_best_per500_l2", features)
+        self.assertIn("feat_stageg2_bullonly_trend_slope_per500_l2", names)
+        self.assertIn("feat_stageg2_bullonly_beat_stageb_frac_l2", names)
 
     def test_evaluate_model_selectors_returns_model_modes(self) -> None:
         compare_csv = self._write_compare_csv()
@@ -100,10 +104,17 @@ class ProfileSetModelSelectorTests(unittest.TestCase):
             feature_lookbacks=[1, 2],
             min_train_windows_list=[2],
             min_hold_windows_list=[1, 2],
+            cold_start_modes=["baseline_or_skip", "prev_winner_with_skip", "trailing_best_vs_stageb_with_skip"],
+            cold_start_lookbacks=[1, 2],
             margins_per_500=[0.0],
             skip_thresholds_per_500=[0.0],
+            modes=["delta_ridge", "delta_logistic", "delta_hgb"],
             ridge_alphas=[1.0],
             logistic_c_values=[1.0],
+            hgb_learning_rates=[0.1],
+            hgb_max_depths=[2],
+            hgb_max_leaf_nodes_list=[15],
+            hgb_min_samples_leaf_list=[2],
             min_selected_bet_rate=0.05,
         )
         modes = {row.mode for row in results}
@@ -111,9 +122,11 @@ class ProfileSetModelSelectorTests(unittest.TestCase):
         self.assertIn("oracle_with_skip", modes)
         self.assertIn("delta_ridge", modes)
         self.assertIn("delta_logistic", modes)
+        self.assertIn("delta_hgb", modes)
         top = results[0]
         self.assertGreaterEqual(float(top.mean_selected_bet_rate), 0.05)
         self.assertIn(int(top.min_hold_windows), {1, 2})
+        self.assertIn(top.cold_start_mode, {"baseline_or_skip", "prev_winner_with_skip", "trailing_best_vs_stageb_with_skip"})
 
     def test_predict_next_recommendation_returns_valid_profile(self) -> None:
         compare_csv = self._write_compare_csv()
@@ -126,13 +139,45 @@ class ProfileSetModelSelectorTests(unittest.TestCase):
             feature_lookbacks=[1, 2],
             min_train_windows=2,
             min_hold_windows=1,
+            cold_start_mode="baseline_or_skip",
+            cold_start_lookback=0,
             ridge_alpha=1.0,
             logistic_c=1.0,
+            hgb_learning_rate=0.1,
+            hgb_max_depth=2,
+            hgb_max_leaf_nodes=15,
+            hgb_min_samples_leaf=2,
             margin_per_500=0.0,
             skip_threshold_per_500=0.0,
         )
         self.assertIn(recommendation.chosen_profile, {"stageb", "stageg2_bullonly", "skip"})
         self.assertGreaterEqual(recommendation.training_window_count, 2)
+
+    def test_cold_start_pick_supports_prev_winner_and_trailing_modes(self) -> None:
+        compare_csv = self._write_compare_csv()
+        profiles, rows = _load_compare_rows(compare_csv)
+        prev_pick = _cold_start_pick(
+            rows=rows,
+            current_idx=1,
+            profiles=profiles,
+            baseline_profile_name="stageb",
+            cold_start_mode="prev_winner_with_skip",
+            cold_start_lookback=0,
+            margin_per_500=0.0,
+            skip_threshold_per_500=0.0,
+        )
+        trailing_pick = _cold_start_pick(
+            rows=rows,
+            current_idx=2,
+            profiles=profiles,
+            baseline_profile_name="stageb",
+            cold_start_mode="trailing_best_vs_stageb_with_skip",
+            cold_start_lookback=2,
+            margin_per_500=0.0,
+            skip_threshold_per_500=0.0,
+        )
+        self.assertEqual("stageb", prev_pick[0])
+        self.assertIn(trailing_pick[0], {"stageb", "stageg2_bullonly", "skip"})
 
 
 if __name__ == "__main__":
