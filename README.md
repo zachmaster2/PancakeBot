@@ -44,6 +44,7 @@ Current shared baseline:
       | Backtest  | `.\.venv\Scripts\python.exe run.py --backtest` | simulates dry/live deterministically without sleeping |
       | Dry       | `.\.venv\Scripts\python.exe run.py --dry`      | simulates bets/claims without broadcasting            |
       | Live      | `.\.venv\Scripts\python.exe run.py`            | places real on-chain bets                             |
+      | Sync only | `.\.venv\Scripts\python.exe run.py --sync-only` | updates closed rounds and kline coverage, then exits  |
 
       - Outputs (`var/`):
          - Backtest:
@@ -86,4 +87,11 @@ Recommended preflight before a long dry run:
 .\.venv\Scripts\python.exe -m inspection.run_runtime_preflight --check-env
 
 .\.venv\Scripts\python.exe -m inspection.run_backtest_scenario --name smoke_promoted_runtime_profile --sim-size 200 --reset-mode continuous
+```
+
+If you only need the latest on-disk market inputs for research or inspection,
+without starting the dry/live loop, use:
+
+```powershell
+.\.venv\Scripts\python.exe run.py --sync-only
 ```
