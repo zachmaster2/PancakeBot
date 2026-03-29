@@ -26,14 +26,21 @@ from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionCont
 from pancakebot.runtime.contract_constants_cache import ContractConstants, load_contract_constants, save_contract_constants
 from pancakebot.runtime.runtime_loop import RuntimeConfig, run_live_loop
 from pancakebot.core.determinism import set_global_determinism
+from pancakebot.integration.sync_mode import sync_runtime_market_data
+from pancakebot.core.errors import InvariantError
+from pancakebot.core.logging import info
 
 
 _BINANCE_US_SYMBOL = "BNBUSDT"
 
 
-def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
+def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: bool) -> None:
     cfg = load_app_config(config_path)
     set_global_determinism(seed=int(cfg.random_seed))
+
+    selected_modes = int(bool(dry)) + int(bool(backtest)) + int(bool(sync_only))
+    if selected_modes > 1:
+        raise InvariantError("run_modes_mutually_exclusive")
 
     round_store = ClosedRoundsStore(cfg.closed_rounds_path)
     klines_store = KlinesStore(cfg.klines_path)
@@ -95,6 +102,30 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool) -> None:
                 market_data_store.close()
             except Exception:
                 pass
+        return
+
+    if sync_only:
+        load_env()
+        graph_api_key = require_env("THE_GRAPH_API_KEY")
+        graph = GraphClient(endpoint=PREDICTION_V2_GRAPH_ENDPOINT, api_key=graph_api_key)
+        summary = sync_runtime_market_data(
+            cfg=cfg,
+            graph=graph,
+            round_store=round_store,
+            klines_store=klines_store,
+            binance_us_client=binance_us_client,
+            binance_us_symbol=_BINANCE_US_SYMBOL,
+        )
+        info(
+            "CORE",
+            "SYNC",
+            "DONE",
+            msg=(
+                f"closed_rounds={int(summary.stored_closed_round_count)} "
+                f"epochs=[{int(summary.earliest_closed_epoch)}..{int(summary.latest_closed_epoch)}] "
+                f"klines_changed={int(summary.kline_changed_count)}"
+            ),
+        )
         return
 
     load_env()

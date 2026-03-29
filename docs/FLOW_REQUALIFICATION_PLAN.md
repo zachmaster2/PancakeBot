@@ -292,3 +292,67 @@ The current next step remains:
 - keep using rolling causal backtests as the primary evidence source
 - use shadow only as a thin final sanity check before any runtime-controller
   spec or rollout
+
+## Current Primary Execution Plan
+
+1. Build richer completed-window causal evaluation artifacts for the current
+   best calibrated controller.
+   - chosen action
+   - predicted `BNB / 500`
+   - realized chosen `BNB / 500`
+   - realized `stageB`
+   - realized oracle
+   - regret vs oracle
+   - selected bet rate
+
+2. Run that evaluation on broader recent rolling sets.
+   - larger recent tails
+   - multiple completed-window slices
+   - no reliance on still-open windows
+
+3. Diagnose controller errors from completed-window results.
+   - bad flow entries
+   - bad `stageG2` entries
+   - over-skipping / under-skipping
+   - pool-composition or calibration weaknesses
+
+4. Refine the controller, not runtime.
+   - skip calibration
+   - profile penalties
+   - smaller / better profile pool
+   - profile-specific one-vs-baseline gates if needed
+
+5. Re-run broader completed-window evaluation after each meaningful
+   refinement.
+
+6. Keep runtime contained until the controller is clearly qualified.
+   - no runtime promotion during this loop
+   - use shadow only at the very end as a sanity check
+
+7. Agent-owned runtime orchestration.
+   - the agent should start, stop, restart, archive, and clear dry runs when
+     they are actually needed
+   - the user should not have to keep dry mode running manually for the
+     research loop
+
+8. Standalone sync instead of abusing dry mode.
+   - use `run.py --sync-only` to update closed rounds and kline coverage on
+     disk without starting the dry/live loop
+   - this is now the preferred way to keep research inputs current between
+     controller experiments
+
+9. If the controller holds up:
+   - freeze parameters and profile set
+   - write a runtime-controller spec
+   - implement a clean window-controller runtime path
+   - run controller-driven dry mode
+   - only then consider live rollout
+
+10. If the controller is mixed:
+   - shrink or improve the profile pool
+   - try profile-specific gates
+   - continue completed-window testing
+
+11. If the controller fails:
+   - pivot back to candidate generation or regime-feature work
+   - rebuild around profiles with better causal extractability

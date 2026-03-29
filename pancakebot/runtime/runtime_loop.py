@@ -1410,6 +1410,24 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     return closed
 
 
+def required_runtime_sync_cache_n(*, strategy_cfg: StrategyConfig) -> int:
+    warmup_rounds = int(required_pipeline_warmup_rounds(strategy_cfg=strategy_cfg))
+    if warmup_rounds <= 0:
+        raise InvariantError("pipeline_warmup_rounds_nonpositive")
+    return max(2, int(warmup_rounds))
+
+
+def required_klines_window_for_closed_cache(
+    *,
+    closed_cache: RollingClosedRoundsCache,
+    cutoff_seconds: int,
+) -> tuple[int, int]:
+    return _required_klines_window(
+        closed_cache=closed_cache,
+        cutoff_seconds=int(cutoff_seconds),
+    )
+
+
 def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
     # Alignment + cutoff anchoring can be noisy around epoch shifts. Ensure we only
     # take an action using a coherent epoch snapshot.
