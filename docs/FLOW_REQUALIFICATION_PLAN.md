@@ -259,6 +259,85 @@ That calibration branch is now positive:
   - flow penalty around `0.2-0.4`
   - no meaningful `stageG2` penalty
 
+## Primary Evidence Pivot
+
+Use completed-window causal evaluation artifacts as the primary source of truth
+for controller refinement, not shadow recommendations.
+
+The new per-window evaluator in
+`inspection/run_profile_set_penalty_window_eval.py` now exports, for each
+completed window:
+
+- chosen profile/action
+- predicted `BNB / 500`
+- realized chosen `BNB / 500`
+- realized `stageB`
+- realized oracle
+- regret vs oracle
+- selected bet rate
+
+That artifact changed the current branch again:
+
+- on the refreshed mixed `216`-window compare set, the earlier calibrated
+  controller (`ridge_alpha=5.0`, flow penalty `0.2`) still beat static
+  `stageB`, but it was materially over-predictive and one catastrophic
+  `flow_bear_loose10` entry accounted for a large share of avoidable loss
+- the same artifact also showed that the refreshed `20`-window set still has
+  `11` cold-start windows, so it is good for diagnosis but too small to treat
+  as a promotion signal
+
+## Current Narrowing Pivot
+
+A focused recalibration on the refreshed mixed compare set now strongly
+suggests that flow should be demoted from the primary controller action set
+until broader evidence revives it.
+
+Evidence:
+
+- [profileset216_stageb_stageg2_flowbear4_penalty_refocus_20260329_profile_set_penalty_selectors.csv](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/profileset216_stageb_stageg2_flowbear4_penalty_refocus_20260329_profile_set_penalty_selectors.csv)
+  reaches about `+0.353109 / 500`
+- the best rows there use very large flow penalties (`3.0-5.0`)
+- those best rows eliminate flow picks entirely, leaving only:
+  - `stageB`
+  - `stageG2`
+  - `skip`
+- the matching evaluator summary,
+  [profileset216_stageb_stageg2_flowbear4_penalty_refocus_evalrows_20260329_profile_set_penalty_window_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/profileset216_stageb_stageg2_flowbear4_penalty_refocus_evalrows_20260329_profile_set_penalty_window_eval_summary.json),
+  cuts mean prediction error from roughly `-0.3168 / 500` to roughly
+  `-0.0778 / 500`
+
+So the next approved branch is:
+
+1. stop treating mixed `stageB + stageG2 + flow + skip` as the primary
+   controller pool
+2. broaden completed-window causal evaluation over the narrower
+   `stageB + stageG2 + skip` lane first
+3. keep flow as a secondary rehabilitation branch only
+4. revisit flow only if broader completed-window evidence shows it is
+   causally extractable again
+
+That broader completed-window check has now been run on corrected,
+cold-start-causal tooling, and it changes the mainline again:
+
+- on the narrower `stageB + stageG2` lane, the simple heuristics are now
+  stronger than the model and penalty families
+- the corrected best broad `40`-window heuristic is about `+0.308969 / 500`
+  at selected bet rate about `5.15%`
+- the corrected best broad `40`-window ridge model is only about
+  `+0.257892 / 500`
+- the corrected best broad `40`-window penalty controller is only about
+  `+0.222563 / 500`
+
+So the current mainline is no longer "model controller over the narrower
+pool." It is:
+
+1. keep runtime contained
+2. treat the simple `stageB` vs `stageG2` window heuristics as the current
+   leader
+3. validate that heuristic across broader recent tails
+4. if it continues to hold, move next to a runtime-controller spec and only
+   then an eventual controlled dry rollout
+
 The next step is therefore not runtime promotion. It is stronger rolling
 causal validation of this calibrated controller on completed windows.
 Shadow-only tooling still exists, but it is secondary.

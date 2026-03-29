@@ -503,8 +503,11 @@ def _predicted_stageb_per_500(
     baseline_profile_name: str,
     feature_lookbacks: list[int],
 ) -> float:
-    longest = max(int(x) for x in feature_lookbacks)
-    return float(feature_row[f"feat_{str(baseline_profile_name)}_mean_per500_l{int(longest)}"])
+    for lookback in sorted((int(x) for x in feature_lookbacks), reverse=True):
+        key = f"feat_{str(baseline_profile_name)}_mean_per500_l{int(lookback)}"
+        if str(key) in feature_row:
+            return float(feature_row[str(key)])
+    return 0.0
 
 
 def _estimated_profile_bet_rate(
@@ -513,16 +516,21 @@ def _estimated_profile_bet_rate(
     profile_name: str,
     feature_lookbacks: list[int],
 ) -> float:
-    longest = max(int(x) for x in feature_lookbacks)
-    return float(feature_row[f"feat_{str(profile_name)}_mean_betrate_l{int(longest)}"])
+    for lookback in sorted((int(x) for x in feature_lookbacks), reverse=True):
+        key = f"feat_{str(profile_name)}_mean_betrate_l{int(lookback)}"
+        if str(key) in feature_row:
+            return float(feature_row[str(key)])
+    return 0.0
 
 
 def _cold_start_pick(
     *,
     rows: list[CompareWindowRow],
+    feature_row: dict[str, float],
     current_idx: int,
     profiles: list[str],
     baseline_profile_name: str,
+    feature_lookbacks: list[int],
     cold_start_mode: str,
     cold_start_lookback: int,
     margin_per_500: float,
@@ -530,17 +538,21 @@ def _cold_start_pick(
 ) -> tuple[str, float, float]:
     row = rows[int(current_idx)]
     baseline_name = str(baseline_profile_name)
-    baseline_value = float(row.per_500[str(baseline_name)])
+    baseline_predicted = _predicted_stageb_per_500(
+        feature_row=feature_row,
+        baseline_profile_name=str(baseline_name),
+        feature_lookbacks=feature_lookbacks,
+    ) if feature_row else 0.0
     baseline_bet_rate = float(row.bet_rate[str(baseline_name)])
     if str(cold_start_mode) == "baseline_or_skip":
-        if float(baseline_value) <= float(skip_threshold_per_500):
+        if float(baseline_predicted) <= float(skip_threshold_per_500):
             return "skip", 0.0, 0.0
-        return str(baseline_name), float(baseline_value), float(baseline_bet_rate)
+        return str(baseline_name), float(row.per_500[str(baseline_name)]), float(baseline_bet_rate)
     if str(cold_start_mode) == "prev_winner_with_skip":
         if int(current_idx) <= 0:
-            if float(baseline_value) <= float(skip_threshold_per_500):
+            if float(baseline_predicted) <= float(skip_threshold_per_500):
                 return "skip", 0.0, 0.0
-            return str(baseline_name), float(baseline_value), float(baseline_bet_rate)
+        return str(baseline_name), float(row.per_500[str(baseline_name)]), float(baseline_bet_rate)
         prev_row = rows[int(current_idx) - 1]
         prev_winner, prev_value = max(prev_row.per_500.items(), key=lambda item: float(item[1]))
         if float(prev_value) <= float(skip_threshold_per_500):
@@ -548,9 +560,9 @@ def _cold_start_pick(
         return str(prev_winner), float(row.per_500[str(prev_winner)]), float(row.bet_rate[str(prev_winner)])
     if str(cold_start_mode) == "trailing_best_vs_stageb_with_skip":
         if int(current_idx) < int(cold_start_lookback):
-            if float(baseline_value) <= float(skip_threshold_per_500):
+            if float(baseline_predicted) <= float(skip_threshold_per_500):
                 return "skip", 0.0, 0.0
-            return str(baseline_name), float(baseline_value), float(baseline_bet_rate)
+            return str(baseline_name), float(row.per_500[str(baseline_name)]), float(baseline_bet_rate)
         hist = rows[int(current_idx) - int(cold_start_lookback) : int(current_idx)]
         stageb_mean = float(sum(float(x.per_500[str(baseline_name)]) for x in hist) / len(hist))
         best_profile_name = str(baseline_name)
@@ -570,7 +582,7 @@ def _cold_start_pick(
                 float(row.per_500[str(best_profile_name)]),
                 float(row.bet_rate[str(best_profile_name)]),
             )
-        return str(baseline_name), float(baseline_value), float(baseline_bet_rate)
+        return str(baseline_name), float(row.per_500[str(baseline_name)]), float(baseline_bet_rate)
     raise InvariantError("profile_set_model_cold_start_mode_invalid")
 
 
@@ -623,9 +635,11 @@ def _pick_model_window(
     if len(train_indices) < int(min_train_windows):
         return _cold_start_pick(
             rows=rows,
+            feature_row=feature_rows[int(current_idx)],
             current_idx=int(current_idx),
             profiles=profiles,
             baseline_profile_name=str(baseline_profile_name),
+            feature_lookbacks=feature_lookbacks,
             cold_start_mode=str(cold_start_mode),
             cold_start_lookback=int(cold_start_lookback),
             margin_per_500=float(margin_per_500),

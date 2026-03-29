@@ -158,9 +158,17 @@ class ProfileSetModelSelectorTests(unittest.TestCase):
         profiles, rows = _load_compare_rows(compare_csv)
         prev_pick = _cold_start_pick(
             rows=rows,
+            feature_row=_feature_dict(
+                rows=rows,
+                idx=1,
+                profiles=profiles,
+                baseline_profile_name="stageb",
+                feature_lookbacks=[1, 2],
+            ),
             current_idx=1,
             profiles=profiles,
             baseline_profile_name="stageb",
+            feature_lookbacks=[1, 2],
             cold_start_mode="prev_winner_with_skip",
             cold_start_lookback=0,
             margin_per_500=0.0,
@@ -168,9 +176,17 @@ class ProfileSetModelSelectorTests(unittest.TestCase):
         )
         trailing_pick = _cold_start_pick(
             rows=rows,
+            feature_row=_feature_dict(
+                rows=rows,
+                idx=2,
+                profiles=profiles,
+                baseline_profile_name="stageb",
+                feature_lookbacks=[1, 2],
+            ),
             current_idx=2,
             profiles=profiles,
             baseline_profile_name="stageb",
+            feature_lookbacks=[1, 2],
             cold_start_mode="trailing_best_vs_stageb_with_skip",
             cold_start_lookback=2,
             margin_per_500=0.0,
@@ -178,6 +194,23 @@ class ProfileSetModelSelectorTests(unittest.TestCase):
         )
         self.assertEqual("stageb", prev_pick[0])
         self.assertIn(trailing_pick[0], {"stageb", "stageg2_bullonly", "skip"})
+
+    def test_cold_start_pick_is_causal_when_no_history_exists(self) -> None:
+        compare_csv = self._write_compare_csv()
+        profiles, rows = _load_compare_rows(compare_csv)
+        pick = _cold_start_pick(
+            rows=rows,
+            feature_row={},
+            current_idx=0,
+            profiles=profiles,
+            baseline_profile_name="stageb",
+            feature_lookbacks=[1, 2],
+            cold_start_mode="baseline_or_skip",
+            cold_start_lookback=0,
+            margin_per_500=0.0,
+            skip_threshold_per_500=0.0,
+        )
+        self.assertEqual(("skip", 0.0, 0.0), pick)
 
 
 if __name__ == "__main__":
