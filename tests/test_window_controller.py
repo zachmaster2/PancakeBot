@@ -344,7 +344,7 @@ class WindowControllerTests(unittest.TestCase):
         self.assertEqual("profile", decision.controller_selected_action)
         self.assertEqual("stageG2", decision.selected_strategy)
 
-    def test_bootstrap_does_not_seed_window_controller_history(self) -> None:
+    def test_bootstrap_seeds_window_controller_history(self) -> None:
         controller = WindowController(
             config=WindowControllerConfig(
                 enabled=True,
@@ -394,8 +394,61 @@ class WindowControllerTests(unittest.TestCase):
             allow_oracle_mode=False,
         )
 
-        self.assertEqual("stageB", decision.controller_selected_profile)
-        self.assertEqual(0, int(decision.controller_window_index or 0))
+        self.assertEqual("stageG2", decision.controller_selected_profile)
+        self.assertEqual(1, int(decision.controller_window_index or 0))
+
+    def test_bootstrap_seeded_controller_does_not_crash_on_next_settlement(self) -> None:
+        controller = WindowController(
+            config=WindowControllerConfig(
+                enabled=True,
+                baseline_profile_name="stageB",
+                alternate_profile_name="stageG2",
+                window_rounds=2,
+                lookback_windows=1,
+                margin_per_500=0.5,
+            )
+        )
+        signals = {
+            "stageB": _signal(
+                candidate_name="stageB",
+                action="BET",
+                bet_side="Bear",
+                bet_size_bnb=0.1,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.02,
+                skip_reason=None,
+            ),
+            "stageG2": _signal(
+                candidate_name="stageG2",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.1,
+                expected_profit_bnb=0.03,
+                selector_score_bnb=0.03,
+                skip_reason=None,
+            ),
+        }
+        pipeline = StrategyPipeline(
+            dislocation_engine=_FakeDislocationEngine(signals=signals),
+            router=_CapturingRouter(),
+            treasury_fee_fraction=0.03,
+            window_controller=controller,
+        )
+
+        pipeline.bootstrap_from_closed_rounds(
+            rounds=[
+                _closed_round(epoch=1, position="Bull"),
+                _closed_round(epoch=2, position="Bull"),
+            ]
+        )
+        pipeline.decide_open_round(
+            round_t=_open_round(epoch=4),
+            bankroll_bnb=50.0,
+            allow_oracle_mode=False,
+        )
+        pipeline.settle_closed_rounds(rounds=[_closed_round(epoch=3, position="Bull")])
+
+        self.assertEqual(3, int(pipeline.last_settled_epoch or 0))
 
 
 if __name__ == "__main__":

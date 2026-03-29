@@ -26,6 +26,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default="disloc_stageB_bullonly_recent8pct_v1",
     )
     parser.add_argument("--expected-bet-sides", type=str, default="Bull")
+    parser.add_argument("--expected-controller-profiles", type=str, default="")
+    parser.add_argument("--expected-controller-actions", type=str, default="")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--duration-seconds", type=int, default=43_200)
     parser.add_argument("--warn-idle-streak-cycles", type=int, default=240)
@@ -67,6 +69,8 @@ def _summarize(
     rows: list[dict[str, str]],
     expected_strategies: set[str],
     expected_bet_sides: set[str],
+    expected_controller_profiles: set[str],
+    expected_controller_actions: set[str],
     warn_idle_streak_cycles: int,
     warn_min_cycles_for_rate_check: int,
     warn_total_bet_rate_below: float,
@@ -100,6 +104,16 @@ def _summarize(
         for row in bet_rows
         if str(row.get("bet_side", "")).strip()
     )
+    controller_profile_counts = Counter(
+        str(row.get("controller_selected_profile", "")).strip()
+        for row in rows
+        if str(row.get("controller_selected_profile", "")).strip()
+    )
+    controller_action_counts = Counter(
+        str(row.get("controller_selected_action", "")).strip()
+        for row in rows
+        if str(row.get("controller_selected_action", "")).strip()
+    )
     recent_expected_profit = [
         value
         for value in (
@@ -124,6 +138,20 @@ def _summarize(
     )
     if expected_bet_sides and unexpected_sides:
         anomalies.append(f"unexpected_bet_sides={unexpected_sides}")
+    unexpected_controller_profiles = (
+        sorted(name for name in controller_profile_counts if str(name) not in expected_controller_profiles)
+        if expected_controller_profiles
+        else []
+    )
+    if expected_controller_profiles and unexpected_controller_profiles:
+        anomalies.append(f"unexpected_controller_profiles={unexpected_controller_profiles}")
+    unexpected_controller_actions = (
+        sorted(name for name in controller_action_counts if str(name) not in expected_controller_actions)
+        if expected_controller_actions
+        else []
+    )
+    if expected_controller_actions and unexpected_controller_actions:
+        anomalies.append(f"unexpected_controller_actions={unexpected_controller_actions}")
     current_idle_streak = _idle_streak(rows)
     if (
         int(total_cycles) >= int(warn_min_cycles_for_rate_check)
@@ -152,6 +180,8 @@ def _summarize(
         "top_skip_reasons": dict(skip_counts.most_common(5)),
         "selected_strategy_counts": dict(strategy_counts),
         "bet_side_counts": dict(side_counts),
+        "controller_selected_profile_counts": dict(controller_profile_counts),
+        "controller_selected_action_counts": dict(controller_action_counts),
         "recent_mean_expected_profit_bnb": (
             0.0
             if not recent_expected_profit
@@ -168,6 +198,8 @@ def main() -> None:
     summary_json = Path(str(args.summary_json))
     expected_strategies = _parse_allowlist(str(args.expected_strategies))
     expected_bet_sides = _parse_allowlist(str(args.expected_bet_sides))
+    expected_controller_profiles = _parse_allowlist(str(args.expected_controller_profiles))
+    expected_controller_actions = _parse_allowlist(str(args.expected_controller_actions))
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     summary_json.parent.mkdir(parents=True, exist_ok=True)
 
@@ -187,6 +219,8 @@ def main() -> None:
                 rows=rows,
                 expected_strategies=set(expected_strategies),
                 expected_bet_sides=set(expected_bet_sides),
+                expected_controller_profiles=set(expected_controller_profiles),
+                expected_controller_actions=set(expected_controller_actions),
                 warn_idle_streak_cycles=int(args.warn_idle_streak_cycles),
                 warn_min_cycles_for_rate_check=int(args.warn_min_cycles_for_rate_check),
                 warn_total_bet_rate_below=float(args.warn_total_bet_rate_below),

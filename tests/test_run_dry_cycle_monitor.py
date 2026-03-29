@@ -21,6 +21,8 @@ class DryCycleMonitorTests(unittest.TestCase):
             rows=rows,
             expected_strategies={"disloc_stageB_bullonly_recent8pct_v1"},
             expected_bet_sides={"Bull"},
+            expected_controller_profiles=set(),
+            expected_controller_actions=set(),
             warn_idle_streak_cycles=240,
             warn_min_cycles_for_rate_check=240,
             warn_total_bet_rate_below=0.02,
@@ -43,6 +45,8 @@ class DryCycleMonitorTests(unittest.TestCase):
             rows=rows,
             expected_strategies={"disloc_stageB_bullonly_recent8pct_v1"},
             expected_bet_sides={"Bull"},
+            expected_controller_profiles=set(),
+            expected_controller_actions=set(),
             warn_idle_streak_cycles=240,
             warn_min_cycles_for_rate_check=240,
             warn_total_bet_rate_below=0.02,
@@ -51,6 +55,34 @@ class DryCycleMonitorTests(unittest.TestCase):
         anomalies = list(summary["anomalies"])
         self.assertTrue(any("unexpected_selected_strategies" in item for item in anomalies))
         self.assertTrue(any("unexpected_bet_sides" in item for item in anomalies))
+
+    def test_allowlists_flag_unexpected_controller_profile_and_action(self) -> None:
+        rows = [
+            {
+                "action": "SKIP",
+                "selected_strategy": "",
+                "bet_side": "",
+                "skip_reason": "selector_no_candidate",
+                "expected_profit_bnb": "",
+                "controller_selected_profile": "flow_bear_loose10",
+                "controller_selected_action": "profile",
+            },
+        ]
+
+        summary = _summarize(
+            rows=rows,
+            expected_strategies={"disloc_stageB_bullonly_recent8pct_v1"},
+            expected_bet_sides={"Bull"},
+            expected_controller_profiles={"disloc_stageB_bullonly_recent8pct_v1", "disloc_stageG2_bullonly_recent5pct_v1"},
+            expected_controller_actions={"skip"},
+            warn_idle_streak_cycles=240,
+            warn_min_cycles_for_rate_check=240,
+            warn_total_bet_rate_below=0.02,
+        )
+
+        anomalies = list(summary["anomalies"])
+        self.assertTrue(any("unexpected_controller_profiles" in item for item in anomalies))
+        self.assertTrue(any("unexpected_controller_actions" in item for item in anomalies))
 
 
 if __name__ == "__main__":

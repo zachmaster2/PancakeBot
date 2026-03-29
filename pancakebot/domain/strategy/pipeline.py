@@ -222,6 +222,12 @@ class StrategyPipeline:
                 candidate_signals=signals,
                 round_closed=round_t,
             )
+            if self._window_controller is not None and bool(self._window_controller.enabled):
+                self._window_controller.observe_round_settlement(
+                    round_t=round_t,
+                    candidate_signals=signals,
+                    realized_profit_by_candidate=realized,
+                )
             self._router.observe_settlement(
                 candidate_signals=signals,
                 realized_profit_by_candidate=realized,
