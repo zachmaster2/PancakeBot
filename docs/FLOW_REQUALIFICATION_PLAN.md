@@ -264,3 +264,41 @@ The next step is therefore shadow validation of this calibrated controller,
 not runtime promotion. A shadow-only recommender now exists in
 `inspection/run_profile_set_penalty_shadow_recommender.py`, and the current
 materialized recommendation is `skip`.
+
+That shadow lane is now upgraded with validation tooling:
+
+- `inspection/run_profile_set_penalty_shadow_refresh.py` refreshes the
+  calibrated mixed compare and emits the current recommendation
+- `inspection/run_profile_set_shadow_validation.py` compares that
+  recommendation against the contained dry run
+- `inspection/run_profile_set_penalty_shadow_validate_refresh.py` wraps both
+  steps into one command
+
+On the refreshed current-data compare set (`2026-03-29`), the calibrated
+controller is still positive but weaker than the older frozen result:
+
+- best refreshed calibrated controller:
+  about `+0.284473 / 500`
+- static `stageB` on that same refreshed compare:
+  about `+0.115151 / 500`
+
+The refreshed shadow recommendation is now materially different from the
+older `skip` recommendation:
+
+- chosen profile: `flow_bear_loose10`
+- predicted next-window strength: about `+1.148784 / 500`
+
+Against the current contained dry run, this validates as
+`divergent_by_design`, not as a runtime bug:
+
+- contained dry is still `stageB`-only and currently all-skip
+- the refreshed shadow lane wants a flow-bear window
+- the resulting divergence is exactly the thing to observe before any runtime
+  controller promotion
+
+So the current next step remains:
+
+- keep runtime contained
+- keep the calibrated controller shadow-only
+- accumulate more shadow-vs-contained observations over time before writing a
+  runtime-controller spec

@@ -98,24 +98,36 @@ Additional inspection probes for strategy-routing experiments:
 18. `inspection/run_profile_set_penalty_shadow_recommender.py`:
    writes a shadow-only next-window recommendation JSON for the calibrated
    penalty selector, without touching runtime control.
-19. `inspection/run_dry_cycle_monitor.py`:
+19. `inspection/run_profile_set_penalty_shadow_refresh.py`:
+   one-command wrapper that rebuilds/resumes the calibrated mixed profile-set
+   compare, then emits the current penalty-shadow recommendation JSON plus a
+   small summary JSON.
+20. `inspection/run_profile_set_shadow_validation.py`:
+   compares a shadow recommendation JSON against the current contained dry
+   artifacts (`dry_cycle_audit.csv`, `dry_bankroll_state.json`,
+   `dry_audit_trades.csv`) and writes a coherence summary.
+21. `inspection/run_profile_set_penalty_shadow_validate_refresh.py`:
+   convenience wrapper that refreshes the calibrated penalty-shadow
+   recommendation and immediately validates it against the current contained
+   dry run.
+22. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
    and flags obvious anomalies during long dry-mode runs.
-20. `inspection/run_backtest_cache_perf.py`:
+23. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
-21. `inspection/run_backtest_warm_matrix.py`:
+24. `inspection/run_backtest_warm_matrix.py`:
    warm-cache matrix runner that prints and exports a consolidated table with:
    mode, reset interval, net profit, profit per 500 rounds, max drawdown,
    num bets, and top skip reasons.
-22. `inspection/run_backtest_router_matrix.py`:
+25. `inspection/run_backtest_router_matrix.py`:
    router sweep runner over `selector_max_score` and/or `online_cellmean`
    knobs, exporting a sorted table with profitability, drawdown, bet count,
    skip reasons, selected-strategy mix, and warm-run time.
-23. `inspection/run_final_model_gate_window_sweep.py`:
+26. `inspection/run_final_model_gate_window_sweep.py`:
    long-window gate/profile sweep with resume support and optional
    multiprocessing (`--max-workers`) for independent runs.
-24. `inspection/cleanup_experiment_artifacts.py`:
+27. `inspection/cleanup_experiment_artifacts.py`:
    retention/cleanup helper for state-cache files, failed-run directories, and
    optional SQLite `VACUUM` on cache/registry DBs.
 
