@@ -200,10 +200,25 @@ class FlowCandidateConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class WindowControllerConfig:
+    """Optional window-level profile controller shared by live/dry/backtest."""
+
+    enabled: bool = False
+    mode: str = "trailing_best_vs_baseline"
+    baseline_profile_name: str = "disloc_stageB_bullonly_recent8pct_v1"
+    alternate_profile_name: str = "disloc_stageG2_bullonly_recent5pct_v1"
+    window_rounds: int = 216
+    lookback_windows: int = 1
+    margin_per_500: float = 0.5
+    skip_threshold_per_500: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyConfig:
     """Top-level strategy configuration root."""
 
     dislocation: DislocationStrategyConfig
     ml_candidate: MlCandidateConfig
     flow_candidate: FlowCandidateConfig = FlowCandidateConfig()
+    window_controller: WindowControllerConfig = WindowControllerConfig()
     router: StrategyRouterConfig = StrategyRouterConfig()

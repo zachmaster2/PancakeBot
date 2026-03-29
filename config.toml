@@ -612,6 +612,18 @@ roll_edge_min = -0.002
 roll_winrate_min = 0.48
 cooldown_trades = 40
 
+[strategy.window_controller]
+# Research-only window controller. Disabled by default until it clears
+# broader causal backtests and a controlled dry rollout.
+enabled = false
+mode = "trailing_best_vs_baseline"
+baseline_profile_name = "disloc_stageB_bullonly_recent8pct_v1"
+alternate_profile_name = "disloc_stageG2_bullonly_recent5pct_v1"
+window_rounds = 216
+lookback_windows = 1
+margin_per_500 = 0.5
+skip_threshold_per_500 = 0.0
+
 [backtest]
 # Number of most-recent closed rounds to replay.
 simulation_size = 20000

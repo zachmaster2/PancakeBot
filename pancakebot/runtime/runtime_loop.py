@@ -46,6 +46,7 @@ from pancakebot.domain.strategy.flow_candidate_adapter import FlowCandidateAdapt
 from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
 from pancakebot.domain.strategy.pipeline import StrategyPipeline, required_pipeline_warmup_rounds
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterConfig
+from pancakebot.domain.strategy.window_controller import WindowController
 from pancakebot.runtime.claim_manager import claim_scan_cursor
 from pancakebot.runtime.bootstrap_snapshot import (
     load_runtime_pipeline_snapshot,
@@ -943,6 +944,12 @@ def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         "cutoff_used_bear_bets",
         "router_mode",
         "pipeline_last_settled_epoch",
+        "controller_mode",
+        "controller_window_index",
+        "controller_selected_profile",
+        "controller_selected_action",
+        "controller_estimated_per_500",
+        "controller_estimated_selected_bet_rate",
         "action",
         "decision_stage",
         "selected_strategy",
@@ -1060,6 +1067,12 @@ def _record_dry_cycle_audit(
             pipeline_last_settled_epoch = int(closed.strategy_pipeline.last_settled_epoch)
 
     selected_strategy: str | object = ""
+    controller_mode: str | object = ""
+    controller_window_index: int | str = ""
+    controller_selected_profile: str | object = ""
+    controller_selected_action: str | object = ""
+    controller_estimated_per_500: float | str = ""
+    controller_estimated_selected_bet_rate: float | str = ""
     bet_side: str | object = ""
     bet_size_bnb: float | str = ""
     p_bull: float | str = ""
@@ -1067,6 +1080,22 @@ def _record_dry_cycle_audit(
     selector_score_bnb: float | str = ""
     if decision is not None:
         selected_strategy = getattr(decision, "selected_strategy", "") or ""
+        controller_mode = getattr(decision, "controller_mode", "") or ""
+        controller_window_raw = getattr(decision, "controller_window_index", None)
+        if controller_window_raw is not None:
+            controller_window_index = int(controller_window_raw)
+        controller_selected_profile = getattr(decision, "controller_selected_profile", "") or ""
+        controller_selected_action = getattr(decision, "controller_selected_action", "") or ""
+        controller_estimated_raw = getattr(decision, "controller_estimated_per_500", None)
+        if isinstance(controller_estimated_raw, (int, float)):
+            controller_estimated_per_500 = float(controller_estimated_raw)
+        controller_estimated_bet_rate_raw = getattr(
+            decision,
+            "controller_estimated_selected_bet_rate",
+            None,
+        )
+        if isinstance(controller_estimated_bet_rate_raw, (int, float)):
+            controller_estimated_selected_bet_rate = float(controller_estimated_bet_rate_raw)
         bet_side = getattr(decision, "bet_side", "") or ""
         bet_size_raw = getattr(decision, "bet_size_bnb", "")
         if isinstance(bet_size_raw, (int, float)):
@@ -1118,6 +1147,12 @@ def _record_dry_cycle_audit(
             "cutoff_used_bear_bets": cutoff_used_pool["cutoff_used_bear_bets"],
             "router_mode": router_mode,
             "pipeline_last_settled_epoch": pipeline_last_settled_epoch,
+            "controller_mode": controller_mode,
+            "controller_window_index": controller_window_index,
+            "controller_selected_profile": controller_selected_profile,
+            "controller_selected_action": controller_selected_action,
+            "controller_estimated_per_500": controller_estimated_per_500,
+            "controller_estimated_selected_bet_rate": controller_estimated_selected_bet_rate,
             "action": str(action),
             "decision_stage": str(decision_stage),
             "selected_strategy": selected_strategy,
@@ -2074,6 +2109,11 @@ def _build_strategy_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesC
         treasury_fee_fraction=float(cfg.treasury_fee_fraction),
         ml_candidate_adapter=ml_adapter,
         flow_candidate_adapter=flow_adapter,
+        window_controller=(
+            WindowController(config=cfg.strategy_cfg.window_controller)
+            if bool(cfg.strategy_cfg.window_controller.enabled)
+            else None
+        ),
     )
     pipeline.refresh_klines(klines=list(klines_cache.klines))
     return pipeline

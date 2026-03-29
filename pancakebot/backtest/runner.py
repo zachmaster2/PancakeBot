@@ -20,6 +20,7 @@ from pancakebot.domain.strategy.flow_candidate_adapter import FlowCandidateAdapt
 from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
 from pancakebot.domain.strategy.pipeline import StrategyPipeline, required_pipeline_warmup_rounds
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterConfig
+from pancakebot.domain.strategy.window_controller import WindowController
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
@@ -146,6 +147,11 @@ def _build_strategy_pipeline(*, runtime_cfg, all_klines: list[Kline] | None) -> 
         treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
         ml_candidate_adapter=ml_adapter,
         flow_candidate_adapter=flow_adapter,
+        window_controller=(
+            WindowController(config=runtime_cfg.strategy_cfg.window_controller)
+            if bool(runtime_cfg.strategy_cfg.window_controller.enabled)
+            else None
+        ),
     )
     if all_klines is not None:
         pipeline.refresh_klines(klines=list(all_klines))

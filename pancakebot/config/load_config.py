@@ -15,6 +15,7 @@ from pancakebot.config.strategy_config import (
     MlCandidateConfig,
     StrategyConfig,
     StrategyRouterConfig,
+    WindowControllerConfig,
 )
 from pancakebot.core.errors import InvariantError
 from pancakebot.domain.models.predictability_modes import (
@@ -680,6 +681,76 @@ def _parse_flow_candidate(candidate: dict[str, Any]) -> FlowCandidateConfig:
     )
 
 
+def _parse_window_controller(controller: dict[str, Any]) -> WindowControllerConfig:
+    defaults = WindowControllerConfig()
+    allowed = {
+        "enabled",
+        "mode",
+        "baseline_profile_name",
+        "alternate_profile_name",
+        "window_rounds",
+        "lookback_windows",
+        "margin_per_500",
+        "skip_threshold_per_500",
+    }
+    _validate_unknown_keys("window_controller", controller, allowed)
+
+    enabled = _opt_bool(controller, "enabled", bool(defaults.enabled))
+    mode = _opt_str(controller, "mode", str(defaults.mode))
+    if str(mode) not in {
+        "trailing_best_vs_baseline",
+        "trailing_best_vs_baseline_with_skip",
+    }:
+        raise InvariantError("strategy_window_controller_mode_invalid")
+
+    baseline_profile_name = _opt_str(
+        controller,
+        "baseline_profile_name",
+        str(defaults.baseline_profile_name),
+    )
+    alternate_profile_name = _opt_str(
+        controller,
+        "alternate_profile_name",
+        str(defaults.alternate_profile_name),
+    )
+    if str(baseline_profile_name) == str(alternate_profile_name):
+        raise InvariantError("strategy_window_controller_profiles_must_differ")
+
+    window_rounds = _opt_int(controller, "window_rounds", int(defaults.window_rounds))
+    if int(window_rounds) <= 0:
+        raise InvariantError("strategy_window_controller_window_rounds_nonpositive")
+
+    lookback_windows = _opt_int(
+        controller,
+        "lookback_windows",
+        int(defaults.lookback_windows),
+    )
+    if int(lookback_windows) <= 0:
+        raise InvariantError("strategy_window_controller_lookback_windows_nonpositive")
+
+    margin_per_500 = _opt_float(
+        controller,
+        "margin_per_500",
+        float(defaults.margin_per_500),
+    )
+    skip_threshold_per_500 = _opt_float(
+        controller,
+        "skip_threshold_per_500",
+        float(defaults.skip_threshold_per_500),
+    )
+
+    return WindowControllerConfig(
+        enabled=bool(enabled),
+        mode=str(mode),
+        baseline_profile_name=str(baseline_profile_name),
+        alternate_profile_name=str(alternate_profile_name),
+        window_rounds=int(window_rounds),
+        lookback_windows=int(lookback_windows),
+        margin_per_500=float(margin_per_500),
+        skip_threshold_per_500=float(skip_threshold_per_500),
+    )
+
+
 def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> DislocationCandidateConfig:
     candidate_name = f"strategy.dislocation.candidates[{int(idx)}]"
     allowed = {
@@ -1181,7 +1252,11 @@ def _parse_dislocation_candidate(candidate: dict[str, Any], idx: int) -> Disloca
 
 
 def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
-    _validate_unknown_keys("strategy", strategy, {"dislocation", "router", "ml_candidate", "flow_candidate"})
+    _validate_unknown_keys(
+        "strategy",
+        strategy,
+        {"dislocation", "router", "ml_candidate", "flow_candidate", "window_controller"},
+    )
 
     dislocation = strategy.get("dislocation", {})
     if dislocation is None:
@@ -1213,6 +1288,13 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
     if not isinstance(flow_candidate_obj, dict):
         raise InvariantError("config_section_not_dict: strategy.flow_candidate")
     flow_candidate_cfg = _parse_flow_candidate(flow_candidate_obj)
+
+    window_controller_obj = strategy.get("window_controller", {})
+    if window_controller_obj is None:
+        window_controller_obj = {}
+    if not isinstance(window_controller_obj, dict):
+        raise InvariantError("config_section_not_dict: strategy.window_controller")
+    window_controller_cfg = _parse_window_controller(window_controller_obj)
 
     selector_obj = dislocation.get("selector", {})
     if selector_obj is None:
@@ -1257,6 +1339,19 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
     else:
         candidate_cfgs = tuple(candidate_cfgs_all)
 
+    if bool(window_controller_cfg.enabled):
+        active_names = {str(c.name) for c in candidate_cfgs}
+        missing_profiles = sorted(
+            name
+            for name in (
+                str(window_controller_cfg.baseline_profile_name),
+                str(window_controller_cfg.alternate_profile_name),
+            )
+            if str(name) not in active_names
+        )
+        if missing_profiles:
+            raise InvariantError(f"strategy_window_controller_profile_missing: {missing_profiles}")
+
     return StrategyConfig(
         dislocation=DislocationStrategyConfig(
             selector=selector_cfg,
@@ -1265,6 +1360,7 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
         router=router_cfg,
         ml_candidate=ml_candidate_cfg,
         flow_candidate=flow_candidate_cfg,
+        window_controller=window_controller_cfg,
     )
 
 

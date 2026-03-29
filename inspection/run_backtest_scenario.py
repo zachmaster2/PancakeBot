@@ -6,6 +6,8 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import re
+import tempfile
 from typing import Any
 
 from pancakebot.backtest.config import BacktestConfig
@@ -29,6 +31,10 @@ from pancakebot.runtime.runtime_loop import RuntimeConfig
 
 _BINANCE_US_SYMBOL = "BNBUSDT"
 _DEFAULT_EXP_ROOT = "../PancakeBot_var_exp"
+_ACTIVE_CANDIDATES_PATTERN = re.compile(
+    r"^active_candidate_names\s*=\s*\[(?:.|\n)*?^\]",
+    re.MULTILINE,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -69,6 +75,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--router-score-threshold-bnb", type=float, default=None)
     parser.add_argument("--selector-warmup-rounds", type=int, default=None)
     parser.add_argument("--router-online-warmup-rounds", type=int, default=None)
+    parser.add_argument("--active-candidate-names", type=str, default=None)
     parser.add_argument("--ml-enabled", type=str, default=None)
     parser.add_argument("--ml-min-tradeable-prob", type=float, default=None)
     parser.add_argument("--ml-min-prob-edge", type=float, default=None)
@@ -110,6 +117,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flow-roll-winrate-min", type=float, default=None)
     parser.add_argument("--flow-cooldown-trades", type=int, default=None)
     parser.add_argument("--flow-selector-score-penalty-bnb", type=float, default=None)
+    parser.add_argument("--window-controller-enabled", type=str, default=None)
+    parser.add_argument(
+        "--window-controller-mode",
+        type=str,
+        choices=("trailing_best_vs_baseline", "trailing_best_vs_baseline_with_skip"),
+        default=None,
+    )
+    parser.add_argument("--window-controller-baseline-profile-name", type=str, default=None)
+    parser.add_argument("--window-controller-alternate-profile-name", type=str, default=None)
+    parser.add_argument("--window-controller-window-rounds", type=int, default=None)
+    parser.add_argument("--window-controller-lookback-windows", type=int, default=None)
+    parser.add_argument("--window-controller-margin-per-500", type=float, default=None)
+    parser.add_argument("--window-controller-skip-threshold-per-500", type=float, default=None)
     return parser
 
 
@@ -152,6 +172,36 @@ def _parse_optional_bool_token(raw: str | None) -> bool | None:
     if token in ("false", "f", "0", "no", "n", "off"):
         return False
     raise InvariantError(f"scenario_ml_enabled_invalid: {raw}")
+
+
+def _load_app_config_with_active_candidate_override(
+    *,
+    config_path: str,
+    active_candidate_names_override: str | None,
+):
+    if active_candidate_names_override is None:
+        return load_app_config(str(config_path))
+
+    names = [
+        str(token).strip()
+        for token in str(active_candidate_names_override).split(",")
+        if str(token).strip() != ""
+    ]
+    if not names:
+        raise InvariantError("scenario_active_candidate_names_empty")
+
+    cfg_text = Path(str(config_path)).read_text(encoding="utf-8")
+    if _ACTIVE_CANDIDATES_PATTERN.search(cfg_text) is None:
+        raise InvariantError("scenario_active_candidate_names_block_missing")
+    replacement = "active_candidate_names = [\n" + "".join(
+        f'  "{str(name)}",\n' for name in names
+    ) + "]"
+    patched = _ACTIVE_CANDIDATES_PATTERN.sub(replacement, cfg_text, count=1)
+
+    with tempfile.TemporaryDirectory() as td:
+        patched_path = Path(td) / "config_active_candidates.toml"
+        patched_path.write_text(patched, encoding="utf-8", newline="\n")
+        return load_app_config(str(patched_path))
 
 
 def _runtime_cfg_from_app(*, cfg, strategy_cfg: StrategyConfig) -> RuntimeConfig:
@@ -250,6 +300,22 @@ def _strategy_cfg_with_router_overrides(
             online_warmup_rounds=int(args.router_online_warmup_rounds),
         )
     dislocation_cfg = strategy_cfg.dislocation
+    if args.active_candidate_names is not None:
+        names = tuple(
+            str(token).strip()
+            for token in str(args.active_candidate_names).split(",")
+            if str(token).strip() != ""
+        )
+        if not names:
+            raise InvariantError("scenario_active_candidate_names_empty")
+        by_name = {str(candidate.name): candidate for candidate in strategy_cfg.dislocation.candidates}
+        missing = sorted(str(name) for name in names if str(name) not in by_name)
+        if missing:
+            raise InvariantError(f"scenario_active_candidate_missing: {missing}")
+        dislocation_cfg = replace(
+            dislocation_cfg,
+            candidates=tuple(by_name[str(name)] for name in names),
+        )
     selector_cfg = dislocation_cfg.selector
     if args.selector_warmup_rounds is not None:
         if int(args.selector_warmup_rounds) <= 0:
@@ -375,12 +441,73 @@ def _strategy_cfg_with_router_overrides(
             selector_score_penalty_bnb=float(args.flow_selector_score_penalty_bnb),
         )
 
+    window_controller_cfg = strategy_cfg.window_controller
+    window_controller_enabled = _parse_optional_bool_token(args.window_controller_enabled)
+    if window_controller_enabled is not None:
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            enabled=bool(window_controller_enabled),
+        )
+    if args.window_controller_mode is not None:
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            mode=str(args.window_controller_mode),
+        )
+    if args.window_controller_baseline_profile_name is not None:
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            baseline_profile_name=str(args.window_controller_baseline_profile_name),
+        )
+    if args.window_controller_alternate_profile_name is not None:
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            alternate_profile_name=str(args.window_controller_alternate_profile_name),
+        )
+    if args.window_controller_window_rounds is not None:
+        if int(args.window_controller_window_rounds) <= 0:
+            raise InvariantError("scenario_window_controller_window_rounds_nonpositive")
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            window_rounds=int(args.window_controller_window_rounds),
+        )
+    if args.window_controller_lookback_windows is not None:
+        if int(args.window_controller_lookback_windows) <= 0:
+            raise InvariantError("scenario_window_controller_lookback_windows_nonpositive")
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            lookback_windows=int(args.window_controller_lookback_windows),
+        )
+    if args.window_controller_margin_per_500 is not None:
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            margin_per_500=float(args.window_controller_margin_per_500),
+        )
+    if args.window_controller_skip_threshold_per_500 is not None:
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            skip_threshold_per_500=float(args.window_controller_skip_threshold_per_500),
+        )
+
+    if bool(window_controller_cfg.enabled):
+        active_names = {str(candidate.name) for candidate in dislocation_cfg.candidates}
+        missing_profiles = sorted(
+            name
+            for name in (
+                str(window_controller_cfg.baseline_profile_name),
+                str(window_controller_cfg.alternate_profile_name),
+            )
+            if str(name) not in active_names
+        )
+        if missing_profiles:
+            raise InvariantError(f"scenario_window_controller_profile_missing: {missing_profiles}")
+
     return replace(
         strategy_cfg,
         router=router_cfg,
         dislocation=dislocation_cfg,
         ml_candidate=ml_cfg,
         flow_candidate=flow_cfg,
+        window_controller=window_controller_cfg,
     )
 
 
@@ -388,7 +515,10 @@ def main() -> None:
     """Run a canonical backtest scenario and write scenario metadata."""
 
     args = _build_parser().parse_args()
-    cfg = load_app_config(str(args.config))
+    cfg = _load_app_config_with_active_candidate_override(
+        config_path=str(args.config),
+        active_candidate_names_override=args.active_candidate_names,
+    )
     set_global_determinism(seed=int(cfg.random_seed))
 
     strategy_cfg = _strategy_cfg_with_router_overrides(strategy_cfg=cfg.strategy, args=args)
