@@ -97,45 +97,55 @@ Additional inspection probes for strategy-routing experiments:
    ridge controller, adding grouped flow and `stageG2` entry penalties plus
    cold-start heuristics. This is the current best offline lane after richer
    generic features and broader profile mining both plateaued.
-18. `inspection/run_profile_set_penalty_shadow_recommender.py`:
+18. `inspection/run_profile_set_penalty_window_eval.py`:
+   evaluates one fixed calibrated penalty-controller configuration window by
+   window, exporting predicted action, realized action PnL, realized `stageB`,
+   oracle, and regret. This is now the preferred artifact for diagnosing
+   controller errors on completed windows.
+19. `inspection/run_profile_set_window_recommender.py`:
+   emits a next-window recommendation from an existing profile-set compare CSV
+   using a simple completed-window heuristic (`prev_winner`, trailing
+   `stageB`-vs-alt`, skip-aware variants, or static profile). This is the
+   preferred bridge when a heuristic lane becomes stronger than the model lane.
+20. `inspection/run_profile_set_penalty_shadow_recommender.py`:
    writes a shadow-only next-window recommendation JSON for the calibrated
    penalty selector, without touching runtime control. This is secondary to
    the completed-window causal evaluation path.
-19. `inspection/run_profile_set_penalty_shadow_refresh.py`:
+21. `inspection/run_profile_set_penalty_shadow_refresh.py`:
    one-command wrapper that rebuilds/resumes the calibrated mixed profile-set
    compare, then emits the current penalty-shadow recommendation JSON plus a
    small summary JSON.
-20. `inspection/run_profile_set_shadow_validation.py`:
+22. `inspection/run_profile_set_shadow_validation.py`:
    compares a shadow recommendation JSON against the current contained dry
    artifacts (`dry_cycle_audit.csv`, `dry_bankroll_state.json`,
    `dry_audit_trades.csv`) and writes a coherence summary.
-21. `inspection/run_profile_set_penalty_shadow_validate_refresh.py`:
+23. `inspection/run_profile_set_penalty_shadow_validate_refresh.py`:
    convenience wrapper that refreshes the calibrated penalty-shadow
    recommendation and immediately validates it against the current contained
    dry run. Use only as a final sanity check.
-22. `inspection/run_profile_set_penalty_shadow_monitor.py`:
+24. `inspection/run_profile_set_penalty_shadow_monitor.py`:
    longitudinal monitor that reruns the calibrated
    refresh-and-validate path only when the contained dry run advances, then
    appends timestamped shadow-vs-dry snapshots to JSONL plus a latest summary
    JSON. Keep this secondary to the rolling causal backtest lane.
-23. `inspection/run_dry_cycle_monitor.py`:
+25. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
    and flags obvious anomalies during long dry-mode runs.
-24. `inspection/run_backtest_cache_perf.py`:
+26. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
-25. `inspection/run_backtest_warm_matrix.py`:
+27. `inspection/run_backtest_warm_matrix.py`:
    warm-cache matrix runner that prints and exports a consolidated table with:
    mode, reset interval, net profit, profit per 500 rounds, max drawdown,
    num bets, and top skip reasons.
-26. `inspection/run_backtest_router_matrix.py`:
+28. `inspection/run_backtest_router_matrix.py`:
    router sweep runner over `selector_max_score` and/or `online_cellmean`
    knobs, exporting a sorted table with profitability, drawdown, bet count,
    skip reasons, selected-strategy mix, and warm-run time.
-27. `inspection/run_final_model_gate_window_sweep.py`:
+29. `inspection/run_final_model_gate_window_sweep.py`:
    long-window gate/profile sweep with resume support and optional
    multiprocessing (`--max-workers`) for independent runs.
-28. `inspection/cleanup_experiment_artifacts.py`:
+30. `inspection/cleanup_experiment_artifacts.py`:
    retention/cleanup helper for state-cache files, failed-run directories, and
    optional SQLite `VACUUM` on cache/registry DBs.
 
