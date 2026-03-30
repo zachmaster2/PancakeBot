@@ -75,92 +75,96 @@ Additional inspection probes for strategy-routing experiments:
    evaluates baseline-relative model controllers (`delta_ridge`,
    `delta_logistic`, `delta_hgb`) with explicit `skip`, selected-bet-rate
    accounting, optional minimum window holds, and configurable cold-start
-   behavior. This is now the preferred next step after a profile-set compare
-   run when heuristic controllers plateau, and the main evidence lane for
-   controller research.
-14. `inspection/run_profile_set_shadow_recommender.py`:
+   behavior. This remains available for bounded historical comparisons, but it
+   is no longer the target controller framing.
+14. `inspection/run_profile_set_absolute_selector.py`:
+   consumes a profile-set compare CSV and evaluates absolute local-value
+   controllers that estimate every profile directly, include `skip = 0`, and
+   choose the best estimated action without privileging a baseline profile.
+   This is now the main controller-research lane.
+15. `inspection/run_profile_set_shadow_recommender.py`:
    consumes an existing profile-set compare CSV plus fixed model parameters and
    writes a current next-window recommendation JSON for shadow-only tracking.
    This is now secondary tooling, not the main controller-evaluation path.
-15. `inspection/run_profile_set_shadow_refresh.py`:
+16. `inspection/run_profile_set_shadow_refresh.py`:
    one-command wrapper that rebuilds/resumes the mixed profile-set compare run
    and then writes the current shadow recommendation JSON plus a small summary
    JSON. Use this only for final sanity checks, not as the primary research
    workflow.
-16. `inspection/run_profile_candidate_miner.py`:
+17. `inspection/run_profile_candidate_miner.py`:
    replays older dislocation profiles on the current non-overlapping
    `216`-window framing, then ranks them by controller-set value against an
    existing mixed-pool compare CSV. This is the preferred entrypoint for
    "skip-displacing older profile" mining.
-17. `inspection/run_profile_set_penalty_selector.py`:
+18. `inspection/run_profile_set_penalty_selector.py`:
    runs a narrower calibration search on top of the proven simple-feature
    ridge controller, adding grouped flow and `stageG2` entry penalties plus
    cold-start heuristics. This is the current best offline lane after richer
    generic features and broader profile mining both plateaued.
-18. `inspection/run_profile_set_penalty_window_eval.py`:
+19. `inspection/run_profile_set_penalty_window_eval.py`:
    evaluates one fixed calibrated penalty-controller configuration window by
    window, exporting predicted action, realized action PnL, realized `stageB`,
    oracle, and regret. This is now the preferred artifact for diagnosing
    controller errors on completed windows.
-19. `inspection/run_profile_set_window_recommender.py`:
+20. `inspection/run_profile_set_window_recommender.py`:
    emits a next-window recommendation from an existing profile-set compare CSV
    using a simple completed-window heuristic (`prev_winner`, trailing
    `stageB`-vs-alt`, skip-aware variants, or static profile). This is the
    preferred bridge when a heuristic lane becomes stronger than the model lane.
-20. `inspection/run_profile_set_penalty_shadow_recommender.py`:
+21. `inspection/run_profile_set_penalty_shadow_recommender.py`:
    writes a shadow-only next-window recommendation JSON for the calibrated
    penalty selector, without touching runtime control. This is secondary to
    the completed-window causal evaluation path.
-21. `inspection/run_profile_set_penalty_shadow_refresh.py`:
+22. `inspection/run_profile_set_penalty_shadow_refresh.py`:
    one-command wrapper that rebuilds/resumes the calibrated mixed profile-set
    compare, then emits the current penalty-shadow recommendation JSON plus a
    small summary JSON.
-22. `inspection/run_profile_set_shadow_validation.py`:
+23. `inspection/run_profile_set_shadow_validation.py`:
    compares a shadow recommendation JSON against the current contained dry
    artifacts (`dry_cycle_audit.csv`, `dry_bankroll_state.json`,
    `dry_audit_trades.csv`) and writes a coherence summary.
-23. `inspection/run_profile_set_penalty_shadow_validate_refresh.py`:
+24. `inspection/run_profile_set_penalty_shadow_validate_refresh.py`:
    convenience wrapper that refreshes the calibrated penalty-shadow
    recommendation and immediately validates it against the current contained
    dry run. Use only as a final sanity check.
-24. `inspection/run_profile_set_penalty_shadow_monitor.py`:
+25. `inspection/run_profile_set_penalty_shadow_monitor.py`:
    longitudinal monitor that reruns the calibrated
    refresh-and-validate path only when the contained dry run advances, then
    appends timestamped shadow-vs-dry snapshots to JSONL plus a latest summary
    JSON. Keep this secondary to the rolling causal backtest lane.
-25. `inspection/run_dry_cycle_monitor.py`:
+26. `inspection/run_dry_cycle_monitor.py`:
    tails `var/runtime/dry_cycle_audit.csv`, writes periodic JSON summaries,
    and flags obvious anomalies during long dry-mode runs. It now also supports
    controller-specific allowlists for `controller_selected_profile` and
    `controller_selected_action`.
-26. `inspection/run_window_controller_shared_eval.py`:
+27. `inspection/run_window_controller_shared_eval.py`:
    runs sequential shared-harness backtests for one fixed window-controller
    setting versus static `stageB` across multiple tail sizes and offsets,
    exporting both per-run rows and aggregate summary JSON. Use this as the
    main qualification gate before any controller-driven dry test. The current
    best branch is `stageB` vs `disloc_cons_20260227_x80`, no-skip
    `lookback=3`, `margin=1.0`.
-27. `inspection/write_window_controller_runtime_config.py`:
+28. `inspection/write_window_controller_runtime_config.py`:
    materializes a dedicated runtime config for a controller dry test under
    `../PancakeBot_var_exp/`, patching both `active_candidate_names` and the
    `[strategy.window_controller]` section so `run.py --dry --config ...` can
    use the controller without editing `config.toml`. Its defaults now match
    the current `stageB` vs `disloc_cons_20260227_x80` dry-test candidate.
-28. `inspection/run_backtest_cache_perf.py`:
+29. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
-29. `inspection/run_backtest_warm_matrix.py`:
+30. `inspection/run_backtest_warm_matrix.py`:
    warm-cache matrix runner that prints and exports a consolidated table with:
    mode, reset interval, net profit, profit per 500 rounds, max drawdown,
    num bets, and top skip reasons.
-30. `inspection/run_backtest_router_matrix.py`:
+31. `inspection/run_backtest_router_matrix.py`:
    router sweep runner over `selector_max_score` and/or `online_cellmean`
    knobs, exporting a sorted table with profitability, drawdown, bet count,
    skip reasons, selected-strategy mix, and warm-run time.
-31. `inspection/run_final_model_gate_window_sweep.py`:
+32. `inspection/run_final_model_gate_window_sweep.py`:
    long-window gate/profile sweep with resume support and optional
    multiprocessing (`--max-workers`) for independent runs.
-32. `inspection/cleanup_experiment_artifacts.py`:
+33. `inspection/cleanup_experiment_artifacts.py`:
    retention/cleanup helper for state-cache files, failed-run directories, and
    optional SQLite `VACUUM` on cache/registry DBs.
 
@@ -318,6 +322,17 @@ Quick usage (do not execute automatically in agent workflows):
   --min-train-windows 6,8,10,12 `
   --min-hold-windows 1,2,3,4 `
   --ridge-alphas 0.25,0.5,1.0,2.0,5.0,10.0
+
+.\.venv\Scripts\python.exe -m inspection.run_profile_set_absolute_selector `
+  --compare-csv ../PancakeBot_var_exp/profileset216_stageb_stageg2_broad40_20260329_profile_set_window_compare.csv `
+  --name-prefix profileset216_stageb_stageg2_broad40_abs `
+  --profile-names stageb,stageg2_bullonly `
+  --cold-start-profile-name stageb `
+  --lookback-windows 2,3,5,8 `
+  --min-history-windows 2,3,5 `
+  --ewm-alphas 0.5,0.7,0.85 `
+  --stability-penalties-per-500 0.0,0.25,0.5,1.0 `
+  --skip-thresholds-per-500 0.0,0.05,0.1
 
 .\.venv\Scripts\python.exe -m inspection.run_profile_set_shadow_recommender `
   --compare-csv ../PancakeBot_var_exp/profileset216_stageb_stageg2_flowbear4_20260328_profile_set_window_compare.csv `

@@ -45,6 +45,7 @@
    - if the user explicitly asks to run dry mode, prefer a single foreground terminal with the normal human runtime logs visible
    - if the agent is running dry mode for unattended research, monitoring, or verification, detached/file-backed launch plus monitor tooling is acceptable
    - do not default to detached dry mode when the user is likely to watch the terminal directly
+11. The long-term controller target is multi-profile absolute local estimation plus `skip`. Do not drift back to baseline-centered controller framing unless the user explicitly asks for a bounded comparison experiment.
 
 ## Decision Standard
 

@@ -259,8 +259,6 @@ def _pick_window(
     if str(mode) == "prev_winner_with_skip":
         if int(idx) == 0:
             metric = current.metrics["stageb"]
-            if float(metric.per_500) <= float(skip_threshold_per_500):
-                return "skip", 0.0, 0.0
             return "stageb", float(metric.per_500), float(metric.bet_rate)
         prev_winner, prev_metric = _best_profile(rows[int(idx) - 1].metrics)
         if float(prev_metric.per_500) <= float(skip_threshold_per_500):
@@ -289,8 +287,6 @@ def _pick_window(
     if str(mode) == "trailing_best_vs_stageb_with_skip":
         if int(idx) < int(lookback):
             metric = current.metrics["stageb"]
-            if float(metric.per_500) <= float(skip_threshold_per_500):
-                return "skip", 0.0, 0.0
             return "stageb", float(metric.per_500), float(metric.bet_rate)
         means = _trailing_means(rows, idx=int(idx), lookback=int(lookback))
         stageb_mean = float(means["stageb"])

@@ -62,6 +62,7 @@ Do not mix these casually. State which one is being done.
 5. Capture the takeaway in durable context if it changes project direction.
 6. For controller/profile-selection work, prefer rolling causal backtests over shadow validation as the main evidence source.
 7. Use shadow only as a thin final sanity check before any runtime-controller rollout.
+8. The target controller design is multi-profile absolute local estimation plus `skip`, not a structurally privileged baseline-versus-alternate controller.
 
 ### 4. For Parity Work
 
