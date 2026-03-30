@@ -169,7 +169,7 @@ class ProfileSetWindowSelectorTests(unittest.TestCase):
         )
         self.assertEqual(("flow_b", 0.1, 0.09), (pick, value, bet_rate))
 
-    def test_skip_aware_multi_profile_modes_can_skip(self) -> None:
+    def test_skip_aware_multi_profile_modes_are_causal_at_cold_start(self) -> None:
         ordered = _ordered_window_rows(self.rows)
         pick, value, bet_rate = _pick_window(
             rows=ordered,
@@ -179,6 +179,19 @@ class ProfileSetWindowSelectorTests(unittest.TestCase):
             lookback=0,
             margin_per_500=0.0,
             skip_threshold_per_500=0.0,
+        )
+        self.assertEqual(("stageb", -0.5, 0.05), (pick, value, bet_rate))
+
+    def test_skip_aware_multi_profile_modes_can_skip_after_history(self) -> None:
+        ordered = _ordered_window_rows(self.rows)
+        pick, value, bet_rate = _pick_window(
+            rows=ordered,
+            idx=1,
+            mode="prev_winner_with_skip",
+            profile_name="",
+            lookback=0,
+            margin_per_500=0.0,
+            skip_threshold_per_500=0.25,
         )
         self.assertEqual(("skip", 0.0, 0.0), (pick, value, bet_rate))
 

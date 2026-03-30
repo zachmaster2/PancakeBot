@@ -17,6 +17,13 @@ the retained flow-specific rehabilitation plan, but controller dry-test
 readiness should now be judged primarily from the window-controller runbook and
 current-context notes.
 
+As of `2026-03-30`, even that baseline-centered controller branch is no longer
+the intended end-state target. The main controller-design plan is now
+[ABSOLUTE_MULTI_PROFILE_CONTROLLER_PLAN.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/ABSOLUTE_MULTI_PROFILE_CONTROLLER_PLAN.md):
+multi-profile absolute local estimation plus `skip`. Use this flow document
+only for the narrower question of whether any flow-derived profile deserves to
+remain in the candidate pool.
+
 ## Why This Is Needed
 
 The currently promoted hybrid runtime (`stageB + flow`) was recently promoted
