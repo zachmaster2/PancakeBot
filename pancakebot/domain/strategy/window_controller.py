@@ -1,20 +1,19 @@
-"""Causal window-level profile controller for shared pipeline modes."""
+"""Causal absolute window-level profile controller for shared pipeline modes."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
+import json
+import math
 
 from pancakebot.config.strategy_config import WindowControllerConfig
 from pancakebot.core.errors import InvariantError
 from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 from pancakebot.domain.types import Round
 
-_VALID_MODES = frozenset(
-    {
-        "trailing_best_vs_baseline",
-        "trailing_best_vs_baseline_with_skip",
-    }
-)
+_VALID_MODES = frozenset({"absolute_best_with_skip"})
+_VALID_ESTIMATOR_MODES = frozenset({"trailing_mean", "ewm_mean"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,15 +22,17 @@ class WindowControllerDecision:
 
     enabled: bool
     mode: str | None
+    estimator_mode: str | None
     window_index: int | None
-    baseline_profile_name: str | None
-    alternate_profile_name: str | None
+    profile_names_json: str | None
     selected_profile_name: str | None
     selected_action: str
-    estimated_baseline_per_500: float | None
-    estimated_alternate_per_500: float | None
     estimated_selected_per_500: float | None
+    estimated_selected_score_per_500: float | None
     estimated_selected_bet_rate: float | None
+    estimated_profiles_per_500_json: str | None
+    estimated_profiles_score_per_500_json: str | None
+    estimated_profiles_bet_rate_json: str | None
     lookback_windows_used: int
 
 
@@ -43,10 +44,28 @@ class WindowController:
             raise InvariantError("window_controller_window_rounds_nonpositive")
         if int(config.lookback_windows) <= 0:
             raise InvariantError("window_controller_lookback_windows_nonpositive")
+        if int(config.min_history_windows) <= 0:
+            raise InvariantError("window_controller_min_history_windows_nonpositive")
+        if int(config.min_history_windows) > int(config.lookback_windows):
+            raise InvariantError("window_controller_min_history_windows_exceeds_lookback")
         if str(config.mode) not in _VALID_MODES:
             raise InvariantError("window_controller_mode_invalid")
-        if str(config.baseline_profile_name) == str(config.alternate_profile_name):
-            raise InvariantError("window_controller_profiles_must_differ")
+        if str(config.estimator_mode) not in _VALID_ESTIMATOR_MODES:
+            raise InvariantError("window_controller_estimator_mode_invalid")
+        if float(config.ewm_alpha) <= 0.0 or float(config.ewm_alpha) > 1.0:
+            raise InvariantError("window_controller_ewm_alpha_out_of_range")
+        if float(config.stability_penalty_per_500) < 0.0:
+            raise InvariantError("window_controller_stability_penalty_negative")
+        if float(config.activity_target_bet_rate) < 0.0 or float(config.activity_target_bet_rate) > 1.0:
+            raise InvariantError("window_controller_activity_target_bet_rate_out_of_range")
+        if float(config.activity_shortfall_penalty_per_500) < 0.0:
+            raise InvariantError("window_controller_activity_shortfall_penalty_negative")
+        if not tuple(config.profile_names):
+            raise InvariantError("window_controller_profile_names_empty")
+        if len(set(str(name) for name in config.profile_names)) != len(tuple(config.profile_names)):
+            raise InvariantError("window_controller_profile_names_duplicate")
+        if str(config.cold_start_profile_name) not in {str(name) for name in config.profile_names}:
+            raise InvariantError("window_controller_cold_start_profile_missing")
 
         self._config = config
         self._anchor_epoch: int | None = None
@@ -84,17 +103,11 @@ class WindowController:
             for window_idx, count in dict(state.get("round_counts_by_window", {})).items()
         }
         self._profit_by_window = {
-            int(window_idx): {
-                str(name): float(value)
-                for name, value in dict(profits).items()
-            }
+            int(window_idx): {str(name): float(value) for name, value in dict(profits).items()}
             for window_idx, profits in dict(state.get("profit_by_window", {})).items()
         }
         self._bet_counts_by_window = {
-            int(window_idx): {
-                str(name): int(value)
-                for name, value in dict(counts).items()
-            }
+            int(window_idx): {str(name): int(value) for name, value in dict(counts).items()}
             for window_idx, counts in dict(state.get("bet_counts_by_window", {})).items()
         }
 
@@ -139,15 +152,17 @@ class WindowController:
             return WindowControllerDecision(
                 enabled=False,
                 mode=None,
+                estimator_mode=None,
                 window_index=None,
-                baseline_profile_name=None,
-                alternate_profile_name=None,
+                profile_names_json=None,
                 selected_profile_name=None,
                 selected_action="off",
-                estimated_baseline_per_500=None,
-                estimated_alternate_per_500=None,
                 estimated_selected_per_500=None,
+                estimated_selected_score_per_500=None,
                 estimated_selected_bet_rate=None,
+                estimated_profiles_per_500_json=None,
+                estimated_profiles_score_per_500_json=None,
+                estimated_profiles_bet_rate_json=None,
                 lookback_windows_used=0,
             )
 
@@ -160,51 +175,84 @@ class WindowController:
         ]
         completed_window_indices.sort()
 
-        baseline_name = str(self._config.baseline_profile_name)
-        alternate_name = str(self._config.alternate_profile_name)
-        lookback = min(int(self._config.lookback_windows), int(len(completed_window_indices)))
+        lookback_used = min(int(self._config.lookback_windows), int(len(completed_window_indices)))
+        if int(lookback_used) < int(self._config.min_history_windows):
+            return WindowControllerDecision(
+                enabled=True,
+                mode=str(self._config.mode),
+                estimator_mode=str(self._config.estimator_mode),
+                window_index=int(window_idx),
+                profile_names_json=json.dumps(list(self._profile_names()), separators=(",", ":")),
+                selected_profile_name=str(self._config.cold_start_profile_name),
+                selected_action="profile",
+                estimated_selected_per_500=0.0,
+                estimated_selected_score_per_500=0.0,
+                estimated_selected_bet_rate=0.0,
+                estimated_profiles_per_500_json="{}",
+                estimated_profiles_score_per_500_json="{}",
+                estimated_profiles_bet_rate_json="{}",
+                lookback_windows_used=int(lookback_used),
+            )
 
-        baseline_mean = 0.0
-        alternate_mean = 0.0
-        selected_profile_name = str(baseline_name)
-        selected_action = "profile"
+        hist = completed_window_indices[-int(lookback_used) :]
+        estimates: dict[str, float] = {}
+        score_estimates: dict[str, float] = {}
+        bet_rate_estimates: dict[str, float] = {}
+        for profile_name in self._profile_names():
+            estimate, bet_rate_estimate = self._estimate_profile(
+                profile_name=str(profile_name),
+                window_indices=hist,
+            )
+            estimates[str(profile_name)] = float(estimate)
+            bet_rate_estimates[str(profile_name)] = float(bet_rate_estimate)
+            score_estimates[str(profile_name)] = float(
+                self._score_profile(
+                    estimate=float(estimate),
+                    bet_rate_estimate=float(bet_rate_estimate),
+                )
+            )
+
+        selected_profile_name = None
+        selected_action = "skip"
         selected_per_500 = 0.0
+        selected_score_per_500 = 0.0
         selected_bet_rate = 0.0
-
-        if int(lookback) > 0:
-            hist = completed_window_indices[-int(lookback) :]
-            baseline_mean = self._mean_per_500(profile_name=str(baseline_name), window_indices=hist)
-            alternate_mean = self._mean_per_500(profile_name=str(alternate_name), window_indices=hist)
-            if (
-                str(self._config.mode) == "trailing_best_vs_baseline_with_skip"
-                and max(float(baseline_mean), float(alternate_mean)) <= float(self._config.skip_threshold_per_500)
-            ):
-                selected_profile_name = None
-                selected_action = "skip"
-                selected_per_500 = 0.0
-                selected_bet_rate = 0.0
-            elif float(alternate_mean - baseline_mean) > float(self._config.margin_per_500):
-                selected_profile_name = str(alternate_name)
-                selected_per_500 = float(alternate_mean)
-                selected_bet_rate = self._mean_bet_rate(profile_name=str(alternate_name), window_indices=hist)
-            else:
-                selected_profile_name = str(baseline_name)
-                selected_per_500 = float(baseline_mean)
-                selected_bet_rate = self._mean_bet_rate(profile_name=str(baseline_name), window_indices=hist)
+        if score_estimates:
+            best_profile_name, best_score = max(score_estimates.items(), key=lambda item: float(item[1]))
+            if float(best_score) > float(self._config.skip_threshold_per_500):
+                selected_profile_name = str(best_profile_name)
+                selected_action = "profile"
+                selected_per_500 = float(estimates[str(best_profile_name)])
+                selected_score_per_500 = float(best_score)
+                selected_bet_rate = float(bet_rate_estimates[str(best_profile_name)])
 
         return WindowControllerDecision(
             enabled=True,
             mode=str(self._config.mode),
+            estimator_mode=str(self._config.estimator_mode),
             window_index=int(window_idx),
-            baseline_profile_name=str(baseline_name),
-            alternate_profile_name=str(alternate_name),
+            profile_names_json=json.dumps(list(self._profile_names()), separators=(",", ":")),
             selected_profile_name=(None if selected_profile_name is None else str(selected_profile_name)),
             selected_action=str(selected_action),
-            estimated_baseline_per_500=float(baseline_mean),
-            estimated_alternate_per_500=float(alternate_mean),
             estimated_selected_per_500=float(selected_per_500),
+            estimated_selected_score_per_500=float(selected_score_per_500),
             estimated_selected_bet_rate=float(selected_bet_rate),
-            lookback_windows_used=int(lookback),
+            estimated_profiles_per_500_json=json.dumps(
+                {str(name): float(value) for name, value in sorted(estimates.items())},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            estimated_profiles_score_per_500_json=json.dumps(
+                {str(name): float(value) for name, value in sorted(score_estimates.items())},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            estimated_profiles_bet_rate_json=json.dumps(
+                {str(name): float(value) for name, value in sorted(bet_rate_estimates.items())},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            lookback_windows_used=int(lookback_used),
         )
 
     def apply_to_candidate_signals(
@@ -218,10 +266,7 @@ class WindowController:
         self._ensure_profile_signals(candidate_signals=candidate_signals)
         if str(decision.selected_action) == "skip":
             return {
-                str(name): self._veto_signal(
-                    signal=signal,
-                    skip_reason="window_controller_skip",
-                )
+                str(name): self._veto_signal(signal=signal, skip_reason="window_controller_skip")
                 for name, signal in candidate_signals.items()
             }
         if decision.selected_profile_name is None:
@@ -245,11 +290,8 @@ class WindowController:
             raise InvariantError("window_controller_epoch_before_anchor")
         return int((int(epoch) - int(self._anchor_epoch)) // int(self._config.window_rounds))
 
-    def _profile_names(self) -> tuple[str, str]:
-        return (
-            str(self._config.baseline_profile_name),
-            str(self._config.alternate_profile_name),
-        )
+    def _profile_names(self) -> tuple[str, ...]:
+        return tuple(str(name) for name in self._config.profile_names)
 
     def _ensure_profile_signals(
         self,
@@ -260,29 +302,67 @@ class WindowController:
             if str(profile_name) not in candidate_signals:
                 raise InvariantError(f"window_controller_profile_signal_missing: {profile_name}")
 
-    def _mean_per_500(self, *, profile_name: str, window_indices: list[int]) -> float:
-        if not window_indices:
-            return 0.0
-        vals: list[float] = []
-        for window_idx in window_indices:
-            rounds = int(self._round_counts_by_window.get(int(window_idx), 0))
-            if int(rounds) <= 0:
-                raise InvariantError("window_controller_window_rounds_missing")
-            profit = float(self._profit_by_window[int(window_idx)].get(str(profile_name), 0.0))
-            vals.append(float(profit) * 500.0 / float(rounds))
-        return float(sum(vals) / float(len(vals)))
+    def _estimate_profile(
+        self,
+        *,
+        profile_name: str,
+        window_indices: Iterable[int],
+    ) -> tuple[float, float]:
+        values = [self._window_per_500(profile_name=str(profile_name), window_idx=int(window_idx)) for window_idx in window_indices]
+        bet_rates = [self._window_bet_rate(profile_name=str(profile_name), window_idx=int(window_idx)) for window_idx in window_indices]
+        if not values:
+            return 0.0, 0.0
+        if str(self._config.estimator_mode) == "trailing_mean":
+            raw_estimate = float(sum(values) / float(len(values)))
+            bet_rate_estimate = float(sum(bet_rates) / float(len(bet_rates)))
+        elif str(self._config.estimator_mode) == "ewm_mean":
+            weights = self._ewm_weights(length=int(len(values)), alpha=float(self._config.ewm_alpha))
+            raw_estimate = float(sum(float(value) * float(weight) for value, weight in zip(values, weights)))
+            bet_rate_estimate = float(sum(float(value) * float(weight) for value, weight in zip(bet_rates, weights)))
+        else:
+            raise InvariantError("window_controller_estimator_mode_invalid")
+        stability_penalty = 0.0
+        if len(values) > 1 and float(self._config.stability_penalty_per_500) > 0.0:
+            stability_penalty = float(self._config.stability_penalty_per_500) * self._std(values)
+        return float(raw_estimate - stability_penalty), float(bet_rate_estimate)
 
-    def _mean_bet_rate(self, *, profile_name: str, window_indices: list[int]) -> float:
-        if not window_indices:
-            return 0.0
-        vals: list[float] = []
-        for window_idx in window_indices:
-            rounds = int(self._round_counts_by_window.get(int(window_idx), 0))
-            if int(rounds) <= 0:
-                raise InvariantError("window_controller_window_rounds_missing")
-            bet_count = int(self._bet_counts_by_window[int(window_idx)].get(str(profile_name), 0))
-            vals.append(float(bet_count) / float(rounds))
-        return float(sum(vals) / float(len(vals)))
+    def _score_profile(self, *, estimate: float, bet_rate_estimate: float) -> float:
+        penalty = 0.0
+        if (
+            float(self._config.activity_target_bet_rate) > 0.0
+            and float(self._config.activity_shortfall_penalty_per_500) > 0.0
+        ):
+            shortfall = max(0.0, float(self._config.activity_target_bet_rate) - float(bet_rate_estimate))
+            penalty = float(self._config.activity_shortfall_penalty_per_500) * float(shortfall)
+        return float(estimate) - float(penalty)
+
+    def _window_per_500(self, *, profile_name: str, window_idx: int) -> float:
+        rounds = int(self._round_counts_by_window.get(int(window_idx), 0))
+        if int(rounds) <= 0:
+            raise InvariantError("window_controller_window_rounds_missing")
+        profit = float(self._profit_by_window[int(window_idx)].get(str(profile_name), 0.0))
+        return float(profit) * 500.0 / float(rounds)
+
+    def _window_bet_rate(self, *, profile_name: str, window_idx: int) -> float:
+        rounds = int(self._round_counts_by_window.get(int(window_idx), 0))
+        if int(rounds) <= 0:
+            raise InvariantError("window_controller_window_rounds_missing")
+        bet_count = int(self._bet_counts_by_window[int(window_idx)].get(str(profile_name), 0))
+        return float(bet_count) / float(rounds)
+
+    @staticmethod
+    def _ewm_weights(*, length: int, alpha: float) -> list[float]:
+        weights = [float(alpha) ** float(int(length) - 1 - idx) for idx in range(int(length))]
+        total = float(sum(weights))
+        if float(total) <= 0.0:
+            raise InvariantError("window_controller_ewm_weights_nonpositive")
+        return [float(weight / total) for weight in weights]
+
+    @staticmethod
+    def _std(values: list[float]) -> float:
+        mean_value = float(sum(values) / float(len(values)))
+        variance = float(sum((float(value) - float(mean_value)) ** 2 for value in values) / float(len(values)))
+        return math.sqrt(float(variance))
 
     @staticmethod
     def _veto_signal(*, signal: StrategyCandidateSignal, skip_reason: str) -> StrategyCandidateSignal:

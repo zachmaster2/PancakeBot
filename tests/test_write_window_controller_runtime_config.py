@@ -19,13 +19,21 @@ class WriteWindowControllerRuntimeConfigTests(unittest.TestCase):
                 "]\n\n"
                 "[strategy.window_controller]\n"
                 "enabled = false\n"
-                'mode = "trailing_best_vs_baseline"\n'
-                'baseline_profile_name = "disloc_stageB_bullonly_recent8pct_v1"\n'
-                'alternate_profile_name = "disloc_stageG2_bullonly_recent5pct_v1"\n'
+                'mode = "absolute_best_with_skip"\n'
+                "profile_names = [\n"
+                '  "disloc_stageB_bullonly_recent8pct_v1",\n'
+                '  "disloc_stageG2_bullonly_recent5pct_v1",\n'
+                "]\n"
+                'cold_start_profile_name = "disloc_stageB_bullonly_recent8pct_v1"\n'
                 "window_rounds = 216\n"
-                "lookback_windows = 1\n"
-                "margin_per_500 = 0.5\n"
-                "skip_threshold_per_500 = 0.0\n\n"
+                "lookback_windows = 2\n"
+                "min_history_windows = 2\n"
+                'estimator_mode = "ewm_mean"\n'
+                "ewm_alpha = 0.5\n"
+                "stability_penalty_per_500 = 0.0\n"
+                "activity_target_bet_rate = 0.0\n"
+                "activity_shortfall_penalty_per_500 = 0.0\n"
+                "skip_threshold_per_500 = 0.05\n\n"
                 "[backtest]\n"
                 "simulation_size = 20000\n",
                 encoding="utf-8",
@@ -39,19 +47,29 @@ class WriteWindowControllerRuntimeConfigTests(unittest.TestCase):
                     "disloc_stageG2_bullonly_recent5pct_v1",
                 ],
                 enabled="true",
-                mode="trailing_best_vs_baseline",
-                baseline_profile_name="disloc_stageB_bullonly_recent8pct_v1",
-                alternate_profile_name="disloc_stageG2_bullonly_recent5pct_v1",
+                mode="absolute_best_with_skip",
+                profile_names=[
+                    "disloc_stageB_bullonly_recent8pct_v1",
+                    "disloc_stageG2_bullonly_recent5pct_v1",
+                ],
+                cold_start_profile_name="disloc_stageB_bullonly_recent8pct_v1",
                 window_rounds=216,
                 lookback_windows=2,
-                margin_per_500=1.0,
-                skip_threshold_per_500=0.0,
+                min_history_windows=2,
+                estimator_mode="ewm_mean",
+                ewm_alpha=0.5,
+                stability_penalty_per_500=0.0,
+                activity_target_bet_rate=0.05,
+                activity_shortfall_penalty_per_500=5.0,
+                skip_threshold_per_500=0.05,
             )
             text = out.read_text(encoding="utf-8")
         self.assertIn('"disloc_stageG2_bullonly_recent5pct_v1"', text)
         self.assertIn("enabled = true", text)
         self.assertIn("lookback_windows = 2", text)
-        self.assertIn("margin_per_500 = 1.0", text)
+        self.assertIn('estimator_mode = "ewm_mean"', text)
+        self.assertIn("activity_target_bet_rate = 0.05", text)
+        self.assertIn("activity_shortfall_penalty_per_500 = 5.0", text)
 
 
 if __name__ == "__main__":

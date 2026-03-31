@@ -114,6 +114,20 @@ def _summarize(
         for row in rows
         if str(row.get("controller_selected_action", "")).strip()
     )
+    controller_profile_cycles = int(
+        sum(1 for row in rows if str(row.get("controller_selected_action", "")).strip() == "profile")
+    )
+    controller_skip_cycles = int(
+        sum(1 for row in rows if str(row.get("controller_selected_action", "")).strip() == "skip")
+    )
+    controller_profile_but_runtime_skip_cycles = int(
+        sum(
+            1
+            for row in rows
+            if str(row.get("controller_selected_action", "")).strip() == "profile"
+            and str(row.get("action", "")).strip() != "BET"
+        )
+    )
     recent_expected_profit = [
         value
         for value in (
@@ -167,6 +181,21 @@ def _summarize(
             f"idle_streak_ge_threshold:{int(current_idle_streak)}"
             f":threshold={int(warn_idle_streak_cycles)}"
         )
+    latest_controller_state: dict[str, object] = {}
+    if rows:
+        latest = rows[-1]
+        latest_controller_state = {
+            "current_epoch": str(latest.get("current_epoch", "")).strip(),
+            "controller_mode": str(latest.get("controller_mode", "")).strip(),
+            "controller_window_index": str(latest.get("controller_window_index", "")).strip(),
+            "controller_lookback_windows_used": str(latest.get("controller_lookback_windows_used", "")).strip(),
+            "controller_selected_profile": str(latest.get("controller_selected_profile", "")).strip(),
+            "controller_selected_action": str(latest.get("controller_selected_action", "")).strip(),
+            "controller_estimated_per_500": str(latest.get("controller_estimated_per_500", "")).strip(),
+            "controller_estimated_selected_bet_rate": str(latest.get("controller_estimated_selected_bet_rate", "")).strip(),
+            "action": str(latest.get("action", "")).strip(),
+            "skip_reason": str(latest.get("skip_reason", "")).strip(),
+        }
 
     return {
         "monitor_ts": int(time.time()),
@@ -182,6 +211,10 @@ def _summarize(
         "bet_side_counts": dict(side_counts),
         "controller_selected_profile_counts": dict(controller_profile_counts),
         "controller_selected_action_counts": dict(controller_action_counts),
+        "controller_profile_cycles": int(controller_profile_cycles),
+        "controller_skip_cycles": int(controller_skip_cycles),
+        "controller_profile_but_runtime_skip_cycles": int(controller_profile_but_runtime_skip_cycles),
+        "latest_controller_state": dict(latest_controller_state),
         "recent_mean_expected_profit_bnb": (
             0.0
             if not recent_expected_profit

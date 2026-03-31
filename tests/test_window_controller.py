@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import json
 import unittest
 
 from pancakebot.config.strategy_config import WindowControllerConfig
+from pancakebot.core.constants import BNB_WEI
 from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 from pancakebot.domain.strategy.pipeline import StrategyPipeline
 from pancakebot.domain.strategy.router import StrategyRouterDecision
 from pancakebot.domain.strategy.window_controller import WindowController
-from pancakebot.domain.types import Round
+from pancakebot.domain.types import Bet, Round
 
 
 def _signal(
@@ -25,12 +28,8 @@ def _signal(
         action=str(action),
         bet_side=bet_side,
         bet_size_bnb=float(bet_size_bnb),
-        expected_profit_bnb=(
-            None if expected_profit_bnb is None else float(expected_profit_bnb)
-        ),
-        selector_score_bnb=(
-            None if selector_score_bnb is None else float(selector_score_bnb)
-        ),
+        expected_profit_bnb=(None if expected_profit_bnb is None else float(expected_profit_bnb)),
+        selector_score_bnb=(None if selector_score_bnb is None else float(selector_score_bnb)),
         skip_reason=skip_reason,
         p_bull=0.5,
         dislocation_bull=0.0,
@@ -38,16 +37,31 @@ def _signal(
 
 
 def _closed_round(*, epoch: int, position: str) -> Round:
+    start_at = 1_000 + int(epoch) * 300
+    lock_at = start_at + 300
     return Round(
         epoch=int(epoch),
-        start_at=1_000 + int(epoch) * 300,
-        lock_at=1_000 + int(epoch) * 300 + 300,
-        close_at=1_000 + int(epoch) * 300 + 600,
+        start_at=int(start_at),
+        lock_at=int(lock_at),
+        close_at=int(lock_at + 300),
         lock_price=600.0,
         close_price=601.0,
         position=str(position),
         failed=False,
-        bets=(),
+        bets=(
+            Bet(
+                wallet_address="0xpoolbull",
+                amount_wei=int(0.1 * BNB_WEI),
+                position="Bull",
+                created_at=int(lock_at - 60),
+            ),
+            Bet(
+                wallet_address="0xpoolbear",
+                amount_wei=int(0.1 * BNB_WEI),
+                position="Bear",
+                created_at=int(lock_at - 60),
+            ),
+        ),
     )
 
 
@@ -154,15 +168,25 @@ class _CapturingRouter:
         )
 
 
+def _base_config() -> WindowControllerConfig:
+    return WindowControllerConfig(
+        enabled=True,
+        mode="absolute_best_with_skip",
+        profile_names=("stageB", "stageG2"),
+        cold_start_profile_name="stageB",
+        window_rounds=2,
+        lookback_windows=2,
+        min_history_windows=1,
+        estimator_mode="ewm_mean",
+        ewm_alpha=0.5,
+        stability_penalty_per_500=0.0,
+        skip_threshold_per_500=0.05,
+    )
+
+
 class WindowControllerTests(unittest.TestCase):
-    def test_cold_start_defaults_to_baseline_profile(self) -> None:
-        controller = WindowController(
-            config=WindowControllerConfig(
-                enabled=True,
-                baseline_profile_name="stageB",
-                alternate_profile_name="stageG2",
-            )
-        )
+    def test_cold_start_defaults_to_cold_start_profile(self) -> None:
+        controller = WindowController(config=_base_config())
         signals = {
             "stageB": _signal(
                 candidate_name="stageB",
@@ -189,18 +213,12 @@ class WindowControllerTests(unittest.TestCase):
         self.assertEqual("profile", decision.selected_action)
         self.assertEqual("stageB", decision.selected_profile_name)
         self.assertEqual(0, int(decision.lookback_windows_used))
+        self.assertEqual("{}", decision.estimated_profiles_per_500_json)
+        self.assertEqual("{}", decision.estimated_profiles_score_per_500_json)
+        self.assertEqual("{}", decision.estimated_profiles_bet_rate_json)
 
-    def test_completed_window_can_flip_to_alternate_profile(self) -> None:
-        controller = WindowController(
-            config=WindowControllerConfig(
-                enabled=True,
-                baseline_profile_name="stageB",
-                alternate_profile_name="stageG2",
-                window_rounds=2,
-                lookback_windows=1,
-                margin_per_500=0.5,
-            )
-        )
+    def test_completed_window_can_pick_best_positive_profile(self) -> None:
+        controller = WindowController(config=_base_config())
         signals = {
             "stageB": _signal(
                 candidate_name="stageB",
@@ -222,34 +240,22 @@ class WindowControllerTests(unittest.TestCase):
             ),
         }
         for epoch in (1, 2):
-            round_t = _closed_round(epoch=epoch, position="Bull")
-            realized = {
-                "stageB": -0.1002,
-                "stageG2": 0.0898,
-            }
             controller.observe_round_settlement(
-                round_t=round_t,
+                round_t=_closed_round(epoch=epoch, position="Bull"),
                 candidate_signals=signals,
-                realized_profit_by_candidate=realized,
+                realized_profit_by_candidate={"stageB": -0.1002, "stageG2": 0.0898},
             )
 
         decision = controller.decision_for_round(round_t=_open_round(epoch=3), candidate_signals=signals)
 
         self.assertEqual("stageG2", decision.selected_profile_name)
-        self.assertGreater(float(decision.estimated_alternate_per_500 or 0.0), float(decision.estimated_baseline_per_500 or 0.0))
+        estimates = json.loads(str(decision.estimated_profiles_per_500_json))
+        self.assertGreater(float(estimates["stageG2"]), float(estimates["stageB"]))
+        scores = json.loads(str(decision.estimated_profiles_score_per_500_json))
+        self.assertGreater(float(scores["stageG2"]), float(scores["stageB"]))
 
-    def test_skip_mode_can_stand_down_when_both_profiles_are_nonpositive(self) -> None:
-        controller = WindowController(
-            config=WindowControllerConfig(
-                enabled=True,
-                mode="trailing_best_vs_baseline_with_skip",
-                baseline_profile_name="stageB",
-                alternate_profile_name="stageG2",
-                window_rounds=2,
-                lookback_windows=1,
-                skip_threshold_per_500=0.0,
-            )
-        )
+    def test_skip_when_best_estimate_is_not_positive_enough(self) -> None:
+        controller = WindowController(config=replace(_base_config(), skip_threshold_per_500=0.05))
         signals = {
             "stageB": _signal(
                 candidate_name="stageB",
@@ -284,17 +290,79 @@ class WindowControllerTests(unittest.TestCase):
         self.assertEqual("SKIP", filtered["stageB"].action)
         self.assertEqual("window_controller_skip", filtered["stageB"].skip_reason)
 
-    def test_pipeline_routes_only_controller_selected_profile(self) -> None:
+    def test_activity_penalty_can_prefer_denser_profile(self) -> None:
         controller = WindowController(
-            config=WindowControllerConfig(
-                enabled=True,
-                baseline_profile_name="stageB",
-                alternate_profile_name="stageG2",
-                window_rounds=2,
-                lookback_windows=1,
-                margin_per_500=0.5,
+            config=replace(
+                _base_config(),
+                window_rounds=1,
+                lookback_windows=2,
+                min_history_windows=1,
+                activity_target_bet_rate=0.75,
+                activity_shortfall_penalty_per_500=0.1,
+                skip_threshold_per_500=-1.0,
             )
         )
+        round_one_signals = {
+            "stageB": _signal(
+                candidate_name="stageB",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.1,
+                expected_profit_bnb=0.02,
+                selector_score_bnb=0.02,
+                skip_reason=None,
+            ),
+            "stageG2": _signal(
+                candidate_name="stageG2",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.1,
+                expected_profit_bnb=0.01,
+                selector_score_bnb=0.01,
+                skip_reason=None,
+            ),
+        }
+        round_two_signals = {
+            "stageB": _signal(
+                candidate_name="stageB",
+                action="SKIP",
+                bet_side=None,
+                bet_size_bnb=0.0,
+                expected_profit_bnb=None,
+                selector_score_bnb=None,
+                skip_reason="selector_no_candidate",
+            ),
+            "stageG2": _signal(
+                candidate_name="stageG2",
+                action="BET",
+                bet_side="Bull",
+                bet_size_bnb=0.1,
+                expected_profit_bnb=0.01,
+                selector_score_bnb=0.01,
+                skip_reason=None,
+            ),
+        }
+        controller.observe_round_settlement(
+            round_t=_closed_round(epoch=1, position="Bull"),
+            candidate_signals=round_one_signals,
+            realized_profit_by_candidate={"stageB": 0.00036, "stageG2": 0.00016},
+        )
+        controller.observe_round_settlement(
+            round_t=_closed_round(epoch=2, position="Bull"),
+            candidate_signals=round_two_signals,
+            realized_profit_by_candidate={"stageB": 0.0, "stageG2": 0.0002},
+        )
+
+        decision = controller.decision_for_round(round_t=_open_round(epoch=3), candidate_signals=round_two_signals)
+
+        self.assertEqual("stageG2", decision.selected_profile_name)
+        self.assertAlmostEqual(0.09333333333333332, float(decision.estimated_selected_per_500), places=6)
+        self.assertAlmostEqual(0.09333333333333332, float(decision.estimated_selected_score_per_500), places=6)
+        scores = json.loads(str(decision.estimated_profiles_score_per_500_json))
+        self.assertGreater(float(scores["stageG2"]), float(scores["stageB"]))
+
+    def test_pipeline_routes_only_controller_selected_profile(self) -> None:
+        controller = WindowController(config=replace(_base_config(), skip_threshold_per_500=-1.0))
         signals = {
             "stageB": _signal(
                 candidate_name="stageB",
@@ -342,19 +410,11 @@ class WindowControllerTests(unittest.TestCase):
         self.assertEqual("BET", router.last_candidate_signals["stageG2"].action)
         self.assertEqual("stageG2", decision.controller_selected_profile)
         self.assertEqual("profile", decision.controller_selected_action)
+        self.assertEqual("ewm_mean", decision.controller_estimator_mode)
         self.assertEqual("stageG2", decision.selected_strategy)
 
     def test_bootstrap_seeds_window_controller_history(self) -> None:
-        controller = WindowController(
-            config=WindowControllerConfig(
-                enabled=True,
-                baseline_profile_name="stageB",
-                alternate_profile_name="stageG2",
-                window_rounds=2,
-                lookback_windows=1,
-                margin_per_500=0.5,
-            )
-        )
+        controller = WindowController(config=replace(_base_config(), skip_threshold_per_500=-1.0))
         signals = {
             "stageB": _signal(
                 candidate_name="stageB",
@@ -398,16 +458,7 @@ class WindowControllerTests(unittest.TestCase):
         self.assertEqual(1, int(decision.controller_window_index or 0))
 
     def test_bootstrap_seeded_controller_does_not_crash_on_next_settlement(self) -> None:
-        controller = WindowController(
-            config=WindowControllerConfig(
-                enabled=True,
-                baseline_profile_name="stageB",
-                alternate_profile_name="stageG2",
-                window_rounds=2,
-                lookback_windows=1,
-                margin_per_500=0.5,
-            )
-        )
+        controller = WindowController(config=replace(_base_config(), skip_threshold_per_500=-1.0))
         signals = {
             "stageB": _signal(
                 candidate_name="stageB",

@@ -23,21 +23,39 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--active-candidate-names",
         type=str,
-        default="disloc_stageB_bullonly_recent8pct_v1,disloc_cons_20260227_x80",
+        default="disloc_stageB_bullonly_recent8pct_v1,disloc_stageG2_bullonly_recent5pct_v1,disloc_altB_20260227_x80",
     )
     parser.add_argument("--window-controller-enabled", type=str, default="true")
     parser.add_argument(
         "--window-controller-mode",
         type=str,
-        choices=("trailing_best_vs_baseline", "trailing_best_vs_baseline_with_skip"),
-        default="trailing_best_vs_baseline",
+        choices=("absolute_best_with_skip",),
+        default="absolute_best_with_skip",
     )
-    parser.add_argument("--window-controller-baseline-profile-name", type=str, default="disloc_stageB_bullonly_recent8pct_v1")
-    parser.add_argument("--window-controller-alternate-profile-name", type=str, default="disloc_cons_20260227_x80")
+    parser.add_argument(
+        "--window-controller-profile-names",
+        type=str,
+        default="disloc_stageB_bullonly_recent8pct_v1,disloc_stageG2_bullonly_recent5pct_v1,disloc_altB_20260227_x80",
+    )
+    parser.add_argument(
+        "--window-controller-cold-start-profile-name",
+        type=str,
+        default="disloc_stageB_bullonly_recent8pct_v1",
+    )
     parser.add_argument("--window-controller-window-rounds", type=int, default=216)
-    parser.add_argument("--window-controller-lookback-windows", type=int, default=3)
-    parser.add_argument("--window-controller-margin-per-500", type=float, default=1.0)
-    parser.add_argument("--window-controller-skip-threshold-per-500", type=float, default=0.0)
+    parser.add_argument("--window-controller-lookback-windows", type=int, default=2)
+    parser.add_argument("--window-controller-min-history-windows", type=int, default=2)
+    parser.add_argument(
+        "--window-controller-estimator-mode",
+        type=str,
+        choices=("trailing_mean", "ewm_mean"),
+        default="ewm_mean",
+    )
+    parser.add_argument("--window-controller-ewm-alpha", type=float, default=0.85)
+    parser.add_argument("--window-controller-stability-penalty-per-500", type=float, default=0.0)
+    parser.add_argument("--window-controller-activity-target-bet-rate", type=float, default=0.0)
+    parser.add_argument("--window-controller-activity-shortfall-penalty-per-500", type=float, default=0.0)
+    parser.add_argument("--window-controller-skip-threshold-per-500", type=float, default=0.05)
     parser.add_argument("--output-dir", type=str, default=_DEFAULT_EXP_ROOT)
     return parser
 
@@ -72,11 +90,16 @@ def _replace_window_controller_section(
     config_text: str,
     enabled: str,
     mode: str,
-    baseline_profile_name: str,
-    alternate_profile_name: str,
+    profile_names: list[str],
+    cold_start_profile_name: str,
     window_rounds: int,
     lookback_windows: int,
-    margin_per_500: float,
+    min_history_windows: int,
+    estimator_mode: str,
+    ewm_alpha: float,
+    stability_penalty_per_500: float,
+    activity_target_bet_rate: float,
+    activity_shortfall_penalty_per_500: float,
     skip_threshold_per_500: float,
 ) -> str:
     if _WINDOW_CONTROLLER_SECTION_PATTERN.search(config_text) is None:
@@ -87,11 +110,18 @@ def _replace_window_controller_section(
         "# broader causal backtests and a controlled dry rollout.\n"
         f"enabled = {str(enabled)}\n"
         f'mode = "{str(mode)}"\n'
-        f'baseline_profile_name = "{str(baseline_profile_name)}"\n'
-        f'alternate_profile_name = "{str(alternate_profile_name)}"\n'
+        "profile_names = [\n"
+        + "".join(f'  "{str(name)}",\n' for name in profile_names)
+        + "]\n"
+        f'cold_start_profile_name = "{str(cold_start_profile_name)}"\n'
         f"window_rounds = {int(window_rounds)}\n"
         f"lookback_windows = {int(lookback_windows)}\n"
-        f"margin_per_500 = {float(margin_per_500)}\n"
+        f"min_history_windows = {int(min_history_windows)}\n"
+        f'estimator_mode = "{str(estimator_mode)}"\n'
+        f"ewm_alpha = {float(ewm_alpha)}\n"
+        f"stability_penalty_per_500 = {float(stability_penalty_per_500)}\n"
+        f"activity_target_bet_rate = {float(activity_target_bet_rate)}\n"
+        f"activity_shortfall_penalty_per_500 = {float(activity_shortfall_penalty_per_500)}\n"
         f"skip_threshold_per_500 = {float(skip_threshold_per_500)}\n\n"
     )
     return _WINDOW_CONTROLLER_SECTION_PATTERN.sub(replacement, config_text, count=1)
@@ -105,11 +135,16 @@ def write_runtime_config(
     active_candidate_names: list[str],
     enabled: str,
     mode: str,
-    baseline_profile_name: str,
-    alternate_profile_name: str,
+    profile_names: list[str],
+    cold_start_profile_name: str,
     window_rounds: int,
     lookback_windows: int,
-    margin_per_500: float,
+    min_history_windows: int,
+    estimator_mode: str,
+    ewm_alpha: float,
+    stability_penalty_per_500: float,
+    activity_target_bet_rate: float,
+    activity_shortfall_penalty_per_500: float,
     skip_threshold_per_500: float,
 ) -> Path:
     config_text = base_config_path.read_text(encoding="utf-8")
@@ -121,11 +156,16 @@ def write_runtime_config(
         config_text=patched,
         enabled=str(enabled),
         mode=str(mode),
-        baseline_profile_name=str(baseline_profile_name),
-        alternate_profile_name=str(alternate_profile_name),
+        profile_names=list(profile_names),
+        cold_start_profile_name=str(cold_start_profile_name),
         window_rounds=int(window_rounds),
         lookback_windows=int(lookback_windows),
-        margin_per_500=float(margin_per_500),
+        min_history_windows=int(min_history_windows),
+        estimator_mode=str(estimator_mode),
+        ewm_alpha=float(ewm_alpha),
+        stability_penalty_per_500=float(stability_penalty_per_500),
+        activity_target_bet_rate=float(activity_target_bet_rate),
+        activity_shortfall_penalty_per_500=float(activity_shortfall_penalty_per_500),
         skip_threshold_per_500=float(skip_threshold_per_500),
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -137,6 +177,7 @@ def write_runtime_config(
 def main() -> None:
     args = _build_parser().parse_args()
     names = _parse_names(str(args.active_candidate_names))
+    profile_names = _parse_names(str(args.window_controller_profile_names))
     enabled = _bool_token(str(args.window_controller_enabled))
     out_path = write_runtime_config(
         base_config_path=Path(str(args.base_config)).resolve(),
@@ -145,11 +186,18 @@ def main() -> None:
         active_candidate_names=names,
         enabled=str(enabled),
         mode=str(args.window_controller_mode),
-        baseline_profile_name=str(args.window_controller_baseline_profile_name),
-        alternate_profile_name=str(args.window_controller_alternate_profile_name),
+        profile_names=profile_names,
+        cold_start_profile_name=str(args.window_controller_cold_start_profile_name),
         window_rounds=int(args.window_controller_window_rounds),
         lookback_windows=int(args.window_controller_lookback_windows),
-        margin_per_500=float(args.window_controller_margin_per_500),
+        min_history_windows=int(args.window_controller_min_history_windows),
+        estimator_mode=str(args.window_controller_estimator_mode),
+        ewm_alpha=float(args.window_controller_ewm_alpha),
+        stability_penalty_per_500=float(args.window_controller_stability_penalty_per_500),
+        activity_target_bet_rate=float(args.window_controller_activity_target_bet_rate),
+        activity_shortfall_penalty_per_500=float(
+            args.window_controller_activity_shortfall_penalty_per_500
+        ),
         skip_threshold_per_500=float(args.window_controller_skip_threshold_per_500),
     )
     print(str(out_path))

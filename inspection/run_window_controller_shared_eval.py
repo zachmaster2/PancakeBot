@@ -18,34 +18,48 @@ class SharedEvalRow:
     sim_size: int
     tail_offset_rounds: int
     controller_mode: str
+    controller_estimator_mode: str
+    controller_profile_names_json: str
     controller_lookback_windows: int
-    controller_margin_per_500: float
+    controller_min_history_windows: int
+    controller_ewm_alpha: float
+    controller_stability_penalty_per_500: float
+    controller_activity_target_bet_rate: float
+    controller_activity_shortfall_penalty_per_500: float
     controller_skip_threshold_per_500: float
     controller_per_500: float
     controller_bet_rate: float
     controller_net_profit_bnb: float
-    static_stageb_per_500: float
-    static_stageb_bet_rate: float
-    static_stageb_net_profit_bnb: float
-    lift_vs_stageb_per_500: float
+    static_profile_name: str
+    static_profile_per_500: float
+    static_profile_bet_rate: float
+    static_profile_net_profit_bnb: float
+    lift_vs_static_profile_per_500: float
 
 
 @dataclass(frozen=True, slots=True)
 class SharedEvalAggregateRow:
     sim_size: int
     controller_mode: str
+    controller_estimator_mode: str
+    controller_profile_names_json: str
     controller_lookback_windows: int
-    controller_margin_per_500: float
+    controller_min_history_windows: int
+    controller_ewm_alpha: float
+    controller_stability_penalty_per_500: float
+    controller_activity_target_bet_rate: float
+    controller_activity_shortfall_penalty_per_500: float
     controller_skip_threshold_per_500: float
+    static_profile_name: str
     num_offsets: int
     controller_mean_per_500: float
     controller_min_per_500: float
     controller_mean_bet_rate: float
-    static_stageb_mean_per_500: float
-    static_stageb_min_per_500: float
-    static_stageb_mean_bet_rate: float
-    mean_lift_vs_stageb_per_500: float
-    min_lift_vs_stageb_per_500: float
+    static_profile_mean_per_500: float
+    static_profile_min_per_500: float
+    static_profile_mean_bet_rate: float
+    mean_lift_vs_static_profile_per_500: float
+    min_lift_vs_static_profile_per_500: float
     lift_wins: int
 
 
@@ -59,15 +73,30 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--controller-mode",
         type=str,
-        choices=("trailing_best_vs_baseline", "trailing_best_vs_baseline_with_skip"),
+        choices=("absolute_best_with_skip",),
         required=True,
     )
-    parser.add_argument("--baseline-profile-name", type=str, default="disloc_stageB_bullonly_recent8pct_v1")
-    parser.add_argument("--alternate-profile-name", type=str, default="disloc_cons_20260227_x80")
+    parser.add_argument(
+        "--controller-profile-names",
+        type=str,
+        default="disloc_stageB_bullonly_recent8pct_v1,disloc_stageG2_bullonly_recent5pct_v1,disloc_altB_20260227_x80",
+    )
+    parser.add_argument("--controller-cold-start-profile-name", type=str, default="disloc_stageB_bullonly_recent8pct_v1")
+    parser.add_argument("--static-profile-name", type=str, default="disloc_stageB_bullonly_recent8pct_v1")
     parser.add_argument("--window-rounds", type=int, default=216)
     parser.add_argument("--lookback-windows", type=int, required=True)
-    parser.add_argument("--margin-per-500", type=float, required=True)
-    parser.add_argument("--skip-threshold-per-500", type=float, default=0.0)
+    parser.add_argument("--min-history-windows", type=int, required=True)
+    parser.add_argument(
+        "--estimator-mode",
+        type=str,
+        choices=("trailing_mean", "ewm_mean"),
+        required=True,
+    )
+    parser.add_argument("--ewm-alpha", type=float, default=0.85)
+    parser.add_argument("--stability-penalty-per-500", type=float, default=0.0)
+    parser.add_argument("--activity-target-bet-rate", type=float, default=0.0)
+    parser.add_argument("--activity-shortfall-penalty-per-500", type=float, default=0.0)
+    parser.add_argument("--skip-threshold-per-500", type=float, default=0.05)
     parser.add_argument("--output-dir", type=str, default=_DEFAULT_EXP_ROOT)
     parser.add_argument("--reuse-existing", action="store_true")
     return parser
@@ -149,11 +178,16 @@ def _controller_command(
     tail_offset_rounds: int,
     router_mode: str,
     controller_mode: str,
-    baseline_profile_name: str,
-    alternate_profile_name: str,
+    controller_profile_names: list[str],
+    controller_cold_start_profile_name: str,
     window_rounds: int,
     lookback_windows: int,
-    margin_per_500: float,
+    min_history_windows: int,
+    estimator_mode: str,
+    ewm_alpha: float,
+    stability_penalty_per_500: float,
+    activity_target_bet_rate: float,
+    activity_shortfall_penalty_per_500: float,
     skip_threshold_per_500: float,
 ) -> list[str]:
     cmd = [
@@ -171,29 +205,34 @@ def _controller_command(
         "--router-mode",
         str(router_mode),
         "--active-candidate-names",
-        f"{str(baseline_profile_name)},{str(alternate_profile_name)}",
+        ",".join(str(name) for name in controller_profile_names),
         "--window-controller-enabled",
         "true",
         "--window-controller-mode",
         str(controller_mode),
-        "--window-controller-baseline-profile-name",
-        str(baseline_profile_name),
-        "--window-controller-alternate-profile-name",
-        str(alternate_profile_name),
+        "--window-controller-profile-names",
+        ",".join(str(name) for name in controller_profile_names),
+        "--window-controller-cold-start-profile-name",
+        str(controller_cold_start_profile_name),
         "--window-controller-window-rounds",
         str(int(window_rounds)),
         "--window-controller-lookback-windows",
         str(int(lookback_windows)),
-        "--window-controller-margin-per-500",
-        str(float(margin_per_500)),
+        "--window-controller-min-history-windows",
+        str(int(min_history_windows)),
+        "--window-controller-estimator-mode",
+        str(estimator_mode),
+        "--window-controller-ewm-alpha",
+        str(float(ewm_alpha)),
+        "--window-controller-stability-penalty-per-500",
+        str(float(stability_penalty_per_500)),
+        "--window-controller-activity-target-bet-rate",
+        str(float(activity_target_bet_rate)),
+        "--window-controller-activity-shortfall-penalty-per-500",
+        str(float(activity_shortfall_penalty_per_500)),
+        "--window-controller-skip-threshold-per-500",
+        str(float(skip_threshold_per_500)),
     ]
-    if str(controller_mode) == "trailing_best_vs_baseline_with_skip":
-        cmd.extend(
-            [
-                "--window-controller-skip-threshold-per-500",
-                str(float(skip_threshold_per_500)),
-            ]
-        )
     return cmd
 
 
@@ -205,7 +244,7 @@ def _static_command(
     sim_size: int,
     tail_offset_rounds: int,
     router_mode: str,
-    baseline_profile_name: str,
+    static_profile_name: str,
 ) -> list[str]:
     return [
         str(python_exe),
@@ -222,44 +261,58 @@ def _static_command(
         "--router-mode",
         str(router_mode),
         "--active-candidate-names",
-        str(baseline_profile_name),
+        str(static_profile_name),
     ]
 
 
 def _aggregate_rows(rows: list[SharedEvalRow]) -> list[SharedEvalAggregateRow]:
-    groups: dict[tuple[int, str, int, float, float], list[SharedEvalRow]] = {}
+    groups: dict[tuple[int, str, str, int, int, float, float, float, str], list[SharedEvalRow]] = {}
     for row in rows:
         key = (
             int(row.sim_size),
             str(row.controller_mode),
+            str(row.controller_estimator_mode),
+            str(row.controller_profile_names_json),
             int(row.controller_lookback_windows),
-            float(row.controller_margin_per_500),
+            int(row.controller_min_history_windows),
+            float(row.controller_ewm_alpha),
+            float(row.controller_stability_penalty_per_500),
+            float(row.controller_activity_target_bet_rate),
+            float(row.controller_activity_shortfall_penalty_per_500),
             float(row.controller_skip_threshold_per_500),
+            str(row.static_profile_name),
         )
         groups.setdefault(key, []).append(row)
     out: list[SharedEvalAggregateRow] = []
     for key, bucket in sorted(groups.items()):
-        lifts = [float(row.lift_vs_stageb_per_500) for row in bucket]
+        lifts = [float(row.lift_vs_static_profile_per_500) for row in bucket]
         controller_vals = [float(row.controller_per_500) for row in bucket]
         controller_bet_rates = [float(row.controller_bet_rate) for row in bucket]
-        baseline_vals = [float(row.static_stageb_per_500) for row in bucket]
-        baseline_bet_rates = [float(row.static_stageb_bet_rate) for row in bucket]
+        baseline_vals = [float(row.static_profile_per_500) for row in bucket]
+        baseline_bet_rates = [float(row.static_profile_bet_rate) for row in bucket]
         out.append(
             SharedEvalAggregateRow(
                 sim_size=int(key[0]),
                 controller_mode=str(key[1]),
-                controller_lookback_windows=int(key[2]),
-                controller_margin_per_500=float(key[3]),
-                controller_skip_threshold_per_500=float(key[4]),
+                controller_estimator_mode=str(key[2]),
+                controller_profile_names_json=str(key[3]),
+                controller_lookback_windows=int(key[4]),
+                controller_min_history_windows=int(key[5]),
+                controller_ewm_alpha=float(key[6]),
+                controller_stability_penalty_per_500=float(key[7]),
+                controller_activity_target_bet_rate=float(key[8]),
+                controller_activity_shortfall_penalty_per_500=float(key[9]),
+                controller_skip_threshold_per_500=float(key[10]),
+                static_profile_name=str(key[11]),
                 num_offsets=int(len(bucket)),
                 controller_mean_per_500=float(sum(controller_vals) / float(len(controller_vals))),
                 controller_min_per_500=float(min(controller_vals)),
                 controller_mean_bet_rate=float(sum(controller_bet_rates) / float(len(controller_bet_rates))),
-                static_stageb_mean_per_500=float(sum(baseline_vals) / float(len(baseline_vals))),
-                static_stageb_min_per_500=float(min(baseline_vals)),
-                static_stageb_mean_bet_rate=float(sum(baseline_bet_rates) / float(len(baseline_bet_rates))),
-                mean_lift_vs_stageb_per_500=float(sum(lifts) / float(len(lifts))),
-                min_lift_vs_stageb_per_500=float(min(lifts)),
+                static_profile_mean_per_500=float(sum(baseline_vals) / float(len(baseline_vals))),
+                static_profile_min_per_500=float(min(baseline_vals)),
+                static_profile_mean_bet_rate=float(sum(baseline_bet_rates) / float(len(baseline_bet_rates))),
+                mean_lift_vs_static_profile_per_500=float(sum(lifts) / float(len(lifts))),
+                min_lift_vs_static_profile_per_500=float(min(lifts)),
                 lift_wins=int(sum(1 for value in lifts if float(value) > 0.0)),
             )
         )
@@ -280,6 +333,13 @@ def main() -> None:
     args = _build_parser().parse_args()
     sim_sizes = _parse_positive_int_list(str(args.sim_sizes))
     tail_offsets = _parse_nonnegative_int_list(str(args.tail_offset_rounds))
+    controller_profile_names = [
+        str(token).strip()
+        for token in str(args.controller_profile_names).split(",")
+        if str(token).strip() != ""
+    ]
+    if not controller_profile_names:
+        raise InvariantError("window_controller_shared_eval_profile_names_empty")
     root = Path.cwd().resolve()
     output_dir = Path(str(args.output_dir)).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -304,11 +364,16 @@ def main() -> None:
                         tail_offset_rounds=int(tail_offset_rounds),
                         router_mode=str(args.router_mode),
                         controller_mode=str(args.controller_mode),
-                        baseline_profile_name=str(args.baseline_profile_name),
-                        alternate_profile_name=str(args.alternate_profile_name),
+                        controller_profile_names=list(controller_profile_names),
+                        controller_cold_start_profile_name=str(args.controller_cold_start_profile_name),
                         window_rounds=int(args.window_rounds),
                         lookback_windows=int(args.lookback_windows),
-                        margin_per_500=float(args.margin_per_500),
+                        min_history_windows=int(args.min_history_windows),
+                        estimator_mode=str(args.estimator_mode),
+                        ewm_alpha=float(args.ewm_alpha),
+                        stability_penalty_per_500=float(args.stability_penalty_per_500),
+                        activity_target_bet_rate=float(args.activity_target_bet_rate),
+                        activity_shortfall_penalty_per_500=float(args.activity_shortfall_penalty_per_500),
                         skip_threshold_per_500=float(args.skip_threshold_per_500),
                     ),
                     cwd=root,
@@ -329,7 +394,7 @@ def main() -> None:
                         sim_size=int(sim_size),
                         tail_offset_rounds=int(tail_offset_rounds),
                         router_mode=str(args.router_mode),
-                        baseline_profile_name=str(args.baseline_profile_name),
+                        static_profile_name=str(args.static_profile_name),
                     ),
                     cwd=root,
                 )
@@ -341,16 +406,23 @@ def main() -> None:
                     sim_size=int(sim_size),
                     tail_offset_rounds=int(tail_offset_rounds),
                     controller_mode=str(args.controller_mode),
+                    controller_estimator_mode=str(args.estimator_mode),
+                    controller_profile_names_json=json.dumps(list(controller_profile_names), separators=(",", ":")),
                     controller_lookback_windows=int(args.lookback_windows),
-                    controller_margin_per_500=float(args.margin_per_500),
+                    controller_min_history_windows=int(args.min_history_windows),
+                    controller_ewm_alpha=float(args.ewm_alpha),
+                    controller_stability_penalty_per_500=float(args.stability_penalty_per_500),
+                    controller_activity_target_bet_rate=float(args.activity_target_bet_rate),
+                    controller_activity_shortfall_penalty_per_500=float(args.activity_shortfall_penalty_per_500),
                     controller_skip_threshold_per_500=float(args.skip_threshold_per_500),
                     controller_per_500=float(controller_per_500),
                     controller_bet_rate=float(controller_bet_rate),
                     controller_net_profit_bnb=float(controller_net_profit),
-                    static_stageb_per_500=float(static_per_500),
-                    static_stageb_bet_rate=float(static_bet_rate),
-                    static_stageb_net_profit_bnb=float(static_net_profit),
-                    lift_vs_stageb_per_500=float(controller_per_500 - static_per_500),
+                    static_profile_name=str(args.static_profile_name),
+                    static_profile_per_500=float(static_per_500),
+                    static_profile_bet_rate=float(static_bet_rate),
+                    static_profile_net_profit_bnb=float(static_net_profit),
+                    lift_vs_static_profile_per_500=float(controller_per_500 - static_per_500),
                 )
             )
 
@@ -362,8 +434,12 @@ def main() -> None:
         json.dumps(
             {
                 "controller_mode": str(args.controller_mode),
+                "controller_estimator_mode": str(args.estimator_mode),
+                "controller_profile_names": list(controller_profile_names),
                 "lookback_windows": int(args.lookback_windows),
-                "margin_per_500": float(args.margin_per_500),
+                "min_history_windows": int(args.min_history_windows),
+                "ewm_alpha": float(args.ewm_alpha),
+                "stability_penalty_per_500": float(args.stability_penalty_per_500),
                 "skip_threshold_per_500": float(args.skip_threshold_per_500),
                 "rows": [asdict(row) for row in rows],
                 "aggregates": [asdict(row) for row in aggregate_rows],

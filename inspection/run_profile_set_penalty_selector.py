@@ -76,7 +76,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ridge-alphas", type=str, default="0.25,0.5,1.0,2.0,5.0,10.0")
     parser.add_argument("--flow-penalties-per-500", type=str, default="0.0,0.1,0.2,0.3,0.5")
     parser.add_argument("--stageg2-penalties-per-500", type=str, default="0.0,0.1,0.2,0.3")
-    parser.add_argument("--min-selected-bet-rate", type=float, default=0.05)
+    parser.add_argument("--min-selected-bet-rate", type=float, default=0.01)
     parser.add_argument("--output-dir", type=str, default=_DEFAULT_EXP_ROOT)
     return parser
 

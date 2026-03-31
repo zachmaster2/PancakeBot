@@ -920,6 +920,150 @@ def _append_dry_audit_row(path: str, row: dict[str, object]) -> None:
         w.writerow([row.get(c, "") for c in cols])
 
 
+def _controller_profile_label(name: str) -> str:
+    text = str(name).strip()
+    aliases = {
+        "disloc_stageB_bullonly_recent8pct_v1": "stageB",
+        "disloc_stageG2_bullonly_recent5pct_v1": "stageG2",
+        "disloc_altB_20260227_x80": "altB",
+    }
+    if text in aliases:
+        return str(aliases[text])
+    if text.startswith("disloc_"):
+        return str(text[len("disloc_") :])
+    return str(text)
+
+
+def _parse_controller_metric_map(raw: str | object) -> dict[str, float]:
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        text = str(raw or "").strip()
+        if text == "":
+            return {}
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, value in data.items():
+        try:
+            out[str(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _controller_decision_log_suffix(
+    *,
+    decision: object | None,
+    final_action: str,
+    final_skip_reason: str | None = None,
+) -> str:
+    if decision is None:
+        return ""
+    mode = str(getattr(decision, "controller_mode", "") or "").strip()
+    if mode == "":
+        return ""
+    estimator_mode = str(getattr(decision, "controller_estimator_mode", "") or "").strip()
+    window_index = getattr(decision, "controller_window_index", None)
+    lookback_windows_used = getattr(decision, "controller_lookback_windows_used", None)
+    selected_action = str(getattr(decision, "controller_selected_action", "") or "").strip()
+    selected_profile = str(getattr(decision, "controller_selected_profile", "") or "").strip()
+    selected_per_500 = getattr(decision, "controller_estimated_per_500", None)
+    selected_score_per_500 = getattr(decision, "controller_estimated_score_per_500", None)
+    selected_bet_rate = getattr(decision, "controller_estimated_selected_bet_rate", None)
+    per_500_map = _parse_controller_metric_map(
+        getattr(decision, "controller_estimated_profiles_per_500_json", "")
+    )
+    score_map = _parse_controller_metric_map(
+        getattr(decision, "controller_estimated_profiles_score_per_500_json", "")
+    )
+    bet_rate_map = _parse_controller_metric_map(
+        getattr(decision, "controller_estimated_profiles_bet_rate_json", "")
+    )
+    names = set(per_500_map) | set(score_map) | set(bet_rate_map)
+    if selected_profile != "":
+        names.add(str(selected_profile))
+    ordered_names = sorted(
+        names,
+        key=lambda name: (
+            0 if str(name) == str(selected_profile) and str(selected_profile) != "" else 1,
+            -float(score_map.get(str(name), float("-inf"))),
+            str(name),
+        ),
+    )
+    profile_parts: list[str] = []
+    for name in ordered_names:
+        label = _controller_profile_label(str(name))
+        prefix = "*" if str(name) == str(selected_profile) and str(selected_profile) != "" else ""
+        part = (
+            f"{prefix}{label}:"
+            f"{float(per_500_map.get(str(name), 0.0)):+.4f}/"
+            f"{float(score_map.get(str(name), 0.0)):+.4f}/"
+            f"{100.0 * float(bet_rate_map.get(str(name), 0.0)):.1f}%"
+        )
+        profile_parts.append(part)
+    suffix_parts = [
+        f"mode={mode}",
+        (f"estimator={estimator_mode}" if estimator_mode != "" else None),
+        (f"win={int(window_index)}" if window_index is not None else None),
+        (
+            f"hist={int(lookback_windows_used)}"
+            if lookback_windows_used is not None
+            else None
+        ),
+        f"ctrl={selected_action or 'off'}",
+        (
+            f"pick={_controller_profile_label(selected_profile)}"
+            if selected_profile != ""
+            else "pick=skip"
+        ),
+        (
+            f"est500={float(selected_per_500):+.4f}"
+            if isinstance(selected_per_500, (int, float))
+            else None
+        ),
+        (
+            f"score500={float(selected_score_per_500):+.4f}"
+            if isinstance(selected_score_per_500, (int, float))
+            else None
+        ),
+        (
+            f"rate={100.0 * float(selected_bet_rate):.1f}%"
+            if isinstance(selected_bet_rate, (int, float))
+            else None
+        ),
+        f"final={str(final_action)}",
+        (
+            f"reason={str(final_skip_reason)}"
+            if final_skip_reason is not None and str(final_skip_reason).strip() != ""
+            else None
+        ),
+        ("profiles=" + ",".join(profile_parts) if profile_parts else None),
+    ]
+    return " ctrl[" + " ".join(part for part in suffix_parts if part) + "]"
+
+
+def _log_controller_decision(
+    *,
+    current_epoch: int,
+    decision: object | None,
+    final_action: str,
+    final_skip_reason: str | None = None,
+) -> None:
+    suffix = _controller_decision_log_suffix(
+        decision=decision,
+        final_action=str(final_action),
+        final_skip_reason=(None if final_skip_reason is None else str(final_skip_reason)),
+    )
+    if suffix == "":
+        return
+    info("RUN", "CTRL", "DECIDE", msg=f"Epoch {int(current_epoch)}{suffix}")
+
+
 def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
     header_cols = [
         "cycle_ts",
@@ -945,11 +1089,17 @@ def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         "router_mode",
         "pipeline_last_settled_epoch",
         "controller_mode",
+        "controller_estimator_mode",
         "controller_window_index",
+        "controller_lookback_windows_used",
         "controller_selected_profile",
         "controller_selected_action",
         "controller_estimated_per_500",
+        "controller_estimated_score_per_500",
         "controller_estimated_selected_bet_rate",
+        "controller_estimated_profiles_per_500_json",
+        "controller_estimated_profiles_score_per_500_json",
+        "controller_estimated_profiles_bet_rate_json",
         "action",
         "decision_stage",
         "selected_strategy",
@@ -1068,11 +1218,17 @@ def _record_dry_cycle_audit(
 
     selected_strategy: str | object = ""
     controller_mode: str | object = ""
+    controller_estimator_mode: str | object = ""
     controller_window_index: int | str = ""
+    controller_lookback_windows_used: int | str = ""
     controller_selected_profile: str | object = ""
     controller_selected_action: str | object = ""
     controller_estimated_per_500: float | str = ""
+    controller_estimated_score_per_500: float | str = ""
     controller_estimated_selected_bet_rate: float | str = ""
+    controller_estimated_profiles_per_500_json: str | object = ""
+    controller_estimated_profiles_score_per_500_json: str | object = ""
+    controller_estimated_profiles_bet_rate_json: str | object = ""
     bet_side: str | object = ""
     bet_size_bnb: float | str = ""
     p_bull: float | str = ""
@@ -1081,14 +1237,21 @@ def _record_dry_cycle_audit(
     if decision is not None:
         selected_strategy = getattr(decision, "selected_strategy", "") or ""
         controller_mode = getattr(decision, "controller_mode", "") or ""
+        controller_estimator_mode = getattr(decision, "controller_estimator_mode", "") or ""
         controller_window_raw = getattr(decision, "controller_window_index", None)
         if controller_window_raw is not None:
             controller_window_index = int(controller_window_raw)
+        controller_lookback_used_raw = getattr(decision, "controller_lookback_windows_used", None)
+        if controller_lookback_used_raw is not None:
+            controller_lookback_windows_used = int(controller_lookback_used_raw)
         controller_selected_profile = getattr(decision, "controller_selected_profile", "") or ""
         controller_selected_action = getattr(decision, "controller_selected_action", "") or ""
         controller_estimated_raw = getattr(decision, "controller_estimated_per_500", None)
         if isinstance(controller_estimated_raw, (int, float)):
             controller_estimated_per_500 = float(controller_estimated_raw)
+        controller_estimated_score_raw = getattr(decision, "controller_estimated_score_per_500", None)
+        if isinstance(controller_estimated_score_raw, (int, float)):
+            controller_estimated_score_per_500 = float(controller_estimated_score_raw)
         controller_estimated_bet_rate_raw = getattr(
             decision,
             "controller_estimated_selected_bet_rate",
@@ -1096,6 +1259,15 @@ def _record_dry_cycle_audit(
         )
         if isinstance(controller_estimated_bet_rate_raw, (int, float)):
             controller_estimated_selected_bet_rate = float(controller_estimated_bet_rate_raw)
+        controller_estimated_profiles_per_500_json = (
+            getattr(decision, "controller_estimated_profiles_per_500_json", "") or ""
+        )
+        controller_estimated_profiles_score_per_500_json = (
+            getattr(decision, "controller_estimated_profiles_score_per_500_json", "") or ""
+        )
+        controller_estimated_profiles_bet_rate_json = (
+            getattr(decision, "controller_estimated_profiles_bet_rate_json", "") or ""
+        )
         bet_side = getattr(decision, "bet_side", "") or ""
         bet_size_raw = getattr(decision, "bet_size_bnb", "")
         if isinstance(bet_size_raw, (int, float)):
@@ -1148,11 +1320,17 @@ def _record_dry_cycle_audit(
             "router_mode": router_mode,
             "pipeline_last_settled_epoch": pipeline_last_settled_epoch,
             "controller_mode": controller_mode,
+            "controller_estimator_mode": controller_estimator_mode,
             "controller_window_index": controller_window_index,
+            "controller_lookback_windows_used": controller_lookback_windows_used,
             "controller_selected_profile": controller_selected_profile,
             "controller_selected_action": controller_selected_action,
             "controller_estimated_per_500": controller_estimated_per_500,
+            "controller_estimated_score_per_500": controller_estimated_score_per_500,
             "controller_estimated_selected_bet_rate": controller_estimated_selected_bet_rate,
+            "controller_estimated_profiles_per_500_json": controller_estimated_profiles_per_500_json,
+            "controller_estimated_profiles_score_per_500_json": controller_estimated_profiles_score_per_500_json,
+            "controller_estimated_profiles_bet_rate_json": controller_estimated_profiles_bet_rate_json,
             "action": str(action),
             "decision_stage": str(decision_stage),
             "selected_strategy": selected_strategy,
@@ -1724,6 +1902,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             if reason == "":
                 raise InvariantError("policy_skip_missing_reason")
 
+            _log_controller_decision(
+                current_epoch=int(current_epoch),
+                decision=decision,
+                final_action="SKIP",
+                final_skip_reason=str(reason),
+            )
             _record_dry_cycle_audit(
                 cfg,
                 closed,
@@ -1747,6 +1931,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         # Step 11: Execution timing guard.
         if now_ts() >= lock_ts_t - _LOCK_SAFETY_MARGIN_SECONDS:
+            _log_controller_decision(
+                current_epoch=int(current_epoch),
+                decision=decision,
+                final_action="SKIP",
+                final_skip_reason="too_close_to_lock_for_bet",
+            )
             _record_dry_cycle_audit(
                 cfg,
                 closed,
@@ -1778,6 +1968,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if amount_wei <= 0:
             raise InvariantError("bet_amount_wei_nonpositive")
 
+        _log_controller_decision(
+            current_epoch=int(current_epoch),
+            decision=decision,
+            final_action="BET",
+            final_skip_reason=None,
+        )
         tx_submit = None
         if not cfg.dry:
             gas_price_wei = cfg.contract.suggest_gas_price_wei()

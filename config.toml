@@ -74,9 +74,11 @@ bet_receipt_timeout_seconds = 45
 # Optional allowlist. When set, only these named candidates are active.
 # Candidate definitions remain below for experiment traceability.
 # Current default:
-#   recent-tail stageB bull-only profile with tuned flow overlay promoted on 2026-03-26.
+#   peer-set absolute controller candidate pool for dry-mode exploration.
 active_candidate_names = [
   "disloc_stageB_bullonly_recent8pct_v1",
+  "disloc_stageG2_bullonly_recent5pct_v1",
+  "disloc_altB_20260227_x80",
 ]
 
 [strategy.dislocation.selector]
@@ -613,17 +615,24 @@ roll_winrate_min = 0.48
 cooldown_trades = 40
 
 [strategy.window_controller]
-# Research-only window controller. Disabled by default until it clears
-# broader causal backtests and a controlled dry rollout.
-enabled = false
-mode = "trailing_best_vs_baseline"
-baseline_profile_name = "disloc_stageB_bullonly_recent8pct_v1"
-alternate_profile_name = "disloc_cons_20260227_x80"
+# Default peer-set absolute controller for dry-mode exploration.
+# `cold_start_profile_name` is only a bootstrap seed before controller history exists.
+enabled = true
+mode = "absolute_best_with_skip"
+profile_names = [
+  "disloc_stageB_bullonly_recent8pct_v1",
+  "disloc_stageG2_bullonly_recent5pct_v1",
+  "disloc_altB_20260227_x80",
+]
+cold_start_profile_name = "disloc_stageB_bullonly_recent8pct_v1"
 window_rounds = 216
-# Current best continuous shared-harness candidate. Still experimental.
-lookback_windows = 3
-margin_per_500 = 1.0
-skip_threshold_per_500 = 0.0
+# Current default peer-set controller lane.
+lookback_windows = 2
+min_history_windows = 2
+estimator_mode = "ewm_mean"
+ewm_alpha = 0.85
+stability_penalty_per_500 = 0.0
+skip_threshold_per_500 = 0.05
 
 [backtest]
 # Number of most-recent closed rounds to replay.

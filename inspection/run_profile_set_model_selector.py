@@ -97,7 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hgb-max-depths", type=str, default="2")
     parser.add_argument("--hgb-max-leaf-nodes", type=str, default="15")
     parser.add_argument("--hgb-min-samples-leaf", type=str, default="2")
-    parser.add_argument("--min-selected-bet-rate", type=float, default=0.05)
+    parser.add_argument("--min-selected-bet-rate", type=float, default=0.01)
     parser.add_argument("--output-dir", type=str, default=_DEFAULT_EXP_ROOT)
     return parser
 

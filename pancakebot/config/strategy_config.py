@@ -204,13 +204,22 @@ class WindowControllerConfig:
     """Optional window-level profile controller shared by live/dry/backtest."""
 
     enabled: bool = False
-    mode: str = "trailing_best_vs_baseline"
-    baseline_profile_name: str = "disloc_stageB_bullonly_recent8pct_v1"
-    alternate_profile_name: str = "disloc_cons_20260227_x80"
+    mode: str = "absolute_best_with_skip"
+    profile_names: tuple[str, ...] = (
+        "disloc_stageB_bullonly_recent8pct_v1",
+        "disloc_stageG2_bullonly_recent5pct_v1",
+        "disloc_altB_20260227_x80",
+    )
+    cold_start_profile_name: str = "disloc_stageB_bullonly_recent8pct_v1"
     window_rounds: int = 216
-    lookback_windows: int = 3
-    margin_per_500: float = 1.0
-    skip_threshold_per_500: float = 0.0
+    lookback_windows: int = 2
+    min_history_windows: int = 2
+    estimator_mode: str = "ewm_mean"
+    ewm_alpha: float = 0.85
+    stability_penalty_per_500: float = 0.0
+    activity_target_bet_rate: float = 0.0
+    activity_shortfall_penalty_per_500: float = 0.0
+    skip_threshold_per_500: float = 0.05
 
 
 @dataclass(frozen=True, slots=True)

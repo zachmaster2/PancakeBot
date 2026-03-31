@@ -686,35 +686,42 @@ def _parse_window_controller(controller: dict[str, Any]) -> WindowControllerConf
     allowed = {
         "enabled",
         "mode",
-        "baseline_profile_name",
-        "alternate_profile_name",
+        "profile_names",
+        "cold_start_profile_name",
         "window_rounds",
         "lookback_windows",
-        "margin_per_500",
+        "min_history_windows",
+        "estimator_mode",
+        "ewm_alpha",
+        "stability_penalty_per_500",
+        "activity_target_bet_rate",
+        "activity_shortfall_penalty_per_500",
         "skip_threshold_per_500",
     }
     _validate_unknown_keys("window_controller", controller, allowed)
 
     enabled = _opt_bool(controller, "enabled", bool(defaults.enabled))
     mode = _opt_str(controller, "mode", str(defaults.mode))
-    if str(mode) not in {
-        "trailing_best_vs_baseline",
-        "trailing_best_vs_baseline_with_skip",
-    }:
+    if str(mode) not in {"absolute_best_with_skip"}:
         raise InvariantError("strategy_window_controller_mode_invalid")
 
-    baseline_profile_name = _opt_str(
+    profile_names = _opt_list_str(
         controller,
-        "baseline_profile_name",
-        str(defaults.baseline_profile_name),
+        "profile_names",
+        tuple(str(name) for name in defaults.profile_names),
     )
-    alternate_profile_name = _opt_str(
+    if not profile_names:
+        raise InvariantError("strategy_window_controller_profile_names_empty")
+    if len(set(profile_names)) != len(profile_names):
+        raise InvariantError("strategy_window_controller_profile_names_duplicate")
+
+    cold_start_profile_name = _opt_str(
         controller,
-        "alternate_profile_name",
-        str(defaults.alternate_profile_name),
+        "cold_start_profile_name",
+        str(defaults.cold_start_profile_name),
     )
-    if str(baseline_profile_name) == str(alternate_profile_name):
-        raise InvariantError("strategy_window_controller_profiles_must_differ")
+    if str(cold_start_profile_name) not in set(profile_names):
+        raise InvariantError("strategy_window_controller_cold_start_profile_missing")
 
     window_rounds = _opt_int(controller, "window_rounds", int(defaults.window_rounds))
     if int(window_rounds) <= 0:
@@ -728,11 +735,56 @@ def _parse_window_controller(controller: dict[str, Any]) -> WindowControllerConf
     if int(lookback_windows) <= 0:
         raise InvariantError("strategy_window_controller_lookback_windows_nonpositive")
 
-    margin_per_500 = _opt_float(
+    min_history_windows = _opt_int(
         controller,
-        "margin_per_500",
-        float(defaults.margin_per_500),
+        "min_history_windows",
+        int(defaults.min_history_windows),
     )
+    if int(min_history_windows) <= 0:
+        raise InvariantError("strategy_window_controller_min_history_windows_nonpositive")
+    if int(min_history_windows) > int(lookback_windows):
+        raise InvariantError("strategy_window_controller_min_history_windows_exceeds_lookback")
+
+    estimator_mode = _opt_str(
+        controller,
+        "estimator_mode",
+        str(defaults.estimator_mode),
+    )
+    if str(estimator_mode) not in {"trailing_mean", "ewm_mean"}:
+        raise InvariantError("strategy_window_controller_estimator_mode_invalid")
+
+    ewm_alpha = _opt_float(
+        controller,
+        "ewm_alpha",
+        float(defaults.ewm_alpha),
+    )
+    if float(ewm_alpha) <= 0.0 or float(ewm_alpha) > 1.0:
+        raise InvariantError("strategy_window_controller_ewm_alpha_out_of_range")
+
+    stability_penalty_per_500 = _opt_float(
+        controller,
+        "stability_penalty_per_500",
+        float(defaults.stability_penalty_per_500),
+    )
+    if float(stability_penalty_per_500) < 0.0:
+        raise InvariantError("strategy_window_controller_stability_penalty_negative")
+
+    activity_target_bet_rate = _opt_float(
+        controller,
+        "activity_target_bet_rate",
+        float(defaults.activity_target_bet_rate),
+    )
+    if float(activity_target_bet_rate) < 0.0 or float(activity_target_bet_rate) > 1.0:
+        raise InvariantError("strategy_window_controller_activity_target_bet_rate_out_of_range")
+
+    activity_shortfall_penalty_per_500 = _opt_float(
+        controller,
+        "activity_shortfall_penalty_per_500",
+        float(defaults.activity_shortfall_penalty_per_500),
+    )
+    if float(activity_shortfall_penalty_per_500) < 0.0:
+        raise InvariantError("strategy_window_controller_activity_shortfall_penalty_negative")
+
     skip_threshold_per_500 = _opt_float(
         controller,
         "skip_threshold_per_500",
@@ -742,11 +794,16 @@ def _parse_window_controller(controller: dict[str, Any]) -> WindowControllerConf
     return WindowControllerConfig(
         enabled=bool(enabled),
         mode=str(mode),
-        baseline_profile_name=str(baseline_profile_name),
-        alternate_profile_name=str(alternate_profile_name),
+        profile_names=tuple(str(name) for name in profile_names),
+        cold_start_profile_name=str(cold_start_profile_name),
         window_rounds=int(window_rounds),
         lookback_windows=int(lookback_windows),
-        margin_per_500=float(margin_per_500),
+        min_history_windows=int(min_history_windows),
+        estimator_mode=str(estimator_mode),
+        ewm_alpha=float(ewm_alpha),
+        stability_penalty_per_500=float(stability_penalty_per_500),
+        activity_target_bet_rate=float(activity_target_bet_rate),
+        activity_shortfall_penalty_per_500=float(activity_shortfall_penalty_per_500),
         skip_threshold_per_500=float(skip_threshold_per_500),
     )
 
@@ -1342,11 +1399,8 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
     if bool(window_controller_cfg.enabled):
         active_names = {str(c.name) for c in candidate_cfgs}
         missing_profiles = sorted(
-            name
-            for name in (
-                str(window_controller_cfg.baseline_profile_name),
-                str(window_controller_cfg.alternate_profile_name),
-            )
+            str(name)
+            for name in tuple(window_controller_cfg.profile_names)
             if str(name) not in active_names
         )
         if missing_profiles:

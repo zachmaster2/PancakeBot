@@ -105,7 +105,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selector-lookbacks", type=str, default="1,2,3,4,5")
     parser.add_argument("--selector-margins-per-500", type=str, default="-0.2,0.0,0.2,0.5")
     parser.add_argument("--selector-skip-thresholds-per-500", type=str, default="0.0")
-    parser.add_argument("--min-selected-bet-rate", type=float, default=0.05)
+    parser.add_argument("--min-selected-bet-rate", type=float, default=0.01)
     parser.add_argument("--no-resume", action="store_true")
     return parser
 

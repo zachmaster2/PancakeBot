@@ -1,4 +1,4 @@
-"""Tests for the promoted shared baseline and runtime state path config."""
+"""Tests for the current shared runtime defaults and runtime state path config."""
 
 from __future__ import annotations
 
@@ -18,18 +18,20 @@ from pancakebot.domain.strategy.pipeline import required_pipeline_warmup_rounds
 from pancakebot.domain.strategy.router import StrategyRouterConfig as DomainRouterConfig
 
 _STAGE_B_BULL_NAME = "disloc_stageB_bullonly_recent8pct_v1"
+_STAGE_G2_BULL_NAME = "disloc_stageG2_bullonly_recent5pct_v1"
+_ALT_B_NAME = "disloc_altB_20260227_x80"
 _CONS_NAME = "disloc_cons_20260227_x80"
 _FLOW_NAME = "flow_lgbm_recent_t12k_r1k_regime40_v1"
 
 
 class LoadConfigBaselineDefaultTests(unittest.TestCase):
-    def test_current_config_matches_contained_selector_max_stageb_runtime(self) -> None:
+    def test_current_config_matches_default_peer_set_controller_runtime(self) -> None:
         cfg = load_app_config("config.toml")
 
         self.assertEqual("selector_max_score", cfg.strategy.router.mode)
         self.assertEqual(10000, int(cfg.strategy.dislocation.selector.warmup_rounds))
         self.assertEqual(10000, int(cfg.strategy.router.online_warmup_rounds))
-        self.assertEqual(10000, int(required_pipeline_warmup_rounds(strategy_cfg=cfg.strategy)))
+        self.assertEqual(15061, int(required_pipeline_warmup_rounds(strategy_cfg=cfg.strategy)))
         self.assertAlmostEqual(0.008, float(cfg.strategy.router.online_score_threshold_bnb))
         self.assertEqual(
             "var/runtime/claim_scan_cursor.txt",
@@ -72,20 +74,28 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertEqual(40, int(cfg.strategy.flow_candidate.roll_window))
         self.assertAlmostEqual(0.48, float(cfg.strategy.flow_candidate.roll_winrate_min))
         self.assertEqual(40, int(cfg.strategy.flow_candidate.cooldown_trades))
-        self.assertEqual(False, bool(cfg.strategy.window_controller.enabled))
-        self.assertEqual("trailing_best_vs_baseline", str(cfg.strategy.window_controller.mode))
-        self.assertEqual(_STAGE_B_BULL_NAME, str(cfg.strategy.window_controller.baseline_profile_name))
+        self.assertEqual(True, bool(cfg.strategy.window_controller.enabled))
+        self.assertEqual("absolute_best_with_skip", str(cfg.strategy.window_controller.mode))
         self.assertEqual(
-            _CONS_NAME,
-            str(cfg.strategy.window_controller.alternate_profile_name),
+            (_STAGE_B_BULL_NAME, _STAGE_G2_BULL_NAME, _ALT_B_NAME),
+            tuple(str(name) for name in cfg.strategy.window_controller.profile_names),
         )
+        self.assertEqual(_STAGE_B_BULL_NAME, str(cfg.strategy.window_controller.cold_start_profile_name))
         self.assertEqual(216, int(cfg.strategy.window_controller.window_rounds))
-        self.assertEqual(3, int(cfg.strategy.window_controller.lookback_windows))
-        self.assertAlmostEqual(1.0, float(cfg.strategy.window_controller.margin_per_500))
-        self.assertAlmostEqual(0.0, float(cfg.strategy.window_controller.skip_threshold_per_500))
+        self.assertEqual(2, int(cfg.strategy.window_controller.lookback_windows))
+        self.assertEqual(2, int(cfg.strategy.window_controller.min_history_windows))
+        self.assertEqual("ewm_mean", str(cfg.strategy.window_controller.estimator_mode))
+        self.assertAlmostEqual(0.85, float(cfg.strategy.window_controller.ewm_alpha))
+        self.assertAlmostEqual(0.0, float(cfg.strategy.window_controller.stability_penalty_per_500))
+        self.assertAlmostEqual(0.0, float(cfg.strategy.window_controller.activity_target_bet_rate))
+        self.assertAlmostEqual(0.0, float(cfg.strategy.window_controller.activity_shortfall_penalty_per_500))
+        self.assertAlmostEqual(0.05, float(cfg.strategy.window_controller.skip_threshold_per_500))
 
         candidates = {str(c.name): c for c in cfg.strategy.dislocation.candidates}
-        self.assertEqual([_STAGE_B_BULL_NAME], list(candidates.keys()))
+        self.assertEqual(
+            [_STAGE_B_BULL_NAME, _STAGE_G2_BULL_NAME, _ALT_B_NAME],
+            list(candidates.keys()),
+        )
 
         stage_b_bull = candidates[_STAGE_B_BULL_NAME]
         self.assertEqual("cutoff_only", stage_b_bull.pool_total_gate_mode)
@@ -132,16 +142,21 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertAlmostEqual(0.48, float(flow_defaults.roll_winrate_min))
         self.assertEqual(40, int(flow_defaults.cooldown_trades))
         self.assertEqual(False, bool(window_controller_defaults.enabled))
-        self.assertEqual("trailing_best_vs_baseline", str(window_controller_defaults.mode))
-        self.assertEqual(_STAGE_B_BULL_NAME, str(window_controller_defaults.baseline_profile_name))
+        self.assertEqual("absolute_best_with_skip", str(window_controller_defaults.mode))
         self.assertEqual(
-            _CONS_NAME,
-            str(window_controller_defaults.alternate_profile_name),
+            (_STAGE_B_BULL_NAME, _STAGE_G2_BULL_NAME, _ALT_B_NAME),
+            tuple(str(name) for name in window_controller_defaults.profile_names),
         )
+        self.assertEqual(_STAGE_B_BULL_NAME, str(window_controller_defaults.cold_start_profile_name))
         self.assertEqual(216, int(window_controller_defaults.window_rounds))
-        self.assertEqual(3, int(window_controller_defaults.lookback_windows))
-        self.assertAlmostEqual(1.0, float(window_controller_defaults.margin_per_500))
-        self.assertAlmostEqual(0.0, float(window_controller_defaults.skip_threshold_per_500))
+        self.assertEqual(2, int(window_controller_defaults.lookback_windows))
+        self.assertEqual(2, int(window_controller_defaults.min_history_windows))
+        self.assertEqual("ewm_mean", str(window_controller_defaults.estimator_mode))
+        self.assertAlmostEqual(0.85, float(window_controller_defaults.ewm_alpha))
+        self.assertAlmostEqual(0.0, float(window_controller_defaults.stability_penalty_per_500))
+        self.assertAlmostEqual(0.0, float(window_controller_defaults.activity_target_bet_rate))
+        self.assertAlmostEqual(0.0, float(window_controller_defaults.activity_shortfall_penalty_per_500))
+        self.assertAlmostEqual(0.05, float(window_controller_defaults.skip_threshold_per_500))
 
     def test_runtime_state_paths_can_be_overridden(self) -> None:
         base_text = Path("config.toml").read_text(encoding="utf-8")

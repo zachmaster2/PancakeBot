@@ -141,15 +141,18 @@ Additional inspection probes for strategy-routing experiments:
    runs sequential shared-harness backtests for one fixed window-controller
    setting versus static `stageB` across multiple tail sizes and offsets,
    exporting both per-run rows and aggregate summary JSON. Use this as the
-   main qualification gate before any controller-driven dry test. The current
-   best branch is `stageB` vs `disloc_cons_20260227_x80`, no-skip
-   `lookback=3`, `margin=1.0`.
+   main qualification gate before any controller-driven dry test. The default
+   runtime controller lane is the absolute peer-set controller with `skip` and
+   no privileged baseline profile. Current config defaults use the peer set
+   `[stageB, stageG2_bullonly, altB]`, `lookback=2`, `min_history=2`,
+   `estimator=ewm_mean`, `alpha=0.85`, `skip_threshold=0.05`.
 28. `inspection/write_window_controller_runtime_config.py`:
    materializes a dedicated runtime config for a controller dry test under
    `../PancakeBot_var_exp/`, patching both `active_candidate_names` and the
    `[strategy.window_controller]` section so `run.py --dry --config ...` can
    use the controller without editing `config.toml`. Its defaults now match
-   the current `stageB` vs `disloc_cons_20260227_x80` dry-test candidate.
+   the current peer-set absolute controller lane, not the older
+   baseline-centered `stageB vs alternate` experiments.
 29. `inspection/run_backtest_cache_perf.py`:
    one-command cache harness that runs `cold -> warm` for `continuous` and
    `chunk_reset` backtests and prints timing deltas with cache miss/hit flags.
@@ -300,7 +303,7 @@ Quick usage (do not execute automatically in agent workflows):
   --selector-lookbacks 1,2,3,4,5 `
   --selector-margins-per-500=-0.2,0.0,0.2,0.5 `
   --selector-skip-thresholds-per-500=0.0,0.05,0.1 `
-  --min-selected-bet-rate 0.05
+  --min-selected-bet-rate 0.01
 
 .\.venv\Scripts\python.exe -m inspection.run_profile_set_window_selector `
   --config config.toml `
@@ -313,7 +316,7 @@ Quick usage (do not execute automatically in agent workflows):
   --selector-lookbacks 1,2,3,4,5 `
   --selector-margins-per-500=-0.2,0.0,0.2,0.5 `
   --selector-skip-thresholds-per-500=0.0,0.05,0.1 `
-  --min-selected-bet-rate 0.05
+  --min-selected-bet-rate 0.01
 
 .\.venv\Scripts\python.exe -m inspection.run_profile_set_model_selector `
   --compare-csv ../PancakeBot_var_exp/profileset216_stageb_stageg2_flowbear4_20260328_profile_set_window_compare.csv `
