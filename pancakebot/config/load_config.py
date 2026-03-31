@@ -8,6 +8,7 @@ import tomllib
 from pancakebot.backtest.config import BacktestConfig
 from pancakebot.config.app_config import AppConfig, RuntimeStatePathsConfig
 from pancakebot.config.strategy_config import (
+    DirectActionPolicyConfig,
     DislocationCandidateConfig,
     DislocationSelectorConfig,
     DislocationStrategyConfig,
@@ -681,6 +682,34 @@ def _parse_flow_candidate(candidate: dict[str, Any]) -> FlowCandidateConfig:
     )
 
 
+def _parse_direct_action_policy(policy: dict[str, Any]) -> DirectActionPolicyConfig:
+    allowed = {
+        "enabled",
+        "model_bundle_path",
+    }
+    _validate_unknown_keys("strategy_direct_action_policy", policy, allowed)
+
+    enabled = _opt_bool(
+        policy,
+        "enabled",
+        bool(DirectActionPolicyConfig.__dataclass_fields__["enabled"].default),
+    )
+    model_bundle_path_raw = policy.get(
+        "model_bundle_path",
+        DirectActionPolicyConfig.__dataclass_fields__["model_bundle_path"].default,
+    )
+    if not isinstance(model_bundle_path_raw, str):
+        raise InvariantError("config_key_not_nonempty_str: model_bundle_path")
+    model_bundle_path = str(model_bundle_path_raw).strip()
+    if bool(enabled) and str(model_bundle_path).strip() == "":
+        raise InvariantError("strategy_direct_action_policy_model_bundle_path_empty")
+
+    return DirectActionPolicyConfig(
+        enabled=bool(enabled),
+        model_bundle_path=str(model_bundle_path),
+    )
+
+
 def _parse_window_controller(controller: dict[str, Any]) -> WindowControllerConfig:
     defaults = WindowControllerConfig()
     allowed = {
@@ -1312,7 +1341,14 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
     _validate_unknown_keys(
         "strategy",
         strategy,
-        {"dislocation", "router", "ml_candidate", "flow_candidate", "window_controller"},
+        {
+            "dislocation",
+            "router",
+            "ml_candidate",
+            "flow_candidate",
+            "direct_action_policy",
+            "window_controller",
+        },
     )
 
     dislocation = strategy.get("dislocation", {})
@@ -1345,6 +1381,13 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
     if not isinstance(flow_candidate_obj, dict):
         raise InvariantError("config_section_not_dict: strategy.flow_candidate")
     flow_candidate_cfg = _parse_flow_candidate(flow_candidate_obj)
+
+    direct_action_policy_obj = strategy.get("direct_action_policy", {})
+    if direct_action_policy_obj is None:
+        direct_action_policy_obj = {}
+    if not isinstance(direct_action_policy_obj, dict):
+        raise InvariantError("config_section_not_dict: strategy.direct_action_policy")
+    direct_action_policy_cfg = _parse_direct_action_policy(direct_action_policy_obj)
 
     window_controller_obj = strategy.get("window_controller", {})
     if window_controller_obj is None:
@@ -1405,6 +1448,8 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
         )
         if missing_profiles:
             raise InvariantError(f"strategy_window_controller_profile_missing: {missing_profiles}")
+    if bool(direct_action_policy_cfg.enabled) and bool(window_controller_cfg.enabled):
+        raise InvariantError("strategy_top_level_policy_conflict")
 
     return StrategyConfig(
         dislocation=DislocationStrategyConfig(
@@ -1414,6 +1459,7 @@ def _parse_strategy(strategy: dict[str, Any]) -> StrategyConfig:
         router=router_cfg,
         ml_candidate=ml_candidate_cfg,
         flow_candidate=flow_candidate_cfg,
+        direct_action_policy=direct_action_policy_cfg,
         window_controller=window_controller_cfg,
     )
 

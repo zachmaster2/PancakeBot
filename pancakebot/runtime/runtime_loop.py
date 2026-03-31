@@ -42,6 +42,7 @@ from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionCont
 from pancakebot.domain.strategy.dislocation_engine import (
     build_dislocation_engine_from_config,
 )
+from pancakebot.domain.strategy.direct_action_policy import DirectActionPolicy
 from pancakebot.domain.strategy.flow_candidate_adapter import FlowCandidateAdapter
 from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
 from pancakebot.domain.strategy.pipeline import StrategyPipeline, required_pipeline_warmup_rounds
@@ -1064,6 +1065,75 @@ def _log_controller_decision(
     info("RUN", "CTRL", "DECIDE", msg=f"Epoch {int(current_epoch)}{suffix}")
 
 
+def _direct_action_decision_log_suffix(
+    *,
+    decision: object | None,
+    final_action: str,
+    final_skip_reason: str | None = None,
+) -> str:
+    if decision is None:
+        return ""
+    mode = str(getattr(decision, "direct_action_mode", "") or "").strip()
+    if mode == "":
+        return ""
+    action_id = str(getattr(decision, "direct_action_action_id", "") or "").strip()
+    action_label = str(getattr(decision, "direct_action_action_label", "") or "").strip()
+    score_bnb = getattr(decision, "direct_action_score_bnb", None)
+    q50_bnb = getattr(decision, "direct_action_q50_bnb", None)
+    top_raw = str(getattr(decision, "direct_action_top_actions_json", "") or "").strip()
+    top_parts: list[str] = []
+    if top_raw != "":
+        try:
+            rows = json.loads(top_raw)
+        except json.JSONDecodeError:
+            rows = []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                label = str(row.get("label", row.get("action_id", ""))).strip()
+                if label == "":
+                    continue
+                try:
+                    q10_value = float(row.get("q10_net_bnb", 0.0))
+                    q50_value = float(row.get("q50_net_bnb", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                top_parts.append(f"{label}:{q10_value:+.4f}/{q50_value:+.4f}")
+    suffix_parts = [
+        f"mode={mode}",
+        (f"pick={action_label}" if action_label != "" else None),
+        (f"id={action_id}" if action_id != "" else None),
+        (f"score={float(score_bnb):+.4f}" if isinstance(score_bnb, (int, float)) else None),
+        (f"q50={float(q50_bnb):+.4f}" if isinstance(q50_bnb, (int, float)) else None),
+        f"final={str(final_action)}",
+        (
+            f"reason={str(final_skip_reason)}"
+            if final_skip_reason is not None and str(final_skip_reason).strip() != ""
+            else None
+        ),
+        ("top=" + ",".join(top_parts) if top_parts else None),
+    ]
+    return " dap[" + " ".join(part for part in suffix_parts if part) + "]"
+
+
+def _log_direct_action_decision(
+    *,
+    current_epoch: int,
+    decision: object | None,
+    final_action: str,
+    final_skip_reason: str | None = None,
+) -> None:
+    suffix = _direct_action_decision_log_suffix(
+        decision=decision,
+        final_action=str(final_action),
+        final_skip_reason=(None if final_skip_reason is None else str(final_skip_reason)),
+    )
+    if suffix == "":
+        return
+    info("RUN", "DAP", "DECIDE", msg=f"Epoch {int(current_epoch)}{suffix}")
+
+
 def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
     header_cols = [
         "cycle_ts",
@@ -1100,6 +1170,12 @@ def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         "controller_estimated_profiles_per_500_json",
         "controller_estimated_profiles_score_per_500_json",
         "controller_estimated_profiles_bet_rate_json",
+        "direct_action_mode",
+        "direct_action_action_id",
+        "direct_action_action_label",
+        "direct_action_score_bnb",
+        "direct_action_q50_bnb",
+        "direct_action_top_actions_json",
         "action",
         "decision_stage",
         "selected_strategy",
@@ -1229,6 +1305,12 @@ def _record_dry_cycle_audit(
     controller_estimated_profiles_per_500_json: str | object = ""
     controller_estimated_profiles_score_per_500_json: str | object = ""
     controller_estimated_profiles_bet_rate_json: str | object = ""
+    direct_action_mode: str | object = ""
+    direct_action_action_id: str | object = ""
+    direct_action_action_label: str | object = ""
+    direct_action_score_bnb: float | str = ""
+    direct_action_q50_bnb: float | str = ""
+    direct_action_top_actions_json: str | object = ""
     bet_side: str | object = ""
     bet_size_bnb: float | str = ""
     p_bull: float | str = ""
@@ -1267,6 +1349,18 @@ def _record_dry_cycle_audit(
         )
         controller_estimated_profiles_bet_rate_json = (
             getattr(decision, "controller_estimated_profiles_bet_rate_json", "") or ""
+        )
+        direct_action_mode = getattr(decision, "direct_action_mode", "") or ""
+        direct_action_action_id = getattr(decision, "direct_action_action_id", "") or ""
+        direct_action_action_label = getattr(decision, "direct_action_action_label", "") or ""
+        direct_action_score_raw = getattr(decision, "direct_action_score_bnb", None)
+        if isinstance(direct_action_score_raw, (int, float)):
+            direct_action_score_bnb = float(direct_action_score_raw)
+        direct_action_q50_raw = getattr(decision, "direct_action_q50_bnb", None)
+        if isinstance(direct_action_q50_raw, (int, float)):
+            direct_action_q50_bnb = float(direct_action_q50_raw)
+        direct_action_top_actions_json = (
+            getattr(decision, "direct_action_top_actions_json", "") or ""
         )
         bet_side = getattr(decision, "bet_side", "") or ""
         bet_size_raw = getattr(decision, "bet_size_bnb", "")
@@ -1331,6 +1425,12 @@ def _record_dry_cycle_audit(
             "controller_estimated_profiles_per_500_json": controller_estimated_profiles_per_500_json,
             "controller_estimated_profiles_score_per_500_json": controller_estimated_profiles_score_per_500_json,
             "controller_estimated_profiles_bet_rate_json": controller_estimated_profiles_bet_rate_json,
+            "direct_action_mode": direct_action_mode,
+            "direct_action_action_id": direct_action_action_id,
+            "direct_action_action_label": direct_action_action_label,
+            "direct_action_score_bnb": direct_action_score_bnb,
+            "direct_action_q50_bnb": direct_action_q50_bnb,
+            "direct_action_top_actions_json": direct_action_top_actions_json,
             "action": str(action),
             "decision_stage": str(decision_stage),
             "selected_strategy": selected_strategy,
@@ -1908,6 +2008,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 final_action="SKIP",
                 final_skip_reason=str(reason),
             )
+            _log_direct_action_decision(
+                current_epoch=int(current_epoch),
+                decision=decision,
+                final_action="SKIP",
+                final_skip_reason=str(reason),
+            )
             _record_dry_cycle_audit(
                 cfg,
                 closed,
@@ -1932,6 +2038,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Step 11: Execution timing guard.
         if now_ts() >= lock_ts_t - _LOCK_SAFETY_MARGIN_SECONDS:
             _log_controller_decision(
+                current_epoch=int(current_epoch),
+                decision=decision,
+                final_action="SKIP",
+                final_skip_reason="too_close_to_lock_for_bet",
+            )
+            _log_direct_action_decision(
                 current_epoch=int(current_epoch),
                 decision=decision,
                 final_action="SKIP",
@@ -1969,6 +2081,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             raise InvariantError("bet_amount_wei_nonpositive")
 
         _log_controller_decision(
+            current_epoch=int(current_epoch),
+            decision=decision,
+            final_action="BET",
+            final_skip_reason=None,
+        )
+        _log_direct_action_decision(
             current_epoch=int(current_epoch),
             decision=decision,
             final_action="BET",
@@ -2305,6 +2423,17 @@ def _build_strategy_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesC
         treasury_fee_fraction=float(cfg.treasury_fee_fraction),
         ml_candidate_adapter=ml_adapter,
         flow_candidate_adapter=flow_adapter,
+        direct_action_policy=(
+            DirectActionPolicy(
+                cutoff_seconds=int(cfg.cutoff_seconds),
+                treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+                klines_store_like=klines_cache,
+                feature_cache_store=cfg.feature_cache_store,
+                model_bundle_path=str(cfg.strategy_cfg.direct_action_policy.model_bundle_path),
+            )
+            if bool(cfg.strategy_cfg.direct_action_policy.enabled)
+            else None
+        ),
         window_controller=(
             WindowController(config=cfg.strategy_cfg.window_controller)
             if bool(cfg.strategy_cfg.window_controller.enabled)

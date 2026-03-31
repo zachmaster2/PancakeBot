@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from pancakebot.runtime.runtime_loop import _controller_decision_log_suffix
+from pancakebot.runtime.runtime_loop import _controller_decision_log_suffix, _direct_action_decision_log_suffix
 
 
 class RuntimeControllerLoggingTests(unittest.TestCase):
@@ -57,6 +57,42 @@ class RuntimeControllerLoggingTests(unittest.TestCase):
             decision=decision,
             final_action="SKIP",
             final_skip_reason="selector_no_candidate",
+        )
+        self.assertEqual("", suffix)
+
+    def test_direct_action_decision_log_suffix_formats_top_actions(self) -> None:
+        decision = SimpleNamespace(
+            direct_action_mode="direct_action_policy_v1",
+            direct_action_action_id="bull_0p10",
+            direct_action_action_label="Bull @ 0.10",
+            direct_action_score_bnb=0.0123,
+            direct_action_q50_bnb=0.0301,
+            direct_action_top_actions_json=(
+                '[{"action_id":"bull_0p10","label":"Bull @ 0.10","q10_net_bnb":0.0123,"q50_net_bnb":0.0301},'
+                '{"action_id":"skip","label":"Skip","q10_net_bnb":0.0,"q50_net_bnb":0.0}]'
+            ),
+        )
+
+        suffix = _direct_action_decision_log_suffix(
+            decision=decision,
+            final_action="BET",
+            final_skip_reason=None,
+        )
+
+        self.assertIn("mode=direct_action_policy_v1", suffix)
+        self.assertIn("pick=Bull @ 0.10", suffix)
+        self.assertIn("id=bull_0p10", suffix)
+        self.assertIn("score=+0.0123", suffix)
+        self.assertIn("q50=+0.0301", suffix)
+        self.assertIn("final=BET", suffix)
+        self.assertIn("top=Bull @ 0.10:+0.0123/+0.0301,Skip:+0.0000/+0.0000", suffix)
+
+    def test_direct_action_decision_log_suffix_empty_without_mode(self) -> None:
+        decision = SimpleNamespace(direct_action_mode="")
+        suffix = _direct_action_decision_log_suffix(
+            decision=decision,
+            final_action="SKIP",
+            final_skip_reason="direct_action_nonpositive_score",
         )
         self.assertEqual("", suffix)
 

@@ -117,6 +117,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flow-roll-winrate-min", type=float, default=None)
     parser.add_argument("--flow-cooldown-trades", type=int, default=None)
     parser.add_argument("--flow-selector-score-penalty-bnb", type=float, default=None)
+    parser.add_argument("--direct-action-enabled", type=str, default=None)
+    parser.add_argument("--direct-action-model-bundle-path", type=str, default=None)
     parser.add_argument("--window-controller-enabled", type=str, default=None)
     parser.add_argument(
         "--window-controller-mode",
@@ -451,6 +453,21 @@ def _strategy_cfg_with_router_overrides(
             selector_score_penalty_bnb=float(args.flow_selector_score_penalty_bnb),
         )
 
+    direct_action_cfg = strategy_cfg.direct_action_policy
+    direct_action_enabled = _parse_optional_bool_token(args.direct_action_enabled)
+    if direct_action_enabled is not None:
+        direct_action_cfg = replace(
+            direct_action_cfg,
+            enabled=bool(direct_action_enabled),
+        )
+    if args.direct_action_model_bundle_path is not None:
+        direct_action_cfg = replace(
+            direct_action_cfg,
+            model_bundle_path=str(args.direct_action_model_bundle_path),
+        )
+    if bool(direct_action_cfg.enabled) and str(direct_action_cfg.model_bundle_path).strip() == "":
+        raise InvariantError("scenario_direct_action_model_bundle_path_empty")
+
     window_controller_cfg = strategy_cfg.window_controller
     window_controller_enabled = _parse_optional_bool_token(args.window_controller_enabled)
     if window_controller_enabled is not None:
@@ -554,6 +571,8 @@ def _strategy_cfg_with_router_overrides(
         )
         if missing_profiles:
             raise InvariantError(f"scenario_window_controller_profile_missing: {missing_profiles}")
+    if bool(direct_action_cfg.enabled) and bool(window_controller_cfg.enabled):
+        raise InvariantError("scenario_top_level_policy_conflict")
 
     return replace(
         strategy_cfg,
@@ -561,6 +580,7 @@ def _strategy_cfg_with_router_overrides(
         dislocation=dislocation_cfg,
         ml_candidate=ml_cfg,
         flow_candidate=flow_cfg,
+        direct_action_policy=direct_action_cfg,
         window_controller=window_controller_cfg,
     )
 
@@ -656,6 +676,12 @@ def main() -> None:
         "flow_selector_score_penalty_bnb": float(
             runtime_cfg.strategy_cfg.flow_candidate.selector_score_penalty_bnb
         ),
+        "direct_action_enabled": bool(runtime_cfg.strategy_cfg.direct_action_policy.enabled),
+        "direct_action_model_bundle_path": str(
+            runtime_cfg.strategy_cfg.direct_action_policy.model_bundle_path
+        ),
+        "window_controller_enabled": bool(runtime_cfg.strategy_cfg.window_controller.enabled),
+        "window_controller_mode": str(runtime_cfg.strategy_cfg.window_controller.mode),
     }
     summary["risk"] = {"max_drawdown_bnb": float(_max_drawdown_bnb(trades_path))}
     summary["skip_reason_groups"] = _skip_reason_groups(summary)

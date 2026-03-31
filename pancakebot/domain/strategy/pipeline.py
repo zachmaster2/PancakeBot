@@ -13,9 +13,11 @@ from pancakebot.core.constants import GAS_COST_BET_BNB
 from pancakebot.core.errors import InvariantError
 from pancakebot.domain.features.schema import max_required_prior_context_rounds_size
 from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
+from pancakebot.domain.strategy.direct_action_policy import DirectActionPolicy, DirectActionPolicyDecision
 from pancakebot.domain.strategy.dislocation_engine import DislocationEngine
 from pancakebot.domain.strategy.flow_candidate_adapter import FlowCandidateAdapter
 from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
+from pancakebot.domain.strategy.direct_action_policy_model import direct_action_required_history_rounds
 from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterDecision
 from pancakebot.domain.strategy.window_controller import WindowController, WindowControllerDecision
 from pancakebot.domain.types import Kline, Round
@@ -33,6 +35,12 @@ _VALID_BET_SIDES = frozenset({"Bull", "Bear"})
 
 def required_pipeline_warmup_rounds(*, strategy_cfg: StrategyConfig) -> int:
     """Return the minimum closed-round warmup needed for active shared providers."""
+
+    if bool(strategy_cfg.direct_action_policy.enabled):
+        warmup_rounds = int(direct_action_required_history_rounds())
+        if int(warmup_rounds) <= 0:
+            raise InvariantError("pipeline_warmup_rounds_nonpositive")
+        return int(warmup_rounds)
 
     required = [
         int(strategy_cfg.dislocation.selector.warmup_rounds),
@@ -89,6 +97,12 @@ class StrategyPipelineDecision:
     controller_estimated_profiles_per_500_json: str | None = None
     controller_estimated_profiles_score_per_500_json: str | None = None
     controller_estimated_profiles_bet_rate_json: str | None = None
+    direct_action_mode: str | None = None
+    direct_action_action_id: str | None = None
+    direct_action_action_label: str | None = None
+    direct_action_score_bnb: float | None = None
+    direct_action_q50_bnb: float | None = None
+    direct_action_top_actions_json: str | None = None
 
 
 class StrategyPipeline:
@@ -102,6 +116,7 @@ class StrategyPipeline:
         treasury_fee_fraction: float,
         ml_candidate_adapter: MlCandidateAdapter | None = None,
         flow_candidate_adapter: FlowCandidateAdapter | None = None,
+        direct_action_policy: DirectActionPolicy | None = None,
         window_controller: WindowController | None = None,
     ) -> None:
         if not (0.0 <= float(treasury_fee_fraction) < 1.0):
@@ -111,6 +126,7 @@ class StrategyPipeline:
         self._treasury_fee_fraction = float(treasury_fee_fraction)
         self._ml_candidate_adapter = ml_candidate_adapter
         self._flow_candidate_adapter = flow_candidate_adapter
+        self._direct_action_policy = direct_action_policy
         self._window_controller = window_controller
         self._pending_candidate_signals_by_epoch: dict[int, dict[str, StrategyCandidateSignal]] = {}
         self._last_settled_epoch: int | None = None
@@ -126,6 +142,9 @@ class StrategyPipeline:
         """Return the latest epoch incorporated into pipeline state."""
 
         return None if self._last_settled_epoch is None else int(self._last_settled_epoch)
+
+    def _direct_action_enabled(self) -> bool:
+        return bool(self._direct_action_policy is not None and bool(self._direct_action_policy.enabled))
 
     def export_kline_index_state(self) -> dict[str, object]:
         """Export dislocation kline index state for backtest caching."""
@@ -152,6 +171,11 @@ class StrategyPipeline:
             "flow_state": (
                 self._flow_candidate_adapter.export_bootstrap_state()
                 if self._flow_candidate_adapter is not None
+                else None
+            ),
+            "direct_action_policy_state": (
+                self._direct_action_policy.export_bootstrap_state()
+                if self._direct_action_policy is not None
                 else None
             ),
             "window_controller_state": (
@@ -190,6 +214,14 @@ class StrategyPipeline:
                 raise InvariantError("pipeline_snapshot_flow_state_invalid")
             self._flow_candidate_adapter.import_bootstrap_state(state=flow_state)
 
+        direct_action_policy_state = state.get("direct_action_policy_state")
+        if direct_action_policy_state is not None:
+            if self._direct_action_policy is None:
+                raise InvariantError("pipeline_snapshot_direct_action_state_without_policy")
+            if not isinstance(direct_action_policy_state, dict):
+                raise InvariantError("pipeline_snapshot_direct_action_state_invalid")
+            self._direct_action_policy.import_bootstrap_state(state=direct_action_policy_state)
+
         window_controller_state = state.get("window_controller_state")
         if window_controller_state is not None:
             if self._window_controller is None:
@@ -218,6 +250,15 @@ class StrategyPipeline:
         """Bootstrap providers and router from historical closed rounds."""
 
         if not rounds:
+            return
+        if bool(self._direct_action_enabled()):
+            for round_t in sorted(rounds, key=lambda x: int(x.epoch)):
+                epoch = int(round_t.epoch)
+                if self._last_settled_epoch is not None and int(epoch) <= int(self._last_settled_epoch):
+                    continue
+                self._direct_action_policy.observe_closed_rounds(rounds=[round_t])
+                self._last_settled_epoch = int(epoch)
+            self._pending_candidate_signals_by_epoch = {}
             return
         for round_t in sorted(rounds, key=lambda x: int(x.epoch)):
             epoch = int(round_t.epoch)
@@ -251,6 +292,8 @@ class StrategyPipeline:
     def candidate_signals_for_open_round(self, *, round_t: Round) -> dict[str, StrategyCandidateSignal]:
         """Collect candidate signals for one target round."""
 
+        if bool(self._direct_action_enabled()):
+            raise InvariantError("candidate_signals_not_used_for_direct_action_policy")
         signals = self._collect_candidate_signals(round_t=round_t)
         self._pending_candidate_signals_by_epoch[int(round_t.epoch)] = signals
         return dict(signals)
@@ -263,6 +306,13 @@ class StrategyPipeline:
         allow_oracle_mode: bool,
     ) -> StrategyPipelineDecision:
         """Generate and route candidate signals for one open round."""
+
+        if bool(self._direct_action_enabled()):
+            direct_decision = self._direct_action_policy.decide_open_round(
+                round_t=round_t,
+                bankroll_bnb=float(bankroll_bnb),
+            )
+            return self._to_pipeline_decision_from_direct_action(direct_decision=direct_decision)
 
         signals = self.candidate_signals_for_open_round(round_t=round_t)
         realized: dict[str, float] | None = None
@@ -296,6 +346,15 @@ class StrategyPipeline:
         """Advance provider/router state from newly closed rounds."""
 
         if not rounds:
+            return
+        if bool(self._direct_action_enabled()):
+            for round_t in sorted(rounds, key=lambda x: int(x.epoch)):
+                epoch = int(round_t.epoch)
+                if self._last_settled_epoch is not None and int(epoch) <= int(self._last_settled_epoch):
+                    continue
+                self._direct_action_policy.observe_closed_rounds(rounds=[round_t])
+                self._last_settled_epoch = int(epoch)
+            self._pending_candidate_signals_by_epoch = {}
             return
         for round_t in sorted(rounds, key=lambda x: int(x.epoch)):
             epoch = int(round_t.epoch)
@@ -531,6 +590,40 @@ class StrategyPipeline:
         )
 
     @staticmethod
+    def _to_pipeline_decision_from_direct_action(
+        *,
+        direct_decision: DirectActionPolicyDecision,
+    ) -> StrategyPipelineDecision:
+        return StrategyPipelineDecision(
+            action=str(direct_decision.action),
+            selected_strategy="direct_action_policy",
+            bet_side=(None if direct_decision.bet_side is None else str(direct_decision.bet_side)),
+            bet_size_bnb=float(direct_decision.bet_size_bnb),
+            expected_profit_bnb=float(direct_decision.q50_net_bnb),
+            selector_score_bnb=float(direct_decision.score_bnb),
+            skip_reason=(None if direct_decision.skip_reason is None else str(direct_decision.skip_reason)),
+            p_bull=None,
+            controller_mode=None,
+            controller_estimator_mode=None,
+            controller_window_index=None,
+            controller_lookback_windows_used=None,
+            controller_selected_profile=None,
+            controller_selected_action=None,
+            controller_estimated_per_500=None,
+            controller_estimated_score_per_500=None,
+            controller_estimated_selected_bet_rate=None,
+            controller_estimated_profiles_per_500_json=None,
+            controller_estimated_profiles_score_per_500_json=None,
+            controller_estimated_profiles_bet_rate_json=None,
+            direct_action_mode="direct_action_policy_v1",
+            direct_action_action_id=str(direct_decision.action_id),
+            direct_action_action_label=str(direct_decision.action_label),
+            direct_action_score_bnb=float(direct_decision.score_bnb),
+            direct_action_q50_bnb=float(direct_decision.q50_net_bnb),
+            direct_action_top_actions_json=str(direct_decision.top_actions_json),
+        )
+
+    @staticmethod
     def _to_pipeline_decision(
         *,
         routed: StrategyRouterDecision,
@@ -603,4 +696,10 @@ class StrategyPipeline:
                 if controller_decision is None or controller_decision.estimated_profiles_bet_rate_json is None
                 else str(controller_decision.estimated_profiles_bet_rate_json)
             ),
+            direct_action_mode=None,
+            direct_action_action_id=None,
+            direct_action_action_label=None,
+            direct_action_score_bnb=None,
+            direct_action_q50_bnb=None,
+            direct_action_top_actions_json=None,
         )
