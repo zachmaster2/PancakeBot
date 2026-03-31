@@ -16,6 +16,7 @@ from pancakebot.core.logging import info, warn
 from pancakebot.domain.strategy.dislocation_engine import (
     build_dislocation_engine_from_config,
 )
+from pancakebot.domain.strategy.direct_action_policy import DirectActionPolicy
 from pancakebot.domain.strategy.flow_candidate_adapter import FlowCandidateAdapter
 from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
 from pancakebot.domain.strategy.pipeline import StrategyPipeline, required_pipeline_warmup_rounds
@@ -147,6 +148,17 @@ def _build_strategy_pipeline(*, runtime_cfg, all_klines: list[Kline] | None) -> 
         treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
         ml_candidate_adapter=ml_adapter,
         flow_candidate_adapter=flow_adapter,
+        direct_action_policy=(
+            DirectActionPolicy(
+                cutoff_seconds=int(runtime_cfg.cutoff_seconds),
+                treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
+                klines_store_like=runtime_cfg.klines_store,
+                feature_cache_store=runtime_cfg.feature_cache_store,
+                model_bundle_path=str(runtime_cfg.strategy_cfg.direct_action_policy.model_bundle_path),
+            )
+            if bool(runtime_cfg.strategy_cfg.direct_action_policy.enabled)
+            else None
+        ),
         window_controller=(
             WindowController(config=runtime_cfg.strategy_cfg.window_controller)
             if bool(runtime_cfg.strategy_cfg.window_controller.enabled)
@@ -271,6 +283,20 @@ def _simulate_rounds(
                     if decision.selector_score_bnb is not None
                     else ""
                 ),
+                str(decision.direct_action_mode or ""),
+                str(decision.direct_action_action_id or ""),
+                str(decision.direct_action_action_label or ""),
+                (
+                    float(decision.direct_action_score_bnb)
+                    if decision.direct_action_score_bnb is not None
+                    else ""
+                ),
+                (
+                    float(decision.direct_action_q50_bnb)
+                    if decision.direct_action_q50_bnb is not None
+                    else ""
+                ),
+                str(decision.direct_action_top_actions_json or ""),
             ]
         )
 
@@ -572,6 +598,12 @@ def _run_backtest_dislocation(*, runtime_cfg, backtest_cfg: BacktestConfig, out_
                 "selected_strategy",
                 "router_mode",
                 "selector_score_bnb",
+                "direct_action_mode",
+                "direct_action_action_id",
+                "direct_action_action_label",
+                "direct_action_score_bnb",
+                "direct_action_q50_bnb",
+                "direct_action_top_actions_json",
             ]
         )
 

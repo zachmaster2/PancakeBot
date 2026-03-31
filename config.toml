@@ -614,6 +614,12 @@ roll_edge_min = -0.002
 roll_winrate_min = 0.48
 cooldown_trades = 40
 
+[strategy.direct_action_policy]
+# Experimental direct action-value path. Keep disabled until a trained bundle is
+# explicitly qualified and supplied.
+enabled = false
+model_bundle_path = ""
+
 [strategy.window_controller]
 # Default peer-set absolute controller for dry-mode exploration.
 # `cold_start_profile_name` is only a bootstrap seed before controller history exists.

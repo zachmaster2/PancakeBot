@@ -200,6 +200,14 @@ class FlowCandidateConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectActionPolicyConfig:
+    """Optional direct action-value policy shared by live/dry/backtest."""
+
+    enabled: bool = False
+    model_bundle_path: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class WindowControllerConfig:
     """Optional window-level profile controller shared by live/dry/backtest."""
 
@@ -229,5 +237,6 @@ class StrategyConfig:
     dislocation: DislocationStrategyConfig
     ml_candidate: MlCandidateConfig
     flow_candidate: FlowCandidateConfig = FlowCandidateConfig()
+    direct_action_policy: DirectActionPolicyConfig = DirectActionPolicyConfig()
     window_controller: WindowControllerConfig = WindowControllerConfig()
     router: StrategyRouterConfig = StrategyRouterConfig()

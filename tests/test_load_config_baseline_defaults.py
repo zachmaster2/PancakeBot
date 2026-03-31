@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pancakebot.config.load_config import load_app_config
 from pancakebot.config.strategy_config import (
+    DirectActionPolicyConfig,
     DislocationSelectorConfig,
     FlowCandidateConfig,
     StrategyRouterConfig as StrategyConfigRouterConfig,
@@ -74,6 +75,8 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertEqual(40, int(cfg.strategy.flow_candidate.roll_window))
         self.assertAlmostEqual(0.48, float(cfg.strategy.flow_candidate.roll_winrate_min))
         self.assertEqual(40, int(cfg.strategy.flow_candidate.cooldown_trades))
+        self.assertEqual(False, bool(cfg.strategy.direct_action_policy.enabled))
+        self.assertEqual("", str(cfg.strategy.direct_action_policy.model_bundle_path))
         self.assertEqual(True, bool(cfg.strategy.window_controller.enabled))
         self.assertEqual("absolute_best_with_skip", str(cfg.strategy.window_controller.mode))
         self.assertEqual(
@@ -116,6 +119,7 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         config_router_defaults = StrategyConfigRouterConfig()
         domain_router_defaults = DomainRouterConfig()
         flow_defaults = FlowCandidateConfig()
+        direct_action_defaults = DirectActionPolicyConfig()
         window_controller_defaults = WindowControllerConfig()
 
         self.assertEqual(10000, int(selector_defaults.warmup_rounds))
@@ -141,6 +145,8 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
         self.assertEqual(40, int(flow_defaults.roll_window))
         self.assertAlmostEqual(0.48, float(flow_defaults.roll_winrate_min))
         self.assertEqual(40, int(flow_defaults.cooldown_trades))
+        self.assertEqual(False, bool(direct_action_defaults.enabled))
+        self.assertEqual("", str(direct_action_defaults.model_bundle_path))
         self.assertEqual(False, bool(window_controller_defaults.enabled))
         self.assertEqual("absolute_best_with_skip", str(window_controller_defaults.mode))
         self.assertEqual(
@@ -255,6 +261,33 @@ class LoadConfigBaselineDefaultTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             cfg_path = Path(td) / "config_bad_paths.toml"
+            cfg_path.write_text(patched, encoding="utf-8")
+            with self.assertRaises(InvariantError):
+                load_app_config(str(cfg_path))
+
+    def test_top_level_policy_conflict_is_rejected(self) -> None:
+        base_text = Path("config.toml").read_text(encoding="utf-8")
+        patched = (
+            str(base_text)
+            .replace(
+                '[strategy.direct_action_policy]\n'
+                '# Experimental direct action-value path. Keep disabled until a trained bundle is\n'
+                '# explicitly qualified and supplied.\n'
+                'enabled = false\n'
+                'model_bundle_path = ""',
+                (
+                    '[strategy.direct_action_policy]\n'
+                    '# Experimental direct action-value path. Keep disabled until a trained bundle is\n'
+                    '# explicitly qualified and supplied.\n'
+                    'enabled = true\n'
+                    'model_bundle_path = "../PancakeBot_var_exp/direct_action_bundle.pkl.gz"'
+                ),
+                1,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config_top_level_policy_conflict.toml"
             cfg_path.write_text(patched, encoding="utf-8")
             with self.assertRaises(InvariantError):
                 load_app_config(str(cfg_path))
