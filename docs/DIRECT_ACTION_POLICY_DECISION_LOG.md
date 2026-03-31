@@ -6,6 +6,11 @@ This document records the main design decisions for the first direct-action
 policy implementation, along with the rejected alternatives and the reason each
 choice was made.
 
+Current implementation status:
+
+1. decisions `1` through `17` are now reflected in code
+2. qualification and promotion decisions remain open
+
 ## Decision 1: Runtime Architecture
 
 Chosen:
@@ -289,3 +294,41 @@ Why this choice:
 
 1. the operator must be able to see the real decision source clearly
 2. mixing the new path into controller fields would hide the redesign boundary
+
+## Decision 16: Top-Level Policy Ownership
+
+Chosen:
+
+1. reject any effective config that enables both direct-action policy and window
+   controller at the same time
+
+Alternatives considered:
+
+1. silently give direct-action priority
+2. silently give window-controller priority
+3. allow both and hope the pipeline behavior is understood
+
+Why this choice:
+
+1. the redesign requires one clear decision owner
+2. silent precedence would recreate the ambiguity we are explicitly removing
+
+## Decision 17: First Offline Evaluation Harness
+
+Chosen:
+
+1. train the frozen direct-action bundle on a latest-tail train/validation
+   slice
+2. evaluate the held-out test window through the shared backtest path using the
+   same inference code the runtime uses
+
+Alternatives considered:
+
+1. evaluate only with a detached offline argmax loop
+2. delay any tooling until runtime integration was complete
+
+Why this choice:
+
+1. it keeps offline qualification and backtest/runtime semantics aligned
+2. it reuses the shared scenario/backtest harness rather than inventing another
+   execution path

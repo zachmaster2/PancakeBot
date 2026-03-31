@@ -14,6 +14,22 @@ direct runtime policy that:
 
 This document is the implementation contract for the first simplified version.
 
+## Implementation Status
+
+As of `2026-03-31`, the first implementation tranche exists:
+
+1. optional config path
+2. offline dataset + quantile bundle training utilities
+3. shared pipeline/runtime/backtest inference path
+4. dedicated direct-action logging and audit fields
+5. first shared walk-forward evaluation harness
+
+Still intentionally deferred:
+
+1. runtime promotion to default
+2. offline qualification results strong enough to justify promotion
+3. dry-mode rollout of the direct-action lane
+
 ## Design Goals
 
 The redesign must satisfy all of the following:

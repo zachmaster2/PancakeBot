@@ -161,6 +161,14 @@ Current interpretation: the runtime-controller branch is alive, but it is not ro
 92. On `2026-03-31`, that planning step was started in durable docs. The primary runtime/training contract is now [DIRECT_ACTION_POLICY_SPEC.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/DIRECT_ACTION_POLICY_SPEC.md), and the cleanup/archive/git-hygiene plan is [DIRECT_ACTION_POLICY_TRANSITION_PLAN.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/DIRECT_ACTION_POLICY_TRANSITION_PLAN.md).
 93. The direct-action spec freezes the first intended action set as `Skip` plus discrete `Bull`/`Bear` bet sizes `0.05`, `0.10`, `0.15`, `0.25`, `0.35`, and `0.50` `BNB`. It also freezes the intended learning framing as contextual action-value estimation over `(round, action)` rows with realized net `BNB` labels.
 94. The current preferred uncertainty contract is now explicit in the spec: quantile-style action-value modeling with a lower-confidence-bound style runtime score is the first-choice design, while mean-minus-uncertainty remains only a fallback if quantile modeling proves impractical.
+95. On `2026-03-31`, the mixed controller-era worktree was intentionally preserved as historical checkpoint commit `081be56` (`Checkpoint controller-era stack before direct-action implementation`) before starting the direct-action implementation tranche.
+96. The direct-action implementation has now started. The shared strategy config/loader supports an optional `strategy.direct_action_policy` section with `enabled` and `model_bundle_path`, and it now rejects ambiguous top-level policy ownership: `direct_action_policy.enabled=true` and `window_controller.enabled=true` may not both be active in the same effective config.
+97. The shared pipeline/runtime/backtest stack now supports an optional inference-only direct-action lane. When enabled, the pipeline bypasses candidate generation, router selection, and window-controller masking for the final round decision and instead uses the frozen direct-action bundle to emit the action directly.
+98. The first direct-action implementation modules are now live in `pancakebot/domain/strategy/direct_action_policy_model.py` and `pancakebot/domain/strategy/direct_action_policy.py`. V1 uses the frozen action grid `Skip` plus `Bull`/`Bear` at `0.05`, `0.10`, `0.15`, `0.25`, `0.35`, and `0.50` `BNB`, with LightGBM quantile regressors (`q10`, `q50`) and runtime score `q10_net_bnb`.
+99. Direct-action observability is now first-class in the shared runtime/backtest surfaces. `StrategyPipelineDecision`, dry-cycle audit rows, runtime decision logs, and backtest trade CSV rows now carry dedicated `direct_action_*` fields rather than overloading the older controller fields.
+100. A first offline qualification harness now exists at [run_direct_action_shared_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_direct_action_shared_eval.py). It trains a frozen direct-action bundle on rolling latest-tail train/validation windows, saves the bundle under `../PancakeBot_var_exp/`, and evaluates the held-out test slice through the shared backtest path using `inspection/run_backtest_scenario.py` with explicit direct-action overrides.
+101. The direct-action path remains optional and disabled by default in `config.toml`. The legacy controller path remains the active runtime default until the direct-action lane is qualified offline and then in dry mode.
+102. Verification for the first implementation tranche passed on `2026-03-31`: focused `unittest` modules for config, snapshot, runtime dry-state/logging, direct-action model/policy/pipeline behavior, scenario overrides, and the new shared eval tool all passed (`48` tests). The touched Python files also passed `py_compile`, and `git diff --check` was clean apart from CRLF warnings.
 
 ## Operational Rules
 
@@ -178,8 +186,8 @@ Obsolete build/cache artifacts should be deleted rather than archived.
 ## Next Likely Work
 
 The older controller-focused items below are now historical and superseded by
-the direct-action redesign planning direction recorded in items `84` through
-`94`.
+the direct-action redesign direction and implementation status recorded in
+items `84` through `102`.
 
 1. Launch the next extended dry-mode run on the one-profile absolute `stageB + skip` controller (`ewm_alpha=0.85`), with normal foreground operator logs visible.
 2. Monitor multi-day dry behavior via runtime audit plus `inspection/run_dry_cycle_monitor.py`, and judge the path on actual dry-run stability rather than on perfect offline wins in every horizon.

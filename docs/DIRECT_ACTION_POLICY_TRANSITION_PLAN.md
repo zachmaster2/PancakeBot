@@ -8,6 +8,15 @@ policy lane without creating more repo drift.
 This is a planning document only. It does not authorize destructive cleanup on
 its own.
 
+## Implementation Status
+
+As of `2026-03-31`, the transition is partway complete:
+
+1. the controller-era mixed worktree was preserved as historical checkpoint commit `081be56`
+2. the direct-action spec/decision/issue docs are frozen enough for implementation
+3. the first direct-action offline/runtime/backtest scaffold is implemented
+4. runtime default promotion and broad legacy cleanup are still deferred
+
 ## Transition Principles
 
 The transition must satisfy:
@@ -98,11 +107,22 @@ The key rule is:
 2. build the causal evaluator
 3. prove the lane offline before runtime integration
 
+Status:
+
+1. initial dataset generator and shared eval harness implemented
+2. qualification evidence still pending
+
 ### Phase 4: Inference Harness
 
 1. add dry/backtest inference for the direct policy
 2. validate operator logs
 3. validate settlement parity against the offline labels
+
+Status:
+
+1. shared backtest/runtime inference path implemented behind feature flag
+2. operator-facing direct-action logs/audit fields implemented
+3. runtime default promotion still deferred
 
 ### Phase 5: Runtime Rollout
 
