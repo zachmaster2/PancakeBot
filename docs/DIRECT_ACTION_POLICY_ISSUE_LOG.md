@@ -67,3 +67,30 @@ Resolution:
 1. integrate the direct-action lane as its own decision path in the shared
    pipeline
 2. when enabled, it is the final decision owner
+
+## Issue 6: Top-Level Policy Ambiguity
+
+Issue:
+
+1. the base runtime config already enabled the legacy window controller, so
+   direct-action experiments could accidentally activate two different
+   top-level decision owners at once
+
+Resolution:
+
+1. reject the conflict in both config loading and scenario override handling
+2. require direct-action experiments to disable the window controller
+   explicitly
+
+## Issue 7: Disabled Bundle Path Must Allow Empty String
+
+Issue:
+
+1. the generic string parser rejected empty strings, but a disabled
+   direct-action config legitimately needs an empty `model_bundle_path`
+
+Resolution:
+
+1. parse `model_bundle_path` with direct-action-specific logic
+2. allow empty string when disabled
+3. enforce non-empty path only when the direct-action policy is enabled
