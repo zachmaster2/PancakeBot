@@ -121,14 +121,24 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--window-controller-mode",
         type=str,
-        choices=("trailing_best_vs_baseline", "trailing_best_vs_baseline_with_skip"),
+        choices=("absolute_best_with_skip",),
         default=None,
     )
-    parser.add_argument("--window-controller-baseline-profile-name", type=str, default=None)
-    parser.add_argument("--window-controller-alternate-profile-name", type=str, default=None)
+    parser.add_argument("--window-controller-profile-names", type=str, default=None)
+    parser.add_argument("--window-controller-cold-start-profile-name", type=str, default=None)
     parser.add_argument("--window-controller-window-rounds", type=int, default=None)
     parser.add_argument("--window-controller-lookback-windows", type=int, default=None)
-    parser.add_argument("--window-controller-margin-per-500", type=float, default=None)
+    parser.add_argument("--window-controller-min-history-windows", type=int, default=None)
+    parser.add_argument(
+        "--window-controller-estimator-mode",
+        type=str,
+        choices=("trailing_mean", "ewm_mean"),
+        default=None,
+    )
+    parser.add_argument("--window-controller-ewm-alpha", type=float, default=None)
+    parser.add_argument("--window-controller-stability-penalty-per-500", type=float, default=None)
+    parser.add_argument("--window-controller-activity-target-bet-rate", type=float, default=None)
+    parser.add_argument("--window-controller-activity-shortfall-penalty-per-500", type=float, default=None)
     parser.add_argument("--window-controller-skip-threshold-per-500", type=float, default=None)
     return parser
 
@@ -453,15 +463,22 @@ def _strategy_cfg_with_router_overrides(
             window_controller_cfg,
             mode=str(args.window_controller_mode),
         )
-    if args.window_controller_baseline_profile_name is not None:
-        window_controller_cfg = replace(
-            window_controller_cfg,
-            baseline_profile_name=str(args.window_controller_baseline_profile_name),
+    if args.window_controller_profile_names is not None:
+        profile_names = tuple(
+            str(token).strip()
+            for token in str(args.window_controller_profile_names).split(",")
+            if str(token).strip() != ""
         )
-    if args.window_controller_alternate_profile_name is not None:
+        if not profile_names:
+            raise InvariantError("scenario_window_controller_profile_names_empty")
         window_controller_cfg = replace(
             window_controller_cfg,
-            alternate_profile_name=str(args.window_controller_alternate_profile_name),
+            profile_names=profile_names,
+        )
+    if args.window_controller_cold_start_profile_name is not None:
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            cold_start_profile_name=str(args.window_controller_cold_start_profile_name),
         )
     if args.window_controller_window_rounds is not None:
         if int(args.window_controller_window_rounds) <= 0:
@@ -477,10 +494,50 @@ def _strategy_cfg_with_router_overrides(
             window_controller_cfg,
             lookback_windows=int(args.window_controller_lookback_windows),
         )
-    if args.window_controller_margin_per_500 is not None:
+    if args.window_controller_min_history_windows is not None:
+        if int(args.window_controller_min_history_windows) <= 0:
+            raise InvariantError("scenario_window_controller_min_history_windows_nonpositive")
         window_controller_cfg = replace(
             window_controller_cfg,
-            margin_per_500=float(args.window_controller_margin_per_500),
+            min_history_windows=int(args.window_controller_min_history_windows),
+        )
+    if args.window_controller_estimator_mode is not None:
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            estimator_mode=str(args.window_controller_estimator_mode),
+        )
+    if args.window_controller_ewm_alpha is not None:
+        if float(args.window_controller_ewm_alpha) <= 0.0 or float(args.window_controller_ewm_alpha) > 1.0:
+            raise InvariantError("scenario_window_controller_ewm_alpha_out_of_range")
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            ewm_alpha=float(args.window_controller_ewm_alpha),
+        )
+    if args.window_controller_stability_penalty_per_500 is not None:
+        if float(args.window_controller_stability_penalty_per_500) < 0.0:
+            raise InvariantError("scenario_window_controller_stability_penalty_negative")
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            stability_penalty_per_500=float(args.window_controller_stability_penalty_per_500),
+        )
+    if args.window_controller_activity_target_bet_rate is not None:
+        if (
+            float(args.window_controller_activity_target_bet_rate) < 0.0
+            or float(args.window_controller_activity_target_bet_rate) > 1.0
+        ):
+            raise InvariantError("scenario_window_controller_activity_target_bet_rate_out_of_range")
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            activity_target_bet_rate=float(args.window_controller_activity_target_bet_rate),
+        )
+    if args.window_controller_activity_shortfall_penalty_per_500 is not None:
+        if float(args.window_controller_activity_shortfall_penalty_per_500) < 0.0:
+            raise InvariantError("scenario_window_controller_activity_shortfall_penalty_negative")
+        window_controller_cfg = replace(
+            window_controller_cfg,
+            activity_shortfall_penalty_per_500=float(
+                args.window_controller_activity_shortfall_penalty_per_500
+            ),
         )
     if args.window_controller_skip_threshold_per_500 is not None:
         window_controller_cfg = replace(
@@ -491,11 +548,8 @@ def _strategy_cfg_with_router_overrides(
     if bool(window_controller_cfg.enabled):
         active_names = {str(candidate.name) for candidate in dislocation_cfg.candidates}
         missing_profiles = sorted(
-            name
-            for name in (
-                str(window_controller_cfg.baseline_profile_name),
-                str(window_controller_cfg.alternate_profile_name),
-            )
+            str(name)
+            for name in tuple(window_controller_cfg.profile_names)
             if str(name) not in active_names
         )
         if missing_profiles:

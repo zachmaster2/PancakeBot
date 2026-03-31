@@ -84,6 +84,58 @@ class DryCycleMonitorTests(unittest.TestCase):
         self.assertTrue(any("unexpected_controller_profiles" in item for item in anomalies))
         self.assertTrue(any("unexpected_controller_actions" in item for item in anomalies))
 
+    def test_summary_counts_controller_profile_runtime_skip_cycles(self) -> None:
+        rows = [
+            {
+                "current_epoch": "10",
+                "action": "SKIP",
+                "selected_strategy": "",
+                "bet_side": "",
+                "skip_reason": "selector_no_candidate",
+                "expected_profit_bnb": "",
+                "controller_mode": "absolute_best_with_skip",
+                "controller_window_index": "2",
+                "controller_lookback_windows_used": "2",
+                "controller_selected_profile": "disloc_stageG2_bullonly_recent5pct_v1",
+                "controller_selected_action": "profile",
+                "controller_estimated_per_500": "0.05",
+                "controller_estimated_selected_bet_rate": "0.04",
+            },
+            {
+                "current_epoch": "11",
+                "action": "SKIP",
+                "selected_strategy": "",
+                "bet_side": "",
+                "skip_reason": "window_controller_skip",
+                "expected_profit_bnb": "",
+                "controller_mode": "absolute_best_with_skip",
+                "controller_window_index": "3",
+                "controller_lookback_windows_used": "2",
+                "controller_selected_profile": "",
+                "controller_selected_action": "skip",
+                "controller_estimated_per_500": "0.0",
+                "controller_estimated_selected_bet_rate": "0.0",
+            },
+        ]
+
+        summary = _summarize(
+            rows=rows,
+            expected_strategies=set(),
+            expected_bet_sides=set(),
+            expected_controller_profiles=set(),
+            expected_controller_actions=set(),
+            warn_idle_streak_cycles=240,
+            warn_min_cycles_for_rate_check=240,
+            warn_total_bet_rate_below=0.02,
+        )
+
+        self.assertEqual(1, int(summary["controller_profile_cycles"]))
+        self.assertEqual(1, int(summary["controller_skip_cycles"]))
+        self.assertEqual(1, int(summary["controller_profile_but_runtime_skip_cycles"]))
+        latest = dict(summary["latest_controller_state"])
+        self.assertEqual("11", latest["current_epoch"])
+        self.assertEqual("skip", latest["controller_selected_action"])
+
 
 if __name__ == "__main__":
     unittest.main()

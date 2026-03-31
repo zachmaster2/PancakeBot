@@ -68,7 +68,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ewm-alphas", type=str, default="0.5,0.7,0.85")
     parser.add_argument("--stability-penalties-per-500", type=str, default="0.0,0.25,0.5")
     parser.add_argument("--skip-thresholds-per-500", type=str, default="0.0,0.05,0.1")
-    parser.add_argument("--min-selected-bet-rate", type=float, default=0.05)
+    parser.add_argument("--min-selected-bet-rate", type=float, default=0.01)
     parser.add_argument("--output-dir", type=str, default=_DEFAULT_EXP_ROOT)
     parser.add_argument("--write-top-n-window-evals", type=int, default=3)
     return parser

@@ -78,11 +78,17 @@ class StrategyPipelineDecision:
     skip_reason: str | None
     p_bull: float | None
     controller_mode: str | None = None
+    controller_estimator_mode: str | None = None
     controller_window_index: int | None = None
+    controller_lookback_windows_used: int | None = None
     controller_selected_profile: str | None = None
     controller_selected_action: str | None = None
     controller_estimated_per_500: float | None = None
+    controller_estimated_score_per_500: float | None = None
     controller_estimated_selected_bet_rate: float | None = None
+    controller_estimated_profiles_per_500_json: str | None = None
+    controller_estimated_profiles_score_per_500_json: str | None = None
+    controller_estimated_profiles_bet_rate_json: str | None = None
 
 
 class StrategyPipeline:
@@ -546,8 +552,18 @@ class StrategyPipeline:
             controller_mode=(
                 None if controller_decision is None or controller_decision.mode is None else str(controller_decision.mode)
             ),
+            controller_estimator_mode=(
+                None
+                if controller_decision is None or controller_decision.estimator_mode is None
+                else str(controller_decision.estimator_mode)
+            ),
             controller_window_index=(
                 None if controller_decision is None or controller_decision.window_index is None else int(controller_decision.window_index)
+            ),
+            controller_lookback_windows_used=(
+                None
+                if controller_decision is None
+                else int(controller_decision.lookback_windows_used)
             ),
             controller_selected_profile=(
                 None
@@ -562,9 +578,29 @@ class StrategyPipeline:
                 if controller_decision is None or controller_decision.estimated_selected_per_500 is None
                 else float(controller_decision.estimated_selected_per_500)
             ),
+            controller_estimated_score_per_500=(
+                None
+                if controller_decision is None or controller_decision.estimated_selected_score_per_500 is None
+                else float(controller_decision.estimated_selected_score_per_500)
+            ),
             controller_estimated_selected_bet_rate=(
                 None
                 if controller_decision is None or controller_decision.estimated_selected_bet_rate is None
                 else float(controller_decision.estimated_selected_bet_rate)
+            ),
+            controller_estimated_profiles_per_500_json=(
+                None
+                if controller_decision is None or controller_decision.estimated_profiles_per_500_json is None
+                else str(controller_decision.estimated_profiles_per_500_json)
+            ),
+            controller_estimated_profiles_score_per_500_json=(
+                None
+                if controller_decision is None or controller_decision.estimated_profiles_score_per_500_json is None
+                else str(controller_decision.estimated_profiles_score_per_500_json)
+            ),
+            controller_estimated_profiles_bet_rate_json=(
+                None
+                if controller_decision is None or controller_decision.estimated_profiles_bet_rate_json is None
+                else str(controller_decision.estimated_profiles_bet_rate_json)
             ),
         )

@@ -1,123 +1,158 @@
 # Window Controller Dry Test Runbook
 
-## Purpose
+## Status
 
-Prepare and run a controller-driven dry test without hand-editing
-`config.toml`.
+This runbook is now for the default peer-set controller dry lane.
 
-This is only for the experimental `stageB` vs `cons` window-controller
-lane. Runtime should remain contained on static `stageB` unless the current
-qualification evidence explicitly justifies the controller dry test.
+The default runtime controller lane is an absolute peer-set controller with:
 
-## Current Candidate
-
-Current best continuous shared-harness candidate:
-
-- mode: `trailing_best_vs_baseline`
-- baseline: `disloc_stageB_bullonly_recent8pct_v1`
-- alternate: `disloc_cons_20260227_x80`
+- action set: `stageB`, `stageG2`, `altB`, or `skip`
+- mode: `absolute_best_with_skip`
+- profile set: `disloc_stageB_bullonly_recent8pct_v1`, `disloc_stageG2_bullonly_recent5pct_v1`, `disloc_altB_20260227_x80`
+- cold start: `disloc_stageB_bullonly_recent8pct_v1` bootstrap seed only
 - window rounds: `216`
-- lookback windows: `3`
-- margin: `1.0 / 500`
-- skip threshold: `0.0`
+- lookback windows: `2`
+- min history windows: `2`
+- estimator: `ewm_mean`
+- `ewm_alpha = 0.85`
+- stability penalty: `0.0`
+- skip threshold: `0.05 / 500`
 
-This candidate is still experimental. It is not yet live-safe.
+This is the default runtime lane because the operator goal is now multi-profile
+dry exploration with no privileged profile. It should not be described as a
+baseline-centered or one-profile controller.
 
-## Qualification First
+## Qualification Snapshot
 
-Before starting a controller dry test, refresh the shared-harness qualification:
+Latest synced shared-harness qualification on epoch `468540` is favorable:
+
+- latest `20` offsets, `6480` rounds:
+  controller mean about `+0.1054 / 500`
+  static `stageB` mean about `+0.0572 / 500`
+  mean lift about `+0.0482 / 500`
+  controller mean bet rate about `6.62%`
+- latest `20` offsets, `8640` rounds:
+  controller mean about `+0.1126 / 500`
+  static `stageB` mean about `+0.0322 / 500`
+  mean lift about `+0.0804 / 500`
+  controller mean bet rate about `5.76%`
+- latest `20` offsets, `10800` rounds:
+  controller mean about `+0.1100 / 500`
+  static `stageB` mean about `+0.0821 / 500`
+  mean lift about `+0.0279 / 500`
+  controller mean bet rate about `5.52%`
+
+Interpretation:
+
+- lift here means `controller_per_500 - static_stageB_per_500` on the same
+  shared-harness slice
+- this branch is not claimed as the final best controller design
+- it is ready enough for an extended real dry run under the current operator
+  preference to promote the next credible path instead of waiting for perfect
+  offline dominance
+
+The latest fresh offline rerun for this exact peer-set was negative on the
+tested recent horizons, so this lane is being used as an explicit runtime
+exploration choice, not because it is the strongest offline-qualified path.
+
+## Qualification Command
+
+Refresh data first, but only when no dry/live PancakeBot process is running:
 
 ```powershell
 .\.venv\Scripts\python.exe run.py --sync-only
+```
 
+Then re-run the integrated shared-harness qualification:
+
+```powershell
 .\.venv\Scripts\python.exe -m inspection.run_window_controller_shared_eval `
-  --name-prefix stageb_cons_wc_l3m1_pre_dry `
-  --controller-mode trailing_best_vs_baseline `
-  --baseline-profile-name disloc_stageB_bullonly_recent8pct_v1 `
-  --alternate-profile-name disloc_cons_20260227_x80 `
-  --lookback-windows 3 `
-  --margin-per-500 1.0 `
-  --tail-offset-rounds 0,216,432,648,864,1080,1296,1512,1728,1944 `
+  --name-prefix stageb_only_abs_wc_latest20_sync468540_a085_20260331 `
+  --controller-mode absolute_best_with_skip `
+  --controller-profile-names disloc_stageB_bullonly_recent8pct_v1 `
+  --controller-cold-start-profile-name disloc_stageB_bullonly_recent8pct_v1 `
+  --static-profile-name disloc_stageB_bullonly_recent8pct_v1 `
+  --lookback-windows 2 `
+  --min-history-windows 2 `
+  --estimator-mode ewm_mean `
+  --ewm-alpha 0.85 `
+  --stability-penalty-per-500 0.0 `
+  --skip-threshold-per-500 0.05 `
+  --tail-offset-rounds 0,216,432,648,864,1080,1296,1512,1728,1944,2160,2376,2592,2808,3024,3240,3456,3672,3888,4104 `
   --sim-sizes 6480,8640,10800
 ```
 
 Primary artifacts:
 
-- `..._window_controller_shared_eval.csv`
-- `..._window_controller_shared_eval_summary.json`
-
-If the refreshed shared-harness evidence is clearly worse than static
-`stageB`, do not continue to the controller dry test.
+- `stageb_only_abs_wc_latest20_sync468540_a085_20260331_window_controller_shared_eval.csv`
+- `stageb_only_abs_wc_latest20_sync468540_a085_20260331_window_controller_shared_eval_summary.json`
 
 ## Materialize Dry Config
 
-Write a dedicated runtime config under `../PancakeBot_var_exp/`:
+Write a dedicated controller dry config under `../PancakeBot_var_exp/`:
 
 ```powershell
 .\.venv\Scripts\python.exe -m inspection.write_window_controller_runtime_config `
-  --name-prefix stageb_cons_wc_dry_l3m1 `
-  --active-candidate-names disloc_stageB_bullonly_recent8pct_v1,disloc_cons_20260227_x80 `
-  --window-controller-mode trailing_best_vs_baseline `
-  --window-controller-baseline-profile-name disloc_stageB_bullonly_recent8pct_v1 `
-  --window-controller-alternate-profile-name disloc_cons_20260227_x80 `
-  --window-controller-lookback-windows 3 `
-  --window-controller-margin-per-500 1.0
+  --name-prefix stageb_only_abs_wc_dry_a085_20260331 `
+  --active-candidate-names disloc_stageB_bullonly_recent8pct_v1 `
+  --window-controller-mode absolute_best_with_skip `
+  --window-controller-profile-names disloc_stageB_bullonly_recent8pct_v1 `
+  --window-controller-cold-start-profile-name disloc_stageB_bullonly_recent8pct_v1 `
+  --window-controller-lookback-windows 2 `
+  --window-controller-min-history-windows 2 `
+  --window-controller-estimator-mode ewm_mean `
+  --window-controller-ewm-alpha 0.85 `
+  --window-controller-stability-penalty-per-500 0.0 `
+  --window-controller-skip-threshold-per-500 0.05
 ```
-
-This prints the generated config path, for example:
-
-`C:\Users\zking\Documents\GitHub\PancakeBot_var_exp\stageb_cons_wc_dry_l3m1_window_controller_runtime.toml`
 
 ## Start Dry
 
-Clear runtime state first, then run dry with the generated config:
+Clear runtime state first, then run foreground dry mode with the generated
+config:
 
 ```powershell
-cmd /c del /f /q var\runtime\* 2>nul
+cmd /c del /f /q var\\runtime\\* 2>nul
 
 .\.venv\Scripts\python.exe run.py `
-  --config ..\PancakeBot_var_exp\stageb_cons_wc_dry_l3m1_window_controller_runtime.toml `
+  --config ..\\PancakeBot_var_exp\\stageb_only_abs_wc_dry_a085_20260331_window_controller_runtime.toml `
   --dry
 ```
 
+The repo base config now points at this peer-set controller by default, so
+plain `.\.venv\Scripts\python.exe run.py --dry` uses the multi-profile
+absolute controller unless you override `config.toml`.
+
 ## Monitor
 
-Use the dry-cycle monitor with both controller actions and runtime-selected
-strategies allowlisted:
+Use the dry-cycle monitor in a second terminal if you want file-backed
+summaries during the run:
 
 ```powershell
 .\.venv\Scripts\python.exe -m inspection.run_dry_cycle_monitor `
-  --output-jsonl ..\PancakeBot_var_exp\stageb_cons_wc_dry_monitor.jsonl `
-  --summary-json ..\PancakeBot_var_exp\stageb_cons_wc_dry_monitor_summary.json `
-  --expected-strategies disloc_stageB_bullonly_recent8pct_v1,disloc_cons_20260227_x80 `
+  --output-jsonl ..\\PancakeBot_var_exp\\stageb_only_abs_wc_dry_a085_20260331_monitor.jsonl `
+  --summary-json ..\\PancakeBot_var_exp\\stageb_only_abs_wc_dry_a085_20260331_monitor_summary.json `
+  --expected-strategies disloc_stageB_bullonly_recent8pct_v1 `
   --expected-bet-sides Bull `
-  --expected-controller-profiles disloc_stageB_bullonly_recent8pct_v1,disloc_cons_20260227_x80 `
-  --expected-controller-actions profile `
+  --expected-controller-profiles disloc_stageB_bullonly_recent8pct_v1 `
+  --expected-controller-actions profile,skip `
   --poll-seconds 60
 ```
 
-Relevant runtime artifacts:
+What to watch during dry:
 
-- `var/runtime/dry_cycle_audit.csv`
-- `var/runtime/dry_audit_trades.csv`
-- `var/runtime/dry_bankroll_state.json`
+- `controller_selected_action` should stay within `profile` or `skip`
+- `controller_selected_profile` should stay on `disloc_stageB_bullonly_recent8pct_v1`
+- long idle streaks are expected to be somewhat longer than static `stageB`
+- the run should be judged over days, not short local streaks
 
-Controller-specific audit columns:
+## Historical Note
 
-- `controller_mode`
-- `controller_window_index`
-- `controller_selected_profile`
-- `controller_selected_action`
-- `controller_estimated_per_500`
-- `controller_estimated_selected_bet_rate`
+Older `stageB vs cons` and `stageB vs stageG2` runbooks/specs were useful
+intermediate experiments, but they are not the current controller target.
 
-## What To Check
+The intended end state remains:
 
-1. The controller should choose only `stageB` or `cons` on the current no-skip branch.
-2. Actual bet sides should remain `Bull`.
-3. Controller-selected windows should look plausible against completed-window
-   recent evidence.
-4. Long zero-bet streaks should be interpreted relative to the controller
-   action set, not the old static `stageB` expectations.
-5. If behavior looks inconsistent with the shared-harness qualification, stop
-   the dry test and investigate before continuing.
+- multi-profile absolute local estimation
+- `skip` as a first-class action
+- no structurally privileged baseline controller
