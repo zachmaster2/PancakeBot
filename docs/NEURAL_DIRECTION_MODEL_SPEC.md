@@ -77,14 +77,22 @@ The first evaluation headline is:
 
 ## Model Ladder
 
-The initial neural-first ranking is:
+The initial neural-first ranking was:
 
 1. `TCN`
 2. `MLP`
 3. `GRU` / `LSTM`
 4. `Transformer`
 
-The first serious mainline should be `TCN`.
+Current evidence has reversed that ordering:
+
+1. `MLP`
+2. `TCN`
+3. `GRU` / `LSTM`
+4. `Transformer`
+
+The current serious mainline is the full-feature `MLP`, while `TCN` remains the
+main secondary neural comparison.
 
 ## Input Structure
 
@@ -169,5 +177,13 @@ Update on April 1, 2026:
    with the shared eval runner
    [run_neural_direction_tcn_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_neural_direction_tcn_eval.py)
 6. the current mainline evidence favors the full-feature MLP over the current
-   TCN variants on the recent kline-limited tail; full-history kline sync is
-   still required before the larger-window comparison matrix can be completed
+   TCN variants on the recent kline-limited tail
+7. the full-history kline sync is now complete, so the larger-window neural
+   matrix is no longer kline-gated
+8. the first post-sync larger MLP runs now show a non-monotonic history-depth
+   effect: `100k` improved the short horizon to about `51.56%` mean held-out
+   win `%` on `6480`, while `200k` dropped back to about `50.65%` on that same
+   horizon; `10800` stayed around `50.76%` to `50.85%`
+9. the flat `400k` MLP point and larger TCN reruns are now in progress in the
+   background and should be used to answer the full-history question before
+   opening wider architecture experiments
