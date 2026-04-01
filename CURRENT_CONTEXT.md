@@ -189,7 +189,10 @@ Current interpretation: the runtime-controller branch is alive, but it is not ro
 120. On April 1, 2026, the full-history kline backfill was completed successfully with a one-off temp-file helper outside the repo. The kline store now covers the required neural-direction range from `1629920460000` through `1775015340000`, which matches the current round-store span plus the required `121` minutes of causal kline warmup. The helper log is [full_kline_backfill_20260401_stdout.log](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/full_kline_backfill_20260401_stdout.log).
 121. The first post-sync larger-window MLP sweep is now complete in [neural_direction_mlp_large_t100000_20260401_neural_direction_mlp_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_large_t100000_20260401_neural_direction_mlp_eval_summary.json). Using the full canonical v8 feature set, `train=100k`, `valid=3k`, sim sizes `6480` and `10800`, and offsets `0,432,864`, mean held-out test win `%` improved to about `51.56%` on `6480` and about `50.76%` on `10800`. This is currently the best finished MLP result on the shorter horizon and clearly above the earlier `75k` ceiling.
 122. The next larger MLP point, [neural_direction_mlp_large_t200000_20260401_neural_direction_mlp_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_large_t200000_20260401_neural_direction_mlp_eval_summary.json), shows that more flat history is not monotonically better. At `train=200k`, mean held-out test win `%` dropped to about `50.65%` on `6480`, while `10800` stayed around `50.85%`. Current interpretation: larger flat windows may help or hurt depending on horizon, so recency versus history depth remains an empirical tradeoff rather than a one-way improvement.
-123. A background post-sync larger-window orchestrator is now running in [run_post_kline_large_neural_sweeps_20260401_stdout.log](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/run_post_kline_large_neural_sweeps_20260401_stdout.log). The next queued result is the flat `400k` MLP run, followed by `TCN` runs at `100k` and `200k`, all on sim sizes `6480` and `10800` with offsets `0,432,864`.
+123. The background post-sync larger-window orchestrator finished successfully in [run_post_kline_large_neural_sweeps_20260401_stdout.log](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/run_post_kline_large_neural_sweeps_20260401_stdout.log). It completed the queued flat `400k` MLP run and the larger `TCN` comparisons at `100k` and `200k`, all on sim sizes `6480` and `10800` with offsets `0,432,864`.
+124. The flat full-history MLP point is now complete in [neural_direction_mlp_large_t400000_20260401_neural_direction_mlp_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_large_t400000_20260401_neural_direction_mlp_eval_summary.json). At `train=400k`, mean held-out test win `%` was about `51.12%` on `6480` and about `51.00%` on `10800`. This is better than the `200k` MLP point on both horizons, but still worse than the `100k` MLP point on `6480` and only modestly better than it on `10800`.
+125. The larger post-sync TCN reruns remain weaker than the MLP. At `train=100k`, [neural_direction_tcn_large_t100000_20260401_neural_direction_tcn_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_tcn_large_t100000_20260401_neural_direction_tcn_eval_summary.json) reached about `50.44%` on `6480` and about `50.60%` on `10800`. At `train=200k`, [neural_direction_tcn_large_t200000_20260401_neural_direction_tcn_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_tcn_large_t200000_20260401_neural_direction_tcn_eval_summary.json) improved to about `51.04%` on `6480` and about `51.06%` on `10800`, but still did not beat the best finished MLP result.
+126. Current evidence after the full-history kline sync is: the full-feature MLP remains the mainline; the best finished short-horizon point is `MLP @ 100k` with about `51.56%` mean held-out win `%` on `6480`; and the flat-history question now looks non-monotonic rather than one-directional (`100k` > `400k` > `200k` on `6480`, while `400k` is the best finished MLP point on `10800`).
 
 ## Operational Rules
 
@@ -219,11 +222,12 @@ through `110`.
 4. Implement the first real neural sequence mainline (`TCN`) using settled
    `outcome_eligible_prior_context_rounds`, a `locked_round` snapshot, a
    `target_round` cutoff snapshot, and cutoff-anchored `context_klines`.
-5. Finish the queued post-sync larger-window sweeps, especially the flat `400k`
-   MLP point and the new `100k` / `200k` TCN comparisons.
-6. Continue neural tuning from the current mainline evidence:
+5. Continue neural tuning from the current mainline evidence:
    full-feature MLP first, TCN second, with future bounded work on larger
    windows, longer sequence designs, and more targeted ablations if needed.
+6. Answer the next history-depth question with more structure than flat windows
+   alone, likely through bounded recency weighting, staged pretrain-plus-recent
+   fine-tune, or other explicitly recent-biased training policies.
 7. Keep the failed realized-net direct-action lane optional and disabled by
    default as historical reference only; do not resume threshold tuning or the
    multi-offset shared-eval sweep for that lane unless a bounded comparison is
