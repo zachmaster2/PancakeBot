@@ -208,6 +208,8 @@ Update on April 1, 2026:
     feature contract, label contract, or materially different architecture
     justifies reopening the history-combination question
 15. the missing confidence-bucket pass for those recent-bias variants is now
-    complete, and it agrees with the broad-win result: none of the recent-bias
-    setups beat the flat-history anchors on top-confidence buckets either, so
-    the current confidence-first mainline stays with flat `MLP @ 400k`
+    complete, and it agrees with the broad-win result at the decision level:
+    the recent-bias variants do not displace the flat-history anchors as the
+    current confidence-first mainline. The mild weighted `400k` setup improved
+    a few isolated `10800` buckets, but the overall selective ranking still
+    stays with flat `MLP @ 400k`
