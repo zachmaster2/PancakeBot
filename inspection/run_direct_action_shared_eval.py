@@ -9,6 +9,7 @@ import subprocess
 
 from pancakebot.config.load_config import load_app_config
 from pancakebot.core.errors import InvariantError
+from pancakebot.domain.strategy.dislocation_engine import build_dislocation_engine_from_config
 from pancakebot.domain.strategy.direct_action_policy_model import (
     build_direct_action_dataset,
     direct_action_required_history_rounds,
@@ -188,6 +189,20 @@ def _load_round_slice(
     return list(rounds), market_data_store, SqliteKlinesStore(market_data_db=market_data_store)
 
 
+def _all_klines_from_store(klines_store: SqliteKlinesStore) -> list[object]:
+    start = klines_store.earliest_open_time_ms()
+    end = klines_store.latest_open_time_ms()
+    if start is None or end is None:
+        raise InvariantError("direct_action_shared_eval_klines_store_empty")
+    out = klines_store.get_klines_between(
+        start_open_time_ms=int(start),
+        end_open_time_ms=int(end) + 60_000,
+    )
+    if not out:
+        raise InvariantError("direct_action_shared_eval_klines_empty")
+    return list(out)
+
+
 def _train_bundle_for_slice(
     *,
     config_path: str,
@@ -208,6 +223,13 @@ def _train_bundle_for_slice(
         sim_size=int(sim_size),
     )
     feature_cache_store = FeatureCacheStore(str(cfg.feature_cache_path))
+    legacy_feature_engine = build_dislocation_engine_from_config(
+        selector_cfg=cfg.strategy.dislocation.selector,
+        candidate_cfgs=cfg.strategy.dislocation.candidates,
+        cutoff_seconds=int(cfg.cutoff_seconds),
+        treasury_fee_fraction=float(constants.treasury_fee_fraction),
+    )
+    legacy_feature_engine.refresh_klines(_all_klines_from_store(klines_store))
     try:
         dataset = build_direct_action_dataset(
             rounds=rounds,
@@ -215,6 +237,10 @@ def _train_bundle_for_slice(
             cutoff_seconds=int(cfg.cutoff_seconds),
             treasury_fee_fraction=float(constants.treasury_fee_fraction),
             feature_cache_store=feature_cache_store,
+            legacy_candidate_signal_provider=legacy_feature_engine,
+            legacy_candidate_names=tuple(
+                str(candidate.name) for candidate in cfg.strategy.dislocation.candidates
+            ),
         )
         target_epochs = list(int(epoch) for epoch in dataset.target_epochs)
         if len(target_epochs) != int(train_size) + int(valid_size) + int(sim_size):

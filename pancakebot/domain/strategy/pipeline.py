@@ -256,6 +256,8 @@ class StrategyPipeline:
                 epoch = int(round_t.epoch)
                 if self._last_settled_epoch is not None and int(epoch) <= int(self._last_settled_epoch):
                     continue
+                self._collect_candidate_signals(round_t=round_t)
+                self._settle_providers(rounds=[round_t])
                 self._direct_action_policy.observe_closed_rounds(rounds=[round_t])
                 self._last_settled_epoch = int(epoch)
             self._pending_candidate_signals_by_epoch = {}
@@ -308,9 +310,11 @@ class StrategyPipeline:
         """Generate and route candidate signals for one open round."""
 
         if bool(self._direct_action_enabled()):
+            legacy_candidate_signals = self._collect_candidate_signals(round_t=round_t)
             direct_decision = self._direct_action_policy.decide_open_round(
                 round_t=round_t,
                 bankroll_bnb=float(bankroll_bnb),
+                legacy_candidate_signals=legacy_candidate_signals,
             )
             return self._to_pipeline_decision_from_direct_action(direct_decision=direct_decision)
 
@@ -352,6 +356,8 @@ class StrategyPipeline:
                 epoch = int(round_t.epoch)
                 if self._last_settled_epoch is not None and int(epoch) <= int(self._last_settled_epoch):
                     continue
+                self._collect_candidate_signals(round_t=round_t)
+                self._settle_providers(rounds=[round_t])
                 self._direct_action_policy.observe_closed_rounds(rounds=[round_t])
                 self._last_settled_epoch = int(epoch)
             self._pending_candidate_signals_by_epoch = {}

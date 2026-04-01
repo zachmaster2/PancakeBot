@@ -1095,11 +1095,12 @@ def _direct_action_decision_log_suffix(
                 if label == "":
                     continue
                 try:
+                    score_value = float(row.get("score_bnb", row.get("q10_net_bnb", 0.0)))
                     q10_value = float(row.get("q10_net_bnb", 0.0))
                     q50_value = float(row.get("q50_net_bnb", 0.0))
                 except (TypeError, ValueError):
                     continue
-                top_parts.append(f"{label}:{q10_value:+.4f}/{q50_value:+.4f}")
+                top_parts.append(f"{label}:{score_value:+.4f}/{q10_value:+.4f}/{q50_value:+.4f}")
     suffix_parts = [
         f"mode={mode}",
         (f"pick={action_label}" if action_label != "" else None),

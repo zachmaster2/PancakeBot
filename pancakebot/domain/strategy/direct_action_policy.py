@@ -13,10 +13,12 @@ from pancakebot.domain.strategy.direct_action_policy_model import (
     _base_feature_vector_for_round,
     _direct_action_feature_row_values,
     action_spec_by_id,
+    direct_action_score_values,
     direct_action_required_history_rounds,
     load_direct_action_bundle,
     summarize_top_action_predictions,
 )
+from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 from pancakebot.domain.types import Round
 
 
@@ -67,10 +69,16 @@ class DirectActionPolicy:
         if int(self._top_k_actions) <= 0:
             raise InvariantError("direct_action_top_k_actions_nonpositive")
         self._history_rounds: list[Round] = []
-        self._required_history_rounds = int(direct_action_required_history_rounds())
-        bundle_required = self._bundle.metadata.get("required_history_rounds")
-        if bundle_required is not None and int(bundle_required) != int(self._required_history_rounds):
-            raise InvariantError("direct_action_bundle_required_history_mismatch")
+        self._required_history_rounds = int(
+            self._bundle.metadata.get("required_history_rounds", direct_action_required_history_rounds())
+        )
+        if int(self._required_history_rounds) <= 0:
+            raise InvariantError("direct_action_bundle_required_history_invalid")
+        self._score_mode = str(self._bundle.metadata.get("score_mode", "q10"))
+        self._score_risk_lambda = float(self._bundle.metadata.get("score_risk_lambda", 0.0))
+        self._legacy_candidate_names = tuple(
+            str(name) for name in self._bundle.metadata.get("legacy_candidate_names", [])
+        )
 
     @property
     def enabled(self) -> bool:
@@ -114,6 +122,7 @@ class DirectActionPolicy:
         *,
         round_t: Round,
         bankroll_bnb: float,
+        legacy_candidate_signals: dict[str, StrategyCandidateSignal] | None = None,
     ) -> DirectActionPolicyDecision:
         if float(bankroll_bnb) < 0.0:
             raise InvariantError("direct_action_bankroll_negative")
@@ -151,14 +160,27 @@ class DirectActionPolicy:
                 summary_rounds=summary_rounds,
                 base_vector=base_vector,
                 action_spec=spec,
+                feature_action_specs=self._bundle.action_specs,
                 cutoff_seconds=int(self._cutoff_seconds),
                 treasury_fee_fraction=float(self._treasury_fee_fraction),
+                legacy_candidate_signals=legacy_candidate_signals,
+                legacy_candidate_names=self._legacy_candidate_names,
             )
             for spec in feasible_specs
         ]
-        q10_values, q50_values = self._bundle.predict_quantiles(feature_rows)
+        q10_values, q50_values = self._bundle.predict_quantiles(
+            feature_rows,
+            action_ids=[str(spec.action_id) for spec in feasible_specs],
+        )
+        score_values = direct_action_score_values(
+            q10_values=q10_values,
+            q50_values=q50_values,
+            score_mode=str(self._score_mode),
+            score_risk_lambda=float(self._score_risk_lambda),
+        )
         top_actions_json = summarize_top_action_predictions(
             action_specs=feasible_specs,
+            score_values=score_values,
             q10_values=q10_values,
             q50_values=q50_values,
             top_k=int(self._top_k_actions),
@@ -166,18 +188,20 @@ class DirectActionPolicy:
         best_idx = max(
             range(len(feasible_specs)),
             key=lambda idx: (
-                float(q10_values[idx]),
+                float(score_values[idx]),
                 float(q50_values[idx]),
+                float(q10_values[idx]),
                 str(feasible_specs[idx].action_id),
             ),
         )
         best_spec = feasible_specs[int(best_idx)]
+        best_score = float(score_values[int(best_idx)])
         best_q10 = float(q10_values[int(best_idx)])
         best_q50 = float(q50_values[int(best_idx)])
 
         if str(best_spec.action) == "SKIP":
             reason = "direct_action_best_action_is_skip"
-        elif float(best_q10) <= 0.0:
+        elif float(best_score) <= 0.0:
             reason = "direct_action_nonpositive_score"
         else:
             reason = None
@@ -191,7 +215,7 @@ class DirectActionPolicy:
                 action="SKIP",
                 bet_side=None,
                 bet_size_bnb=0.0,
-                score_bnb=float(best_q10),
+                score_bnb=float(best_score),
                 q50_net_bnb=float(best_q50),
                 top_actions_json=str(top_actions_json),
                 skip_reason=str(reason),
@@ -204,7 +228,7 @@ class DirectActionPolicy:
             action="BET",
             bet_side=(None if best_spec.bet_side is None else str(best_spec.bet_side)),
             bet_size_bnb=float(best_spec.bet_size_bnb),
-            score_bnb=float(best_q10),
+            score_bnb=float(best_score),
             q50_net_bnb=float(best_q50),
             top_actions_json=str(top_actions_json),
             skip_reason=None,

@@ -68,8 +68,8 @@ class RuntimeControllerLoggingTests(unittest.TestCase):
             direct_action_score_bnb=0.0123,
             direct_action_q50_bnb=0.0301,
             direct_action_top_actions_json=(
-                '[{"action_id":"bull_0p10","label":"Bull @ 0.10","q10_net_bnb":0.0123,"q50_net_bnb":0.0301},'
-                '{"action_id":"skip","label":"Skip","q10_net_bnb":0.0,"q50_net_bnb":0.0}]'
+                '[{"action_id":"bull_0p10","label":"Bull @ 0.10","score_bnb":0.0123,"q10_net_bnb":-0.0040,"q50_net_bnb":0.0301},'
+                '{"action_id":"skip","label":"Skip","score_bnb":0.0,"q10_net_bnb":0.0,"q50_net_bnb":0.0}]'
             ),
         )
 
@@ -85,7 +85,7 @@ class RuntimeControllerLoggingTests(unittest.TestCase):
         self.assertIn("score=+0.0123", suffix)
         self.assertIn("q50=+0.0301", suffix)
         self.assertIn("final=BET", suffix)
-        self.assertIn("top=Bull @ 0.10:+0.0123/+0.0301,Skip:+0.0000/+0.0000", suffix)
+        self.assertIn("top=Bull @ 0.10:+0.0123/-0.0040/+0.0301,Skip:+0.0000/+0.0000/+0.0000", suffix)
 
     def test_direct_action_decision_log_suffix_empty_without_mode(self) -> None:
         decision = SimpleNamespace(direct_action_mode="")
