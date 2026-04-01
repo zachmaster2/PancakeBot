@@ -9,6 +9,7 @@ import numpy as np
 from pancakebot.domain.models.neural_direction_dataset import NeuralDirectionDataset
 from pancakebot.domain.models.neural_direction_mlp import (
     NeuralDirectionMlpConfig,
+    build_exponential_recency_weights,
     load_neural_direction_mlp_bundle,
     predict_neural_direction_probabilities,
     save_neural_direction_mlp_bundle,
@@ -104,6 +105,61 @@ class NeuralDirectionMlpTests(unittest.TestCase):
             feature_matrix=dataset.feature_matrix,
         )
         self.assertTrue(np.allclose(probs_before, probs_after))
+
+    def test_exponential_recency_weights_favor_newer_examples(self) -> None:
+        weights = build_exponential_recency_weights(
+            num_examples=8,
+            half_life_examples=2.0,
+        )
+        self.assertEqual((8,), weights.shape)
+        self.assertAlmostEqual(1.0, float(np.mean(weights)), places=5)
+        self.assertGreater(float(weights[-1]), float(weights[0]))
+
+    def test_train_supports_sample_weights_and_warm_start(self) -> None:
+        dataset = self._dataset()
+        base_bundle = train_neural_direction_mlp(
+            dataset=dataset,
+            train_target_epochs=dataset.target_epochs[:6],
+            valid_target_epochs=dataset.target_epochs[6:8],
+            random_seed=13,
+            config=NeuralDirectionMlpConfig(
+                hidden_sizes=(8,),
+                dropout=0.0,
+                learning_rate=0.01,
+                weight_decay=0.0,
+                batch_size=4,
+                max_epochs=20,
+                patience_epochs=4,
+            ),
+        )
+        finetune_bundle = train_neural_direction_mlp(
+            dataset=dataset,
+            train_target_epochs=dataset.target_epochs[:8],
+            valid_target_epochs=dataset.target_epochs[8:],
+            random_seed=13,
+            config=NeuralDirectionMlpConfig(
+                hidden_sizes=(8,),
+                dropout=0.0,
+                learning_rate=0.01,
+                weight_decay=0.0,
+                batch_size=4,
+                max_epochs=20,
+                patience_epochs=4,
+            ),
+            train_sample_weights=build_exponential_recency_weights(
+                num_examples=8,
+                half_life_examples=2.0,
+            ),
+            initial_bundle=base_bundle,
+        )
+
+        probs = predict_neural_direction_probabilities(
+            bundle=finetune_bundle,
+            feature_matrix=dataset.feature_matrix,
+        )
+        self.assertEqual((10,), probs.shape)
+        self.assertTrue(bool(finetune_bundle.metadata["warm_started"]))
+        self.assertGreater(float(finetune_bundle.metadata["train_weight_max"]), 1.0)
 
 
 if __name__ == "__main__":
