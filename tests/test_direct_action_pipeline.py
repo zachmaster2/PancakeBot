@@ -9,6 +9,10 @@ from pancakebot.domain.types import Round
 
 
 class _FakeDislocationEngine:
+    def __init__(self) -> None:
+        self.requested_epochs: list[int] = []
+        self.settled_epoch_batches: list[list[int]] = []
+
     def export_bootstrap_state(self) -> dict[str, object]:
         return {}
 
@@ -23,6 +27,13 @@ class _FakeDislocationEngine:
 
     def refresh_klines(self, klines) -> None:
         return None
+
+    def candidate_signals_for_open_round(self, *, round_t: Round) -> dict[str, object]:
+        self.requested_epochs.append(int(round_t.epoch))
+        return {}
+
+    def settle_closed_rounds(self, rounds) -> None:
+        self.settled_epoch_batches.append([int(round_t.epoch) for round_t in rounds])
 
 
 class _FakeRouter:
@@ -40,8 +51,16 @@ class _FakeDirectActionPolicy:
 
     def __init__(self) -> None:
         self.observed_epoch_batches: list[list[int]] = []
+        self.last_legacy_candidate_signals: dict[str, object] | None = None
 
-    def decide_open_round(self, *, round_t: Round, bankroll_bnb: float) -> DirectActionPolicyDecision:
+    def decide_open_round(
+        self,
+        *,
+        round_t: Round,
+        bankroll_bnb: float,
+        legacy_candidate_signals=None,
+    ) -> DirectActionPolicyDecision:
+        self.last_legacy_candidate_signals = dict(legacy_candidate_signals or {})
         return DirectActionPolicyDecision(
             enabled=True,
             action_id="bull_0p10",
@@ -89,7 +108,8 @@ class DirectActionPipelineTests(unittest.TestCase):
         )
 
     def test_decide_open_round_maps_direct_action_fields(self) -> None:
-        pipeline = self._pipeline(_FakeDirectActionPolicy())
+        policy = _FakeDirectActionPolicy()
+        pipeline = self._pipeline(policy)
 
         decision = pipeline.decide_open_round(
             round_t=_round(epoch=10),
@@ -105,6 +125,7 @@ class DirectActionPipelineTests(unittest.TestCase):
         self.assertEqual("bull_0p10", decision.direct_action_action_id)
         self.assertAlmostEqual(0.012, float(decision.direct_action_score_bnb or 0.0))
         self.assertAlmostEqual(0.025, float(decision.expected_profit_bnb))
+        self.assertEqual({}, policy.last_legacy_candidate_signals)
 
     def test_bootstrap_and_settlement_route_only_to_direct_action_policy(self) -> None:
         policy = _FakeDirectActionPolicy()

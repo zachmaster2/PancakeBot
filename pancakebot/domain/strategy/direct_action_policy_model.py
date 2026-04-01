@@ -19,6 +19,7 @@ from pancakebot.core.errors import InvariantError
 from pancakebot.domain.features.feature_builder import build_features, vectorize
 from pancakebot.domain.features.pool_amounts import compute_pool_amounts_wei_at_or_before
 from pancakebot.domain.features.schema import FEATURE_SCHEMA, max_required_context_klines_size, max_required_prior_context_rounds_size
+from pancakebot.domain.strategy.candidate_signal import StrategyCandidateSignal
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
@@ -33,6 +34,7 @@ warnings.filterwarnings(
 _DIRECT_ACTION_BUNDLE_VERSION = "direct_action_bundle_v1"
 _DIRECT_ACTION_SUMMARY_HORIZONS = (24, 72, 216)
 _DEFAULT_ACTION_SIZES_BNB = (0.05, 0.10, 0.15, 0.25, 0.35, 0.50)
+_DEFAULT_SCORE_RISK_LAMBDA = 0.15
 _LGBM_Q10 = {
     "objective": "quantile",
     "alpha": 0.10,
@@ -40,7 +42,7 @@ _LGBM_Q10 = {
     "learning_rate": 0.05,
     "num_leaves": 63,
     "max_depth": -1,
-    "min_child_samples": 200,
+    "min_child_samples": 50,
     "feature_fraction": 0.9,
     "bagging_fraction": 0.9,
     "bagging_freq": 1,
@@ -56,7 +58,7 @@ _LGBM_Q50 = {
     "learning_rate": 0.05,
     "num_leaves": 63,
     "max_depth": -1,
-    "min_child_samples": 200,
+    "min_child_samples": 50,
     "feature_fraction": 0.9,
     "bagging_fraction": 0.9,
     "bagging_freq": 1,
@@ -102,7 +104,12 @@ class DirectActionModelBundle:
     q50_model: object
     metadata: dict[str, object]
 
-    def predict_quantiles(self, feature_rows: Sequence[Sequence[float]]) -> tuple[list[float], list[float]]:
+    def predict_quantiles(
+        self,
+        feature_rows: Sequence[Sequence[float]],
+        *,
+        action_ids: Sequence[str] | None = None,
+    ) -> tuple[list[float], list[float]]:
         x_arr = np.asarray(feature_rows, dtype=float)
         if x_arr.ndim != 2:
             raise InvariantError("direct_action_predict_x_not_2d")
@@ -110,8 +117,18 @@ class DirectActionModelBundle:
             return [], []
         if int(x_arr.shape[1]) != int(len(self.feature_names)):
             raise InvariantError("direct_action_predict_feature_count_mismatch")
-        q10 = np.asarray(self.q10_model.predict(x_arr), dtype=float)
-        q50 = np.asarray(self.q50_model.predict(x_arr), dtype=float)
+        q10 = _predict_bundle_component(
+            model=self.q10_model,
+            x_arr=x_arr,
+            action_ids=action_ids,
+            bundle_action_specs=self.action_specs,
+        )
+        q50 = _predict_bundle_component(
+            model=self.q50_model,
+            x_arr=x_arr,
+            action_ids=action_ids,
+            bundle_action_specs=self.action_specs,
+        )
         if q10.shape != q50.shape:
             raise InvariantError("direct_action_predict_quantile_shape_mismatch")
         if not np.all(np.isfinite(q10)) or not np.all(np.isfinite(q50)):
@@ -123,11 +140,21 @@ class DirectActionModelBundle:
 class DirectActionDataset:
     """Contiguous direct-action dataset over a round tail."""
 
+    required_history_rounds: int
     feature_names: tuple[str, ...]
     action_specs: tuple[DirectActionSpec, ...]
     target_epochs: tuple[int, ...]
     rows: tuple[DirectActionFeatureRow, ...]
     rows_by_epoch: dict[int, dict[str, DirectActionFeatureRow]]
+
+
+@dataclass(frozen=True, slots=True)
+class _ConstantPredictionModel:
+    value: float
+
+    def predict(self, x) -> list[float]:
+        size = int(len(x))
+        return [float(self.value)] * int(size)
 
 
 def default_direct_action_specs(
@@ -178,7 +205,12 @@ def direct_action_required_history_rounds() -> int:
     return int(max(int(max_required_prior_context_rounds_size()), int(max(_DIRECT_ACTION_SUMMARY_HORIZONS))))
 
 
-def direct_action_feature_names() -> tuple[str, ...]:
+def direct_action_feature_names(
+    *,
+    action_specs: Sequence[DirectActionSpec] | None = None,
+    legacy_candidate_names: Sequence[str] = (),
+) -> tuple[str, ...]:
+    specs = tuple(default_direct_action_specs() if action_specs is None else action_specs)
     names = list(FEATURE_SCHEMA.columns)
     names.extend(
         [
@@ -191,6 +223,7 @@ def direct_action_feature_names() -> tuple[str, ...]:
             "action_cutoff_pool_share_side",
         ]
     )
+    names.extend(_action_indicator_feature_names(action_specs=specs))
     for horizon in _DIRECT_ACTION_SUMMARY_HORIZONS:
         names.extend(
             [
@@ -199,6 +232,7 @@ def direct_action_feature_names() -> tuple[str, ...]:
                 f"action_std_net_h{int(horizon)}",
             ]
         )
+    names.extend(_legacy_candidate_feature_names(legacy_candidate_names=legacy_candidate_names))
     return tuple(str(name) for name in names)
 
 
@@ -273,21 +307,39 @@ def build_direct_action_dataset(
     treasury_fee_fraction: float,
     feature_cache_store: object | None = None,
     action_specs: Sequence[DirectActionSpec] | None = None,
+    required_history_rounds: int | None = None,
+    legacy_candidate_signal_provider: object | None = None,
+    legacy_candidate_names: Sequence[str] | None = None,
 ) -> DirectActionDataset:
     """Build one direct-action dataset for a contiguous closed-round slice."""
 
-    feature_names = direct_action_feature_names()
+    legacy_names = tuple(str(name) for name in (legacy_candidate_names or ()))
     specs = tuple(default_direct_action_specs() if action_specs is None else action_specs)
+    feature_names = direct_action_feature_names(
+        action_specs=specs,
+        legacy_candidate_names=legacy_names,
+    )
     if not rounds:
         raise InvariantError("direct_action_dataset_rounds_empty")
-    required_history = int(direct_action_required_history_rounds())
+    required_history = int(
+        direct_action_required_history_rounds()
+        if required_history_rounds is None
+        else int(required_history_rounds)
+    )
     base_prior_required = int(max_required_prior_context_rounds_size())
     if len(rounds) <= int(required_history):
         raise InvariantError("direct_action_dataset_rounds_insufficient")
+    _validate_legacy_candidate_signal_provider(provider=legacy_candidate_signal_provider)
+    if legacy_candidate_signal_provider is not None and not legacy_names:
+        raise InvariantError("direct_action_legacy_candidate_names_empty")
 
     rows: list[DirectActionFeatureRow] = []
     rows_by_epoch: dict[int, dict[str, DirectActionFeatureRow]] = {}
     target_epochs: list[int] = []
+    if legacy_candidate_signal_provider is not None:
+        for round_t in rounds[: int(required_history)]:
+            legacy_candidate_signal_provider.candidate_signals_for_open_round(round_t=round_t)
+            legacy_candidate_signal_provider.settle_closed_rounds([round_t])
     for idx in range(int(required_history), int(len(rounds))):
         round_t = rounds[int(idx)]
         target_epochs.append(int(round_t.epoch))
@@ -302,6 +354,11 @@ def build_direct_action_dataset(
             cutoff_seconds=int(cutoff_seconds),
             feature_cache_store=feature_cache_store,
         )
+        legacy_candidate_signals = (
+            None
+            if legacy_candidate_signal_provider is None
+            else legacy_candidate_signal_provider.candidate_signals_for_open_round(round_t=round_t)
+        )
         row_map: dict[str, DirectActionFeatureRow] = {}
         for spec in specs:
             feature_values = _direct_action_feature_row_values(
@@ -309,8 +366,11 @@ def build_direct_action_dataset(
                 summary_rounds=summary_rounds,
                 base_vector=base_vector,
                 action_spec=spec,
+                feature_action_specs=specs,
                 cutoff_seconds=int(cutoff_seconds),
                 treasury_fee_fraction=float(treasury_fee_fraction),
+                legacy_candidate_signals=legacy_candidate_signals,
+                legacy_candidate_names=legacy_names,
             )
             row = DirectActionFeatureRow(
                 target_epoch=int(round_t.epoch),
@@ -327,8 +387,11 @@ def build_direct_action_dataset(
             row_map[str(spec.action_id)] = row
             rows.append(row)
         rows_by_epoch[int(round_t.epoch)] = row_map
+        if legacy_candidate_signal_provider is not None:
+            legacy_candidate_signal_provider.settle_closed_rounds([round_t])
 
     return DirectActionDataset(
+        required_history_rounds=int(required_history),
         feature_names=tuple(feature_names),
         action_specs=tuple(specs),
         target_epochs=tuple(target_epochs),
@@ -345,6 +408,7 @@ def train_direct_action_bundle(
     random_seed: int,
     recency_weight_floor: float = 0.5,
     recency_weight_power: float = 1.0,
+    score_risk_lambda: float = _DEFAULT_SCORE_RISK_LAMBDA,
     extra_metadata: dict[str, object] | None = None,
 ) -> DirectActionModelBundle:
     """Fit the first direct-action quantile bundle."""
@@ -356,58 +420,77 @@ def train_direct_action_bundle(
     train_epoch_set = {int(epoch) for epoch in train_epochs}
     valid_epoch_set = {int(epoch) for epoch in valid_epochs}
 
-    x_train: list[list[float]] = []
-    y_train: list[float] = []
-    sample_weight: list[float] = []
     weight_by_epoch = _build_epoch_recency_weights(
         target_epochs=train_epochs,
         floor=float(recency_weight_floor),
         power=float(recency_weight_power),
     )
-    x_valid: list[list[float]] = []
-    y_valid: list[float] = []
+    rows_by_action: dict[str, list[DirectActionFeatureRow]] = {
+        str(spec.action_id): [] for spec in dataset.action_specs
+    }
     for row in dataset.rows:
-        epoch = int(row.target_epoch)
-        if int(epoch) in train_epoch_set:
-            x_train.append(list(row.feature_values))
-            y_train.append(float(row.realized_net_bnb))
-            sample_weight.append(float(weight_by_epoch[int(epoch)]))
-        elif int(epoch) in valid_epoch_set:
-            x_valid.append(list(row.feature_values))
-            y_valid.append(float(row.realized_net_bnb))
+        action_id = str(row.action_id)
+        if action_id not in rows_by_action:
+            raise InvariantError("direct_action_train_row_action_missing")
+        rows_by_action[action_id].append(row)
 
-    if len(x_train) <= 1:
-        raise InvariantError("direct_action_train_rows_insufficient")
-
-    x_train_arr = np.asarray(x_train, dtype=float)
-    y_train_arr = np.asarray(y_train, dtype=float)
-    sample_weight_arr = np.asarray(sample_weight, dtype=float)
-    if x_train_arr.ndim != 2 or y_train_arr.ndim != 1:
-        raise InvariantError("direct_action_train_array_shape_invalid")
-
-    q10_model = _fit_quantile_model(
-        x_train=x_train_arr,
-        y_train=y_train_arr,
-        sample_weight=sample_weight_arr,
-        x_valid=(None if not x_valid else np.asarray(x_valid, dtype=float)),
-        y_valid=(None if not y_valid else np.asarray(y_valid, dtype=float)),
-        params=dict(_LGBM_Q10),
-        random_seed=int(random_seed),
-    )
-    q50_model = _fit_quantile_model(
-        x_train=x_train_arr,
-        y_train=y_train_arr,
-        sample_weight=sample_weight_arr,
-        x_valid=(None if not x_valid else np.asarray(x_valid, dtype=float)),
-        y_valid=(None if not y_valid else np.asarray(y_valid, dtype=float)),
-        params=dict(_LGBM_Q50),
-        random_seed=int(random_seed),
-    )
+    q10_models: dict[str, object] = {}
+    q50_models: dict[str, object] = {}
+    for spec in dataset.action_specs:
+        action_id = str(spec.action_id)
+        if str(spec.action) == "SKIP":
+            q10_models[action_id] = _ConstantPredictionModel(value=0.0)
+            q50_models[action_id] = _ConstantPredictionModel(value=0.0)
+            continue
+        x_train: list[list[float]] = []
+        y_train: list[float] = []
+        sample_weight: list[float] = []
+        x_valid: list[list[float]] = []
+        y_valid: list[float] = []
+        for row in rows_by_action[action_id]:
+            epoch = int(row.target_epoch)
+            if int(epoch) in train_epoch_set:
+                x_train.append(list(row.feature_values))
+                y_train.append(float(row.realized_net_bnb))
+                sample_weight.append(float(weight_by_epoch[int(epoch)]))
+            elif int(epoch) in valid_epoch_set:
+                x_valid.append(list(row.feature_values))
+                y_valid.append(float(row.realized_net_bnb))
+        if len(x_train) <= 1:
+            raise InvariantError("direct_action_train_rows_insufficient")
+        x_train_arr = np.asarray(x_train, dtype=float)
+        y_train_arr = np.asarray(y_train, dtype=float)
+        sample_weight_arr = np.asarray(sample_weight, dtype=float)
+        if x_train_arr.ndim != 2 or y_train_arr.ndim != 1:
+            raise InvariantError("direct_action_train_array_shape_invalid")
+        q10_models[action_id] = _fit_quantile_model(
+            x_train=x_train_arr,
+            y_train=y_train_arr,
+            sample_weight=sample_weight_arr,
+            x_valid=(None if not x_valid else np.asarray(x_valid, dtype=float)),
+            y_valid=(None if not y_valid else np.asarray(y_valid, dtype=float)),
+            params=dict(_LGBM_Q10),
+            random_seed=int(random_seed),
+        )
+        q50_models[action_id] = _fit_quantile_model(
+            x_train=x_train_arr,
+            y_train=y_train_arr,
+            sample_weight=sample_weight_arr,
+            x_valid=(None if not x_valid else np.asarray(x_valid, dtype=float)),
+            y_valid=(None if not y_valid else np.asarray(y_valid, dtype=float)),
+            params=dict(_LGBM_Q50),
+            random_seed=int(random_seed),
+        )
     metadata = {
         "bundle_version": str(_DIRECT_ACTION_BUNDLE_VERSION),
+        "model_layout": "per_action",
         "summary_horizons": list(int(value) for value in _DIRECT_ACTION_SUMMARY_HORIZONS),
-        "required_history_rounds": int(direct_action_required_history_rounds()),
-        "score_mode": "q10",
+        "required_history_rounds": int(dataset.required_history_rounds),
+        "score_mode": "q50_minus_lambda_spread",
+        "score_risk_lambda": float(score_risk_lambda),
+        "legacy_candidate_names": list(
+            _legacy_candidate_names_from_feature_names(feature_names=dataset.feature_names)
+        ),
         "train_target_epochs": [int(value) for value in train_epochs],
         "valid_target_epochs": [int(value) for value in valid_epochs],
         "recency_weight_floor": float(recency_weight_floor),
@@ -419,8 +502,8 @@ def train_direct_action_bundle(
     return DirectActionModelBundle(
         feature_names=tuple(dataset.feature_names),
         action_specs=tuple(dataset.action_specs),
-        q10_model=q10_model,
-        q50_model=q50_model,
+        q10_model=dict(q10_models),
+        q50_model=dict(q50_models),
         metadata=metadata,
     )
 
@@ -492,6 +575,37 @@ def _fit_quantile_model(
         ]
     model.fit(x_train, y_train, **fit_kwargs)
     return model
+
+
+def _predict_bundle_component(
+    *,
+    model: object,
+    x_arr: np.ndarray,
+    action_ids: Sequence[str] | None,
+    bundle_action_specs: Sequence[DirectActionSpec],
+) -> np.ndarray:
+    if isinstance(model, dict):
+        if action_ids is None or len(action_ids) != int(len(x_arr)):
+            raise InvariantError("direct_action_predict_action_ids_missing")
+        out = np.zeros(int(len(x_arr)), dtype=float)
+        row_indexes_by_action: dict[str, list[int]] = {}
+        for idx, action_id in enumerate(action_ids):
+            row_indexes_by_action.setdefault(str(action_id), []).append(int(idx))
+        valid_action_ids = {str(spec.action_id) for spec in bundle_action_specs}
+        if row_indexes_by_action.keys() - valid_action_ids:
+            raise InvariantError("direct_action_predict_action_id_invalid")
+        for action_id, row_indexes in row_indexes_by_action.items():
+            action_model = model.get(str(action_id))
+            if action_model is None or not hasattr(action_model, "predict"):
+                raise InvariantError("direct_action_predict_action_model_missing")
+            preds = np.asarray(action_model.predict(x_arr[np.asarray(row_indexes, dtype=int)]), dtype=float)
+            if preds.shape != (len(row_indexes),):
+                raise InvariantError("direct_action_predict_action_shape_invalid")
+            out[np.asarray(row_indexes, dtype=int)] = preds
+        return out
+    if not hasattr(model, "predict"):
+        raise InvariantError("direct_action_predict_model_invalid")
+    return np.asarray(model.predict(x_arr), dtype=float)
 
 
 def _build_epoch_recency_weights(
@@ -628,8 +742,11 @@ def _direct_action_feature_row_values(
     summary_rounds: Sequence[Round],
     base_vector: Sequence[float],
     action_spec: DirectActionSpec,
+    feature_action_specs: Sequence[DirectActionSpec],
     cutoff_seconds: int,
     treasury_fee_fraction: float,
+    legacy_candidate_signals: dict[str, StrategyCandidateSignal] | None = None,
+    legacy_candidate_names: Sequence[str] = (),
 ) -> list[float]:
     if len(base_vector) != int(len(FEATURE_SCHEMA.columns)):
         raise InvariantError("direct_action_base_vector_len_mismatch")
@@ -646,6 +763,12 @@ def _direct_action_feature_row_values(
             _action_pool_share_side(action_spec=action_spec, cutoff_snapshot=cutoff_snapshot),
         ]
     )
+    values.extend(
+        _action_indicator_feature_values(
+            current_action_spec=action_spec,
+            feature_action_specs=feature_action_specs,
+        )
+    )
     for horizon in _DIRECT_ACTION_SUMMARY_HORIZONS:
         mean_net, positive_rate, std_net = _rolling_action_summary(
             prior_rounds=summary_rounds,
@@ -660,7 +783,121 @@ def _direct_action_feature_row_values(
                 float(std_net),
             ]
         )
+    values.extend(
+        _legacy_candidate_feature_values(
+            legacy_candidate_names=legacy_candidate_names,
+            legacy_candidate_signals=legacy_candidate_signals,
+        )
+    )
     return values
+
+
+def _legacy_candidate_feature_names(*, legacy_candidate_names: Sequence[str]) -> list[str]:
+    names: list[str] = []
+    for candidate_name in legacy_candidate_names:
+        prefix = f"legacy_{str(candidate_name)}"
+        names.extend(
+            [
+                f"{prefix}_is_bet",
+                f"{prefix}_is_skip",
+                f"{prefix}_side_bull",
+                f"{prefix}_side_bear",
+                f"{prefix}_bet_size_bnb",
+                f"{prefix}_expected_profit_bnb",
+                f"{prefix}_p_bull",
+                f"{prefix}_dislocation_bull",
+            ]
+        )
+    return names
+
+
+def _action_indicator_feature_names(*, action_specs: Sequence[DirectActionSpec]) -> list[str]:
+    return [f"action_id_is_{str(spec.action_id)}" for spec in action_specs]
+
+
+def _action_indicator_feature_values(
+    *,
+    current_action_spec: DirectActionSpec,
+    feature_action_specs: Sequence[DirectActionSpec],
+) -> list[float]:
+    current_id = str(current_action_spec.action_id)
+    return [
+        1.0 if current_id == str(spec.action_id) else 0.0
+        for spec in feature_action_specs
+    ]
+
+
+def _legacy_candidate_feature_values(
+    *,
+    legacy_candidate_names: Sequence[str],
+    legacy_candidate_signals: dict[str, StrategyCandidateSignal] | None,
+) -> list[float]:
+    values: list[float] = []
+    signal_map = {} if legacy_candidate_signals is None else dict(legacy_candidate_signals)
+    for candidate_name in legacy_candidate_names:
+        signal = signal_map.get(str(candidate_name))
+        if signal is None:
+            values.extend([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0])
+            continue
+        action = str(signal.action)
+        side = str(signal.bet_side or "")
+        expected_profit = signal.expected_profit_bnb
+        p_bull = signal.p_bull
+        dislocation_bull = signal.dislocation_bull
+        values.extend(
+            [
+                1.0 if action == "BET" else 0.0,
+                1.0 if action != "BET" else 0.0,
+                1.0 if side == "Bull" else 0.0,
+                1.0 if side == "Bear" else 0.0,
+                float(signal.bet_size_bnb),
+                0.0 if expected_profit is None else float(expected_profit),
+                0.5 if p_bull is None else float(p_bull),
+                0.0 if dislocation_bull is None else float(dislocation_bull),
+            ]
+        )
+    return values
+
+
+def _legacy_candidate_names_from_feature_names(*, feature_names: Sequence[str]) -> tuple[str, ...]:
+    out: list[str] = []
+    suffix = "_is_bet"
+    for feature_name in feature_names:
+        name = str(feature_name)
+        if not name.startswith("legacy_") or not name.endswith(suffix):
+            continue
+        out.append(name[len("legacy_") : -len(suffix)])
+    return tuple(out)
+
+
+def _validate_legacy_candidate_signal_provider(*, provider: object | None) -> None:
+    if provider is None:
+        return
+    if not hasattr(provider, "candidate_signals_for_open_round") or not hasattr(provider, "settle_closed_rounds"):
+        raise InvariantError("direct_action_legacy_signal_provider_invalid")
+
+
+def direct_action_score_values(
+    *,
+    q10_values: Sequence[float],
+    q50_values: Sequence[float],
+    score_mode: str,
+    score_risk_lambda: float = _DEFAULT_SCORE_RISK_LAMBDA,
+) -> list[float]:
+    if len(q10_values) != len(q50_values):
+        raise InvariantError("direct_action_score_value_len_mismatch")
+    mode = str(score_mode).strip()
+    if mode == "" or mode == "q10":
+        return [float(value) for value in q10_values]
+    if mode != "q50_minus_lambda_spread":
+        raise InvariantError(f"direct_action_score_mode_invalid: {mode}")
+    lam = float(score_risk_lambda)
+    if not math.isfinite(lam) or lam < 0.0:
+        raise InvariantError("direct_action_score_risk_lambda_invalid")
+    return [
+        float(q50) - float(lam) * (float(q50) - float(q10))
+        for q10, q50 in zip(q10_values, q50_values)
+    ]
 
 
 def _cutoff_pool_snapshot_bnb(*, round_t: Round, cutoff_seconds: int) -> tuple[float, float, float]:
@@ -744,6 +981,7 @@ def _rolling_action_summary(
 def summarize_top_action_predictions(
     *,
     action_specs: Sequence[DirectActionSpec],
+    score_values: Sequence[float],
     q10_values: Sequence[float],
     q50_values: Sequence[float],
     top_k: int,
@@ -751,17 +989,19 @@ def summarize_top_action_predictions(
     """Return a compact JSON summary for logging/audit."""
 
     rows: list[dict[str, object]] = []
-    for spec, q10_value, q50_value in zip(action_specs, q10_values, q50_values):
+    for spec, score_value, q10_value, q50_value in zip(action_specs, score_values, q10_values, q50_values):
         rows.append(
             {
                 "action_id": str(spec.action_id),
                 "label": str(spec.label),
+                "score_bnb": float(score_value),
                 "q10_net_bnb": float(q10_value),
                 "q50_net_bnb": float(q50_value),
             }
         )
     rows.sort(
         key=lambda row: (
+            -float(row["score_bnb"]),
             -float(row["q10_net_bnb"]),
             -float(row["q50_net_bnb"]),
             str(row["action_id"]),

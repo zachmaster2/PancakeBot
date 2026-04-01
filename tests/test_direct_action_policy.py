@@ -37,7 +37,11 @@ class DirectActionPolicyTests(unittest.TestCase):
             action_specs=default_direct_action_specs()[:3],
             q10_model=_ConstantModel(q10),
             q50_model=_ConstantModel(q50),
-            metadata={"required_history_rounds": 5},
+            metadata={
+                "required_history_rounds": 5,
+                "score_mode": "q50_minus_lambda_spread",
+                "score_risk_lambda": 0.25,
+            },
         )
 
     @patch("pancakebot.domain.strategy.direct_action_policy.direct_action_required_history_rounds", return_value=5)
@@ -63,7 +67,7 @@ class DirectActionPolicyTests(unittest.TestCase):
     )
     @patch("pancakebot.domain.strategy.direct_action_policy.direct_action_required_history_rounds", return_value=5)
     @patch("pancakebot.domain.strategy.direct_action_policy.max_required_prior_context_rounds_size", return_value=2)
-    def test_positive_q10_picks_best_bet(
+    def test_positive_risk_adjusted_score_picks_best_bet(
         self,
         _prior_mock,
         _required_mock,
@@ -84,7 +88,7 @@ class DirectActionPolicyTests(unittest.TestCase):
         self.assertEqual("bull_0p05", decision.action_id)
         self.assertEqual("Bull", decision.bet_side)
         self.assertAlmostEqual(0.05, float(decision.bet_size_bnb))
-        self.assertAlmostEqual(0.01, float(decision.score_bnb))
+        self.assertAlmostEqual(0.025, float(decision.score_bnb))
         self.assertAlmostEqual(0.03, float(decision.q50_net_bnb))
 
     @patch("pancakebot.domain.strategy.direct_action_policy._base_feature_vector_for_round", return_value=[1.0, 2.0])
@@ -94,7 +98,7 @@ class DirectActionPolicyTests(unittest.TestCase):
     )
     @patch("pancakebot.domain.strategy.direct_action_policy.direct_action_required_history_rounds", return_value=5)
     @patch("pancakebot.domain.strategy.direct_action_policy.max_required_prior_context_rounds_size", return_value=2)
-    def test_nonpositive_best_q10_falls_back_to_skip_but_keeps_raw_scores(
+    def test_nonpositive_best_score_falls_back_to_skip_but_keeps_best_raw_values(
         self,
         _prior_mock,
         _required_mock,
@@ -105,7 +109,7 @@ class DirectActionPolicyTests(unittest.TestCase):
             cutoff_seconds=10,
             treasury_fee_fraction=0.03,
             klines_store_like=object(),
-            bundle=self._bundle(q10=[-0.02, -0.01, -0.03], q50=[-0.01, 0.02, -0.02]),
+            bundle=self._bundle(q10=[-0.02, -0.01, -0.03], q50=[-0.01, 0.00, -0.02]),
         )
         policy.observe_closed_rounds(rounds=[_round(epoch=i) for i in range(1, 6)])
 
@@ -114,8 +118,8 @@ class DirectActionPolicyTests(unittest.TestCase):
         self.assertEqual("SKIP", decision.action)
         self.assertEqual("skip", decision.action_id)
         self.assertEqual("direct_action_nonpositive_score", decision.skip_reason)
-        self.assertAlmostEqual(-0.01, float(decision.score_bnb))
-        self.assertAlmostEqual(0.02, float(decision.q50_net_bnb))
+        self.assertAlmostEqual(-0.0025, float(decision.score_bnb))
+        self.assertAlmostEqual(0.0, float(decision.q50_net_bnb))
 
 
 if __name__ == "__main__":
