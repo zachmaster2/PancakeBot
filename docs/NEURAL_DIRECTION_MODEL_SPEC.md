@@ -207,3 +207,7 @@ Update on April 1, 2026:
     or pretrain/fine-tune variants of the same MLP/v8 lane unless a new
     feature contract, label contract, or materially different architecture
     justifies reopening the history-combination question
+15. the missing confidence-bucket pass for those recent-bias variants is now
+    complete, and it agrees with the broad-win result: none of the recent-bias
+    setups beat the flat-history anchors on top-confidence buckets either, so
+    the current confidence-first mainline stays with flat `MLP @ 400k`
