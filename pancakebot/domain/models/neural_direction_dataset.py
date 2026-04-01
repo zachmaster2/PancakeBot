@@ -31,6 +31,15 @@ class NeuralDirectionDataset:
         return int(len(self.target_epochs))
 
 
+def available_feature_groups() -> tuple[str, ...]:
+    seen: list[str] = []
+    for feature_def in FEATURE_SCHEMA.features:
+        group = str(feature_def.group)
+        if group not in seen:
+            seen.append(group)
+    return tuple(seen)
+
+
 def neural_direction_required_history_rounds() -> int:
     return int(max_required_prior_context_rounds_size())
 
@@ -54,6 +63,50 @@ def tail_neural_direction_dataset(*, dataset: NeuralDirectionDataset, n: int) ->
         previous_settled_labels=np.asarray(dataset.previous_settled_labels[start:], dtype=np.int64),
         previous_settled_available=np.asarray(dataset.previous_settled_available[start:], dtype=bool),
         feature_matrix=np.asarray(dataset.feature_matrix[start:], dtype=np.float32),
+        metadata=metadata,
+    )
+
+
+def select_feature_groups(
+    *,
+    dataset: NeuralDirectionDataset,
+    include_groups: Sequence[str] | None = None,
+    exclude_groups: Sequence[str] | None = None,
+) -> NeuralDirectionDataset:
+    include = None if include_groups is None else tuple(str(group) for group in include_groups)
+    exclude = None if exclude_groups is None else tuple(str(group) for group in exclude_groups)
+    available = set(available_feature_groups())
+    for group in include or ():
+        if str(group) not in available:
+            raise InvariantError(f"neural_direction_include_group_unknown: {str(group)}")
+    for group in exclude or ():
+        if str(group) not in available:
+            raise InvariantError(f"neural_direction_exclude_group_unknown: {str(group)}")
+
+    selected_columns: list[str] = []
+    selected_indices: list[int] = []
+    for idx, feature_def in enumerate(FEATURE_SCHEMA.features):
+        group = str(feature_def.group)
+        if include is not None and str(group) not in include:
+            continue
+        if exclude is not None and str(group) in exclude:
+            continue
+        selected_indices.append(int(idx))
+        selected_columns.append(str(feature_def.name))
+    if not selected_indices:
+        raise InvariantError("neural_direction_feature_selection_empty")
+
+    metadata = dict(dataset.metadata)
+    metadata["selected_feature_groups_include"] = None if include is None else tuple(include)
+    metadata["selected_feature_groups_exclude"] = None if exclude is None else tuple(exclude)
+    metadata["selected_feature_columns_count"] = int(len(selected_indices))
+    return NeuralDirectionDataset(
+        feature_columns=tuple(selected_columns),
+        target_epochs=tuple(int(epoch) for epoch in dataset.target_epochs),
+        labels=np.asarray(dataset.labels, dtype=np.int64),
+        previous_settled_labels=np.asarray(dataset.previous_settled_labels, dtype=np.int64),
+        previous_settled_available=np.asarray(dataset.previous_settled_available, dtype=bool),
+        feature_matrix=np.asarray(dataset.feature_matrix[:, selected_indices], dtype=np.float32),
         metadata=metadata,
     )
 

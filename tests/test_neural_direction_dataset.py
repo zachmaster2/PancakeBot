@@ -5,11 +5,13 @@ import unittest
 from pathlib import Path
 
 from pancakebot.domain.models.neural_direction_dataset import (
+    available_feature_groups,
     build_neural_direction_dataset,
     direction_label_from_position,
     neural_direction_required_context_klines,
     neural_direction_required_history_rounds,
     previous_settled_direction_label,
+    select_feature_groups,
     tail_neural_direction_dataset,
 )
 from pancakebot.domain.types import Kline, Round
@@ -135,6 +137,30 @@ class NeuralDirectionDatasetTests(unittest.TestCase):
 
         self.assertEqual(dataset1.num_examples, dataset2.num_examples)
         self.assertEqual(tuple(dataset1.target_epochs), tuple(dataset2.target_epochs))
+
+    def test_select_feature_groups_filters_matrix_columns(self) -> None:
+        history_n = int(neural_direction_required_history_rounds())
+        rounds = [
+            _closed_round(epoch=epoch, position=("Bull" if epoch % 2 == 0 else "Bear"))
+            for epoch in range(1, int(history_n) + 5)
+        ]
+        earliest_ms = (int(rounds[0].start_at) - 10_000) * 1000
+        klines = [
+            _kline(open_time_ms=int(earliest_ms) + idx * 60_000, close_price=600.0 + idx * 0.1)
+            for idx in range(int(neural_direction_required_context_klines()) + 400)
+        ]
+        dataset = build_neural_direction_dataset(
+            rounds=rounds,
+            klines_store_like=_FakeKlineStore(klines),
+            cutoff_seconds=17,
+        )
+        selected = select_feature_groups(
+            dataset=dataset,
+            include_groups=("price", "regime"),
+        )
+        self.assertLess(selected.feature_matrix.shape[1], dataset.feature_matrix.shape[1])
+        self.assertTrue(all(col.startswith("price_") or col.startswith("regime_") for col in selected.feature_columns))
+        self.assertIn("price", available_feature_groups())
 
 
 if __name__ == "__main__":
