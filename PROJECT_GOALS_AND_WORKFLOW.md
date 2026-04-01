@@ -62,7 +62,7 @@ Do not mix these casually. State which one is being done.
 5. Capture the takeaway in durable context if it changes project direction.
 6. For controller/profile-selection work, prefer rolling causal backtests over shadow validation as the main evidence source.
 7. Use shadow only as a thin final sanity check before any runtime-controller rollout.
-8. The target runtime design is a single direct policy over actions: one causal model should score `Skip` plus discrete `Bull`/`Bear` bet-size actions directly, using rolling realized-window summaries as features rather than as the decision mechanism.
+8. The current redesign target is a single neural direction model over valid rounds: one causal model should predict the `target_round` outcome as `Bull` or `Bear`, using the canonical `target_round` / `open_round` / `locked_round` / `prior_context_rounds` / `context_klines` terminology and causal cutoff rules.
 
 ### 4. For Parity Work
 

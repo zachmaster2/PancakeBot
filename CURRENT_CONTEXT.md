@@ -173,6 +173,10 @@ Current interpretation: the runtime-controller branch is alive, but it is not ro
 104. Diagnosis of that first smoke run showed that raw pooled `q10` was the immediate failure mode and the generic-feature-only model had essentially no usable signal. A bounded follow-up changed the runtime score to `q50 - lambda * (q50 - q10)`, reintroduced legacy dislocation candidate outputs as feature-only inputs, and added explicit action-id indicators. The rerun in [direct_action_v1_smoke2_20260331_direct_action_shared_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direct_action_v1_smoke2_20260331_direct_action_shared_eval_summary.json) still produced `0` bets over `6480` rounds.
 105. The pooled lower-quantile model remained structurally wrong even after explicit action-id indicators: it continued to assign an almost identical negative lower tail to `skip` and most bet actions. That led to a code-level switch from pooled quantile models to per-action quantile heads while keeping one unified runtime policy contract. The updated bundle still uses the same action set and logging surfaces, but `skip` is now a constant zero quantile model and each non-skip action gets its own `q10` and `q50` fit.
 106. The per-action smoke rerun in [direct_action_v1_smoke4_20260331_direct_action_shared_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direct_action_v1_smoke4_20260331_direct_action_shared_eval_summary.json) escaped the all-skip failure mode but is still decisively unqualified: about `-49.999 BNB` net, about `-3.8579 / 500`, bet rate about `21.96%`, and max drawdown about `53.29 BNB` on the held-out `6480`-round slice. Tightening the logged score threshold after the fact did not rescue the lane; all tested thresholds remained negative. The blocker is now model signal / target design, not threshold tuning or missing evaluation coverage.
+107. Later on March 31, 2026, the redesign target pivoted again from direct action-value prediction to a simpler neural binary direction lane. The new target is one model that predicts the `target_round` outcome as `Bull` or `Bear` for every valid round, with headline evaluation metric out-of-sample win `%`, not realized `BNB`.
+108. The first durable spec for that pivot is now [NEURAL_DIRECTION_MODEL_SPEC.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/NEURAL_DIRECTION_MODEL_SPEC.md). It freezes the terminology and causal contract around `target_round`, `open_round`, `locked_round`, `prior_context_rounds`, `outcome_eligible_prior_context_rounds`, and `context_klines`, and it makes explicit that target-round features must use cutoff-time bets and cutoff-anchored klines only.
+109. A full-history round backfill from epoch `1` was launched in the background on March 31, 2026 using the existing Graph/store infrastructure. Before launch, [closed_rounds.jsonl](/C:/Users/zking/Documents/GitHub/PancakeBot/var/closed_rounds.jsonl) contained `109,687` rounds over epochs `358877..468684`. The backfill job writes logs to [full_round_backfill_20260331_stdout.log](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/full_round_backfill_20260331_stdout.log) and [full_round_backfill_20260331_stderr.log](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/full_round_backfill_20260331_stderr.log).
+110. The current neural-first model ranking is now: `TCN` first, `MLP` as the simple neural sanity baseline, then `GRU/LSTM`, then `Transformer` only if simpler neural sequence models plateau. The first training-size matrix to answer the all-history question is `20k`, `50k`, `100k`, `200k`, and all available history, judged only by chronological held-out win `%`.
 
 ## Operational Rules
 
@@ -189,26 +193,26 @@ Obsolete build/cache artifacts should be deleted rather than archived.
 
 ## Next Likely Work
 
-The older controller-focused items below are now historical and superseded by
-the direct-action redesign direction and implementation status recorded in
-items `84` through `102`.
+The older controller-focused and direct-action items below are now historical.
+They are superseded by the neural direction pivot recorded in items `107`
+through `110`.
 
-1. Launch the next extended dry-mode run on the one-profile absolute `stageB + skip` controller (`ewm_alpha=0.85`), with normal foreground operator logs visible.
-2. Monitor multi-day dry behavior via runtime audit plus `inspection/run_dry_cycle_monitor.py`, and judge the path on actual dry-run stability rather than on perfect offline wins in every horizon.
-3. Keep the failed multi-profile absolute pools offline until they recover on fresh shared-harness evidence.
-4. Continue mining and screening profiles by true skip-replacing positive value, not by “less bad than baseline” behavior.
-5. Write V2 design specs, starting with project goals/workflow, then runtime/logging.
-6. Rebuild V2 around an explicit runtime contract and operator logging contract.
-7. Expand the offline meta-strategy selector beyond the first block-level V1 in [META_STRATEGY_PROBLEM.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/META_STRATEGY_PROBLEM.md).
-8. Re-run parity validation only after the relevant contracts are approved.
-
-Superseding note on March 31, 2026:
-
-1. the direct-action items `103` through `106` now supersede the older
-   controller-oriented next-work list above
-2. the current realized-net quantile lane should remain optional and disabled
-   by default
-3. do not run the full multi-offset shared-eval sweep for the current
-   realized-net quantile lane
-4. the next model iteration should revisit the learning target / model contract
-   rather than continue threshold tuning
+1. Finish the full-history round backfill from epoch `1` and verify the store
+   range once the background job completes.
+2. Launch the matching full-history kline backfill so `context_klines` cover
+   the same historical span as the round store.
+3. Freeze the binary label contract for valid `target_round` rows:
+   `Bull`/`Bear` only, excluding `House`, failed, and other unusable rounds.
+4. Build the first canonical baselines for headline out-of-sample win `%`:
+   `always_bull`, `always_bear`, and one trivial prior-side baseline.
+5. Implement the simple neural sanity baseline (`MLP`) against the canonical
+   causal input contract.
+6. Implement the first real neural sequence mainline (`TCN`) using settled
+   `outcome_eligible_prior_context_rounds`, a `locked_round` snapshot, a
+   `target_round` cutoff snapshot, and cutoff-anchored `context_klines`.
+7. Run the first train-window matrix on chronological recent held-out slices:
+   `20k`, `50k`, `100k`, `200k`, and all available history.
+8. Keep the failed realized-net direct-action lane optional and disabled by
+   default as historical reference only; do not resume threshold tuning or the
+   multi-offset shared-eval sweep for that lane unless a bounded comparison is
+   explicitly requested.

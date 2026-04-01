@@ -45,7 +45,7 @@
    - if the user explicitly asks to run dry mode, prefer a single foreground terminal with the normal human runtime logs visible
    - if the agent is running dry mode for unattended research, monitoring, or verification, detached/file-backed launch plus monitor tooling is acceptable
    - do not default to detached dry mode when the user is likely to watch the terminal directly
-11. The long-term strategy target is a single direct policy over actions, not a stacked profile/controller/router design. Favor one causal model that scores `Skip` plus discrete `Bull`/`Bear` bet-size actions directly, using rolling realized-window summaries as features. Do not drift back to baseline-centered controller framing or profile-selection-as-runtime-policy unless the user explicitly asks for a bounded comparison experiment.
+11. The current redesign target is a single neural direction model over valid rounds, not a stacked profile/controller/router design. Favor one causal model that predicts the `target_round` outcome as `Bull` or `Bear`, with headline evaluation metric out-of-sample win `%`. Use the canonical round-context terminology in [TERMINOLOGY.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/TERMINOLOGY.md) and the causal contract in [NEURAL_DIRECTION_MODEL_SPEC.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/NEURAL_DIRECTION_MODEL_SPEC.md). Do not drift back to controller-era layering unless the user explicitly asks for a bounded historical comparison.
 
 ## Decision Standard
 
