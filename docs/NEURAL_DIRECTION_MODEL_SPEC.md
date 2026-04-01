@@ -184,6 +184,14 @@ Update on April 1, 2026:
    effect: `100k` improved the short horizon to about `51.56%` mean held-out
    win `%` on `6480`, while `200k` dropped back to about `50.65%` on that same
    horizon; `10800` stayed around `50.76%` to `50.85%`
-9. the flat `400k` MLP point and larger TCN reruns are now in progress in the
-   background and should be used to answer the full-history question before
-   opening wider architecture experiments
+9. the flat `400k` MLP point and larger `TCN` reruns are now complete: `MLP @
+   400k` reached about `51.12%` on `6480` and about `51.00%` on `10800`, while
+   `TCN @ 200k` reached about `51.04%` on `6480` and about `51.06%` on `10800`
+10. confidence now matters enough to change setup ranking: the broad best
+    finished short-horizon setup remains `MLP @ 100k`, but the strongest
+    selective-confidence setup is `MLP @ 400k`, especially in the top `10%`
+    through `1%` coverage buckets
+11. the useful calibrated confidence thresholds are currently modest, mostly
+    around `0.52` to `0.56`, so the next selective-policy work should be based
+    on empirical coverage/threshold curves rather than an assumed `0.7+`
+    probability cutoff
