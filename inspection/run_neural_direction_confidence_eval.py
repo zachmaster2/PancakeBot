@@ -40,8 +40,11 @@ class NeuralDirectionConfidenceEvalRow:
     source_bundle_path: str
     sim_size: int
     tail_offset_rounds: int
+    training_policy: str
     train_size: int
+    pretrain_size: int
     valid_size: int
+    recency_half_life_examples: float | None
     seq_len: int | None
     coverage_fraction_requested: float
     selected_count: int
@@ -61,7 +64,10 @@ class NeuralDirectionConfidenceEvalRow:
 class NeuralDirectionConfidenceAggregateRow:
     model_type: str
     sim_size: int
+    training_policy: str
     train_size: int
+    pretrain_size: int
+    recency_half_life_examples: float | None
     seq_len: int | None
     coverage_fraction_requested: float
     num_offsets: int
@@ -79,8 +85,11 @@ class _SourceEvalJob:
     source_bundle_path: str
     sim_size: int
     tail_offset_rounds: int
+    training_policy: str
     train_size: int
+    pretrain_size: int
     valid_size: int
+    recency_half_life_examples: float | None
     seq_len: int | None
 
 
@@ -137,8 +146,15 @@ def _load_source_jobs(*, rows_csvs: tuple[Path, ...], model_type: str) -> list[_
                         source_bundle_path=str(source_row["bundle_path"]),
                         sim_size=int(source_row["sim_size"]),
                         tail_offset_rounds=int(source_row["tail_offset_rounds"]),
+                        training_policy=str(source_row.get("training_policy", "flat")),
                         train_size=int(source_row["train_size"]),
+                        pretrain_size=int(source_row.get("pretrain_size", 0)),
                         valid_size=int(source_row["valid_size"]),
+                        recency_half_life_examples=(
+                            None
+                            if source_row.get("recency_half_life_examples") in (None, "", "None")
+                            else float(source_row["recency_half_life_examples"])
+                        ),
                         seq_len=None if seq_len is None else int(seq_len),
                     )
                 )
@@ -151,17 +167,20 @@ def _split_target_epochs(
     *,
     target_epochs: tuple[int, ...],
     train_size: int,
+    pretrain_size: int,
     valid_size: int,
     sim_size: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    needed = int(train_size) + int(valid_size) + int(sim_size)
+    needed = int(pretrain_size) + int(train_size) + int(valid_size) + int(sim_size)
     if len(target_epochs) < int(needed):
         raise InvariantError("neural_direction_confidence_split_len_mismatch")
     target_tail = tuple(int(epoch) for epoch in target_epochs[-int(needed) :])
-    train_epochs = tuple(int(epoch) for epoch in target_tail[: int(train_size)])
+    train_start = int(pretrain_size)
+    train_end = int(pretrain_size) + int(train_size)
+    train_epochs = tuple(int(epoch) for epoch in target_tail[train_start:train_end])
     valid_epochs = tuple(
         int(epoch)
-        for epoch in target_tail[int(train_size) : int(train_size) + int(valid_size)]
+        for epoch in target_tail[train_end : train_end + int(valid_size)]
     )
     test_epochs = tuple(int(epoch) for epoch in target_tail[-int(sim_size) :])
     return train_epochs, valid_epochs, test_epochs
@@ -214,26 +233,46 @@ def _tcn_probs_for_epochs(*, bundle_path: str, eval_slice, seq_len: int, valid_e
 
 
 def _aggregate_rows(rows: list[NeuralDirectionConfidenceEvalRow]) -> list[NeuralDirectionConfidenceAggregateRow]:
-    grouped: dict[tuple[str, int, int, int | None, float], list[NeuralDirectionConfidenceEvalRow]] = {}
+    grouped: dict[tuple[str, int, str, int, int, float | None, int | None, float], list[NeuralDirectionConfidenceEvalRow]] = {}
     for row in rows:
         key = (
             str(row.model_type),
             int(row.sim_size),
+            str(row.training_policy),
             int(row.train_size),
+            int(row.pretrain_size),
+            None
+            if row.recency_half_life_examples is None
+            else float(row.recency_half_life_examples),
             None if row.seq_len is None else int(row.seq_len),
             float(row.coverage_fraction_requested),
         )
         grouped.setdefault(key, []).append(row)
     out: list[NeuralDirectionConfidenceAggregateRow] = []
-    for key in sorted(grouped, key=lambda item: (item[0], item[1], item[2], -item[4], -1 if item[3] is None else item[3])):
+    for key in sorted(
+        grouped,
+        key=lambda item: (
+            str(item[0]),
+            int(item[1]),
+            str(item[2]),
+            int(item[3]),
+            int(item[4]),
+            -1.0 if item[5] is None else float(item[5]),
+            -float(item[7]),
+            -1 if item[6] is None else int(item[6]),
+        ),
+    ):
         group = grouped[key]
         out.append(
             NeuralDirectionConfidenceAggregateRow(
                 model_type=str(key[0]),
                 sim_size=int(key[1]),
-                train_size=int(key[2]),
-                seq_len=None if key[3] is None else int(key[3]),
-                coverage_fraction_requested=float(key[4]),
+                training_policy=str(key[2]),
+                train_size=int(key[3]),
+                pretrain_size=int(key[4]),
+                recency_half_life_examples=None if key[5] is None else float(key[5]),
+                seq_len=None if key[6] is None else int(key[6]),
+                coverage_fraction_requested=float(key[7]),
                 num_offsets=int(len(group)),
                 mean_selected_win_rate=float(np.mean([row.selected_win_rate for row in group])),
                 min_selected_win_rate=float(min(row.selected_win_rate for row in group)),
@@ -279,6 +318,7 @@ def main() -> None:
         _, valid_epochs, test_epochs = _split_target_epochs(
             target_epochs=eval_slice.dataset.target_epochs,
             train_size=int(job.train_size),
+            pretrain_size=int(job.pretrain_size),
             valid_size=int(job.valid_size),
             sim_size=int(job.sim_size),
         )
@@ -327,8 +367,13 @@ def main() -> None:
                     source_bundle_path=str(job.source_bundle_path),
                     sim_size=int(job.sim_size),
                     tail_offset_rounds=int(job.tail_offset_rounds),
+                    training_policy=str(job.training_policy),
                     train_size=int(job.train_size),
+                    pretrain_size=int(job.pretrain_size),
                     valid_size=int(job.valid_size),
+                    recency_half_life_examples=None
+                    if job.recency_half_life_examples is None
+                    else float(job.recency_half_life_examples),
                     seq_len=None if job.seq_len is None else int(job.seq_len),
                     coverage_fraction_requested=float(bucket.coverage_fraction_requested),
                     selected_count=int(bucket.selected_count),
@@ -350,7 +395,9 @@ def main() -> None:
                 "model_type": str(model_type),
                 "job_index": int(idx),
                 "job_count": int(len(source_jobs)),
+                "training_policy": str(job.training_policy),
                 "train_size": int(job.train_size),
+                "pretrain_size": int(job.pretrain_size),
                 "sim_size": int(job.sim_size),
                 "tail_offset_rounds": int(job.tail_offset_rounds),
                 "seq_len": None if job.seq_len is None else int(job.seq_len),

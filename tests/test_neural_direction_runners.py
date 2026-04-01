@@ -10,6 +10,10 @@ from inspection.run_neural_direction_baselines import (
     NeuralDirectionBaselineRow,
     _aggregate_rows as _aggregate_baseline_rows,
 )
+from inspection.run_neural_direction_confidence_eval import (
+    NeuralDirectionConfidenceEvalRow,
+    _aggregate_rows as _aggregate_confidence_rows,
+)
 from inspection.run_neural_direction_mlp_eval import (
     NeuralDirectionMlpEvalRow,
     _aggregate_rows as _aggregate_mlp_rows,
@@ -153,6 +157,65 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
         self.assertEqual(1, len(aggregates))
         self.assertAlmostEqual(0.54, aggregates[0].mean_test_win_rate)
         self.assertAlmostEqual(0.54, aggregates[0].mean_valid_win_rate)
+
+    def test_confidence_aggregate_rows_keep_training_policy(self) -> None:
+        rows = [
+            NeuralDirectionConfidenceEvalRow(
+                model_type="mlp",
+                source_rows_csv="rows_a.csv",
+                source_bundle_path="bundle_a.pt",
+                sim_size=6480,
+                tail_offset_rounds=0,
+                training_policy="pretrain_finetune",
+                train_size=100000,
+                pretrain_size=300000,
+                valid_size=3000,
+                recency_half_life_examples=None,
+                seq_len=None,
+                coverage_fraction_requested=0.1,
+                selected_count=648,
+                selected_fraction_actual=0.1,
+                selected_win_rate=0.54,
+                selected_mean_confidence=0.53,
+                selected_min_confidence=0.52,
+                selected_max_confidence=0.61,
+                overall_test_win_rate=0.515,
+                overall_test_mean_confidence=0.507,
+                calibration_temperature=1.02,
+                calibration_valid_loss_before=0.69,
+                calibration_valid_loss_after=0.68,
+            ),
+            NeuralDirectionConfidenceEvalRow(
+                model_type="mlp",
+                source_rows_csv="rows_b.csv",
+                source_bundle_path="bundle_b.pt",
+                sim_size=6480,
+                tail_offset_rounds=432,
+                training_policy="pretrain_finetune",
+                train_size=100000,
+                pretrain_size=300000,
+                valid_size=3000,
+                recency_half_life_examples=None,
+                seq_len=None,
+                coverage_fraction_requested=0.1,
+                selected_count=648,
+                selected_fraction_actual=0.1,
+                selected_win_rate=0.56,
+                selected_mean_confidence=0.54,
+                selected_min_confidence=0.53,
+                selected_max_confidence=0.62,
+                overall_test_win_rate=0.517,
+                overall_test_mean_confidence=0.508,
+                calibration_temperature=1.01,
+                calibration_valid_loss_before=0.69,
+                calibration_valid_loss_after=0.68,
+            ),
+        ]
+        aggregates = _aggregate_confidence_rows(rows)
+        self.assertEqual(1, len(aggregates))
+        self.assertEqual("pretrain_finetune", aggregates[0].training_policy)
+        self.assertEqual(300000, aggregates[0].pretrain_size)
+        self.assertAlmostEqual(0.55, aggregates[0].mean_selected_win_rate)
 
 
 if __name__ == "__main__":
