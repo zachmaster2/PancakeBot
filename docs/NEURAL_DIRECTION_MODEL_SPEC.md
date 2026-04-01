@@ -164,5 +164,10 @@ Update on April 1, 2026:
    [neural_direction_mlp.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/neural_direction_mlp.py)
    with the shared eval runner
    [run_neural_direction_mlp_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_neural_direction_mlp_eval.py)
-5. `TCN` remains the next model to build after the full-history round and
-   kline syncs complete
+5. the first `TCN` sequence path is now implemented in
+   [neural_direction_tcn.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/neural_direction_tcn.py)
+   with the shared eval runner
+   [run_neural_direction_tcn_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_neural_direction_tcn_eval.py)
+6. the current mainline evidence favors the full-feature MLP over the current
+   TCN variants on the recent kline-limited tail; full-history kline sync is
+   still required before the larger-window comparison matrix can be completed

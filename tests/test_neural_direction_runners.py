@@ -15,6 +15,11 @@ from inspection.run_neural_direction_mlp_eval import (
     _aggregate_rows as _aggregate_mlp_rows,
     _parse_hidden_sizes,
 )
+from inspection.run_neural_direction_tcn_eval import (
+    NeuralDirectionTcnEvalRow,
+    _aggregate_rows as _aggregate_tcn_rows,
+    _parse_channels,
+)
 
 
 class NeuralDirectionRunnerTests(unittest.TestCase):
@@ -28,6 +33,7 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
 
     def test_parse_hidden_sizes(self) -> None:
         self.assertEqual((128, 64), _parse_hidden_sizes("128,64"))
+        self.assertEqual((64, 32), _parse_channels("64,32"))
 
     def test_baseline_aggregate_rows(self) -> None:
         rows = [
@@ -91,6 +97,44 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
         aggregates = _aggregate_mlp_rows(rows)
         self.assertEqual(1, len(aggregates))
         self.assertAlmostEqual(0.53, aggregates[0].mean_test_win_rate)
+        self.assertAlmostEqual(0.54, aggregates[0].mean_valid_win_rate)
+
+    def test_tcn_aggregate_rows(self) -> None:
+        rows = [
+            NeuralDirectionTcnEvalRow(
+                sim_size=6480,
+                tail_offset_rounds=0,
+                train_size=15000,
+                valid_size=3000,
+                random_seed=1,
+                num_examples=24480,
+                feature_dim=10,
+                seq_len=16,
+                loaded_round_count=26000,
+                total_rounds_available=30000,
+                bundle_path="a",
+                valid_win_rate=0.57,
+                test_win_rate=0.55,
+            ),
+            NeuralDirectionTcnEvalRow(
+                sim_size=6480,
+                tail_offset_rounds=216,
+                train_size=15000,
+                valid_size=3000,
+                random_seed=1,
+                num_examples=24480,
+                feature_dim=10,
+                seq_len=16,
+                loaded_round_count=26000,
+                total_rounds_available=30000,
+                bundle_path="b",
+                valid_win_rate=0.51,
+                test_win_rate=0.53,
+            ),
+        ]
+        aggregates = _aggregate_tcn_rows(rows)
+        self.assertEqual(1, len(aggregates))
+        self.assertAlmostEqual(0.54, aggregates[0].mean_test_win_rate)
         self.assertAlmostEqual(0.54, aggregates[0].mean_valid_win_rate)
 
 
