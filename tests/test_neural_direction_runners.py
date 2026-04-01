@@ -14,6 +14,7 @@ from inspection.run_neural_direction_mlp_eval import (
     NeuralDirectionMlpEvalRow,
     _aggregate_rows as _aggregate_mlp_rows,
     _parse_hidden_sizes,
+    _training_policy_name,
 )
 from inspection.run_neural_direction_tcn_eval import (
     NeuralDirectionTcnEvalRow,
@@ -68,8 +69,11 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
             NeuralDirectionMlpEvalRow(
                 sim_size=6480,
                 tail_offset_rounds=0,
+                training_policy="flat",
                 train_size=15000,
+                pretrain_size=0,
                 valid_size=3000,
+                recency_half_life_examples=None,
                 random_seed=1,
                 num_examples=24480,
                 feature_dim=10,
@@ -82,8 +86,11 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
             NeuralDirectionMlpEvalRow(
                 sim_size=6480,
                 tail_offset_rounds=216,
+                training_policy="flat",
                 train_size=15000,
+                pretrain_size=0,
                 valid_size=3000,
+                recency_half_life_examples=None,
                 random_seed=1,
                 num_examples=24480,
                 feature_dim=10,
@@ -98,6 +105,16 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
         self.assertEqual(1, len(aggregates))
         self.assertAlmostEqual(0.53, aggregates[0].mean_test_win_rate)
         self.assertAlmostEqual(0.54, aggregates[0].mean_valid_win_rate)
+        self.assertEqual("flat", aggregates[0].training_policy)
+
+    def test_training_policy_name(self) -> None:
+        self.assertEqual("flat", _training_policy_name(pretrain_size=0, recency_half_life_examples=0.0))
+        self.assertEqual("recency_exp", _training_policy_name(pretrain_size=0, recency_half_life_examples=50_000.0))
+        self.assertEqual("pretrain_finetune", _training_policy_name(pretrain_size=300_000, recency_half_life_examples=0.0))
+        self.assertEqual(
+            "pretrain_finetune_recency_exp",
+            _training_policy_name(pretrain_size=300_000, recency_half_life_examples=50_000.0),
+        )
 
     def test_tcn_aggregate_rows(self) -> None:
         rows = [

@@ -70,6 +70,8 @@ def train_neural_direction_mlp(
     valid_target_epochs: Sequence[int],
     random_seed: int,
     config: NeuralDirectionMlpConfig | None = None,
+    train_sample_weights: np.ndarray | None = None,
+    initial_bundle: NeuralDirectionMlpBundle | None = None,
 ) -> NeuralDirectionMlpBundle:
     model_cfg = config or default_neural_direction_mlp_config()
     _validate_dataset_for_mlp(dataset=dataset)
@@ -80,6 +82,10 @@ def train_neural_direction_mlp(
     if len(valid_x) <= 0:
         raise InvariantError("neural_direction_mlp_valid_empty")
 
+    train_weights = _prepare_train_sample_weights(
+        train_sample_weights=train_sample_weights,
+        train_example_count=int(len(train_x)),
+    )
     impute_values, feature_means, feature_stds = _fit_preprocessor(train_x=train_x)
     train_x_proc = _apply_preprocessor(
         x=train_x,
@@ -98,16 +104,23 @@ def train_neural_direction_mlp(
     torch.manual_seed(int(random_seed))
 
     model = NeuralDirectionMlp(input_dim=int(train_x_proc.shape[1]), config=model_cfg)
+    if initial_bundle is not None:
+        _load_initial_bundle(
+            model=model,
+            initial_bundle=initial_bundle,
+            dataset=dataset,
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(model_cfg.learning_rate),
         weight_decay=float(model_cfg.weight_decay),
     )
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.BCEWithLogitsLoss(reduction="none")
 
     train_dataset = TensorDataset(
         torch.from_numpy(train_x_proc),
         torch.from_numpy(train_y.astype(np.float32)),
+        torch.from_numpy(train_weights),
     )
     generator = torch.Generator()
     generator.manual_seed(int(random_seed))
@@ -128,17 +141,18 @@ def train_neural_direction_mlp(
 
     for epoch_idx in range(int(model_cfg.max_epochs)):
         model.train()
-        for batch_x, batch_y in loader:
+        for batch_x, batch_y, batch_w in loader:
             optimizer.zero_grad(set_to_none=True)
             logits = model(batch_x)
-            loss = loss_fn(logits, batch_y)
+            losses = loss_fn(logits, batch_y)
+            loss = torch.sum(losses * batch_w) / torch.clamp_min(torch.sum(batch_w), 1e-8)
             loss.backward()
             optimizer.step()
 
         model.eval()
         with torch.no_grad():
             valid_logits = model(valid_x_tensor)
-            valid_loss = float(loss_fn(valid_logits, valid_y_tensor).item())
+            valid_loss = float(torch.mean(loss_fn(valid_logits, valid_y_tensor)).item())
             valid_probs = torch.sigmoid(valid_logits).cpu().numpy()
         valid_preds = (valid_probs >= 0.5).astype(np.int64)
         valid_win_rate = float(np.mean(valid_preds == valid_y.astype(np.int64)))
@@ -179,6 +193,9 @@ def train_neural_direction_mlp(
             "best_epoch": int(best_epoch),
             "best_valid_loss": float(best_valid_loss),
             "best_valid_win_rate": float(best_valid_win_rate),
+            "train_weight_min": float(np.min(train_weights)),
+            "train_weight_max": float(np.max(train_weights)),
+            "warm_started": bool(initial_bundle is not None),
         },
     )
 
@@ -320,3 +337,62 @@ def _apply_preprocessor(
         raise InvariantError("neural_direction_preprocessor_x_rank_invalid")
     x_imputed = np.where(np.isnan(raw), impute_values, raw).astype(np.float32)
     return ((x_imputed - feature_means) / feature_stds).astype(np.float32)
+
+
+def build_exponential_recency_weights(
+    *,
+    num_examples: int,
+    half_life_examples: float,
+) -> np.ndarray:
+    if int(num_examples) <= 0:
+        raise InvariantError("neural_direction_mlp_recency_num_examples_nonpositive")
+    if float(half_life_examples) <= 0.0:
+        raise InvariantError("neural_direction_mlp_recency_half_life_nonpositive")
+    age_from_newest = np.arange(int(num_examples) - 1, -1, -1, dtype=np.float32)
+    raw = np.power(np.float32(0.5), age_from_newest / float(half_life_examples)).astype(np.float32)
+    mean_value = float(np.mean(raw))
+    if not np.isfinite(mean_value) or float(mean_value) <= 0.0:
+        raise InvariantError("neural_direction_mlp_recency_weights_invalid")
+    return np.asarray(raw / mean_value, dtype=np.float32)
+
+
+def _prepare_train_sample_weights(
+    *,
+    train_sample_weights: np.ndarray | None,
+    train_example_count: int,
+) -> np.ndarray:
+    if int(train_example_count) <= 0:
+        raise InvariantError("neural_direction_mlp_train_example_count_nonpositive")
+    if train_sample_weights is None:
+        return np.ones(int(train_example_count), dtype=np.float32)
+    weights = np.asarray(train_sample_weights, dtype=np.float32)
+    if weights.ndim != 1:
+        raise InvariantError("neural_direction_mlp_train_weights_rank_invalid")
+    if int(len(weights)) != int(train_example_count):
+        raise InvariantError("neural_direction_mlp_train_weights_len_mismatch")
+    if bool(np.any(~np.isfinite(weights))):
+        raise InvariantError("neural_direction_mlp_train_weights_nonfinite")
+    if bool(np.any(weights < 0.0)):
+        raise InvariantError("neural_direction_mlp_train_weights_negative")
+    total_weight = float(np.sum(weights))
+    if float(total_weight) <= 0.0:
+        raise InvariantError("neural_direction_mlp_train_weights_zero_sum")
+    return np.asarray(weights * (float(train_example_count) / float(total_weight)), dtype=np.float32)
+
+
+def _load_initial_bundle(
+    *,
+    model: NeuralDirectionMlp,
+    initial_bundle: NeuralDirectionMlpBundle,
+    dataset: NeuralDirectionDataset,
+) -> None:
+    if tuple(str(col) for col in initial_bundle.feature_columns) != tuple(
+        str(col) for col in dataset.feature_columns
+    ):
+        raise InvariantError("neural_direction_mlp_initial_bundle_feature_columns_mismatch")
+    try:
+        model.load_state_dict(initial_bundle.state_dict)
+    except Exception as exc:
+        raise InvariantError(
+            f"neural_direction_mlp_initial_bundle_incompatible: {exc}"
+        ) from exc
