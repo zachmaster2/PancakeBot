@@ -195,3 +195,15 @@ Update on April 1, 2026:
     around `0.52` to `0.56`, so the next selective-policy work should be based
     on empirical coverage/threshold curves rather than an assumed `0.7+`
     probability cutoff
+12. bounded recent-bias training-policy support now exists in the MLP lane:
+    the trainer can apply exponential recency weighting inside a train window
+    and can warm-start a recent fine-tune run from an older pretraining block
+13. those bounded recent-bias reruns did not beat the flat-history anchors on
+    the current MLP/v8-feature lane: mild `400k` recency weighting dropped to
+    about `50.86%` on `6480` and about `50.83%` on `10800`, `300k -> 100k`
+    staged fine-tuning reached only about `50.96%` on `6480`, and the combined
+    staged-plus-recency variant fell further to about `50.42%` on `6480`
+14. current recommendation: stop spending time on additional recency-weighting
+    or pretrain/fine-tune variants of the same MLP/v8 lane unless a new
+    feature contract, label contract, or materially different architecture
+    justifies reopening the history-combination question

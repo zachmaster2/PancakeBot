@@ -198,6 +198,9 @@ Current interpretation: the runtime-controller branch is alive, but it is not ro
 129. On the longer `10800` horizon, the broad overall leader is narrowly `TCN @ 200k` at about `51.06%`, but the stronger selective-confidence lane is still the MLP family. `MLP @ 400k` led the finished `10%`, `5%`, and `2%` buckets at about `53.52%`, `54.82%`, and `56.33%`, while `MLP @ 100k` produced the best finished `1%` bucket at about `58.95%` but with wider offset spread.
 130. Current interpretation after the confidence grid is: overall-win ranking and selective-confidence ranking are not the same. If the objective is broad directional accuracy, `MLP @ 100k` remains the best finished short-horizon mainline. If the objective is selective high-confidence betting, `MLP @ 400k` is now the strongest finished setup overall. The useful calibrated confidence thresholds are also much lower than a naive human-style `0.7+` expectation; the current strong buckets mostly start around `0.52` to `0.56`, so a very high hard threshold would likely select almost nothing.
 131. Disk-pressure note: the biggest reclaimable hotspot remains [backtest_state_cache](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/backtest_state_cache), currently about `34.6 GB`, split mostly between `closed_rounds_tail` and `pipeline_bootstrap`. The repo already has [cleanup_experiment_artifacts.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/cleanup_experiment_artifacts.py) to prune old state-cache entries if cleanup becomes necessary.
+132. On April 1, 2026, bounded recent-bias MLP training-policy research was added to [neural_direction_mlp.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/neural_direction_mlp.py) and [run_neural_direction_mlp_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_neural_direction_mlp_eval.py): the trainer now supports exponential recency weighting within a train window and warm-started pretrain-plus-fine-tune runs, while the eval rows/summaries now record `training_policy`, `pretrain_size`, and `recency_half_life_examples`. Confidence-eval bookkeeping was updated too so later confidence summaries can keep those policy variants distinct.
+133. The first bounded recent-bias reruns did not beat the flat-history anchors. Mild full-history recency weighting on `MLP @ 400k` with half-life `100k`, in [neural_direction_mlp_recentbias_r400k_hl100k_20260401_neural_direction_mlp_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_recentbias_r400k_hl100k_20260401_neural_direction_mlp_eval_summary.json), fell to about `50.86%` on `6480` and about `50.83%` on `10800`, worse than both flat `MLP @ 100k` and flat `MLP @ 400k`. A follow-up selective-confidence rerun for that weighted setup was attempted, but it was not forced to completion after the broad rerun had already come in weaker than the existing flat-history anchors.
+134. The staged-history variants also failed on the primary recent horizon. [neural_direction_mlp_recentbias_p300k_f100k_6480_20260401_neural_direction_mlp_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_recentbias_p300k_f100k_6480_20260401_neural_direction_mlp_eval_summary.json) reached only about `50.96%` mean held-out win `%` on `6480`, and [neural_direction_mlp_recentbias_p300k_f100k_hl50000_6480_20260401_neural_direction_mlp_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_recentbias_p300k_f100k_hl50000_6480_20260401_neural_direction_mlp_eval_summary.json) was worse at about `50.42%`. Current interpretation: do not prioritize more recency-weighting or pretrain/fine-tune variations on the current MLP/v8-feature lane unless a new feature contract, architecture, or labeling change gives a specific reason to reopen that branch.
 
 ## Operational Rules
 
@@ -234,9 +237,11 @@ through `110`.
    run thresholded skip-style evals for the main candidates, especially
    `MLP @ 100k` and `MLP @ 400k`, using calibrated confidence cutoffs that map
    to the promising `10%`, `5%`, `2%`, and `1%` coverage ranges.
-7. Answer the next history-depth question with more structure than flat windows
-   alone, likely through bounded recency weighting, staged pretrain-plus-recent
-   fine-tune, or other explicitly recent-biased training policies.
+7. Treat the bounded recent-bias history-combination branch as answered for the
+   current MLP/v8-feature lane: it did not beat the flat `100k` or flat `400k`
+   anchors, so further work should shift to selective-policy evaluation,
+   feature-contract changes, or materially different model designs rather than
+   more training-policy variations of the same lane.
 8. Keep the failed realized-net direct-action lane optional and disabled by
    default as historical reference only; do not resume threshold tuning or the
    multi-offset shared-eval sweep for that lane unless a bounded comparison is
