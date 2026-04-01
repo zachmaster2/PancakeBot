@@ -30,6 +30,16 @@ Still intentionally deferred:
 2. offline qualification results strong enough to justify promotion
 3. dry-mode rollout of the direct-action lane
 
+Current qualification note:
+
+1. the first held-out smoke evaluations on March 31, 2026 did not qualify the
+   current realized-net quantile lane
+2. the pooled quantile bundle first degenerated to all-skip, and the later
+   per-action quantile bundle overbet and lost heavily on the same held-out
+   `6480`-round slice
+3. the runtime contract remains the intended direction, but the current model
+   family should not be promoted as-is
+
 ## Design Goals
 
 The redesign must satisfy all of the following:
@@ -106,10 +116,12 @@ The runtime decision rule is:
 2. choose the action with the highest score
 3. if the best non-skip score is not positive, choose `Skip`
 
-The initial score contract is a lower-confidence-bound style score:
+The current first implemented score contract is a lower-confidence-bound style
+score:
 
-1. preferred form: `score(action) = q10_net_bnb(action)`
-2. acceptable equivalent: `q50_net_bnb(action) - lambda * uncertainty(action)`
+1. implemented form: `score(action) = q50_net_bnb(action) - lambda * (q50_net_bnb(action) - q10_net_bnb(action))`
+2. current default `lambda = 0.15`
+3. raw `q10` remains a bounded reference, not the current runtime score
 
 The implementation should expose the chosen score form explicitly in config and
 logs. The first version should keep the scoring rule simple and stable rather
@@ -117,7 +129,8 @@ than highly configurable.
 
 ## Learning Formulation
 
-The preferred formulation is contextual action-value estimation.
+The current implemented formulation is still contextual action-value
+estimation.
 
 Each training row corresponds to one `(round, action)` pair and contains:
 
@@ -126,8 +139,9 @@ Each training row corresponds to one `(round, action)` pair and contains:
 3. action identity features
 4. realized net outcome for that action
 
-This keeps every action in one unified scoring problem and avoids treating any
-action or legacy profile as special.
+The current code uses a shared action-row dataset but per-action quantile heads.
+This keeps the runtime policy unified while avoiding the lower-tail collapse
+observed in the first pooled quantile attempt.
 
 ## Label Definition
 
@@ -226,10 +240,11 @@ Confidence is a required part of the decision contract.
 The first version should use an uncertainty-aware action-value model with a
 directly interpretable conservative score.
 
-Preferred first approach:
+Current first implemented approach:
 
 1. quantile regression over realized net for each action
-2. runtime scoring by lower confidence bound, preferably `q10`
+2. explicit `q10` and `q50` outputs
+3. runtime scoring by a simple lower-confidence-bound style spread rule
 
 Why this is preferred:
 
@@ -238,7 +253,9 @@ Why this is preferred:
 3. it avoids turning bet-rate floors into a primary target
 4. it makes confidence a property of expected utility, not just direction
 
-If quantile modeling proves impractical, the first fallback is:
+The first implemented qualification results show that quantile modeling over raw
+realized net is not yet sufficient for promotion. If the current lane continues
+to fail after bounded revisions, the next model-contract fallback should be:
 
 1. mean net plus explicit uncertainty estimate
 2. runtime score `mean - lambda * uncertainty`
