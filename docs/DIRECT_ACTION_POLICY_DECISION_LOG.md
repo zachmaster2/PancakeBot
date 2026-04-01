@@ -8,8 +8,9 @@ choice was made.
 
 Current implementation status:
 
-1. decisions `1` through `17` are now reflected in code
-2. qualification and promotion decisions remain open
+1. decisions `1` through `18` are now reflected in code or durable evaluation
+2. the current direct realized-net quantile lane is still unqualified for
+   promotion
 
 ## Decision 1: Runtime Architecture
 
@@ -77,11 +78,12 @@ Chosen:
 1. canonical current-round feature builder output (`v8`)
 2. explicit action identity features
 3. rolling realized exact-action summaries over `24`, `72`, and `216` rounds
+4. bounded legacy dislocation candidate outputs as auxiliary features only
 
 Alternatives considered:
 
-1. include legacy profile outputs in the first version
-2. use only current-round features with no rolling action summaries
+1. use only current-round features with no rolling action summaries
+2. exclude all legacy candidate/profile outputs from the first version
 3. add a much broader set of horizons and handcrafted summary families
 
 Why this choice:
@@ -90,22 +92,32 @@ Why this choice:
 2. it keeps the first version small
 3. it satisfies the redesign requirement that rolling realized windows remain
    features, not the decision mechanism
+4. the first held-out smoke run showed that the generic-feature-only model had
+   essentially no usable signal, so bounded legacy candidate outputs were
+   reintroduced as features only
 
 ## Decision 5: Legacy Profile Features
 
 Chosen:
 
-1. do not include legacy profile outputs as features in the first version
+1. include only bounded legacy dislocation candidate outputs as auxiliary
+   features
+2. do not reintroduce legacy profiles as runtime actions or privileged policy
+   owners
 
 Alternatives considered:
 
-1. include `stageB`, `stageG2`, and `altB` outputs as auxiliary features
+1. exclude all legacy outputs entirely
+2. reintroduce `stageB`, `stageG2`, and `altB` as the actual runtime action
+   space
 
 Why this choice:
 
 1. the redesign is explicitly trying to escape profile-centric runtime logic
-2. excluding them in V1 keeps the feature contract honest and simpler
-3. they can still be added later if the direct-action lane clearly needs them
+2. the generic-feature-only smoke run was too weak to justify keeping the
+   feature contract that sparse
+3. auxiliary feature use preserves the single-policy runtime contract while
+   still letting the model borrow signal from existing candidate logic
 
 ## Decision 6: Rolling Summary Statistics
 
@@ -133,56 +145,67 @@ Why this choice:
 Chosen:
 
 1. one shared action-row dataset
-2. one shared model family over `(round, action)` rows
+2. one unified runtime policy over peer actions
+3. per-action quantile heads over the shared feature contract
 
 Alternatives considered:
 
-1. one separate model per action
+1. one pooled quantile model over all `(round, action)` rows
 2. side classification plus a separate size model
 3. profile selection as an intermediate target
 
 Why this choice:
 
-1. all actions remain peers
-2. it matches the agreed contextual action-value framing
-3. it avoids special treatment for specific actions
+1. all actions remain peers in the runtime policy contract
+2. the pooled lower-quantile model collapsed toward a global negative lower
+   tail and failed to calibrate `skip` or small actions distinctly
+3. per-action heads are still simple enough for the first lane while avoiding
+   the pooled `q10` pathology
 
 ## Decision 8: Model Family
 
 Chosen:
 
 1. LightGBM quantile regressors
-2. one model for `q10`
-3. one model for `q50`
+2. one `q10` model per non-skip action
+3. one `q50` model per non-skip action
+4. `skip` uses a constant zero quantile model
 
 Alternatives considered:
 
-1. `HistGradientBoostingRegressor` quantile models
-2. mean-plus-variance regression
-3. ensemble disagreement as the primary uncertainty method
+1. one pooled `q10` and one pooled `q50` model across all actions
+2. `HistGradientBoostingRegressor` quantile models
+3. mean-plus-variance regression
+4. ensemble disagreement as the primary uncertainty method
 
 Why this choice:
 
 1. LightGBM is already used in the repo
 2. quantile regression matches the desired confidence semantics directly
-3. `q10` and `q50` are enough for a first conservative implementation
+3. the pooled quantile bundle was not action-aware enough on held-out data,
+   especially in the lower tail
+4. the per-action bundle is still operationally simple and materially more
+   coherent than the pooled version
 
 ## Decision 9: Runtime Score
 
 Chosen:
 
-1. runtime score is `q10_net_bnb`
+1. runtime score is `q50_net_bnb - lambda * (q50_net_bnb - q10_net_bnb)`
+2. first default `lambda = 0.15`
 
 Alternatives considered:
 
-1. `q50 - lambda * uncertainty`
+1. raw `q10_net_bnb`
 2. predicted mean only
-3. a configurable family of score rules in V1
+3. a broader configurable family of score rules in V1
 
 Why this choice:
 
-1. it is the simplest lower-confidence-bound contract
-2. it directly encodes the desired conservative behavior
+1. raw `q10` proved too conservative in the first held-out smoke run and
+   produced an all-skip degenerate policy
+2. the `q50-minus-lambda-spread` rule preserves explicit uncertainty while
+   keeping the score simple and operator-readable
 3. it avoids overconfiguring the first version
 
 ## Decision 10: Training Window Defaults
@@ -332,3 +355,26 @@ Why this choice:
 1. it keeps offline qualification and backtest/runtime semantics aligned
 2. it reuses the shared scenario/backtest harness rather than inventing another
    execution path
+
+## Decision 18: Qualification Gate After The First Smoke Runs
+
+Chosen:
+
+1. do not run the full multi-size or multi-offset sweep for the current
+   realized-net quantile lane
+2. treat the lane as blocked pending a model-contract revision
+
+Alternatives considered:
+
+1. continue threshold tuning on the existing score
+2. fan out the full shared-eval sweep anyway
+3. promote a dry run despite the poor held-out smoke behavior
+
+Why this choice:
+
+1. the pooled bundle first degenerated to all-skip, then the per-action bundle
+   overbet and lost about `-3.8579 / 500` on the same held-out `6480` slice
+2. simple score-threshold tightening did not rescue the per-action bundle; all
+   tested thresholds remained negative
+3. the next problem is model signal/target design, not a missing evaluation
+   sweep

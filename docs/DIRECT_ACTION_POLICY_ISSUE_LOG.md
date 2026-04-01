@@ -94,3 +94,53 @@ Resolution:
 1. parse `model_bundle_path` with direct-action-specific logic
 2. allow empty string when disabled
 3. enforce non-empty path only when the direct-action policy is enabled
+
+## Issue 8: Raw `q10` Collapsed The First Smoke Run To All-Skip
+
+Issue:
+
+1. the first held-out smoke qualification on `6480` rounds produced `0` bets
+2. the direct cause was that raw `q10` scores were negative for every non-skip
+   action on every round
+3. the pooled lower-quantile model effectively learned a generic negative lower
+   tail instead of usable action-specific lower bounds
+
+Resolution:
+
+1. stop treating raw `q10` as the runtime score
+2. move to a simpler explicit lower-confidence-bound style score:
+   `q50 - lambda * (q50 - q10)`
+3. reintroduce bounded legacy dislocation candidate outputs as auxiliary
+   features only
+
+## Issue 9: Pooled Lower Quantiles Did Not Calibrate `skip` Or Action Identity
+
+Issue:
+
+1. even after adding explicit action-id features, the pooled `q10` model still
+   predicted an almost identical negative lower tail for `skip` and most bet
+   actions
+2. this was a model-family problem, not just a logging or threshold issue
+
+Resolution:
+
+1. keep the unified runtime policy contract
+2. replace the pooled quantile bundle with per-action quantile heads
+3. keep `skip` as a constant zero quantile model
+
+## Issue 10: The Per-Action Realized-Net Quantile Lane Is Still Not Qualified
+
+Issue:
+
+1. the per-action smoke run on the same held-out `6480` rounds escaped the
+   all-skip failure mode but overbet large sizes and lost about `-49.999 BNB`
+2. normalized result was about `-3.8579 / 500`
+3. simple score-threshold tightening did not rescue the path; every tested
+   threshold remained negative
+
+Resolution:
+
+1. stop short of the full shared-eval sweep for this model family
+2. mark the current realized-net quantile lane as unqualified
+3. treat the next blocker as a target/model-contract problem, not a missing
+   threshold tune
