@@ -150,3 +150,19 @@ As of March 31, 2026:
    background
 2. the neural direction spec is design-only so far
 3. no neural model implementation has started yet
+
+Update on April 1, 2026:
+
+1. the first shared dataset builder is now implemented in
+   [neural_direction_dataset.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/neural_direction_dataset.py)
+2. the first implementation deliberately reuses the canonical v8 causal feature
+   builder as the MLP input contract, instead of creating a second competing
+   feature builder before the first baseline/model comparison
+3. the headline-only baseline runner is now implemented in
+   [run_neural_direction_baselines.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_neural_direction_baselines.py)
+4. the first trainable neural sanity path is now implemented as a torch MLP in
+   [neural_direction_mlp.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/neural_direction_mlp.py)
+   with the shared eval runner
+   [run_neural_direction_mlp_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_neural_direction_mlp_eval.py)
+5. `TCN` remains the next model to build after the full-history round and
+   kline syncs complete
