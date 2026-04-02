@@ -16,11 +16,13 @@ from pancakebot.domain.models.neural_direction_dataset import (
 )
 from pancakebot.infra.feature_cache_store import FeatureCacheStore
 from pancakebot.infra.market_data_db import MarketDataDb, SqliteKlinesStore
+from pancakebot.domain.types import Round
 
 
 @dataclass(frozen=True, slots=True)
 class NeuralDirectionEvalSlice:
     dataset: NeuralDirectionDataset
+    target_rounds_by_epoch: dict[int, Round]
     loaded_round_count: int
     total_rounds_available: int
 
@@ -139,8 +141,18 @@ def load_recent_direction_eval_slice(
                 exclude_groups=exclude_feature_groups,
             )
             if int(dataset.num_examples) >= int(required_examples):
+                tail_dataset = tail_neural_direction_dataset(dataset=dataset, n=int(required_examples))
+                target_epoch_set = {int(epoch) for epoch in tail_dataset.target_epochs}
+                target_rounds_by_epoch = {
+                    int(round_t.epoch): round_t
+                    for round_t in rounds
+                    if int(round_t.epoch) in target_epoch_set
+                }
+                if len(target_rounds_by_epoch) != int(tail_dataset.num_examples):
+                    raise InvariantError("neural_direction_eval_target_rounds_len_mismatch")
                 return NeuralDirectionEvalSlice(
-                    dataset=tail_neural_direction_dataset(dataset=dataset, n=int(required_examples)),
+                    dataset=tail_dataset,
+                    target_rounds_by_epoch=target_rounds_by_epoch,
                     loaded_round_count=int(load_n),
                     total_rounds_available=int(total_rounds_available),
                 )
