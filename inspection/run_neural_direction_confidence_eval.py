@@ -13,6 +13,7 @@ from inspection.neural_direction_eval_common import (
     rows_path,
     summary_path,
 )
+from inspection.neural_direction_raw_eval_common import load_recent_raw_direction_eval_slice
 from pancakebot.core.errors import InvariantError
 from pancakebot.domain.models.neural_direction_confidence import (
     apply_temperature_calibrator_to_probs,
@@ -23,6 +24,14 @@ from pancakebot.domain.models.neural_direction_confidence import (
 from pancakebot.domain.models.neural_direction_mlp import (
     load_neural_direction_mlp_bundle,
     predict_neural_direction_probabilities,
+)
+from pancakebot.domain.models.neural_direction_raw_sequence_dataset import (
+    build_raw_sequence_examples_for_target_epochs,
+    select_raw_sequence_lengths,
+)
+from pancakebot.domain.models.neural_direction_raw_tcn import (
+    load_neural_direction_raw_tcn_bundle,
+    predict_neural_direction_raw_tcn_probabilities,
 )
 from pancakebot.domain.models.neural_direction_tcn import (
     build_sequence_examples_for_target_epochs,
@@ -46,6 +55,9 @@ class NeuralDirectionConfidenceEvalRow:
     valid_size: int
     recency_half_life_examples: float | None
     seq_len: int | None
+    settled_history_len: int | None
+    round_flow_bins: int | None
+    kline_seq_len: int | None
     coverage_fraction_requested: float
     selected_count: int
     selected_fraction_actual: float
@@ -69,6 +81,9 @@ class NeuralDirectionConfidenceAggregateRow:
     pretrain_size: int
     recency_half_life_examples: float | None
     seq_len: int | None
+    settled_history_len: int | None
+    round_flow_bins: int | None
+    kline_seq_len: int | None
     coverage_fraction_requested: float
     num_offsets: int
     mean_selected_win_rate: float
@@ -81,6 +96,7 @@ class NeuralDirectionConfidenceAggregateRow:
 
 @dataclass(frozen=True, slots=True)
 class _SourceEvalJob:
+    model_type: str
     source_rows_csv: str
     source_bundle_path: str
     sim_size: int
@@ -91,12 +107,15 @@ class _SourceEvalJob:
     valid_size: int
     recency_half_life_examples: float | None
     seq_len: int | None
+    settled_history_len: int | None
+    round_flow_bins: int | None
+    kline_seq_len: int | None
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.toml")
-    parser.add_argument("--model-type", type=str, choices=("mlp", "tcn"), required=True)
+    parser.add_argument("--model-type", type=str, choices=("mlp", "tcn", "raw_tcn"), required=True)
     parser.add_argument("--name-prefix", type=str, required=True)
     parser.add_argument("--rows-csvs", type=str, required=True)
     parser.add_argument("--coverage-fractions", type=str, default="1.0,0.75,0.5,0.25,0.10,0.05,0.02,0.01")
@@ -140,8 +159,16 @@ def _load_source_jobs(*, rows_csvs: tuple[Path, ...], model_type: str) -> list[_
                 seq_len: int | None = None
                 if str(model_type) == "tcn":
                     seq_len = int(source_row["seq_len"])
+                settled_history_len = None
+                round_flow_bins = None
+                kline_seq_len = None
+                if str(model_type) == "raw_tcn":
+                    settled_history_len = int(source_row["settled_history_len"])
+                    round_flow_bins = int(source_row["round_flow_bins"])
+                    kline_seq_len = int(source_row["kline_seq_len"])
                 out.append(
                     _SourceEvalJob(
+                        model_type=str(model_type),
                         source_rows_csv=str(rows_csv),
                         source_bundle_path=str(source_row["bundle_path"]),
                         sim_size=int(source_row["sim_size"]),
@@ -156,6 +183,9 @@ def _load_source_jobs(*, rows_csvs: tuple[Path, ...], model_type: str) -> list[_
                             else float(source_row["recency_half_life_examples"])
                         ),
                         seq_len=None if seq_len is None else int(seq_len),
+                        settled_history_len=None if settled_history_len is None else int(settled_history_len),
+                        round_flow_bins=None if round_flow_bins is None else int(round_flow_bins),
+                        kline_seq_len=None if kline_seq_len is None else int(kline_seq_len),
                     )
                 )
     if not out:
@@ -232,8 +262,54 @@ def _tcn_probs_for_epochs(*, bundle_path: str, eval_slice, seq_len: int, valid_e
     )
 
 
+def _raw_tcn_probs_for_epochs(
+    *,
+    bundle_path: str,
+    eval_slice,
+    settled_history_len: int,
+    kline_seq_len: int,
+    valid_epochs,
+    test_epochs,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    dataset = select_raw_sequence_lengths(
+        dataset=eval_slice.dataset,
+        settled_history_len=int(settled_history_len),
+        kline_seq_len=int(kline_seq_len),
+    )
+    bundle = load_neural_direction_raw_tcn_bundle(str(bundle_path))
+    valid_round_x, valid_kline_x, valid_snapshot_x, valid_y = build_raw_sequence_examples_for_target_epochs(
+        dataset=dataset,
+        target_epochs=valid_epochs,
+    )
+    test_round_x, test_kline_x, test_snapshot_x, test_y = build_raw_sequence_examples_for_target_epochs(
+        dataset=dataset,
+        target_epochs=test_epochs,
+    )
+    valid_probs = predict_neural_direction_raw_tcn_probabilities(
+        bundle=bundle,
+        round_sequence=valid_round_x,
+        kline_sequence=valid_kline_x,
+        snapshot_matrix=valid_snapshot_x,
+    )
+    test_probs = predict_neural_direction_raw_tcn_probabilities(
+        bundle=bundle,
+        round_sequence=test_round_x,
+        kline_sequence=test_kline_x,
+        snapshot_matrix=test_snapshot_x,
+    )
+    return (
+        np.asarray(valid_probs, dtype=np.float32),
+        np.asarray(valid_y, dtype=np.int64),
+        np.asarray(test_probs, dtype=np.float32),
+        np.asarray(test_y, dtype=np.int64),
+    )
+
+
 def _aggregate_rows(rows: list[NeuralDirectionConfidenceEvalRow]) -> list[NeuralDirectionConfidenceAggregateRow]:
-    grouped: dict[tuple[str, int, str, int, int, float | None, int | None, float], list[NeuralDirectionConfidenceEvalRow]] = {}
+    grouped: dict[
+        tuple[str, int, str, int, int, float | None, int | None, int | None, int | None, int | None, float],
+        list[NeuralDirectionConfidenceEvalRow],
+    ] = {}
     for row in rows:
         key = (
             str(row.model_type),
@@ -245,6 +321,9 @@ def _aggregate_rows(rows: list[NeuralDirectionConfidenceEvalRow]) -> list[Neural
             if row.recency_half_life_examples is None
             else float(row.recency_half_life_examples),
             None if row.seq_len is None else int(row.seq_len),
+            None if row.settled_history_len is None else int(row.settled_history_len),
+            None if row.round_flow_bins is None else int(row.round_flow_bins),
+            None if row.kline_seq_len is None else int(row.kline_seq_len),
             float(row.coverage_fraction_requested),
         )
         grouped.setdefault(key, []).append(row)
@@ -258,8 +337,11 @@ def _aggregate_rows(rows: list[NeuralDirectionConfidenceEvalRow]) -> list[Neural
             int(item[3]),
             int(item[4]),
             -1.0 if item[5] is None else float(item[5]),
-            -float(item[7]),
             -1 if item[6] is None else int(item[6]),
+            -1 if item[7] is None else int(item[7]),
+            -1 if item[8] is None else int(item[8]),
+            -1 if item[9] is None else int(item[9]),
+            -float(item[10]),
         ),
     ):
         group = grouped[key]
@@ -272,7 +354,10 @@ def _aggregate_rows(rows: list[NeuralDirectionConfidenceEvalRow]) -> list[Neural
                 pretrain_size=int(key[4]),
                 recency_half_life_examples=None if key[5] is None else float(key[5]),
                 seq_len=None if key[6] is None else int(key[6]),
-                coverage_fraction_requested=float(key[7]),
+                settled_history_len=None if key[7] is None else int(key[7]),
+                round_flow_bins=None if key[8] is None else int(key[8]),
+                kline_seq_len=None if key[9] is None else int(key[9]),
+                coverage_fraction_requested=float(key[10]),
                 num_offsets=int(len(group)),
                 mean_selected_win_rate=float(np.mean([row.selected_win_rate for row in group])),
                 min_selected_win_rate=float(min(row.selected_win_rate for row in group)),
@@ -296,6 +381,7 @@ def main() -> None:
 
     rows_out: list[NeuralDirectionConfidenceEvalRow] = []
     max_required_examples_by_offset: dict[int, int] = {}
+    max_raw_params_by_offset: dict[int, tuple[int, int, int]] = {}
     for job in source_jobs:
         required_examples = int(job.train_size) + int(job.valid_size) + int(job.sim_size)
         if job.seq_len is not None:
@@ -303,15 +389,37 @@ def main() -> None:
         prev = max_required_examples_by_offset.get(int(job.tail_offset_rounds))
         if prev is None or int(required_examples) > int(prev):
             max_required_examples_by_offset[int(job.tail_offset_rounds)] = int(required_examples)
+        if str(model_type) == "raw_tcn":
+            prev_raw = max_raw_params_by_offset.get(int(job.tail_offset_rounds))
+            candidate = (
+                int(job.settled_history_len or 0),
+                int(job.round_flow_bins or 0),
+                int(job.kline_seq_len or 0),
+            )
+            if prev_raw is None or candidate > prev_raw:
+                max_raw_params_by_offset[int(job.tail_offset_rounds)] = candidate
 
-    eval_slices_by_offset = {
-        int(tail_offset_rounds): load_recent_direction_eval_slice(
-            config_path=str(args.config),
-            required_examples=int(required_examples),
-            tail_offset_rounds=int(tail_offset_rounds),
-        )
-        for tail_offset_rounds, required_examples in sorted(max_required_examples_by_offset.items())
-    }
+    if str(model_type) == "raw_tcn":
+        eval_slices_by_offset = {
+            int(tail_offset_rounds): load_recent_raw_direction_eval_slice(
+                config_path=str(args.config),
+                required_examples=int(required_examples),
+                tail_offset_rounds=int(tail_offset_rounds),
+                settled_history_len=int(max_raw_params_by_offset[int(tail_offset_rounds)][0]),
+                round_flow_bins=int(max_raw_params_by_offset[int(tail_offset_rounds)][1]),
+                kline_seq_len=int(max_raw_params_by_offset[int(tail_offset_rounds)][2]),
+            )
+            for tail_offset_rounds, required_examples in sorted(max_required_examples_by_offset.items())
+        }
+    else:
+        eval_slices_by_offset = {
+            int(tail_offset_rounds): load_recent_direction_eval_slice(
+                config_path=str(args.config),
+                required_examples=int(required_examples),
+                tail_offset_rounds=int(tail_offset_rounds),
+            )
+            for tail_offset_rounds, required_examples in sorted(max_required_examples_by_offset.items())
+        }
 
     for idx, job in enumerate(source_jobs, start=1):
         eval_slice = eval_slices_by_offset[int(job.tail_offset_rounds)]
@@ -329,11 +437,20 @@ def main() -> None:
                 valid_epochs=valid_epochs,
                 test_epochs=test_epochs,
             )
-        else:
+        elif str(model_type) == "tcn":
             valid_probs, valid_y, test_probs, test_y = _tcn_probs_for_epochs(
                 bundle_path=str(job.source_bundle_path),
                 eval_slice=eval_slice,
                 seq_len=int(job.seq_len),
+                valid_epochs=valid_epochs,
+                test_epochs=test_epochs,
+            )
+        else:
+            valid_probs, valid_y, test_probs, test_y = _raw_tcn_probs_for_epochs(
+                bundle_path=str(job.source_bundle_path),
+                eval_slice=eval_slice,
+                settled_history_len=int(job.settled_history_len),
+                kline_seq_len=int(job.kline_seq_len),
                 valid_epochs=valid_epochs,
                 test_epochs=test_epochs,
             )
@@ -375,6 +492,15 @@ def main() -> None:
                     if job.recency_half_life_examples is None
                     else float(job.recency_half_life_examples),
                     seq_len=None if job.seq_len is None else int(job.seq_len),
+                    settled_history_len=None
+                    if job.settled_history_len is None
+                    else int(job.settled_history_len),
+                    round_flow_bins=None
+                    if job.round_flow_bins is None
+                    else int(job.round_flow_bins),
+                    kline_seq_len=None
+                    if job.kline_seq_len is None
+                    else int(job.kline_seq_len),
                     coverage_fraction_requested=float(bucket.coverage_fraction_requested),
                     selected_count=int(bucket.selected_count),
                     selected_fraction_actual=float(bucket.selected_fraction_actual),

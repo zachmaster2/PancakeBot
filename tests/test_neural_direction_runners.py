@@ -14,6 +14,10 @@ from inspection.run_neural_direction_policy_eval import (
     NeuralDirectionPolicyEvalRow,
     _aggregate_rows as _aggregate_policy_rows,
 )
+from inspection.run_neural_direction_raw_tcn_eval import (
+    NeuralDirectionRawTcnEvalRow,
+    _aggregate_rows as _aggregate_raw_tcn_rows,
+)
 from inspection.run_neural_direction_confidence_eval import (
     NeuralDirectionConfidenceEvalRow,
     _aggregate_rows as _aggregate_confidence_rows,
@@ -176,6 +180,9 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
                 valid_size=3000,
                 recency_half_life_examples=None,
                 seq_len=None,
+                settled_history_len=None,
+                round_flow_bins=None,
+                kline_seq_len=None,
                 coverage_fraction_requested=0.1,
                 selected_count=648,
                 selected_fraction_actual=0.1,
@@ -201,6 +208,9 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
                 valid_size=3000,
                 recency_half_life_examples=None,
                 seq_len=None,
+                settled_history_len=None,
+                round_flow_bins=None,
+                kline_seq_len=None,
                 coverage_fraction_requested=0.1,
                 selected_count=648,
                 selected_fraction_actual=0.1,
@@ -234,6 +244,9 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
                 pretrain_size=0,
                 valid_size=3000,
                 seq_len=None,
+                settled_history_len=None,
+                round_flow_bins=None,
+                kline_seq_len=None,
                 target_coverage_fraction=0.05,
                 threshold_used=0.537,
                 bet_size_bnb=0.1,
@@ -263,6 +276,9 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
                 pretrain_size=0,
                 valid_size=3000,
                 seq_len=None,
+                settled_history_len=None,
+                round_flow_bins=None,
+                kline_seq_len=None,
                 target_coverage_fraction=0.05,
                 threshold_used=0.538,
                 bet_size_bnb=0.1,
@@ -290,6 +306,60 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
         self.assertIsNone(aggregates[0].seq_len)
         self.assertAlmostEqual(0.5375, aggregates[0].mean_threshold_used)
         self.assertAlmostEqual((0.09259 + 0.0463) / 2.0, aggregates[0].mean_profit_per_500_bnb)
+
+    def test_raw_tcn_aggregate_rows(self) -> None:
+        rows = [
+            NeuralDirectionRawTcnEvalRow(
+                model_type="raw_tcn",
+                training_policy="flat",
+                sim_size=6480,
+                tail_offset_rounds=0,
+                train_size=100000,
+                valid_size=3000,
+                random_seed=1,
+                settled_history_len=16,
+                round_seq_len=18,
+                round_flow_bins=4,
+                kline_seq_len=64,
+                num_examples=109480,
+                round_feature_dim=43,
+                kline_feature_dim=9,
+                snapshot_dim=19,
+                loaded_round_count=115000,
+                total_rounds_available=468000,
+                bundle_path="a",
+                valid_win_rate=0.56,
+                test_win_rate=0.54,
+            ),
+            NeuralDirectionRawTcnEvalRow(
+                model_type="raw_tcn",
+                training_policy="flat",
+                sim_size=6480,
+                tail_offset_rounds=432,
+                train_size=100000,
+                valid_size=3000,
+                random_seed=1,
+                settled_history_len=16,
+                round_seq_len=18,
+                round_flow_bins=4,
+                kline_seq_len=64,
+                num_examples=109480,
+                round_feature_dim=43,
+                kline_feature_dim=9,
+                snapshot_dim=19,
+                loaded_round_count=115000,
+                total_rounds_available=468000,
+                bundle_path="b",
+                valid_win_rate=0.54,
+                test_win_rate=0.52,
+            ),
+        ]
+        aggregates = _aggregate_raw_tcn_rows(rows)
+        self.assertEqual(1, len(aggregates))
+        self.assertEqual("raw_tcn", aggregates[0].model_type)
+        self.assertEqual(16, aggregates[0].settled_history_len)
+        self.assertEqual(64, aggregates[0].kline_seq_len)
+        self.assertAlmostEqual(0.53, aggregates[0].mean_test_win_rate)
 
 
 if __name__ == "__main__":
