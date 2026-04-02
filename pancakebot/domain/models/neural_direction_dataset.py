@@ -111,6 +111,37 @@ def select_feature_groups(
     )
 
 
+def select_feature_columns_exact(
+    *,
+    dataset: NeuralDirectionDataset,
+    feature_columns: Sequence[str],
+) -> NeuralDirectionDataset:
+    requested = tuple(str(col) for col in feature_columns)
+    if not requested:
+        raise InvariantError("neural_direction_exact_feature_selection_empty")
+    index_by_name = {
+        str(col): idx for idx, col in enumerate(dataset.feature_columns)
+    }
+    selected_indices: list[int] = []
+    for col in requested:
+        idx = index_by_name.get(str(col))
+        if idx is None:
+            raise InvariantError(f"neural_direction_exact_feature_missing: {str(col)}")
+        selected_indices.append(int(idx))
+    metadata = dict(dataset.metadata)
+    metadata["selected_feature_columns_exact"] = tuple(requested)
+    metadata["selected_feature_columns_count"] = int(len(selected_indices))
+    return NeuralDirectionDataset(
+        feature_columns=tuple(requested),
+        target_epochs=tuple(int(epoch) for epoch in dataset.target_epochs),
+        labels=np.asarray(dataset.labels, dtype=np.int64),
+        previous_settled_labels=np.asarray(dataset.previous_settled_labels, dtype=np.int64),
+        previous_settled_available=np.asarray(dataset.previous_settled_available, dtype=bool),
+        feature_matrix=np.asarray(dataset.feature_matrix[:, selected_indices], dtype=np.float32),
+        metadata=metadata,
+    )
+
+
 def build_neural_direction_dataset(
     *,
     rounds: Sequence[Round],

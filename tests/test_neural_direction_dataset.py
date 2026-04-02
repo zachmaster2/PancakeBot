@@ -11,6 +11,7 @@ from pancakebot.domain.models.neural_direction_dataset import (
     neural_direction_required_context_klines,
     neural_direction_required_history_rounds,
     previous_settled_direction_label,
+    select_feature_columns_exact,
     select_feature_groups,
     tail_neural_direction_dataset,
 )
@@ -161,6 +162,38 @@ class NeuralDirectionDatasetTests(unittest.TestCase):
         self.assertLess(selected.feature_matrix.shape[1], dataset.feature_matrix.shape[1])
         self.assertTrue(all(col.startswith("price_") or col.startswith("regime_") for col in selected.feature_columns))
         self.assertIn("price", available_feature_groups())
+
+    def test_select_feature_columns_exact_preserves_requested_order(self) -> None:
+        history_n = int(neural_direction_required_history_rounds())
+        rounds = [
+            _closed_round(epoch=epoch, position=("Bull" if epoch % 2 == 0 else "Bear"))
+            for epoch in range(1, int(history_n) + 5)
+        ]
+        earliest_ms = (int(rounds[0].start_at) - 10_000) * 1000
+        klines = [
+            _kline(open_time_ms=int(earliest_ms) + idx * 60_000, close_price=600.0 + idx * 0.1)
+            for idx in range(int(neural_direction_required_context_klines()) + 400)
+        ]
+        dataset = build_neural_direction_dataset(
+            rounds=rounds,
+            klines_store_like=_FakeKlineStore(klines),
+            cutoff_seconds=17,
+        )
+        requested = (
+            str(dataset.feature_columns[5]),
+            str(dataset.feature_columns[0]),
+            str(dataset.feature_columns[3]),
+        )
+        selected = select_feature_columns_exact(
+            dataset=dataset,
+            feature_columns=requested,
+        )
+        self.assertEqual(requested, selected.feature_columns)
+        self.assertEqual((dataset.num_examples, len(requested)), selected.feature_matrix.shape)
+        self.assertEqual(
+            float(dataset.feature_matrix[0, 5]),
+            float(selected.feature_matrix[0, 0]),
+        )
 
 
 if __name__ == "__main__":

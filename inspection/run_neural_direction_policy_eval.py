@@ -22,6 +22,9 @@ from pancakebot.domain.models.neural_direction_confidence import (
     chosen_side_confidence,
     fit_temperature_calibrator_from_probs,
 )
+from pancakebot.domain.models.neural_direction_dataset import (
+    select_feature_columns_exact,
+)
 from pancakebot.domain.models.neural_direction_mlp import (
     load_neural_direction_mlp_bundle,
     predict_neural_direction_probabilities,
@@ -366,10 +369,14 @@ def main() -> None:
             sim_size=int(job.sim_size),
         )
         if str(job.model_type) == "mlp":
+            bundle = load_neural_direction_mlp_bundle(str(job.source_bundle_path))
+            dataset = select_feature_columns_exact(
+                dataset=dataset,
+                feature_columns=tuple(bundle.feature_columns),
+            )
             index_by_epoch = {int(epoch): idx for idx, epoch in enumerate(dataset.target_epochs)}
             valid_idx = np.asarray([int(index_by_epoch[int(epoch)]) for epoch in valid_epochs], dtype=np.int64)
             test_idx = np.asarray([int(index_by_epoch[int(epoch)]) for epoch in test_epochs], dtype=np.int64)
-            bundle = load_neural_direction_mlp_bundle(str(job.source_bundle_path))
             probs_all = predict_neural_direction_probabilities(
                 bundle=bundle,
                 feature_matrix=np.asarray(dataset.feature_matrix, dtype=np.float32),
@@ -381,6 +388,10 @@ def main() -> None:
             if job.seq_len is None:
                 raise InvariantError("neural_direction_policy_tcn_seq_len_missing")
             bundle = load_neural_direction_tcn_bundle(str(job.source_bundle_path))
+            dataset = select_feature_columns_exact(
+                dataset=dataset,
+                feature_columns=tuple(bundle.feature_columns),
+            )
             valid_sequences = build_neural_direction_tcn_feature_sequences(
                 dataset=dataset,
                 target_epochs=valid_epochs,

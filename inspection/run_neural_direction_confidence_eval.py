@@ -25,6 +25,9 @@ from pancakebot.domain.models.neural_direction_mlp import (
     load_neural_direction_mlp_bundle,
     predict_neural_direction_probabilities,
 )
+from pancakebot.domain.models.neural_direction_dataset import (
+    select_feature_columns_exact,
+)
 from pancakebot.domain.models.neural_direction_raw_sequence_dataset import (
     build_raw_sequence_examples_for_target_epochs,
     select_raw_sequence_lengths,
@@ -217,8 +220,11 @@ def _split_target_epochs(
 
 
 def _mlp_probs_for_epochs(*, bundle_path: str, eval_slice, valid_epochs, test_epochs) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    dataset = eval_slice.dataset
     bundle = load_neural_direction_mlp_bundle(str(bundle_path))
+    dataset = select_feature_columns_exact(
+        dataset=eval_slice.dataset,
+        feature_columns=tuple(bundle.feature_columns),
+    )
     probs_all = predict_neural_direction_probabilities(
         bundle=bundle,
         feature_matrix=np.asarray(dataset.feature_matrix, dtype=np.float32),
@@ -234,8 +240,11 @@ def _mlp_probs_for_epochs(*, bundle_path: str, eval_slice, valid_epochs, test_ep
 
 
 def _tcn_probs_for_epochs(*, bundle_path: str, eval_slice, seq_len: int, valid_epochs, test_epochs) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    dataset = eval_slice.dataset
     bundle = load_neural_direction_tcn_bundle(str(bundle_path))
+    dataset = select_feature_columns_exact(
+        dataset=eval_slice.dataset,
+        feature_columns=tuple(bundle.feature_columns),
+    )
     valid_x, valid_y = build_sequence_examples_for_target_epochs(
         dataset=dataset,
         target_epochs=valid_epochs,
