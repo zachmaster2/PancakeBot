@@ -92,6 +92,15 @@ class NeuralDirectionRawTcnTests(unittest.TestCase):
         self.assertGreaterEqual(dataset.num_examples, 1)
         self.assertEqual(6, dataset.round_sequence.shape[1])
         self.assertEqual(16, dataset.kline_sequence.shape[1])
+        target_row = dataset.round_sequence[0, -1]
+        locked_row = dataset.round_sequence[0, -2]
+        columns = {name: idx for idx, name in enumerate(dataset.round_feature_columns)}
+        self.assertEqual(0.0, float(target_row[columns["lock_price_known"]]))
+        self.assertEqual(0.0, float(target_row[columns["close_price_known"]]))
+        self.assertEqual(0.0, float(target_row[columns["outcome_known"]]))
+        self.assertEqual(1.0, float(locked_row[columns["lock_price_known"]]))
+        self.assertEqual(0.0, float(locked_row[columns["close_price_known"]]))
+        self.assertEqual(0.0, float(locked_row[columns["outcome_known"]]))
 
         short_dataset = select_raw_sequence_lengths(
             dataset=dataset,
