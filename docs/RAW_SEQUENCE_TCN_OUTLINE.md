@@ -331,3 +331,26 @@ For that first implementation, use the simplest bet-flow representation:
 1. fixed-width causal time bins
 2. no wallet identity
 3. no hierarchical bet-event encoder
+
+## Status
+
+The first bounded implementation of this outline is now in the repo, but the
+current evidence does not support continuing this exact simple branch.
+
+Important findings:
+
+1. the first raw-sequence rerun exposed a real causal bug
+2. the historical `target_round` and `locked_round` rows were leaking
+   future-only fields into the raw round sequence
+3. that leak is now fixed, and the masking is covered by tests
+4. after the fix, the bounded short-horizon raw branch still underperformed the
+   current derived-feature `TCN` on both broad win `%` and confidence buckets
+
+Current decision:
+
+1. keep this outline as valid architectural reference
+2. do not continue the current simple fixed-bin raw branch into settled-policy
+   evaluation
+3. only reopen raw-sequence work if a materially different representation is
+   introduced, such as richer event structure or a meaningfully stronger raw
+   branch contract

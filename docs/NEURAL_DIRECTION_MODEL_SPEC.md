@@ -280,3 +280,18 @@ Update on April 1, 2026:
     snapshot branch, all under the same existing causal contract. This branch
     is intended to test whether the current derived-feature `TCN` is losing
     temporal signal by operating on already-compressed target-level features
+25. the first bounded raw-sequence branch is now implemented, but the post-fix
+    evidence is negative. A real causal leak was found and fixed first:
+    `target_round` and `locked_round` were exposing future-only fields in the
+    raw round sequence, which had briefly produced impossible `100%` win rates.
+    After the fix, the bounded short-horizon rerun in
+    [neural_direction_raw_tcn_focus16_20260402_neural_direction_raw_tcn_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_raw_tcn_focus16_20260402_neural_direction_raw_tcn_eval_summary.json)
+    reached only about `50.32%` at `train=100k` and about `49.87%` at
+    `train=200k` on `6480`, both worse than the current derived-feature `TCN`
+    references
+26. the bounded raw-sequence confidence pass in
+    [neural_direction_raw_tcn_focus16_conf_20260402_neural_direction_confidence_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_raw_tcn_focus16_conf_20260402_neural_direction_confidence_summary.json)
+    also remained weaker than the derived-feature `TCN`. Current decision:
+    keep the raw-sequence branch as recorded historical work, but do not push
+    this exact simple fixed-bin raw branch into settled-policy evaluation or
+    broader grid expansion
