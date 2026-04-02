@@ -245,3 +245,31 @@ Update on April 1, 2026:
     settlement path. If the direction-only threshold policy remains mixed after
     that, the next design branch should be payout-aware or side-conditioned
     policy logic rather than more threshold-only tuning
+20. that bounded comparison is now complete, and the settled-policy picture is
+    split by horizon. Flat `MLP @ 100k`, in
+    [neural_direction_mlp_100k_policy_grid_20260401_neural_direction_policy_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_100k_policy_grid_20260401_neural_direction_policy_summary.json),
+    is now the strongest finished long-horizon settled-policy lane:
+    on `10800`, target `1%` coverage reached about `+0.02237 / 500` at `0.05`
+    BNB and about `+0.03972 / 500` at `0.10` BNB, while target `2%` coverage
+    also stayed positive. On `6480`, the same MLP lane was weaker and only
+    mildly positive in its best aggregate pocket
+21. the full settled TCN policy matrix is also complete in
+    [neural_direction_tcn_policy_grid_20260401_neural_direction_policy_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_tcn_policy_grid_20260401_neural_direction_policy_summary.json).
+    It produced the strongest short-horizon settled-policy pocket so far:
+    `TCN @ 100k`, `seq_len=16`, target `1%` coverage reached about
+    `+0.02739 / 500` at `0.05` BNB and about `+0.04673 / 500` at `0.10` BNB on
+    `6480`. The more conservative `TCN @ 200k`, `seq_len=16`, target `1%`
+    lane was also positive on all three offsets, but weaker. However, the TCN
+    family remained negative on average across the tested `10800` aggregates
+22. current settled-policy interpretation:
+    - `MLP @ 400k` is no longer the sole confidence-first reference once real
+      settlement is included
+    - short-horizon settled-policy leader: tight `TCN` pockets on `6480`
+    - longer-horizon settled-policy leader: flat `MLP @ 100k` on `10800`
+    - there is still no single direction-only threshold policy that looks
+      broadly robust across both horizons
+23. the settled-policy runner now supports both model families and records
+    `model_type`, `train_size`, `pretrain_size`, `valid_size`, and `seq_len`
+    in the aggregate output so unlike setups are not silently collapsed into
+    one row. This matters because the TCN and MLP policy winners differ by
+    horizon
