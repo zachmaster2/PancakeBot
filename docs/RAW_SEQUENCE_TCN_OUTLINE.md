@@ -43,6 +43,16 @@ Recommended design order:
 
 I do not recommend jumping straight to `raw-only` first.
 
+Current V1 decision:
+
+1. start with the simplest rawer branch first
+2. do not include wallet identity in the first raw-sequence implementation
+3. do not build a hierarchical bet-event encoder yet
+4. represent visible bet flow with fixed-width causal summaries instead
+
+Wallet-aware event modeling remains a later optional branch, not the starting
+point.
+
 ## Causal Contract
 
 This outline still uses the canonical terminology in
@@ -90,6 +100,35 @@ Recommended first sequence window:
 
 This branch should preserve state differences explicitly rather than pretending
 all timesteps are the same kind of row.
+
+### 1A. Simplest Bet-Flow Representation
+
+The first implementation should use fixed-width binned flow summaries, not raw
+variable-length bet lists.
+
+Recommended first binning:
+
+1. split the visible bet window into a small fixed number of time bins
+2. for each bin, record:
+   - bull amount
+   - bear amount
+   - bull bet count
+   - bear bet count
+   - net bull minus bear amount
+
+Recommended first bin counts:
+
+1. `target_round`: `4` or `6` bins across the visible pre-cutoff window
+2. `locked_round`: `4` or `6` bins across its visible decision-time window
+3. settled prior rounds: either one coarse summary per round or the same bin
+   scheme if memory allows
+
+This keeps the first branch:
+
+1. causal
+2. fixed-width
+3. cheaper than event-level modeling
+4. materially rawer than the current derived-feature path
 
 ### 2. Kline Sequence Branch
 
@@ -200,6 +239,18 @@ Even in the rawer branch, a few bounded derived features are still useful:
 This is still a neural sequence model. It does not need to be pure raw bytes to
 count as rawer and less tabular than the current path.
 
+## What Is Explicitly Deferred
+
+These are intentionally out of scope for the first raw-sequence branch:
+
+1. wallet identifier embeddings
+2. wallet-history feature joins
+3. full variable-length raw bet-event encoders
+4. attention over within-round bet lists
+
+Those can be revisited later only if the simpler fixed-bin branch shows enough
+promise to justify the extra complexity.
+
 ## What To Avoid
 
 1. do not rebuild the entire v8 engineered table and then just stack `TCN` on
@@ -274,3 +325,9 @@ That is the cleanest way to test the hypothesis:
 
 1. current `TCN` may be leaving signal on the table
 2. but fully discarding the existing causal feature work is premature
+
+For that first implementation, use the simplest bet-flow representation:
+
+1. fixed-width causal time bins
+2. no wallet identity
+3. no hierarchical bet-event encoder
