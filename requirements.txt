@@ -6,4 +6,5 @@ pandas-stubs>=3.0.0.260204
 scikit-learn>=1.8.0
 lightgbm>=4.6.0
 torch>=2.11.0
+matplotlib>=3.10.8
 web3>=7.14.1

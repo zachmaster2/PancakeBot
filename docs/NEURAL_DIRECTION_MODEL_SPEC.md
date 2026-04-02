@@ -273,3 +273,10 @@ Update on April 1, 2026:
     in the aggregate output so unlike setups are not silently collapsed into
     one row. This matters because the TCN and MLP policy winners differ by
     horizon
+24. the next architecture branch under consideration is now documented in
+    [RAW_SEQUENCE_TCN_OUTLINE.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/RAW_SEQUENCE_TCN_OUTLINE.md).
+    The recommended first version is a hybrid raw-sequence `TCN`: one round
+    sequence branch, one `context_klines` sequence branch, and one small
+    snapshot branch, all under the same existing causal contract. This branch
+    is intended to test whether the current derived-feature `TCN` is losing
+    temporal signal by operating on already-compressed target-level features
