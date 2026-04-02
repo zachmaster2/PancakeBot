@@ -423,20 +423,20 @@ def _build_round_timestep_features(
         "delta_bull_share_vs_prev": 0.0,
         "delta_log_imb_vs_prev": 0.0,
     }
-    if round_t.lock_price is not None and float(round_t.lock_price) > 0.0:
+    if str(state) != "target" and round_t.lock_price is not None and float(round_t.lock_price) > 0.0:
         features["lock_price_known"] = 1.0
         if prev_close_price is not None and float(prev_close_price) > 0.0:
             features["lock_price_rel_prev_close"] = float(float(round_t.lock_price) / float(prev_close_price) - 1.0)
-    if round_t.close_price is not None and float(round_t.close_price) > 0.0:
+    if str(state) == "settled" and round_t.close_price is not None and float(round_t.close_price) > 0.0:
         features["close_price_known"] = 1.0
         if round_t.lock_price is not None and float(round_t.lock_price) > 0.0:
             features["close_return_from_lock"] = float(float(round_t.close_price) / float(round_t.lock_price) - 1.0)
         if prev_close_price is not None and float(prev_close_price) > 0.0:
             features["close_return_from_prev_close"] = float(float(round_t.close_price) / float(prev_close_price) - 1.0)
-    if str(round_t.position) == "Bull":
+    if str(state) == "settled" and str(round_t.position) == "Bull":
         features["outcome_is_bull"] = 1.0
         features["outcome_known"] = 1.0
-    elif str(round_t.position) == "Bear":
+    elif str(state) == "settled" and str(round_t.position) == "Bear":
         features["outcome_is_bear"] = 1.0
         features["outcome_known"] = 1.0
     features.update(
