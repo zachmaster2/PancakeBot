@@ -261,8 +261,22 @@ def predict_neural_direction_tcn_probabilities(
     model.eval()
     with torch.no_grad():
         logits = model(torch.from_numpy(x_proc))
-        probs = torch.sigmoid(logits).cpu().numpy()
+    probs = torch.sigmoid(logits).cpu().numpy()
     return np.asarray(probs, dtype=np.float32)
+
+
+def build_neural_direction_tcn_feature_sequences(
+    *,
+    dataset: NeuralDirectionDataset,
+    target_epochs: Sequence[int],
+    seq_len: int,
+) -> np.ndarray:
+    x, _ = _sequence_rows_for_target_epochs(
+        dataset=dataset,
+        target_epochs=target_epochs,
+        seq_len=int(seq_len),
+    )
+    return np.asarray(x, dtype=np.float32)
 
 
 def build_sequence_examples_for_target_epochs(
