@@ -10,6 +10,10 @@ from inspection.run_neural_direction_baselines import (
     NeuralDirectionBaselineRow,
     _aggregate_rows as _aggregate_baseline_rows,
 )
+from inspection.run_neural_direction_policy_eval import (
+    NeuralDirectionPolicyEvalRow,
+    _aggregate_rows as _aggregate_policy_rows,
+)
 from inspection.run_neural_direction_confidence_eval import (
     NeuralDirectionConfidenceEvalRow,
     _aggregate_rows as _aggregate_confidence_rows,
@@ -216,6 +220,69 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
         self.assertEqual("pretrain_finetune", aggregates[0].training_policy)
         self.assertEqual(300000, aggregates[0].pretrain_size)
         self.assertAlmostEqual(0.55, aggregates[0].mean_selected_win_rate)
+
+    def test_policy_aggregate_rows(self) -> None:
+        rows = [
+            NeuralDirectionPolicyEvalRow(
+                source_rows_csv="rows.csv",
+                source_bundle_path="bundle.pt",
+                training_policy="flat",
+                sim_size=6480,
+                tail_offset_rounds=0,
+                train_size=400000,
+                pretrain_size=0,
+                valid_size=3000,
+                target_coverage_fraction=0.05,
+                threshold_used=0.537,
+                bet_size_bnb=0.1,
+                num_rounds=6480,
+                num_bets=320,
+                num_wins=180,
+                num_skips_below_threshold=6160,
+                num_skips_insufficient_bankroll=0,
+                bet_rate=0.049,
+                win_rate=0.5625,
+                net_profit_bnb=1.2,
+                profit_per_500_bnb=0.09259,
+                max_drawdown_bnb=0.8,
+                final_bankroll_bnb=51.2,
+                selected_mean_confidence=0.55,
+                selected_min_confidence=0.537,
+                selected_max_confidence=0.65,
+            ),
+            NeuralDirectionPolicyEvalRow(
+                source_rows_csv="rows.csv",
+                source_bundle_path="bundle.pt",
+                training_policy="flat",
+                sim_size=6480,
+                tail_offset_rounds=432,
+                train_size=400000,
+                pretrain_size=0,
+                valid_size=3000,
+                target_coverage_fraction=0.05,
+                threshold_used=0.538,
+                bet_size_bnb=0.1,
+                num_rounds=6480,
+                num_bets=330,
+                num_wins=170,
+                num_skips_below_threshold=6150,
+                num_skips_insufficient_bankroll=0,
+                bet_rate=0.051,
+                win_rate=0.515,
+                net_profit_bnb=0.6,
+                profit_per_500_bnb=0.0463,
+                max_drawdown_bnb=1.0,
+                final_bankroll_bnb=50.6,
+                selected_mean_confidence=0.551,
+                selected_min_confidence=0.538,
+                selected_max_confidence=0.66,
+            ),
+        ]
+        aggregates = _aggregate_policy_rows(rows)
+        self.assertEqual(1, len(aggregates))
+        self.assertEqual("flat", aggregates[0].training_policy)
+        self.assertAlmostEqual(0.5375, aggregates[0].mean_threshold_used)
+        self.assertAlmostEqual((0.09259 + 0.0463) / 2.0, aggregates[0].mean_profit_per_500_bnb)
 
 
 if __name__ == "__main__":
