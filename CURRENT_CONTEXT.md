@@ -202,6 +202,8 @@ Current interpretation: the runtime-controller branch is alive, but it is not ro
 133. The first bounded recent-bias reruns did not beat the flat-history anchors. Mild full-history recency weighting on `MLP @ 400k` with half-life `100k`, in [neural_direction_mlp_recentbias_r400k_hl100k_20260401_neural_direction_mlp_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_recentbias_r400k_hl100k_20260401_neural_direction_mlp_eval_summary.json), fell to about `50.86%` on `6480` and about `50.83%` on `10800`, worse than both flat `MLP @ 100k` and flat `MLP @ 400k`. A follow-up selective-confidence rerun for that weighted setup was attempted, but it was not forced to completion after the broad rerun had already come in weaker than the existing flat-history anchors.
 134. The staged-history variants also failed on the primary recent horizon. [neural_direction_mlp_recentbias_p300k_f100k_6480_20260401_neural_direction_mlp_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_recentbias_p300k_f100k_6480_20260401_neural_direction_mlp_eval_summary.json) reached only about `50.96%` mean held-out win `%` on `6480`, and [neural_direction_mlp_recentbias_p300k_f100k_hl50000_6480_20260401_neural_direction_mlp_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_recentbias_p300k_f100k_hl50000_6480_20260401_neural_direction_mlp_eval_summary.json) was worse at about `50.42%`. Current interpretation: do not prioritize more recency-weighting or pretrain/fine-tune variations on the current MLP/v8-feature lane unless a new feature contract, architecture, or labeling change gives a specific reason to reopen that branch.
 135. The missing confidence-bucket comparison for the completed recent-bias variants is now filled in by [neural_direction_mlp_recentbias_conf_grid_20260401_neural_direction_confidence_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_recentbias_conf_grid_20260401_neural_direction_confidence_summary.json). It confirms the same practical conclusion as the broad reruns: the recent-bias variants do not displace the flat-history anchors as the current selective mainlines. On `6480`, the mild weighted `400k` setup reached about `51.90%` at top `10%`, about `52.37%` at top `5%`, about `55.13%` at top `2%`, and about `55.90%` at top `1%`, still worse than the flat `400k` confidence anchor (`53.86%`, `53.40%`, `56.41%`, `61.03%`). The staged `300k -> 100k` setup reached about `52.57%`, `52.98%`, `52.82%`, and `54.36%` on those same buckets, while the staged-plus-recency variant was weaker still at about `52.21%`, `51.75%`, `50.77%`, and `53.85%`. The only nuance is that the mild weighted `400k` setup improved a few isolated `10800` confidence buckets over flat `400k`, but not enough to overturn the overall ranking. Current interpretation: the current MLP/v8 lane’s best selective choices remain the flat-history anchors, especially flat `400k` for confidence-first selection.
+136. Thresholded selective-policy tooling is now implemented in [neural_direction_policy.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/neural_direction_policy.py) and [run_neural_direction_policy_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_neural_direction_policy_eval.py). It reuses saved neural-direction eval bundles, fits a validation-only temperature calibrator, converts target coverage fractions into chosen-side confidence thresholds on the validation slice, and then simulates fixed-size `Bull`/`Bear` bets on the test slice using the existing final-pool settlement/accounting path, including gas and treasury fee. The first bounded policy grid used flat `MLP @ 400k`, target coverages `10%`, `5%`, `2%`, and `1%`, and fixed bet sizes `0.05` and `0.10` BNB.
+137. The first settled selective-policy result is mixed and not broadly promotable. In [neural_direction_mlp_400k_policy_grid_20260401_neural_direction_policy_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/neural_direction_mlp_400k_policy_grid_20260401_neural_direction_policy_summary.json), the shorter `6480` horizon turned positive only at the tighter bands: target `2%` coverage translated to about `1.09%` actual mean bet rate and reached about `+0.01267 / 500` at `0.05` BNB and about `+0.01954 / 500` at `0.10` BNB, while target `1%` coverage translated to about `0.62%` actual bet rate and stayed modestly positive at about `+0.00679 / 500` and about `+0.01101 / 500`. The looser `10%` and `5%` bands remained negative even with win rates around `53.8%` to `54.9%`. On the longer `10800` horizon, every tested band stayed negative on average after real settlement, even though the selected-slice win rates were often above `54%`. Current interpretation: selected win `%` alone is not enough; the current direction-only confidence policy is not robust across horizons under final-pool settlement. The only clearly usable pocket so far is the short-horizon `6480` / target-`2%` lane, and even that is a small edge rather than a promotion-ready general policy.
 
 ## Operational Rules
 
@@ -234,16 +236,20 @@ through `110`.
 5. Continue neural tuning from the current mainline evidence:
    full-feature MLP first, TCN second, with future bounded work on larger
    windows, longer sequence designs, and more targeted ablations if needed.
-6. Convert the confidence-grid result into actual selective policy tests:
-   run thresholded skip-style evals for the main candidates, especially
-   `MLP @ 100k` and `MLP @ 400k`, using calibrated confidence cutoffs that map
-   to the promising `10%`, `5%`, `2%`, and `1%` coverage ranges.
-7. Treat the bounded recent-bias history-combination branch as answered for the
+6. Extend the first settled selective-policy pass deliberately rather than
+   assuming the confidence-grid ranking carries straight into `BNB`:
+   compare flat `MLP @ 100k` versus flat `MLP @ 400k` under the same
+   thresholded fixed-stake settlement path, and then decide whether the
+   profitable `6480` / target-`2%` pocket is reproducible or just localized.
+7. If the direction-only threshold policy remains mixed after that bounded
+   comparison, shift the next research branch toward payout-aware or
+   side-conditioned policy logic rather than more threshold-only tuning.
+8. Treat the bounded recent-bias history-combination branch as answered for the
    current MLP/v8-feature lane: it did not beat the flat `100k` or flat `400k`
    anchors, so further work should shift to selective-policy evaluation,
    feature-contract changes, or materially different model designs rather than
    more training-policy variations of the same lane.
-8. Keep the failed realized-net direct-action lane optional and disabled by
+9. Keep the failed realized-net direct-action lane optional and disabled by
    default as historical reference only; do not resume threshold tuning or the
    multi-offset shared-eval sweep for that lane unless a bounded comparison is
    explicitly requested.

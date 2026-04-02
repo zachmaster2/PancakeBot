@@ -213,3 +213,35 @@ Update on April 1, 2026:
     current confidence-first mainline. The mild weighted `400k` setup improved
     a few isolated `10800` buckets, but the overall selective ranking still
     stays with flat `MLP @ 400k`
+16. thresholded selective-policy evaluation is now implemented in
+    [neural_direction_policy.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/neural_direction_policy.py)
+    and
+    [run_neural_direction_policy_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_neural_direction_policy_eval.py).
+    The current first-pass policy is intentionally simple:
+    - direction = calibrated `Bull` if `p(Bull) >= 0.5`, else `Bear`
+    - skip if chosen-side calibrated confidence is below a threshold derived
+      from the validation slice
+    - fixed stake only
+    - settle against the true final pools with the existing gas/treasury
+      accounting path
+17. the first settled `MLP @ 400k` policy grid over target coverages `10%`,
+    `5%`, `2%`, and `1%` is mixed rather than broadly promotable. On the
+    shorter `6480` horizon, the only clearly positive average lane is the
+    tighter target-`2%` band, which translated to about `1.09%` actual mean
+    bet rate and reached about `+0.01267 / 500` at `0.05` BNB and about
+    `+0.01954 / 500` at `0.10` BNB. On `10800`, every tested band remained
+    negative on average after real settlement even when selected-slice win `%`
+    stayed above `54%`. This confirms that confidence-selected win `%` is not
+    sufficient by itself; final-pool economics can erase the broad-looking edge
+18. an important operational nuance from that first policy grid is that
+    validation-derived target coverage does not transfer perfectly to test
+    coverage. For example, target `2%` on `6480` became about `1.09%` actual
+    mean test bet rate, while target `5%` became about `3.14%`. Policy work
+    should therefore report both target coverage and realized test bet rate,
+    not assume they are identical
+19. current policy recommendation: do not promote the direction-only
+    confidence-threshold policy yet. The next bounded comparison should be
+    flat `MLP @ 100k` versus flat `MLP @ 400k` under the same fixed-stake
+    settlement path. If the direction-only threshold policy remains mixed after
+    that, the next design branch should be payout-aware or side-conditioned
+    policy logic rather than more threshold-only tuning
