@@ -224,6 +224,7 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
     def test_policy_aggregate_rows(self) -> None:
         rows = [
             NeuralDirectionPolicyEvalRow(
+                model_type="mlp",
                 source_rows_csv="rows.csv",
                 source_bundle_path="bundle.pt",
                 training_policy="flat",
@@ -232,6 +233,7 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
                 train_size=400000,
                 pretrain_size=0,
                 valid_size=3000,
+                seq_len=None,
                 target_coverage_fraction=0.05,
                 threshold_used=0.537,
                 bet_size_bnb=0.1,
@@ -251,6 +253,7 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
                 selected_max_confidence=0.65,
             ),
             NeuralDirectionPolicyEvalRow(
+                model_type="mlp",
                 source_rows_csv="rows.csv",
                 source_bundle_path="bundle.pt",
                 training_policy="flat",
@@ -259,6 +262,7 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
                 train_size=400000,
                 pretrain_size=0,
                 valid_size=3000,
+                seq_len=None,
                 target_coverage_fraction=0.05,
                 threshold_used=0.538,
                 bet_size_bnb=0.1,
@@ -280,7 +284,10 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
         ]
         aggregates = _aggregate_policy_rows(rows)
         self.assertEqual(1, len(aggregates))
+        self.assertEqual("mlp", aggregates[0].model_type)
         self.assertEqual("flat", aggregates[0].training_policy)
+        self.assertEqual(400000, aggregates[0].train_size)
+        self.assertIsNone(aggregates[0].seq_len)
         self.assertAlmostEqual(0.5375, aggregates[0].mean_threshold_used)
         self.assertAlmostEqual((0.09259 + 0.0463) / 2.0, aggregates[0].mean_profit_per_500_bnb)
 

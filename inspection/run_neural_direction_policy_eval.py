@@ -25,6 +25,11 @@ from pancakebot.domain.models.neural_direction_mlp import (
     load_neural_direction_mlp_bundle,
     predict_neural_direction_probabilities,
 )
+from pancakebot.domain.models.neural_direction_tcn import (
+    build_neural_direction_tcn_feature_sequences,
+    load_neural_direction_tcn_bundle,
+    predict_neural_direction_tcn_probabilities,
+)
 from pancakebot.domain.models.neural_direction_policy import (
     confidence_threshold_for_target_coverage,
     simulate_confidence_threshold_policy,
@@ -36,6 +41,7 @@ _DEFAULT_EXP_ROOT = "../PancakeBot_var_exp"
 
 @dataclass(frozen=True, slots=True)
 class _SourceEvalJob:
+    model_type: str
     source_rows_csv: str
     source_bundle_path: str
     training_policy: str
@@ -44,10 +50,12 @@ class _SourceEvalJob:
     train_size: int
     pretrain_size: int
     valid_size: int
+    seq_len: int | None
 
 
 @dataclass(frozen=True, slots=True)
 class NeuralDirectionPolicyEvalRow:
+    model_type: str
     source_rows_csv: str
     source_bundle_path: str
     training_policy: str
@@ -56,6 +64,7 @@ class NeuralDirectionPolicyEvalRow:
     train_size: int
     pretrain_size: int
     valid_size: int
+    seq_len: int | None
     target_coverage_fraction: float
     threshold_used: float
     bet_size_bnb: float
@@ -77,8 +86,13 @@ class NeuralDirectionPolicyEvalRow:
 
 @dataclass(frozen=True, slots=True)
 class NeuralDirectionPolicyEvalAggregateRow:
+    model_type: str
     training_policy: str
     sim_size: int
+    train_size: int
+    pretrain_size: int
+    valid_size: int
+    seq_len: int | None
     target_coverage_fraction: float
     bet_size_bnb: float
     num_offsets: int
@@ -152,8 +166,12 @@ def _load_source_jobs(*, rows_csvs: tuple[Path, ...]) -> list[_SourceEvalJob]:
         with rows_csv.open("r", newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             for source_row in reader:
+                seq_len_raw = source_row.get("seq_len")
+                seq_len = None if seq_len_raw in (None, "") else int(seq_len_raw)
+                model_type = "tcn" if seq_len is not None else "mlp"
                 out.append(
                     _SourceEvalJob(
+                        model_type=str(model_type),
                         source_rows_csv=str(rows_csv),
                         source_bundle_path=str(source_row["bundle_path"]),
                         training_policy=str(source_row.get("training_policy", "flat")),
@@ -162,6 +180,7 @@ def _load_source_jobs(*, rows_csvs: tuple[Path, ...]) -> list[_SourceEvalJob]:
                         train_size=int(source_row["train_size"]),
                         pretrain_size=int(source_row.get("pretrain_size", 0)),
                         valid_size=int(source_row["valid_size"]),
+                        seq_len=seq_len,
                     )
                 )
     if not out:
@@ -189,24 +208,46 @@ def _split_target_epochs(
 
 
 def _aggregate_rows(rows: list[NeuralDirectionPolicyEvalRow]) -> list[NeuralDirectionPolicyEvalAggregateRow]:
-    grouped: dict[tuple[str, int, float, float], list[NeuralDirectionPolicyEvalRow]] = {}
+    grouped: dict[tuple[str, str, int, int, int, int, int | None, float, float], list[NeuralDirectionPolicyEvalRow]] = {}
     for row in rows:
         key = (
+            str(row.model_type),
             str(row.training_policy),
             int(row.sim_size),
+            int(row.train_size),
+            int(row.pretrain_size),
+            int(row.valid_size),
+            None if row.seq_len is None else int(row.seq_len),
             float(row.target_coverage_fraction),
             float(row.bet_size_bnb),
         )
         grouped.setdefault(key, []).append(row)
     out: list[NeuralDirectionPolicyEvalAggregateRow] = []
-    for key in sorted(grouped, key=lambda item: (str(item[0]), int(item[1]), -float(item[2]), float(item[3]))):
+    for key in sorted(
+        grouped,
+        key=lambda item: (
+            str(item[0]),
+            str(item[1]),
+            int(item[2]),
+            int(item[3]),
+            int(item[4]),
+            -1 if item[6] is None else int(item[6]),
+            -float(item[7]),
+            float(item[8]),
+        ),
+    ):
         group = grouped[key]
         out.append(
             NeuralDirectionPolicyEvalAggregateRow(
-                training_policy=str(key[0]),
-                sim_size=int(key[1]),
-                target_coverage_fraction=float(key[2]),
-                bet_size_bnb=float(key[3]),
+                model_type=str(key[0]),
+                training_policy=str(key[1]),
+                sim_size=int(key[2]),
+                train_size=int(key[3]),
+                pretrain_size=int(key[4]),
+                valid_size=int(key[5]),
+                seq_len=None if key[6] is None else int(key[6]),
+                target_coverage_fraction=float(key[7]),
+                bet_size_bnb=float(key[8]),
                 num_offsets=int(len(group)),
                 mean_threshold_used=float(np.mean([row.threshold_used for row in group])),
                 mean_bet_rate=float(np.mean([row.bet_rate for row in group])),
@@ -252,16 +293,41 @@ def main() -> None:
             valid_size=int(job.valid_size),
             sim_size=int(job.sim_size),
         )
-        bundle = load_neural_direction_mlp_bundle(str(job.source_bundle_path))
-        probs_all = predict_neural_direction_probabilities(
-            bundle=bundle,
-            feature_matrix=np.asarray(dataset.feature_matrix, dtype=np.float32),
-        )
         index_by_epoch = {int(epoch): idx for idx, epoch in enumerate(dataset.target_epochs)}
         valid_idx = np.asarray([int(index_by_epoch[int(epoch)]) for epoch in valid_epochs], dtype=np.int64)
         test_idx = np.asarray([int(index_by_epoch[int(epoch)]) for epoch in test_epochs], dtype=np.int64)
-        valid_probs = np.asarray(probs_all[valid_idx], dtype=np.float32)
-        test_probs = np.asarray(probs_all[test_idx], dtype=np.float32)
+        if str(job.model_type) == "mlp":
+            bundle = load_neural_direction_mlp_bundle(str(job.source_bundle_path))
+            probs_all = predict_neural_direction_probabilities(
+                bundle=bundle,
+                feature_matrix=np.asarray(dataset.feature_matrix, dtype=np.float32),
+            )
+            valid_probs = np.asarray(probs_all[valid_idx], dtype=np.float32)
+            test_probs = np.asarray(probs_all[test_idx], dtype=np.float32)
+        elif str(job.model_type) == "tcn":
+            if job.seq_len is None:
+                raise InvariantError("neural_direction_policy_tcn_seq_len_missing")
+            bundle = load_neural_direction_tcn_bundle(str(job.source_bundle_path))
+            valid_sequences = build_neural_direction_tcn_feature_sequences(
+                dataset=dataset,
+                target_epochs=valid_epochs,
+                seq_len=int(job.seq_len),
+            )
+            test_sequences = build_neural_direction_tcn_feature_sequences(
+                dataset=dataset,
+                target_epochs=test_epochs,
+                seq_len=int(job.seq_len),
+            )
+            valid_probs = predict_neural_direction_tcn_probabilities(
+                bundle=bundle,
+                feature_sequences=valid_sequences,
+            )
+            test_probs = predict_neural_direction_tcn_probabilities(
+                bundle=bundle,
+                feature_sequences=test_sequences,
+            )
+        else:
+            raise InvariantError("neural_direction_policy_model_type_unknown")
         valid_y = np.asarray(dataset.labels[valid_idx], dtype=np.int64)
         calibrator = fit_temperature_calibrator_from_probs(
             bull_probs=valid_probs,
@@ -301,6 +367,7 @@ def main() -> None:
                 )
                 rows.append(
                     NeuralDirectionPolicyEvalRow(
+                        model_type=str(job.model_type),
                         source_rows_csv=str(job.source_rows_csv),
                         source_bundle_path=str(job.source_bundle_path),
                         training_policy=str(job.training_policy),
@@ -309,6 +376,7 @@ def main() -> None:
                         train_size=int(job.train_size),
                         pretrain_size=int(job.pretrain_size),
                         valid_size=int(job.valid_size),
+                        seq_len=None if job.seq_len is None else int(job.seq_len),
                         target_coverage_fraction=float(coverage_fraction),
                         threshold_used=float(threshold),
                         bet_size_bnb=float(bet_size_bnb),
@@ -331,11 +399,14 @@ def main() -> None:
         print(
             {
                 "phase": "job_done",
+                "model_type": str(job.model_type),
                 "job_index": int(job_idx),
                 "job_count": int(len(source_jobs)),
                 "training_policy": str(job.training_policy),
                 "sim_size": int(job.sim_size),
                 "tail_offset_rounds": int(job.tail_offset_rounds),
+                "train_size": int(job.train_size),
+                "seq_len": None if job.seq_len is None else int(job.seq_len),
             },
             flush=True,
         )
