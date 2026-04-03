@@ -10,6 +10,10 @@ from inspection.run_neural_direction_baselines import (
     NeuralDirectionBaselineRow,
     _aggregate_rows as _aggregate_baseline_rows,
 )
+from inspection.run_direction_tree_eval import (
+    DirectionTreeEvalRow,
+    _aggregate_rows as _aggregate_direction_tree_rows,
+)
 from inspection.run_neural_direction_policy_eval import (
     NeuralDirectionPolicyEvalRow,
     _aggregate_rows as _aggregate_policy_rows,
@@ -165,6 +169,45 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
         self.assertEqual(1, len(aggregates))
         self.assertAlmostEqual(0.54, aggregates[0].mean_test_win_rate)
         self.assertAlmostEqual(0.54, aggregates[0].mean_valid_win_rate)
+
+    def test_direction_tree_aggregate_rows(self) -> None:
+        rows = [
+            DirectionTreeEvalRow(
+                model_type="lightgbm",
+                sim_size=6480,
+                tail_offset_rounds=0,
+                train_size=100000,
+                valid_size=3000,
+                random_seed=1,
+                num_examples=109480,
+                feature_dim=120,
+                loaded_round_count=120000,
+                total_rounds_available=468000,
+                bundle_path="a.pkl",
+                valid_win_rate=0.54,
+                test_win_rate=0.53,
+            ),
+            DirectionTreeEvalRow(
+                model_type="lightgbm",
+                sim_size=6480,
+                tail_offset_rounds=432,
+                train_size=100000,
+                valid_size=3000,
+                random_seed=1,
+                num_examples=109480,
+                feature_dim=120,
+                loaded_round_count=120000,
+                total_rounds_available=468000,
+                bundle_path="b.pkl",
+                valid_win_rate=0.56,
+                test_win_rate=0.55,
+            ),
+        ]
+        aggregates = _aggregate_direction_tree_rows(rows)
+        self.assertEqual(1, len(aggregates))
+        self.assertEqual("lightgbm", aggregates[0].model_type)
+        self.assertAlmostEqual(0.54, aggregates[0].mean_test_win_rate)
+        self.assertAlmostEqual(0.55, aggregates[0].mean_valid_win_rate)
 
     def test_confidence_aggregate_rows_keep_training_policy(self) -> None:
         rows = [

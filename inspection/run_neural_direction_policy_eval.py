@@ -22,6 +22,10 @@ from pancakebot.domain.models.neural_direction_confidence import (
     chosen_side_confidence,
     fit_temperature_calibrator_from_probs,
 )
+from pancakebot.domain.models.direction_tree_model import (
+    load_direction_tree_bundle,
+    predict_direction_tree_probabilities,
+)
 from pancakebot.domain.models.neural_direction_dataset import (
     select_feature_columns_exact,
 )
@@ -412,6 +416,22 @@ def main() -> None:
             )
             index_by_epoch = {int(epoch): idx for idx, epoch in enumerate(dataset.target_epochs)}
             valid_idx = np.asarray([int(index_by_epoch[int(epoch)]) for epoch in valid_epochs], dtype=np.int64)
+            valid_y = np.asarray(dataset.labels[valid_idx], dtype=np.int64)
+        elif str(job.model_type) in ("lightgbm", "catboost"):
+            bundle = load_direction_tree_bundle(str(job.source_bundle_path))
+            dataset = select_feature_columns_exact(
+                dataset=dataset,
+                feature_columns=tuple(bundle.feature_columns),
+            )
+            index_by_epoch = {int(epoch): idx for idx, epoch in enumerate(dataset.target_epochs)}
+            valid_idx = np.asarray([int(index_by_epoch[int(epoch)]) for epoch in valid_epochs], dtype=np.int64)
+            test_idx = np.asarray([int(index_by_epoch[int(epoch)]) for epoch in test_epochs], dtype=np.int64)
+            probs_all = predict_direction_tree_probabilities(
+                bundle=bundle,
+                feature_matrix=np.asarray(dataset.feature_matrix, dtype=np.float32),
+            )
+            valid_probs = np.asarray(probs_all[valid_idx], dtype=np.float32)
+            test_probs = np.asarray(probs_all[test_idx], dtype=np.float32)
             valid_y = np.asarray(dataset.labels[valid_idx], dtype=np.int64)
         elif str(job.model_type) == "raw_tcn":
             valid_round_x, valid_kline_x, valid_snapshot_x, valid_y = build_raw_sequence_examples_for_target_epochs(
