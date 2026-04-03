@@ -205,30 +205,24 @@ def main() -> None:
     source_jobs = _load_source_jobs(rows_csvs=_parse_rows_csvs(args.rows_csvs))
 
     jobs_by_group: dict[tuple[int, int], list[_SourceEvalJob]] = {}
-    max_required_by_offset: dict[int, int] = {}
     for job in source_jobs:
         jobs_by_group.setdefault((int(job.sim_size), int(job.tail_offset_rounds)), []).append(job)
-        required = int(job.pretrain_size) + int(job.train_size) + int(job.valid_size) + int(job.sim_size)
-        if job.seq_len is not None:
-            required += int(job.seq_len) - 1
-        prev = max_required_by_offset.get(int(job.tail_offset_rounds))
-        if prev is None or int(required) > int(prev):
-            max_required_by_offset[int(job.tail_offset_rounds)] = int(required)
-
-    eval_slices_by_offset = {
-        int(offset): load_recent_direction_eval_slice(
-            config_path=str(args.config),
-            required_examples=int(required),
-            tail_offset_rounds=int(offset),
-        )
-        for offset, required in sorted(max_required_by_offset.items())
-    }
 
     round_rows: list[dict[str, object]] = []
     comparison_groups: list[dict[str, object]] = []
 
     for (sim_size, tail_offset_rounds), jobs in sorted(jobs_by_group.items()):
-        eval_slice = eval_slices_by_offset[int(tail_offset_rounds)]
+        required_examples = 0
+        for job in jobs:
+            needed = int(job.pretrain_size) + int(job.train_size) + int(job.valid_size) + int(job.sim_size)
+            if job.seq_len is not None:
+                needed += int(job.seq_len) - 1
+            required_examples = max(int(required_examples), int(needed))
+        eval_slice = load_recent_direction_eval_slice(
+            config_path=str(args.config),
+            required_examples=int(required_examples),
+            tail_offset_rounds=int(tail_offset_rounds),
+        )
         valid_epochs_ref: tuple[int, ...] | None = None
         test_epochs_ref: tuple[int, ...] | None = None
         valid_y_ref: np.ndarray | None = None
