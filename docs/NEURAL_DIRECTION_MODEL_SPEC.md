@@ -336,3 +336,54 @@ Update on April 1, 2026:
       the repo rather than altering the research direction
     - the existing feature-cache / reusable intermediate-data path should be
       treated as part of the mainline execution plan, not as optional cleanup
+
+Update on April 3, 2026:
+
+1. the tree-plus-ensemble branch is now complete. Broad tree support landed in
+   [direction_tree_model.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/direction_tree_model.py)
+   and
+   [run_direction_tree_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_direction_tree_eval.py),
+   and the shared confidence/policy runners now also support `lightgbm` and
+   `catboost` bundles
+2. `LightGBM` broad sweeps are complete across `20k`, `50k`, `75k`, `100k`,
+   `200k`, and `400k`, and the current broad winner is `LightGBM @ 50k` on all
+   finished horizons
+3. `CatBoost` broad sweeps are also complete across the same train-size ladder.
+   `CatBoost` is now the strongest finished single broad direction family:
+   `50k` is best on `6480` and `8640`, and `20k` is best on `10800`
+4. the aligned frozen base comparison is now recorded in
+   [direction_ensemble_frozen_manifest_final_20260403.csv](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_frozen_manifest_final_20260403.csv).
+   The final aligned sets are:
+   - `6480`: `MLP @ 100k`, `TCN @ 200k`, `LightGBM @ 50k`, `CatBoost @ 50k`
+   - `10800`: `MLP @ 400k`, `TCN @ 200k`, `LightGBM @ 50k`, `CatBoost @ 20k`
+5. the aligned ensemble comparison is complete in
+   [direction_ensemble_final_20260403_direction_ensemble_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_final_20260403_direction_ensemble_summary.json).
+   The calibrated soft ensemble is now the best broad aligned model on `6480`
+   at about `51.85%`, and it matches the best single-model broad result on
+   `10800` at about `51.46%`
+6. the simple stacked ensemble is explicitly disqualified as a broad mainline.
+   It fell to about `50.60%` on `6480` and about `50.56%` on `10800`, with
+   clear offset instability
+7. the finished confidence comparison for the aligned final set is now in
+   [direction_ensemble_analysis_20260403_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_analysis_20260403_summary.json).
+   On `6480`, the strongest aligned top-`2%` buckets are now the ensemble
+   lanes (`soft` about `58.43%`, `stacked` about `58.36%`), followed by
+   `CatBoost` at about `56.24%`. On `10800`, `MLP` is still the strongest
+   aligned top-`2%` single model at about `56.03%`
+8. the settled-policy comparison for the final aligned set is complete in
+   [direction_ensemble_final_20260403_direction_ensemble_policy_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_final_20260403_direction_ensemble_policy_summary.json).
+   The strongest broad short-horizon settled pocket is now `CatBoost` on
+   `6480` at target `10%` coverage and `0.05` `BNB`, about `+0.0538 / 500`.
+   The long-horizon `10800` settled-policy picture is still weak; only a few
+   very tight pockets are slightly positive
+9. current practical ranking:
+   - broad single-model direction mainline: `CatBoost`
+   - broad ensemble mainline: calibrated soft ensemble
+   - confidence-first aligned short-horizon lane: soft ensemble, then `CatBoost`
+   - current stacker: reject
+10. current next-step recommendation:
+    - do not spend more time on broad direction tuning first
+    - use `CatBoost` and the calibrated soft ensemble as the new direction
+      anchors
+    - move the next bounded branch to payout-aware policy research, especially
+      around the profitable `6480` `CatBoost` pocket
