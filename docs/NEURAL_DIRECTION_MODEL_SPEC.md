@@ -387,3 +387,37 @@ Update on April 3, 2026:
       anchors
     - move the next bounded branch to payout-aware policy research, especially
       around the profitable `6480` `CatBoost` pocket
+
+Update on April 3, 2026, latest-tail long-stream check:
+
+1. the market data tail was synced again before the long-stream check. Closed
+   rounds now extend through epoch `469584`, and klines now extend through
+   `1775249880000`
+2. a dedicated latest contiguous holdout is now complete in
+   [long_contiguous_holdout_report_20260403.md](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/long_contiguous_holdout_report_20260403.md).
+   This branch freezes one latest contiguous held-out stream of `50000` valid
+   `target_round` rows ending at the newest synced data
+3. broad direction ranking on that one long latest stream is different from the
+   earlier multi-offset ranking. In
+   [direction_ensemble_longstream_20260403_direction_ensemble_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_longstream_20260403_direction_ensemble_summary.json),
+   `MLP @ 400k` is the best broad model at about `50.806%`, `CatBoost @ 50k`
+   is close behind at about `50.640%`, and the soft ensemble drops to about
+   `50.390%`
+4. the single long latest stream also weakens the earlier confidence story.
+   In
+   [direction_ensemble_longstream_analysis_20260403_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_longstream_analysis_20260403_summary.json),
+   `MLP` is the strongest long-stream confidence lane, reaching about `52.29%`
+   at realized top-`2%` and about `54.53%` at realized top-`1%`, but the
+   earlier shorter multi-offset confidence pockets do not carry over cleanly
+5. the most important latest-tail result is policy, not broad win `%`. In
+   [direction_ensemble_longstream_20260403_direction_ensemble_policy_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_longstream_20260403_direction_ensemble_policy_summary.json),
+   every tested thresholded settled-policy lane on the latest `50000`-round
+   stream is negative after final-pool settlement, treasury fee, and gas. The
+   least-bad tested pocket is only `MLP`, target `1%`, `0.05` `BNB`, at about
+   `-0.0192 / 500`
+6. current interpretation after the long-stream check:
+   - broad direction signal still exists
+   - but the current threshold-only policy shape does not compound positive
+     `BNB` over a long latest-tail stream
+   - this strengthens the recommendation to move next into payout-aware policy
+     logic rather than more threshold-only direction selection
