@@ -295,3 +295,36 @@ Update on April 1, 2026:
     keep the raw-sequence branch as recorded historical work, but do not push
     this exact simple fixed-bin raw branch into settled-policy evaluation or
     broader grid expansion
+27. the next direction-model branch is no longer "more neural knob tuning."
+    The next execution plan is:
+    - add broad `CatBoost` direction runners on the same causal feature set
+    - add broad `LightGBM` direction runners on the same causal feature set
+    - sweep `train_size` for those tree models exactly as was done for the
+      neural models (`20k`, `50k`, `75k`, `100k`, `200k`, `400k`)
+    - freeze the best broad setup per family
+    - compare frozen `CatBoost`, `LightGBM`, `MLP`, and `TCN` on the same
+      aligned validation/test windows
+    - build a calibrated soft ensemble first
+    - then build a simple stacked ensemble over the base-model probabilities
+28. when multiple base models are used, all base models must share the same
+    `valid` and `test` windows for a given comparison, but each family may keep
+    its own best `train_size`. In other words, the right edge of the split is
+    aligned across models, while the left edge of the training block may differ
+    by model family.
+29. the first ensemble implementation should stay simple and one-source at
+    runtime:
+    - each base model outputs calibrated `p(Bull)` for every valid
+      `target_round`
+    - a soft ensemble averages those calibrated probabilities
+    - a stacked ensemble trains one small combiner on validation-slice base
+      predictions
+    - runtime still exposes one final `p(Bull)` and one final direction
+30. result visualization preference is now explicit: when the experiment
+    supports it, prefer round-based or time-based continuous views over
+    discrete knob charts. Good default views are:
+    - rolling win `%` over rounds
+    - rolling confidence-selected win `%` over rounds
+    - cumulative net `BNB` over rounds
+    - per-model probability traces or agreement/disagreement over rounds
+    Discrete knob plots are still acceptable for compact ablations, but they
+    are no longer the preferred default presentation.
