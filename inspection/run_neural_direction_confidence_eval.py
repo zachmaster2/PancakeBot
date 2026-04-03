@@ -21,6 +21,10 @@ from pancakebot.domain.models.neural_direction_confidence import (
     fit_temperature_calibrator_from_probs,
     summarize_confidence_buckets,
 )
+from pancakebot.domain.models.direction_tree_model import (
+    load_direction_tree_bundle,
+    predict_direction_tree_probabilities,
+)
 from pancakebot.domain.models.neural_direction_mlp import (
     load_neural_direction_mlp_bundle,
     predict_neural_direction_probabilities,
@@ -118,7 +122,7 @@ class _SourceEvalJob:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.toml")
-    parser.add_argument("--model-type", type=str, choices=("mlp", "tcn", "raw_tcn"), required=True)
+    parser.add_argument("--model-type", type=str, choices=("mlp", "tcn", "raw_tcn", "lightgbm", "catboost"), required=True)
     parser.add_argument("--name-prefix", type=str, required=True)
     parser.add_argument("--rows-csvs", type=str, required=True)
     parser.add_argument("--coverage-fractions", type=str, default="1.0,0.75,0.5,0.25,0.10,0.05,0.02,0.01")
@@ -269,6 +273,26 @@ def _tcn_probs_for_epochs(*, bundle_path: str, eval_slice, seq_len: int, valid_e
         np.asarray(test_probs, dtype=np.float32),
         np.asarray(test_y, dtype=np.int64),
     )
+
+
+def _tree_probs_for_epochs(*, bundle_path: str, eval_slice, valid_epochs, test_epochs) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    bundle = load_direction_tree_bundle(str(bundle_path))
+    dataset = select_feature_columns_exact(
+        dataset=eval_slice.dataset,
+        feature_columns=tuple(bundle.feature_columns),
+    )
+    probs_all = predict_direction_tree_probabilities(
+        bundle=bundle,
+        feature_matrix=np.asarray(dataset.feature_matrix, dtype=np.float32),
+    )
+    index_by_epoch = {int(epoch): idx for idx, epoch in enumerate(dataset.target_epochs)}
+    valid_idx = np.asarray([int(index_by_epoch[int(epoch)]) for epoch in valid_epochs], dtype=np.int64)
+    test_idx = np.asarray([int(index_by_epoch[int(epoch)]) for epoch in test_epochs], dtype=np.int64)
+    valid_probs = np.asarray(probs_all[valid_idx], dtype=np.float32)
+    test_probs = np.asarray(probs_all[test_idx], dtype=np.float32)
+    valid_y = np.asarray(dataset.labels[valid_idx], dtype=np.int64)
+    test_y = np.asarray(dataset.labels[test_idx], dtype=np.int64)
+    return valid_probs, valid_y, test_probs, test_y
 
 
 def _raw_tcn_probs_for_epochs(
@@ -451,6 +475,13 @@ def main() -> None:
                 bundle_path=str(job.source_bundle_path),
                 eval_slice=eval_slice,
                 seq_len=int(job.seq_len),
+                valid_epochs=valid_epochs,
+                test_epochs=test_epochs,
+            )
+        elif str(model_type) in ("lightgbm", "catboost"):
+            valid_probs, valid_y, test_probs, test_y = _tree_probs_for_epochs(
+                bundle_path=str(job.source_bundle_path),
+                eval_slice=eval_slice,
                 valid_epochs=valid_epochs,
                 test_epochs=test_epochs,
             )
