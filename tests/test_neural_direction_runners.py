@@ -18,6 +18,10 @@ from inspection.run_neural_direction_policy_eval import (
     NeuralDirectionPolicyEvalRow,
     _aggregate_rows as _aggregate_policy_rows,
 )
+from inspection.run_direction_ensemble_policy_eval import (
+    DirectionEnsemblePolicyEvalRow,
+    _aggregate_rows as _aggregate_direction_ensemble_policy_rows,
+)
 from inspection.run_neural_direction_raw_tcn_eval import (
     NeuralDirectionRawTcnEvalRow,
     _aggregate_rows as _aggregate_raw_tcn_rows,
@@ -403,6 +407,59 @@ class NeuralDirectionRunnerTests(unittest.TestCase):
         self.assertEqual(16, aggregates[0].settled_history_len)
         self.assertEqual(64, aggregates[0].kline_seq_len)
         self.assertAlmostEqual(0.53, aggregates[0].mean_test_win_rate)
+
+    def test_direction_ensemble_policy_aggregate_rows(self) -> None:
+        rows = [
+            DirectionEnsemblePolicyEvalRow(
+                model_name="soft",
+                sim_size=6480,
+                tail_offset_rounds=0,
+                target_coverage_fraction=0.02,
+                threshold_used=0.55,
+                bet_size_bnb=0.1,
+                num_rounds=6480,
+                num_bets=70,
+                num_wins=40,
+                num_skips_below_threshold=6410,
+                num_skips_insufficient_bankroll=0,
+                bet_rate=70 / 6480,
+                win_rate=40 / 70,
+                net_profit_bnb=0.8,
+                profit_per_500_bnb=0.0617,
+                max_drawdown_bnb=0.5,
+                final_bankroll_bnb=50.8,
+                selected_mean_confidence=0.57,
+                selected_min_confidence=0.55,
+                selected_max_confidence=0.63,
+            ),
+            DirectionEnsemblePolicyEvalRow(
+                model_name="soft",
+                sim_size=6480,
+                tail_offset_rounds=432,
+                target_coverage_fraction=0.02,
+                threshold_used=0.56,
+                bet_size_bnb=0.1,
+                num_rounds=6480,
+                num_bets=68,
+                num_wins=39,
+                num_skips_below_threshold=6412,
+                num_skips_insufficient_bankroll=0,
+                bet_rate=68 / 6480,
+                win_rate=39 / 68,
+                net_profit_bnb=0.4,
+                profit_per_500_bnb=0.0309,
+                max_drawdown_bnb=0.7,
+                final_bankroll_bnb=50.4,
+                selected_mean_confidence=0.58,
+                selected_min_confidence=0.56,
+                selected_max_confidence=0.64,
+            ),
+        ]
+        aggregates = _aggregate_direction_ensemble_policy_rows(rows)
+        self.assertEqual(1, len(aggregates))
+        self.assertEqual("soft", aggregates[0].model_name)
+        self.assertAlmostEqual(0.555, aggregates[0].mean_threshold_used)
+        self.assertAlmostEqual((0.0617 + 0.0309) / 2.0, aggregates[0].mean_profit_per_500_bnb)
 
 
 if __name__ == "__main__":
