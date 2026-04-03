@@ -228,6 +228,13 @@ Current interpretation: the runtime-controller branch is alive, but it is not ro
     - checkpoint reports must be written to disk under `../PancakeBot_var_exp/`, not emitted in chat while the run is in progress
     - disk pressure should be handled by deleting or archiving old experiment data outside the repo rather than changing the research direction or cutting corners
     - the existing feature-cache / reusable intermediate-data path should be actively used to avoid recomputing the same causal feature tables more than once
+152. On April 3, 2026, the tree-plus-ensemble direction branch was completed. Broad tree-model support now exists in [direction_tree_model.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/direction_tree_model.py) and [run_direction_tree_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_direction_tree_eval.py), and the shared confidence/policy runners now support `lightgbm` and `catboost` bundles alongside the existing `MLP` and `TCN` lanes.
+153. The full broad `LightGBM` sweep is complete across train sizes `20k`, `50k`, `75k`, `100k`, `200k`, and `400k`. [direction_tree_lightgbm_grid_t50000_20260402_direction_tree_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_tree_lightgbm_grid_t50000_20260402_direction_tree_eval_summary.json) is the winner on all finished horizons: about `51.57%` on `6480`, about `51.30%` on `8640`, and about `51.34%` on `10800`.
+154. The full broad `CatBoost` sweep is also complete across the same train-size ladder. `CatBoost` became the strongest finished single broad direction family overall: [direction_tree_catboost_grid_t50000_20260403_direction_tree_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_tree_catboost_grid_t50000_20260403_direction_tree_eval_summary.json) is best on `6480` (about `51.71%`) and `8640` (about `51.63%`), while [direction_tree_catboost_grid_t20000_20260403_direction_tree_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_tree_catboost_grid_t20000_20260403_direction_tree_eval_summary.json) is best on `10800` (about `51.46%`). The large-history `400k` CatBoost run, in [direction_tree_catboost_grid_t400000_20260403_direction_tree_eval_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_tree_catboost_grid_t400000_20260403_direction_tree_eval_summary.json), stayed competitive but did not overtake the smaller-window winners.
+155. The aligned frozen base comparison is now recorded in [direction_ensemble_frozen_manifest_final_20260403.csv](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_frozen_manifest_final_20260403.csv). The final broad comparison used `MLP @ 100k`, `TCN @ 200k`, `LightGBM @ 50k`, and `CatBoost @ 50k` on `6480`, and `MLP @ 400k`, `TCN @ 200k`, `LightGBM @ 50k`, and `CatBoost @ 20k` on `10800`.
+156. The aligned ensemble results are complete in [direction_ensemble_final_20260403_direction_ensemble_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_final_20260403_direction_ensemble_summary.json). The calibrated soft ensemble is now the best broad aligned direction model on `6480`, with about `51.85%` mean test win `%`, beating every single frozen base model. On `10800`, the soft ensemble matched the best single-model broad result at about `51.46%`, effectively tying the `CatBoost` winner. The simple stacked ensemble is explicitly disqualified as a broad mainline: it dropped to about `50.60%` on `6480` and about `50.56%` on `10800`, with clear offset instability.
+157. The finished ensemble rows also answer the confidence question for the aligned final set. In [direction_ensemble_analysis_20260403_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_analysis_20260403_summary.json), the strongest top-`2%` aligned confidence buckets on `6480` are the ensemble lanes (`soft` about `58.43%`, `stacked` about `58.36%`), followed by `CatBoost` at about `56.24%`. On `10800`, the best aligned top-`2%` confidence lane is still `MLP` at about `56.03%`, followed by `soft` at about `54.91%`. So the current ranking is split: broad direction mainline is now `CatBoost` or `soft`, but the selective-confidence picture is still not owned by one family on every horizon.
+158. The settled-policy comparison for the finished final set is complete in [direction_ensemble_final_20260403_direction_ensemble_policy_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_final_20260403_direction_ensemble_policy_summary.json). The strongest broad short-horizon settled pocket is now `CatBoost` on `6480` at target `10%` coverage and `0.05` `BNB`, about `+0.0538 / 500`. Tight `TCN` and `stacked` pockets still produced some positive `1%` or `2%` niches on `6480`, but they are not broad winners. On `10800`, the settled-policy picture remains weak; only a few very tight pockets are slightly positive, and the broad ensemble lanes stayed negative after real settlement. Current decision: broad direction mainline should move to `CatBoost`, any ensemble use should prefer calibrated soft averaging, the current stacker should not be promoted, and the next bounded research step should be payout-aware policy work around the profitable `6480` `CatBoost`/soft direction anchors rather than more broad direction tuning.
 
 ## Operational Rules
 
@@ -248,33 +255,20 @@ The older controller-focused and direct-action items below are now historical.
 They are superseded by the neural direction pivot recorded in items `107`
 through `110`.
 
-1. Freeze the binary label contract for valid `target_round` rows:
-   `Bull`/`Bear` only, excluding `House`, failed, and other unusable rounds.
-2. Build the first canonical baselines for headline out-of-sample win `%`:
-   `always_bull`, `always_bear`, and one trivial prior-side baseline.
-3. Implement the simple neural sanity baseline (`MLP`) against the canonical
-   causal input contract.
-4. Implement the first real neural sequence mainline (`TCN`) using settled
-   `outcome_eligible_prior_context_rounds`, a `locked_round` snapshot, a
-   `target_round` cutoff snapshot, and cutoff-anchored `context_klines`.
-5. Continue neural tuning from the current mainline evidence:
-   full-feature MLP first, TCN second, with future bounded work on larger
-   windows, longer sequence designs, and more targeted ablations if needed.
-6. The settled-policy ranking is now split by horizon rather than solved by one
-   model: short-horizon `6480` currently favors tight TCN pockets (`100k` or
-   `200k`, `seq_len=16`, target `1%`), while longer-horizon `10800` now favors
-   flat `MLP @ 100k` at target `1%` or `2%`.
-7. The next bounded decision step should be to choose whether the project wants
-   a single compromise policy or is willing to accept horizon-specific
-   candidates. If a single general policy is required, the current evidence
-   still points toward payout-aware or side-conditioned policy logic rather
-   than more threshold-only tuning.
-8. Treat the bounded recent-bias history-combination branch as answered for the
-   current MLP/v8-feature lane: it did not beat the flat `100k` or flat `400k`
-   anchors, so further work should shift to selective-policy evaluation,
-   feature-contract changes, or materially different model designs rather than
-   more training-policy variations of the same lane.
-9. Keep the failed realized-net direct-action lane optional and disabled by
-   default as historical reference only; do not resume threshold tuning or the
-   multi-offset shared-eval sweep for that lane unless a bounded comparison is
-   explicitly requested.
+1. Treat `CatBoost` as the new broad single-model direction mainline, replacing
+   the old neural-only assumption that `MLP @ 100k` was the default broad
+   anchor.
+2. Treat the calibrated soft ensemble as the only currently acceptable ensemble
+   lane; the simple stacked combiner is disqualified until a materially better
+   meta-model design is justified by new evidence.
+3. Keep the project runtime contract simple even if multiple base models are
+   used internally: one final calibrated `p(Bull)` and one final direction.
+4. Prioritize payout-aware policy research next, using the profitable `6480`
+   `CatBoost` and soft-ensemble anchors as the starting point. The open blocker
+   is now payout/policy quality, not broad direction quality.
+5. Treat `10800` as still unresolved under real settlement. Broad direction is
+   now stronger there, but the finished threshold-only settled-policy lanes are
+   still mostly negative.
+6. Keep the failed realized-net direct-action lane and the simple raw-sequence
+   `TCN` lane as historical reference only; do not resume them unless a
+   bounded comparison is explicitly requested.
