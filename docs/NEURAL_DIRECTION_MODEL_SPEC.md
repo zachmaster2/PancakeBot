@@ -328,3 +328,11 @@ Update on April 1, 2026:
     - per-model probability traces or agreement/disagreement over rounds
     Discrete knob plots are still acceptable for compact ablations, but they
     are no longer the preferred default presentation.
+31. the execution details for the next tree-plus-ensemble branch are now
+    frozen in [ENSEMBLE_DIRECTION_EXECUTION_PLAN.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/ENSEMBLE_DIRECTION_EXECUTION_PLAN.md).
+    That plan also makes explicit that:
+    - checkpoint reports should be written to disk, not chat
+    - disk pressure should be handled by pruning or archiving artifacts outside
+      the repo rather than altering the research direction
+    - the existing feature-cache / reusable intermediate-data path should be
+      treated as part of the mainline execution plan, not as optional cleanup

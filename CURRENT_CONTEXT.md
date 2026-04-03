@@ -224,6 +224,10 @@ Current interpretation: the runtime-controller branch is alive, but it is not ro
 148. Ensemble window handling is now explicit. For a given comparison, all base models must share the same `valid` and `test` windows, but each family may keep its own best `train_size`. That means the split right edge is aligned across models while the training left edge may differ by model family. `TCN` still needs its additional `seq_len - 1` warmup context, but that warmup is context only, not extra labeled train data.
 149. The first ensemble runtime contract should stay simple and one-source. Multiple base models may exist internally, but runtime should still emit one final calibrated `p(Bull)` and one final `Bull`/`Bear` direction. Do not drift into a controller-style multi-owner runtime stack.
 150. Plotting preference is now explicit: when possible, prefer round-based or time-based continuous views over discrete knob charts. Preferred visuals are rolling win `%`, rolling confidence-selected win `%`, cumulative settled `BNB`, and per-model probability/agreement traces over rounds. Discrete knob plots remain acceptable for bounded ablations, but they are no longer the preferred default way to inspect model behavior.
+151. The detailed execution contract for the next branch is now frozen in [ENSEMBLE_DIRECTION_EXECUTION_PLAN.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/ENSEMBLE_DIRECTION_EXECUTION_PLAN.md). That plan makes three additional operator instructions explicit:
+    - checkpoint reports must be written to disk under `../PancakeBot_var_exp/`, not emitted in chat while the run is in progress
+    - disk pressure should be handled by deleting or archiving old experiment data outside the repo rather than changing the research direction or cutting corners
+    - the existing feature-cache / reusable intermediate-data path should be actively used to avoid recomputing the same causal feature tables more than once
 
 ## Operational Rules
 
