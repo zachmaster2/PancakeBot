@@ -240,6 +240,30 @@ Current interpretation: the runtime-controller branch is alive, but it is not ro
 161. The broad long-stream direction result is materially different from the earlier multi-offset ranking. On the single latest `50000`-round stream, [direction_ensemble_longstream_20260403_direction_ensemble_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_longstream_20260403_direction_ensemble_summary.json) shows `MLP @ 400k` as the best broad model at about `50.806%`, with `CatBoost @ 50k` close behind at about `50.640%`. The calibrated soft ensemble did not help on this one long latest stream; it fell to about `50.390%`, and the stacked ensemble stayed slightly worse still. Current interpretation: the broad multi-offset advantage of soft averaging does not automatically transfer to one long latest-tail stream.
 162. The long-stream confidence ordering also shifted. In [direction_ensemble_longstream_analysis_20260403_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_longstream_analysis_20260403_summary.json), `MLP` is the strongest current long-stream confidence lane: about `52.07%` at realized top-`10%`, about `52.29%` at realized top-`2%`, and about `54.53%` at realized top-`1%`. `CatBoost` is strongest at the long-stream aligned top-`2%` bucket after `MLP` is accounted for on broad/top-`1%` slices, but the ordering is weaker and less profitable than the earlier shorter multi-offset pockets.
 163. Most importantly, every tested thresholded settled-policy lane on the single latest `50000`-round stream is negative after final-pool settlement, treasury fee, and gas. The best tested long-stream policy pocket is only [direction_ensemble_longstream_20260403_direction_ensemble_policy_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/direction_ensemble_longstream_20260403_direction_ensemble_policy_summary.json) `MLP`, target `1%`, `0.05` `BNB`, at about `-0.0192 / 500`; `CatBoost`, target `2%`, `0.05` `BNB`, is close behind at about `-0.0207 / 500`. The long-stream cumulative plots in [long_contiguous_holdout_report_20260403.md](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/long_contiguous_holdout_report_20260403.md) show that even where broad win `%` stays above `50%`, cumulative `BNB` still drifts downward over the long latest-tail run. Current decision: the long-stream result strengthens the conclusion that payout-aware policy logic, not more threshold-only direction selection, is now the main blocker.
+164. On April 3, 2026, the first fixed-stake payout-aware branch landed in [payout_aware_tree_model.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/payout_aware_tree_model.py), [payout_aware_policy.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/payout_aware_policy.py), [run_payout_aware_policy_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_payout_aware_policy_eval.py), and [run_payout_aware_policy_analysis.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_payout_aware_policy_analysis.py). The runner now supports two payout targets:
+    - `direct_net`: regress realized side-specific net directly
+    - `win_profit_residual`: regress the residual from cutoff-time naive win payout to realized final-settlement win payout, then combine that with a separate direction probability source
+165. The first direct side-net payout-aware runs did not qualify on the latest contiguous `50000`-round stream. The least-bad finished direct row was still negative: [payoutaware_longstream_lightgbm_20260403_payout_aware_policy_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/payoutaware_longstream_lightgbm_20260403_payout_aware_policy_summary.json) `lightgbm`, `train=400k`, reached only about `-0.0739 / 500`, while the analogous direct `catboost` rows were materially worse.
+166. The residual payout decomposition is the first branch that turned the latest contiguous `50000`-round stream positive under full settlement. In [payoutaware_residual_cat_mlp_20260403_payout_aware_policy_summary.json](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/payoutaware_residual_cat_mlp_20260403_payout_aware_policy_summary.json), the current winner is:
+    - payout model `catboost`
+    - target mode `win_profit_residual`
+    - direction source `mlp`
+    - payout-model train size `400000`
+    - fixed stake `0.05` `BNB`
+    - final latest-`50k` result about `+3.795205 BNB`, or about `+0.037952 / 500`
+    - bet rate about `8.87%`
+    - win rate about `50.53%`
+    - max drawdown about `3.216 BNB`
+167. The durable long-stream report for that positive branch is [payout_aware_longstream_report_20260403.md](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/payout_aware_longstream_report_20260403.md). Its best-curve diagnostics for the winning row are:
+    - cumulative minimum about `-1.482350 BNB`
+    - cumulative maximum about `+4.617233 BNB`
+    - final cumulative value about `+3.795205 BNB`
+    - about `81.86%` of held-out rounds spent at nonnegative cumulative profit
+    - main continuous plots:
+      - [payout_aware_longstream_report_20260403_cumulative_bnb_all.png](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/payout_aware_longstream_report_20260403_cumulative_bnb_all.png)
+      - [payout_aware_longstream_report_20260403_cumulative_bnb_best.png](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/payout_aware_longstream_report_20260403_cumulative_bnb_best.png)
+      - [payout_aware_longstream_report_20260403_rolling_profit_per500_best.png](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/payout_aware_longstream_report_20260403_rolling_profit_per500_best.png)
+168. Nearby payout-aware variants were checked before locking the current winner. The same residual decomposition with `catboost` as the direction source turned negative on the long stream (about `-0.0426 / 500`), while `mean2_mlp_catboost` stayed positive but weaker (about `+0.0294 / 500`). Current interpretation: for the current latest-tail standard, `MLP` is the best direction source inside the payout-aware residual policy even though `CatBoost` remained the stronger broad single-model direction family on earlier aligned comparisons.
 
 ## Operational Rules
 
@@ -281,3 +305,8 @@ through `110`.
    live-like sanity check currently available. It says the direction models
    still have signal, but that the current threshold-only policy shape does not
    compound positive `BNB` on a long latest-tail stream.
+8. Treat the payout-aware residual branch as the new policy mainline. The
+   current best latest-tail result is `catboost` payout modeling with target
+   mode `win_profit_residual`, direction source `mlp`, `train=400k`, and
+   fixed `0.05` `BNB`, which is the first branch to make the latest contiguous
+   `50000`-round stream positive under full settlement.
