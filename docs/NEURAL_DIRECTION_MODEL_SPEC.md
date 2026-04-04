@@ -421,3 +421,34 @@ Update on April 3, 2026, latest-tail long-stream check:
      `BNB` over a long latest-tail stream
    - this strengthens the recommendation to move next into payout-aware policy
      logic rather than more threshold-only direction selection
+7. the first payout-aware fixed-stake branch is now implemented in
+   [payout_aware_tree_model.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/payout_aware_tree_model.py),
+   [payout_aware_policy.py](/C:/Users/zking/Documents/GitHub/PancakeBot/pancakebot/domain/models/payout_aware_policy.py),
+   [run_payout_aware_policy_eval.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_payout_aware_policy_eval.py),
+   and
+   [run_payout_aware_policy_analysis.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_payout_aware_policy_analysis.py)
+8. two payout targets now exist:
+   - `direct_net`: regress realized side-specific net directly
+   - `win_profit_residual`: regress the residual from cutoff-time naive win
+     payout to realized final-settlement win payout, then combine it with a
+     separate direction probability source
+9. the direct side-net payout-aware branch did not qualify on the latest
+   contiguous `50k` holdout. The best finished direct row remained negative
+10. the residual payout decomposition is the first branch to turn the latest
+    contiguous `50k` stream positive. The current winner is:
+    - payout model `catboost`
+    - target mode `win_profit_residual`
+    - direction source `mlp`
+    - payout-model train size `400k`
+    - fixed stake `0.05` `BNB`
+    - latest `50k` result about `+3.795205 BNB`, or about `+0.037952 / 500`
+11. the durable latest-tail report is
+    [payout_aware_longstream_report_20260403.md](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/payout_aware_longstream_report_20260403.md)
+12. nearby residual variants confirm that direction source matters inside the
+    payout-aware branch: `catboost` direction source turned negative on the
+    latest-tail stream, while `mean2_mlp_catboost` stayed positive but weaker
+13. current recommendation:
+    - stop treating threshold-only direction selection as the main policy lane
+    - treat the residual payout-aware branch as the current policy mainline
+    - optimize that branch for smoother cumulative growth and/or higher final
+      `BNB`
