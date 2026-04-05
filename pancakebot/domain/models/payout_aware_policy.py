@@ -12,6 +12,30 @@ from pancakebot.domain.types import Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
 
+def _profit_if_side_wins_from_projected_pools(
+    *,
+    projected_bull_pool_bnb: float,
+    projected_bear_pool_bnb: float,
+    bet_size_bnb: float,
+    bet_side: str,
+    treasury_fee_fraction: float,
+) -> float:
+    if float(bet_size_bnb) <= 0.0:
+        raise InvariantError("payout_aware_projected_profit_bet_size_nonpositive")
+    bet_side_u = str(bet_side).upper()
+    if bet_side_u not in ("BULL", "BEAR"):
+        raise InvariantError("payout_aware_projected_profit_side_invalid")
+    bull_after = float(projected_bull_pool_bnb) + (float(bet_size_bnb) if bet_side_u == "BULL" else 0.0)
+    bear_after = float(projected_bear_pool_bnb) + (float(bet_size_bnb) if bet_side_u == "BEAR" else 0.0)
+    total_after = float(bull_after) + float(bear_after)
+    denom = float(bull_after) if bet_side_u == "BULL" else float(bear_after)
+    if float(denom) <= 0.0 or float(total_after) <= 0.0:
+        return -float(GAS_COST_CLAIM_BNB) - float(GAS_COST_BET_BNB)
+    payout_multiple = float(total_after) * (1.0 - float(treasury_fee_fraction)) / float(denom)
+    credit_bnb = float(bet_size_bnb) * float(payout_multiple) - float(GAS_COST_CLAIM_BNB)
+    return float(credit_bnb) - float(bet_size_bnb) - float(GAS_COST_BET_BNB)
+
+
 @dataclass(frozen=True, slots=True)
 class PayoutAwarePolicyTraceRow:
     target_epoch: int
@@ -106,15 +130,47 @@ def naive_cutoff_profit_if_side_wins(
     )
     bull_pool_bnb = float(pools_wei.bull_wei) / float(BNB_WEI)
     bear_pool_bnb = float(pools_wei.bear_wei) / float(BNB_WEI)
-    bull_after = float(bull_pool_bnb) + (float(bet_size_bnb) if bet_side_u == "BULL" else 0.0)
-    bear_after = float(bear_pool_bnb) + (float(bet_size_bnb) if bet_side_u == "BEAR" else 0.0)
-    total_after = float(bull_after) + float(bear_after)
-    denom = float(bull_after) if bet_side_u == "BULL" else float(bear_after)
-    if float(denom) <= 0.0 or float(total_after) <= 0.0:
-        return -float(GAS_COST_CLAIM_BNB) - float(GAS_COST_BET_BNB)
-    payout_multiple = float(total_after) * (1.0 - float(treasury_fee_fraction)) / float(denom)
-    credit_bnb = float(bet_size_bnb) * float(payout_multiple) - float(GAS_COST_CLAIM_BNB)
-    return float(credit_bnb) - float(bet_size_bnb) - float(GAS_COST_BET_BNB)
+    return _profit_if_side_wins_from_projected_pools(
+        projected_bull_pool_bnb=float(bull_pool_bnb),
+        projected_bear_pool_bnb=float(bear_pool_bnb),
+        bet_size_bnb=float(bet_size_bnb),
+        bet_side=str(bet_side_u),
+        treasury_fee_fraction=float(treasury_fee_fraction),
+    )
+
+
+def projected_profit_if_side_wins(
+    *,
+    round_closed: Round,
+    bet_size_bnb: float,
+    bet_side: str,
+    treasury_fee_fraction: float,
+    cutoff_seconds: int,
+    pred_late_inflow_total_bnb: float,
+    pred_late_inflow_bull_frac: float,
+) -> float:
+    if round_closed.lock_at is None:
+        raise InvariantError("payout_aware_projected_profit_round_unlocked")
+    if int(cutoff_seconds) < 0:
+        raise InvariantError("payout_aware_projected_profit_cutoff_seconds_negative")
+    late_total = max(0.0, float(pred_late_inflow_total_bnb))
+    late_bull_frac = min(1.0, max(0.0, float(pred_late_inflow_bull_frac)))
+    cutoff_ts = int(round_closed.lock_at) - int(cutoff_seconds)
+    pools_wei = compute_pool_amounts_wei_at_or_before(
+        bets=round_closed.bets,
+        cutoff_ts=int(cutoff_ts),
+    )
+    cutoff_bull_pool_bnb = float(pools_wei.bull_wei) / float(BNB_WEI)
+    cutoff_bear_pool_bnb = float(pools_wei.bear_wei) / float(BNB_WEI)
+    projected_bull_pool_bnb = float(cutoff_bull_pool_bnb) + float(late_total) * float(late_bull_frac)
+    projected_bear_pool_bnb = float(cutoff_bear_pool_bnb) + float(late_total) * (1.0 - float(late_bull_frac))
+    return _profit_if_side_wins_from_projected_pools(
+        projected_bull_pool_bnb=float(projected_bull_pool_bnb),
+        projected_bear_pool_bnb=float(projected_bear_pool_bnb),
+        bet_size_bnb=float(bet_size_bnb),
+        bet_side=str(bet_side),
+        treasury_fee_fraction=float(treasury_fee_fraction),
+    )
 
 
 def simulate_payout_aware_policy(

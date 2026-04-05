@@ -452,3 +452,26 @@ Update on April 3, 2026, latest-tail long-stream check:
     - treat the residual payout-aware branch as the current policy mainline
     - optimize that branch for smoother cumulative growth and/or higher final
       `BNB`
+
+Update on April 4, 2026, bounded stop-or-continue follow-up:
+
+1. the bounded payout-aware residual follow-up round is complete in
+   [payout_bounded_round_20260404_bounded_round_report.md](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/payout_bounded_round_20260404_bounded_round_report.md)
+2. that round found a locally better latest-tail endpoint (`+4.073849 BNB`
+   with `catboost` source `catboost`, `train=200k`, `bet=0.05`) but it failed
+   the required adjacent-offset robustness test badly, so it ended in `quit`,
+   not `dry-run`
+3. the causal pool follow-up showed that cutoff pool imbalance is much weaker
+   than final-pool imbalance and can become slightly contrarian in the latest
+   regime, especially for extreme cutoff `bull_share` buckets
+4. the last sensible bounded branch under the current data contract was a
+   direct late-pool transition forecast from the cutoff snapshot, implemented
+   in [run_late_pool_projection_bounded_round.py](/C:/Users/zking/Documents/GitHub/PancakeBot/inspection/run_late_pool_projection_bounded_round.py)
+5. that late-pool branch also failed to beat or materially stabilize the
+   payout-aware residual bar on the synced latest contiguous `50k` standard:
+   the best row in
+   [late_pool_projection_bounded_20260404_late_pool_bounded_report.md](/C:/Users/zking/Documents/GitHub/PancakeBot_var_exp/late_pool_projection_bounded_20260404_late_pool_bounded_report.md)
+   was still slightly negative at about `-0.001923 / 500`
+6. current decision under the present information set is to stop rather than
+   continue toward dry-run. A future restart would need a materially different
+   project, not more tuning on the current public round/pool/kline contract.
