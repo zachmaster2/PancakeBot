@@ -12,7 +12,8 @@ with two differences:
 The correlation script handles missing fields gracefully (skips those features).
 
 Usage:
-  python inspection/run_okx_klines_backfill.py --out-path ../PancakeBot_var_data/klines_okx.jsonl --tail-days 200
+  python inspection/run_okx_klines_backfill.py
+  python inspection/run_okx_klines_backfill.py --tail-days 200
 
 Resumable: if the output file already exists, the script starts from the most
 recent stored candle and only fetches newer data.
@@ -43,7 +44,7 @@ _RATE_LIMIT_SLEEP = 0.25  # seconds between requests (4 req/s, well inside 20/2s
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="OKX BNB/USDT 1m kline backfill")
     p.add_argument("--out-path", type=str,
-                   default="../PancakeBot_var_data/klines_okx.jsonl",
+                   default="var/klines_okx.jsonl",
                    help="Output JSONL path")
     p.add_argument("--tail-days", type=float, default=200,
                    help="How many days of history to fetch (from now backwards)")
