@@ -60,8 +60,6 @@ def collect_preflight_checks(
     cfg = load_app_config(str(config_path))
     env_map = dict(os.environ if env is None else env)
     checks = [
-        _file_exists_check(name="closed_rounds_path", path=str(cfg.closed_rounds_path)),
-        _file_exists_check(name="klines_path", path=str(cfg.klines_path)),
         _file_exists_check(name="abi_json_path", path=str(cfg.abi_json_path)),
         _parent_writable_check(name="latency_log_parent", path=str(cfg.latency_log_path)),
         _parent_writable_check(
@@ -97,15 +95,14 @@ def collect_preflight_checks(
             path=str(cfg.runtime_state_paths.live_pipeline_bootstrap_state_path),
         ),
         PreflightCheck(
-            name="active_candidates_nonempty",
-            passed=bool(len(cfg.strategy.dislocation.candidates) > 0),
-            detail=",".join(str(c.name) for c in cfg.strategy.dislocation.candidates),
+            name="momentum_gate_enabled",
+            passed=bool(cfg.momentum_gate.enabled),
+            detail=f"symbol={cfg.momentum_gate.symbol} threshold={cfg.momentum_gate.threshold}",
         ),
     ]
     if bool(check_env):
         checks.extend(
             [
-                _env_present_check(name="THE_GRAPH_API_KEY", env=env_map),
                 _env_present_check(name="BSC_WALLET_PRIVATE_KEY", env=env_map),
             ]
         )
@@ -132,11 +129,10 @@ def main() -> None:
         check_env=bool(args.check_env),
     )
 
-    active_names = ", ".join(str(c.name) for c in cfg.strategy.dislocation.candidates)
     print(f"CONFIG={args.config}")
     print(f"ACCOUNTING_GAS_WEI={int(GAS_PRICE_WEI)}")
-    print(f"ROUTER_MODE={cfg.strategy.router.mode}")
-    print(f"ACTIVE_CANDIDATES={active_names}")
+    print(f"MOMENTUM_GATE_ENABLED={cfg.momentum_gate.enabled}")
+    print(f"MOMENTUM_GATE_SYMBOL={cfg.momentum_gate.symbol}")
     for check in checks:
         status = "PASS" if bool(check.passed) else "FAIL"
         print(f"{status} {check.name}: {check.detail}")

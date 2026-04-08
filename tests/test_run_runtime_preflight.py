@@ -13,7 +13,7 @@ class RuntimePreflightTests(unittest.TestCase):
             env={},
         )
 
-        self.assertEqual("selector_max_score", cfg.strategy.router.mode)
+        self.assertTrue(bool(cfg.momentum_gate.enabled))
         self.assertTrue(all(bool(check.passed) for check in checks))
         check_names = {check.name for check in checks}
         self.assertIn("dry_cycle_audit_parent", check_names)
@@ -26,7 +26,7 @@ class RuntimePreflightTests(unittest.TestCase):
         )
 
         env_checks = {check.name: check for check in checks if check.name.startswith("env:")}
-        self.assertEqual(False, bool(env_checks["env:THE_GRAPH_API_KEY"].passed))
+        self.assertNotIn("env:THE_GRAPH_API_KEY", env_checks)
         self.assertEqual(False, bool(env_checks["env:BSC_WALLET_PRIVATE_KEY"].passed))
 
 
