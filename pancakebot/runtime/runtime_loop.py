@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -282,12 +284,18 @@ def _append_jsonl(path: str, record: dict[str, object]) -> None:
 def _write_json_file_atomic(path: str, record: dict[str, object]) -> None:
     out = Path(path)
     _ensure_parent_dir(str(out))
-    tmp = out.with_suffix(out.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(record, separators=(",", ":"), sort_keys=True),
-        encoding="utf-8",
-    )
-    tmp.replace(out)
+    content = json.dumps(record, separators=(",", ":"), sort_keys=True)
+    fd, tmp_path = tempfile.mkstemp(dir=out.parent, prefix=out.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, str(out))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _mono_ms() -> float:
