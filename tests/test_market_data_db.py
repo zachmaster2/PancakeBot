@@ -39,9 +39,6 @@ def _kline(open_ms: int, close_ms: int) -> Kline:
         close_price=1.05,
         volume=10.0,
         quote_asset_volume=20.0,
-        number_of_trades=5,
-        taker_buy_base_volume=4.0,
-        taker_buy_quote_volume=8.0,
     )
 
 
