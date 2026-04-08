@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from pancakebot.config.env import load_env
 from pancakebot.config.load_config import load_app_config
 from pancakebot.core.constants import GAS_PRICE_WEI
@@ -36,11 +34,7 @@ def _parent_writable_check(*, name: str, path: str) -> PreflightCheck:
     try:
         parent.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        return PreflightCheck(
-            name=str(name),
-            passed=False,
-            detail=f"{parent} err={e}",
-        )
+        return PreflightCheck(name=str(name), passed=False, detail=f"{parent} err={e}")
     return PreflightCheck(name=str(name), passed=True, detail=str(parent))
 
 
@@ -103,11 +97,9 @@ def collect_preflight_checks(
         ),
     ]
     if bool(check_env):
-        checks.extend(
-            [
-                _env_present_check(name="BSC_WALLET_PRIVATE_KEY", env=env_map),
-            ]
-        )
+        checks.extend([
+            _env_present_check(name="BSC_WALLET_PRIVATE_KEY", env=env_map),
+        ])
     return cfg, checks
 
 
@@ -117,7 +109,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--check-env",
         action="store_true",
-        help="Also require THE_GRAPH_API_KEY and BSC_WALLET_PRIVATE_KEY to be present after loading .env.",
+        help="Also require BSC_WALLET_PRIVATE_KEY to be present after loading .env.",
     )
     return p
 

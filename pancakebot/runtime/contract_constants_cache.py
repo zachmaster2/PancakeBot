@@ -7,7 +7,7 @@ from pathlib import Path
 from pancakebot.core.errors import InvariantError
 
 
-_DEFAULT_PATH = Path("../PancakeBot_var_data/contract_constants.json")
+_DEFAULT_PATH = Path("var/contract_constants.json")
 
 
 @dataclass(frozen=True, slots=True)

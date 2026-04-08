@@ -130,6 +130,7 @@ def load_app_config(path: str) -> AppConfig:
     paths = raw.get("paths")
     graph = raw.get("graph")
     runtime = raw.get("runtime")
+    contract_raw = raw.get("contract", {})
     backtest = raw.get("backtest", {})
     momentum_gate_raw = raw.get("momentum_gate", {})
 
@@ -143,6 +144,10 @@ def load_app_config(path: str) -> AppConfig:
         backtest = {}
     if not isinstance(backtest, dict):
         raise InvariantError("config_section_not_dict: backtest")
+    if contract_raw is None:
+        contract_raw = {}
+    if not isinstance(contract_raw, dict):
+        raise InvariantError("config_section_not_dict: contract")
     if momentum_gate_raw is None:
         momentum_gate_raw = {}
     if not isinstance(momentum_gate_raw, dict):
@@ -252,6 +257,19 @@ def load_app_config(path: str) -> AppConfig:
     if bet_receipt_timeout_seconds <= 0:
         raise InvariantError("bet_receipt_timeout_seconds_must_be_positive")
 
+    _validate_unknown_keys("contract", contract_raw, {
+        "min_bet_amount_bnb", "treasury_fee_fraction", "buffer_seconds",
+    })
+    min_bet_amount_bnb = _opt_float(contract_raw, "min_bet_amount_bnb", 0.001)
+    if float(min_bet_amount_bnb) <= 0.0:
+        raise InvariantError("contract_min_bet_amount_bnb_must_be_positive")
+    treasury_fee_fraction = _opt_float(contract_raw, "treasury_fee_fraction", 0.03)
+    if not (0.0 <= float(treasury_fee_fraction) < 1.0):
+        raise InvariantError("contract_treasury_fee_fraction_out_of_range")
+    buffer_seconds_cfg = _opt_int(contract_raw, "buffer_seconds", 30)
+    if int(buffer_seconds_cfg) <= 0:
+        raise InvariantError("contract_buffer_seconds_must_be_positive")
+
     allowed_bt_keys = {
         "simulation_size",
         "initial_bankroll_bnb",
@@ -332,5 +350,8 @@ def load_app_config(path: str) -> AppConfig:
             live_pipeline_bootstrap_state_path=str(live_pipeline_bootstrap_state_path),
         ),
         momentum_gate=momentum_gate_cfg,
+        min_bet_amount_bnb=float(min_bet_amount_bnb),
+        treasury_fee_fraction=float(treasury_fee_fraction),
+        buffer_seconds=int(buffer_seconds_cfg),
         backtest=backtest_cfg,
     )

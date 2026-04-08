@@ -20,7 +20,7 @@ from pancakebot.infra.graph_client import GraphClient
 from pancakebot.infra.rpc_pool import choose_rpc_url
 from pancakebot.infra.onchain.web3_contract_config import Web3ContractConfig
 from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionContract
-from pancakebot.runtime.contract_constants_cache import ContractConstants, load_contract_constants, save_contract_constants
+from pancakebot.runtime.contract_constants_cache import ContractConstants, save_contract_constants
 from pancakebot.runtime.runtime_loop import RuntimeConfig, run_live_loop
 from pancakebot.integration.sync_mode import sync_runtime_market_data
 from pancakebot.core.errors import InvariantError
@@ -31,16 +31,15 @@ from pancakebot.core.logging import info
 
 
 
-def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: bool) -> None:
+def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) -> None:
     cfg = load_app_config(config_path)
 
-    selected_modes = int(bool(dry)) + int(bool(backtest)) + int(bool(sync_only))
+    selected_modes = int(bool(dry)) + int(bool(backtest)) + int(bool(sync))
     if selected_modes > 1:
         raise InvariantError("run_modes_mutually_exclusive")
 
     if backtest:
         round_store = ClosedRoundsStore(cfg.closed_rounds_path)
-        constants = load_contract_constants()
         market_data_store = MarketDataDb(cfg.market_data_db_path)
         try:
             market_data_store.ensure_sources_synced(
@@ -61,9 +60,9 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: b
                 momentum_gate=None,
                 dry=dry,
                 runtime_state_paths=cfg.runtime_state_paths,
-                min_bet_amount_bnb=float(constants.min_bet_amount_bnb),
-                treasury_fee_fraction=float(constants.treasury_fee_fraction),
-                buffer_seconds=int(constants.buffer_seconds),
+                min_bet_amount_bnb=float(cfg.min_bet_amount_bnb),
+                treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+                buffer_seconds=int(cfg.buffer_seconds),
             )
             run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var"))
         finally:
@@ -73,7 +72,7 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: b
                 pass
         return
 
-    if sync_only:
+    if sync:
         load_env()
         graph_api_key = require_env("THE_GRAPH_API_KEY")
         graph = GraphClient(endpoint=PREDICTION_V2_GRAPH_ENDPOINT, api_key=graph_api_key)
@@ -89,7 +88,8 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: b
             "DONE",
             msg=(
                 f"closed_rounds={int(summary.stored_closed_round_count)} "
-                f"epochs=[{int(summary.earliest_closed_epoch)}..{int(summary.latest_closed_epoch)}]"
+                f"epochs=[{int(summary.earliest_closed_epoch)}..{int(summary.latest_closed_epoch)}] "
+                f"klines={int(summary.klines_total)} klines_new={int(summary.klines_appended)}"
             ),
         )
         return
