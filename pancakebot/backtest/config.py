@@ -16,6 +16,9 @@ class BacktestConfig:
     reset_mode: str = "continuous"
     reset_every_rounds: int = 0
     tail_offset_rounds: int = 0
+    # Optional epoch range filter. When set, overrides simulation_size windowing.
+    epoch_start: int | None = None
+    epoch_end: int | None = None
 
     def validate(self) -> None:
         if not isinstance(self.simulation_size, int):
@@ -45,3 +48,7 @@ class BacktestConfig:
             raise InvariantError("backtest_tail_offset_rounds_not_int")
         if int(self.tail_offset_rounds) < 0:
             raise InvariantError("backtest_tail_offset_rounds_negative")
+
+        if self.epoch_start is not None and self.epoch_end is not None:
+            if int(self.epoch_start) > int(self.epoch_end):
+                raise InvariantError("backtest_epoch_start_after_epoch_end")
