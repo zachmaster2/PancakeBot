@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from pancakebot.config.env import load_env
 from pancakebot.config.load_config import load_app_config
 from pancakebot.core.constants import GAS_PRICE_WEI

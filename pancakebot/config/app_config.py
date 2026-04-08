@@ -32,7 +32,6 @@ class AppConfig:
 
     # Runtime
     cutoff_seconds: int
-    random_seed: int
     latency_log_path: str
     dry_initial_bankroll_bnb: float | None
     wait_for_bet_receipt: bool

@@ -22,7 +22,6 @@ from pancakebot.infra.onchain.web3_contract_config import Web3ContractConfig
 from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionContract
 from pancakebot.runtime.contract_constants_cache import ContractConstants, load_contract_constants, save_contract_constants
 from pancakebot.runtime.runtime_loop import RuntimeConfig, run_live_loop
-from pancakebot.core.determinism import set_global_determinism
 from pancakebot.integration.sync_mode import sync_runtime_market_data
 from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
@@ -34,7 +33,6 @@ from pancakebot.core.logging import info
 
 def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: bool) -> None:
     cfg = load_app_config(config_path)
-    set_global_determinism(seed=int(cfg.random_seed))
 
     selected_modes = int(bool(dry)) + int(bool(backtest)) + int(bool(sync_only))
     if selected_modes > 1:

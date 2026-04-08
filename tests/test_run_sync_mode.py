@@ -25,7 +25,6 @@ class RunSyncModeTests(unittest.TestCase):
             market_data_db_path="../PancakeBot_var_exp/market_data.db",
             abi_json_path="abi/predictionv2.json",
             cutoff_seconds=12,
-            random_seed=1,
             latency_log_path="var/latency.log",
             dry_initial_bankroll_bnb=50.0,
             wait_for_bet_receipt=False,
@@ -45,7 +44,6 @@ class RunSyncModeTests(unittest.TestCase):
         )
         with (
             patch("pancakebot.integration.app.load_app_config", return_value=fake_cfg),
-            patch("pancakebot.integration.app.set_global_determinism"),
             patch("pancakebot.integration.app.ClosedRoundsStore"),
             patch("pancakebot.integration.app.load_env"),
             patch("pancakebot.integration.app.require_env", return_value="graph-key") as require_env_mock,
