@@ -1,28 +1,36 @@
 """Momentum-only strategy pipeline.
 
-Replaces the complex dislocation/router/ML pipeline with a single signal:
-the last confirmed 1m BNB/USDT return on OKX at cutoff time.
+Signal: dual-asset BNB+BTC momentum gate (OKX 1s candles).
+Sizing: pool-proportional with BTC/payout adjustments.
 
-  ret_1m = (close / open) - 1 of the last closed 1m kline before cutoff
-
-  If ret_1m >  threshold  → BET Bull
-  If ret_1m < -threshold  → BET Bear
-  Otherwise               → SKIP
-
-In live/dry mode the kline is fetched live from OKX via MomentumGate.
-In backtest mode the kline is looked up from the in-memory klines cache
-(which must be populated from OKX historical data, i.e. klines_okx.jsonl).
+Live/dry mode: MomentumGate fetches live 1s klines from OKX at cutoff.
+Backtest mode: uses pre-fetched 1s kline arrays from JSONL caches.
 """
 
 from __future__ import annotations
 
-from bisect import bisect_right
 from dataclasses import dataclass
 
+from pancakebot.core.constants import BNB_WEI
 from pancakebot.core.errors import InvariantError
-from pancakebot.core.logging import warn
-from pancakebot.domain.strategy.momentum_gate import MomentumGate, MomentumGateConfig
+from pancakebot.domain.strategy.momentum_gate import (
+    MomentumGate,
+    MomentumGateConfig,
+    MomentumGateResult,
+    compute_signal_from_klines,
+)
 from pancakebot.domain.types import Kline, Round
+
+# Sizing constants — tuned together on 5000 rounds; do not change independently.
+_BASE_FRAC = 0.06
+_FLOOR_BNB = 0.05
+_CAP_BNB = 0.35
+_BTC_AGREE_MULT = 1.25
+_BTC_DISAGREE_MULT = 0.6
+_PAYOUT_HI_THRESH = 2.0
+_PAYOUT_HI_MULT = 1.7
+_PAYOUT_LO_THRESH = 1.7
+_PAYOUT_LO_MULT = 0.9
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,47 +53,46 @@ class StrategyPipelineDecision:
     controller_selected_action: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class _BacktestKlineResult:
-    ret_1m: float | None
-    signal: str | None      # "Bull", "Bear", or None
-    skip_reason: str | None
-    kline_age_seconds: float | None
+def _compute_bet_size(
+    *,
+    signal: str,
+    tier: str,
+    btc_agrees: bool,
+    btc_disagrees: bool,
+    pool_bull_bnb: float,
+    pool_bear_bnb: float,
+    treasury_fee_fraction: float,
+) -> float:
+    """Pool-proportional sizing with BTC/payout adjustments."""
+    pool_bnb = pool_bull_bnb + pool_bear_bnb
+    if pool_bnb <= 0:
+        return _FLOOR_BNB
 
+    bet = max(_FLOOR_BNB, pool_bnb * _BASE_FRAC)
 
-def _compute_from_kline(kline: dict | Kline, threshold: float) -> _BacktestKlineResult:
-    """Compute ret_1m signal from a kline object."""
-    if isinstance(kline, Kline):
-        open_price = float(kline.open_price)
-        close_price = float(kline.close_price)
-        close_time_ms = int(kline.close_time_ms)
-    else:
-        open_price = float(kline["open_price"])
-        close_price = float(kline["close_price"])
-        close_time_ms = int(kline["close_time_ms"])
+    # Payout multiplier adjustment
+    our_side = pool_bull_bnb if signal == "Bull" else pool_bear_bnb
+    if our_side > 0:
+        pm = pool_bnb * (1.0 - treasury_fee_fraction) / our_side
+        if pm >= _PAYOUT_HI_THRESH:
+            bet *= _PAYOUT_HI_MULT
+        elif pm < _PAYOUT_LO_THRESH:
+            bet *= _PAYOUT_LO_MULT
 
-    if open_price <= 0:
-        return _BacktestKlineResult(ret_1m=None, signal=None,
-                                    skip_reason="momentum_gate_invalid_open_price",
-                                    kline_age_seconds=None)
+    # BTC confirmation boost
+    if btc_agrees:
+        bet *= _BTC_AGREE_MULT
+    elif btc_disagrees:
+        bet *= _BTC_DISAGREE_MULT
 
-    ret_1m = float((close_price / open_price) - 1.0)
-
-    if ret_1m > float(threshold):
-        signal: str | None = "Bull"
-    elif ret_1m < -float(threshold):
-        signal = "Bear"
-    else:
-        signal = None
-
-    return _BacktestKlineResult(ret_1m=ret_1m, signal=signal, skip_reason=None, kline_age_seconds=None)
+    return min(_CAP_BNB, bet)
 
 
 class MomentumOnlyPipeline:
     """Momentum-only pipeline: satisfies the StrategyPipeline interface.
 
     In live/dry mode pass `gate` (a MomentumGate backed by OKX client).
-    In backtest mode leave `gate=None`; the pipeline uses `klines_cache` instead.
+    In backtest mode leave `gate=None`; the pipeline uses cached 1s klines.
     """
 
     def __init__(
@@ -95,13 +102,18 @@ class MomentumOnlyPipeline:
         gate: MomentumGate | None,
         cutoff_seconds: int,
         min_bet_amount_bnb: float,
+        treasury_fee_fraction: float,
     ) -> None:
         self._cfg = config
-        self._gate = gate  # None in backtest
+        self._gate = gate
         self._cutoff_seconds = int(cutoff_seconds)
         self._min_bet_amount_bnb = float(min_bet_amount_bnb)
+        self._treasury_fee_fraction = float(treasury_fee_fraction)
         self._last_settled_epoch: int | None = None
-        # In backtest, klines are refreshed via refresh_klines.
+        # Backtest: 1s klines per epoch {epoch: [[ts_ms, o, h, l, c, vol], ...]}
+        self._spot_klines_by_epoch: dict[int, list[list]] = {}
+        self._btc_klines_by_epoch: dict[int, list[list]] = {}
+        # Legacy 1m klines (kept for interface compat but unused for signal)
         self._klines: list[Kline] = []
         self._kline_open_times: list[int] = []
 
@@ -121,9 +133,17 @@ class MomentumOnlyPipeline:
         return True
 
     def refresh_klines(self, *, klines: list[Kline]) -> None:
-        """Update the local kline cache (used in backtest mode)."""
+        """Update the local 1m kline cache (kept for interface compat)."""
         self._klines = list(klines)
         self._kline_open_times = [int(k.open_time_ms) for k in self._klines]
+
+    def refresh_spot_klines(self, *, spot_klines_by_epoch: dict[int, list[list]]) -> None:
+        """Load pre-fetched BNB 1s kline arrays keyed by epoch (backtest mode)."""
+        self._spot_klines_by_epoch = dict(spot_klines_by_epoch)
+
+    def refresh_btc_klines(self, *, btc_klines_by_epoch: dict[int, list[list]]) -> None:
+        """Load pre-fetched BTC 1s kline arrays keyed by epoch (backtest mode)."""
+        self._btc_klines_by_epoch = dict(btc_klines_by_epoch)
 
     def settle_closed_rounds(self, *, rounds: list[Round]) -> None:
         """Track the last settled epoch (no ML state to update)."""
@@ -153,73 +173,66 @@ class MomentumOnlyPipeline:
         round_t: Round,
         bankroll_bnb: float,
         allow_oracle_mode: bool,
+        pool_bull_bnb: float = 0.0,
+        pool_bear_bnb: float = 0.0,
     ) -> StrategyPipelineDecision:
-        """Return BET or SKIP based on OKX 1m momentum signal."""
-
-        bet_size_bnb = float(self._cfg.bet_size_bnb)
-        if bet_size_bnb < float(self._min_bet_amount_bnb):
-            return self._skip("bet_size_below_min_bet_amount")
+        """Return BET or SKIP based on dual-asset momentum signal."""
 
         lock_at = int(round_t.lock_at)
-        cutoff_ts_s = lock_at - self._cutoff_seconds
-        cutoff_ts_ms = cutoff_ts_s * 1000
+        cutoff_ts_ms = (lock_at - self._cutoff_seconds) * 1000
 
         if self._gate is not None:
             # Live/dry: fetch from OKX
             result = self._gate.evaluate(cutoff_ts_ms=int(cutoff_ts_ms))
-            if result.skip_reason is not None:
-                return self._skip(str(result.skip_reason))
-            if result.signal is None:
-                return self._skip(
-                    f"momentum_gate_no_signal:ret_1m={result.ret_1m:.6f}"
-                    if result.ret_1m is not None
-                    else "momentum_gate_no_signal"
-                )
-            return self._bet(side=str(result.signal), size_bnb=bet_size_bnb)
+        else:
+            # Backtest: use cached 1s klines
+            result = self._evaluate_from_cache(
+                epoch=int(round_t.epoch),
+                cutoff_ts_ms=int(cutoff_ts_ms),
+            )
+            # Compute pools from round bets if not provided externally
+            if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
+                pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, lock_at)
 
-        # Backtest: look up from klines cache
-        return self._decide_from_klines_cache(
-            cutoff_ts_ms=int(cutoff_ts_ms),
-            bet_size_bnb=bet_size_bnb,
+        if result.skip_reason is not None:
+            return self._skip(str(result.skip_reason))
+        if result.signal is None:
+            return self._skip("gate_no_signal")
+
+        bet_size = _compute_bet_size(
+            signal=str(result.signal),
+            tier=str(result.tier or "accel"),
+            btc_agrees=bool(result.btc_agrees),
+            btc_disagrees=bool(result.btc_disagrees),
+            pool_bull_bnb=float(pool_bull_bnb),
+            pool_bear_bnb=float(pool_bear_bnb),
+            treasury_fee_fraction=self._treasury_fee_fraction,
         )
+
+        if bet_size < self._min_bet_amount_bnb:
+            return self._skip("bet_size_below_min")
+
+        return self._bet(side=str(result.signal), size_bnb=float(bet_size))
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _decide_from_klines_cache(
+    def _evaluate_from_cache(
         self,
         *,
+        epoch: int,
         cutoff_ts_ms: int,
-        bet_size_bnb: float,
-    ) -> StrategyPipelineDecision:
-        if not self._klines:
-            return self._skip("momentum_gate_no_klines_in_cache")
-
-        # Find last kline whose open_time_ms < cutoff_ts_ms
-        # (strictly before cutoff — the kline must be fully closed)
-        idx = bisect_right(self._kline_open_times, cutoff_ts_ms - 1) - 1
-        if idx < 0:
-            return self._skip("momentum_gate_no_kline_before_cutoff")
-
-        kline = self._klines[idx]
-        close_time_ms = int(kline.close_time_ms)
-        age_s = float((int(cutoff_ts_ms) - close_time_ms) / 1000)
-
-        if age_s > float(self._cfg.max_staleness_seconds):
-            warn("GATE", "BACKTEST", "STALE_KLINE", age_seconds=age_s)
-            return self._skip(f"momentum_gate_stale_kline:age={age_s:.1f}s")
-
-        result = _compute_from_kline(kline, float(self._cfg.threshold))
-        if result.skip_reason is not None:
-            return self._skip(result.skip_reason)
-        if result.signal is None:
-            return self._skip(
-                f"momentum_gate_no_signal:ret_1m={result.ret_1m:.6f}"
-                if result.ret_1m is not None
-                else "momentum_gate_no_signal"
+    ) -> MomentumGateResult:
+        """Run signal logic on cached klines (backtest path)."""
+        bnb_klines = self._spot_klines_by_epoch.get(epoch)
+        if bnb_klines is None or len(bnb_klines) == 0:
+            return MomentumGateResult(
+                signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
+                skip_reason="gate_no_spot_klines", kline_age_seconds=None,
             )
-        return self._bet(side=str(result.signal), size_bnb=bet_size_bnb)
+        btc_klines = self._btc_klines_by_epoch.get(epoch)
+        return compute_signal_from_klines(bnb_klines, btc_klines, cutoff_ts_ms)
 
     @staticmethod
     def _skip(reason: str) -> StrategyPipelineDecision:
@@ -255,3 +268,17 @@ class MomentumOnlyPipeline:
 
     def candidate_signals_for_open_round(self, *, round_t: Round) -> dict:
         return {}
+
+
+def _pools_from_bets(round_t: Round, lock_at: int) -> tuple[float, float]:
+    """Compute bull/bear pool BNB from round bets at or before lock_at."""
+    bull_wei = 0
+    bear_wei = 0
+    for bet in round_t.bets:
+        if int(bet.created_at) > lock_at:
+            continue
+        if bet.position == "Bull":
+            bull_wei += int(bet.amount_wei)
+        else:
+            bear_wei += int(bet.amount_wei)
+    return float(bull_wei) / float(BNB_WEI), float(bear_wei) / float(BNB_WEI)
