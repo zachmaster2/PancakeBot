@@ -40,7 +40,7 @@ from pancakebot.core.logging import info, warn
 from pancakebot.core.time import now_ts
 from pancakebot.core.money import bankroll_suffix, format_bankroll, usd_suffix
 
-_LOCK_SAFETY_MARGIN_SECONDS = 5  # locked
+_LOCK_SAFETY_MARGIN_SECONDS = 3  # abort bet if wall-clock is within this many seconds of lock_at
 
 # Extra cushion added to the claim-check wake time to avoid alignment retries near Graph/RPC boundaries.
 _CLAIM_CHECK_PADDING_SECONDS = 5
@@ -1189,10 +1189,16 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         if closed.strategy_pipeline is None:
             raise InvariantError("strategy_pipeline_missing")
+        # Fetch fresh pool data for pool-proportional sizing.
+        open_rd_snap = cfg.contract.round_data(int(current_epoch))
+        pool_bull_bnb = float(open_rd_snap.bull_amount_wei) / float(BNB_WEI)
+        pool_bear_bnb = float(open_rd_snap.bear_amount_wei) / float(BNB_WEI)
         decision = closed.strategy_pipeline.decide_open_round(
             round_t=open_round,
             bankroll_bnb=float(bankroll_bnb),
             allow_oracle_mode=False,
+            pool_bull_bnb=float(pool_bull_bnb),
+            pool_bear_bnb=float(pool_bear_bnb),
         )
         if decision.p_bull is not None:
             pred_p_final = float(decision.p_bull)
@@ -1406,6 +1412,7 @@ def _build_momentum_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesC
         gate=cfg.momentum_gate,
         cutoff_seconds=int(cfg.cutoff_seconds),
         min_bet_amount_bnb=float(cfg.min_bet_amount_bnb),
+        treasury_fee_fraction=float(cfg.treasury_fee_fraction),
     )
     if klines_cache is not None:
         pipeline.refresh_klines(klines=list(klines_cache.klines))

@@ -315,25 +315,19 @@ def load_app_config(path: str) -> AppConfig:
     backtest_cfg.validate()
 
     _validate_unknown_keys("momentum_gate", momentum_gate_raw, {
-        "enabled", "symbol", "threshold", "max_staleness_seconds", "bet_size_bnb",
+        "enabled", "symbol", "btc_symbol", "max_staleness_seconds",
     })
     mg_enabled = _opt_bool(momentum_gate_raw, "enabled", False)
     mg_symbol = _opt_str(momentum_gate_raw, "symbol", "BNB-USDT")
-    mg_threshold = _opt_float(momentum_gate_raw, "threshold", 0.0001)
-    if float(mg_threshold) <= 0:
-        raise InvariantError("momentum_gate_threshold_must_be_positive")
+    mg_btc_symbol = _opt_str(momentum_gate_raw, "btc_symbol", "BTC-USDT")
     mg_max_staleness = _opt_int(momentum_gate_raw, "max_staleness_seconds", 120)
     if int(mg_max_staleness) <= 0:
         raise InvariantError("momentum_gate_max_staleness_must_be_positive")
-    mg_bet_size_bnb = _opt_float(momentum_gate_raw, "bet_size_bnb", 0.05)
-    if float(mg_bet_size_bnb) <= 0:
-        raise InvariantError("momentum_gate_bet_size_bnb_must_be_positive")
     momentum_gate_cfg = MomentumGateConfig(
         enabled=bool(mg_enabled),
         symbol=str(mg_symbol),
-        threshold=float(mg_threshold),
+        btc_symbol=str(mg_btc_symbol),
         max_staleness_seconds=int(mg_max_staleness),
-        bet_size_bnb=float(mg_bet_size_bnb),
     )
 
     return AppConfig(

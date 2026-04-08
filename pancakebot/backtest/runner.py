@@ -1,12 +1,13 @@
 """Backtest runner — momentum-only offline replay.
 
 Iterates closed rounds in chronological order, runs MomentumOnlyPipeline
-(no live OKX gate; uses local klines cache instead), and settles each bet
-against the closed-round pool data from closed_rounds.jsonl.
+(no live OKX gate; uses cached 1s spot klines instead), and settles each
+bet against the closed-round pool data from closed_rounds.jsonl.
 """
 from __future__ import annotations
 
 import csv
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,9 @@ from pancakebot.core.logging import info
 from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline
 from pancakebot.domain.types import Kline, Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
+
+_SPOT_KLINES_PATH = Path("var/cutoff_spot_prices.jsonl")
+_BTC_SPOT_KLINES_PATH = Path("var/btc_spot_prices.jsonl")
 
 
 @dataclass(slots=True)
@@ -59,6 +63,25 @@ def _load_all_klines(runtime_cfg) -> list[Kline]:
     if not klines:
         raise InvariantError("backtest_klines_store_empty")
     return klines
+
+
+def _load_spot_klines_from(path: Path) -> dict[int, list[list]]:
+    """Load pre-fetched 1s kline arrays from a JSONL file.
+
+    Returns {epoch: [[ts_ms, o, h, l, c, vol], ...]} for epochs that
+    have data.  Returns empty dict if the file doesn't exist.
+    """
+    if not path.exists():
+        return {}
+    result: dict[int, list[list]] = {}
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        if rec.get("error") or rec.get("klines_1s") is None:
+            continue
+        result[int(rec["epoch"])] = rec["klines_1s"]
+    return result
 
 
 def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) -> None:
@@ -114,7 +137,18 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
         ),
     )
 
-    # Build momentum pipeline (no live gate — backtest uses klines cache).
+    # Load pre-fetched 1s spot klines for honest backtest signal.
+    spot_klines = _load_spot_klines_from(_SPOT_KLINES_PATH)
+    if spot_klines:
+        info("BACK", "SETUP", "SPOT_KL", msg=f"Loaded BNB 1s spot klines for {len(spot_klines)} epochs")
+    else:
+        info("BACK", "SETUP", "SPOT_KL", msg="No BNB spot klines found — backtest will skip all rounds")
+
+    btc_klines = _load_spot_klines_from(_BTC_SPOT_KLINES_PATH)
+    if btc_klines:
+        info("BACK", "SETUP", "BTC_KL", msg=f"Loaded BTC 1s spot klines for {len(btc_klines)} epochs")
+
+    # Build momentum pipeline (no live gate — backtest uses cached 1s spot klines).
     from pancakebot.domain.strategy.momentum_gate import MomentumGateConfig
     gate_config: MomentumGateConfig = runtime_cfg.momentum_gate_config  # type: ignore[assignment]
     pipeline = MomentumOnlyPipeline(
@@ -122,9 +156,12 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
         gate=None,
         cutoff_seconds=int(runtime_cfg.cutoff_seconds),
         min_bet_amount_bnb=float(runtime_cfg.min_bet_amount_bnb),
+        treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
     )
     pipeline.refresh_klines(klines=list(all_klines))
-    info("BACK", "SETUP", "PIPELINE", msg="MomentumOnlyPipeline ready (backtest/klines mode)")
+    pipeline.refresh_spot_klines(spot_klines_by_epoch=spot_klines)
+    pipeline.refresh_btc_klines(btc_klines_by_epoch=btc_klines)
+    info("BACK", "SETUP", "PIPELINE", msg="MomentumOnlyPipeline ready (backtest/dual-asset mode)")
 
     # Output files.
     out_dir.mkdir(parents=True, exist_ok=True)
