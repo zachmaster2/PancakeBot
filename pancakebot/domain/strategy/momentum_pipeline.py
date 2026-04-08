@@ -166,10 +166,7 @@ class MomentumOnlyPipeline:
 
         if self._gate is not None:
             # Live/dry: fetch from OKX
-            result = self._gate.evaluate(
-                cutoff_ts_ms=int(cutoff_ts_ms),
-                pipeline_bet_side=None,
-            )
+            result = self._gate.evaluate(cutoff_ts_ms=int(cutoff_ts_ms))
             if result.skip_reason is not None:
                 return self._skip(str(result.skip_reason))
             if result.signal is None:

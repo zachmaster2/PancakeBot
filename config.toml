@@ -54,13 +54,9 @@ bet_receipt_timeout_seconds = 45
 # bet placement. Fetches the last confirmed 1m BNB/USDT kline from OKX at
 # cutoff time and computes ret_1m = (close/open) - 1.
 #
-# mode = "override": only bet when |ret_1m| >= threshold; bet_side follows signal.
-# mode = "filter":   veto pipeline bets that disagree with signal; pass through
-#                    when gate has no opinion (|ret_1m| < threshold).
 enabled = true
 symbol = "BNB-USDT"
 threshold = 0.0001
-mode = "override"
 max_staleness_seconds = 120
 bet_size_bnb = 0.05
 
