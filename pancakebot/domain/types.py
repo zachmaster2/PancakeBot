@@ -98,7 +98,7 @@ class Round:
 
 @dataclass(frozen=True, slots=True)
 class Kline:
-    """A Binance US Spot kline (candle) record (fully CLOSED).
+    """An OKX 1m kline (candle) record (fully CLOSED).
 
     Times are in milliseconds since epoch.
     """
@@ -111,9 +111,6 @@ class Kline:
     close_price: float
     volume: float
     quote_asset_volume: float
-    number_of_trades: int
-    taker_buy_base_volume: float
-    taker_buy_quote_volume: float
 
     @staticmethod
     def from_json(rec: dict[str, Any]) -> "Kline":
@@ -127,9 +124,6 @@ class Kline:
                 close_price=float(rec["close_price"]),
                 volume=float(rec["volume"]),
                 quote_asset_volume=float(rec["quote_asset_volume"]),
-                number_of_trades=int(rec["number_of_trades"]),
-                taker_buy_base_volume=float(rec["taker_buy_base_volume"]),
-                taker_buy_quote_volume=float(rec["taker_buy_quote_volume"]),
             )
         except Exception as e:
             raise InvariantError(f"kline_parse_error: {e}")
@@ -144,7 +138,4 @@ class Kline:
             "close_price": float(self.close_price),
             "volume": float(self.volume),
             "quote_asset_volume": float(self.quote_asset_volume),
-            "number_of_trades": int(self.number_of_trades),
-            "taker_buy_base_volume": float(self.taker_buy_base_volume),
-            "taker_buy_quote_volume": float(self.taker_buy_quote_volume),
         }

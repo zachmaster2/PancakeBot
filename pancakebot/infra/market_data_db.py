@@ -84,10 +84,7 @@ class MarketDataDb:
                     low_price REAL NOT NULL,
                     close_price REAL NOT NULL,
                     volume REAL NOT NULL,
-                    quote_asset_volume REAL NOT NULL,
-                    number_of_trades INTEGER NOT NULL,
-                    taker_buy_base_volume REAL NOT NULL,
-                    taker_buy_quote_volume REAL NOT NULL
+                    quote_asset_volume REAL NOT NULL
                 );
                 """
             )
@@ -203,10 +200,7 @@ class MarketDataDb:
                     low_price,
                     close_price,
                     volume,
-                    quote_asset_volume,
-                    number_of_trades,
-                    taker_buy_base_volume,
-                    taker_buy_quote_volume
+                    quote_asset_volume
                 FROM klines
                 ORDER BY open_time_ms ASC
                 """
@@ -442,9 +436,6 @@ class MarketDataDb:
                                 float(k.close_price),
                                 float(k.volume),
                                 float(k.quote_asset_volume),
-                                int(k.number_of_trades),
-                                float(k.taker_buy_base_volume),
-                                float(k.taker_buy_quote_volume),
                             )
                         )
                         if len(kline_rows) >= int(self._KLINE_BATCH_ROWS):
@@ -458,11 +449,8 @@ class MarketDataDb:
                                     low_price,
                                     close_price,
                                     volume,
-                                    quote_asset_volume,
-                                    number_of_trades,
-                                    taker_buy_base_volume,
-                                    taker_buy_quote_volume
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    quote_asset_volume
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 kline_rows,
                             )
@@ -479,11 +467,8 @@ class MarketDataDb:
                             low_price,
                             close_price,
                             volume,
-                            quote_asset_volume,
-                            number_of_trades,
-                            taker_buy_base_volume,
-                            taker_buy_quote_volume
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            quote_asset_volume
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         kline_rows,
                     )
@@ -528,9 +513,6 @@ class MarketDataDb:
             close_price=float(row["close_price"]),
             volume=float(row["volume"]),
             quote_asset_volume=float(row["quote_asset_volume"]),
-            number_of_trades=int(row["number_of_trades"]),
-            taker_buy_base_volume=float(row["taker_buy_base_volume"]),
-            taker_buy_quote_volume=float(row["taker_buy_quote_volume"]),
         )
 
 
