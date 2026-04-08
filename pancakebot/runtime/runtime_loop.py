@@ -2,11 +2,9 @@
 
 Hard rules (project-level):
   - Do not catch-and-continue exceptions (developer errors must crash).
-  - No disk reads in the main live loop: closed rounds are loaded once at startup
-    and then maintained via an in-memory rolling cache.
+  - Pure RPC + OKX: no Graph API, no closed-rounds cache in live/dry mode.
 
-This module orchestrates I/O (Graph, on-chain) and strategy execution for the
-shared production strategy pipeline (candidate providers + router).
+This module orchestrates on-chain RPC and OKX momentum-gate strategy execution.
 """
 
 from __future__ import annotations
@@ -17,47 +15,26 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
 
 from pancakebot.config.app_config import RuntimeStatePathsConfig
-from pancakebot.config.strategy_config import StrategyConfig
 from pancakebot.core.constants import (
     BNB_WEI,
     GAS_LIMIT_BET,
     GAS_LIMIT_CLAIM,
     GAS_COST_BET_BNB,
 )
-from pancakebot.domain.closed_rounds_cache import RollingClosedRoundsCache
-from pancakebot.infra.closed_rounds_sync import sync_closed_rounds
-from pancakebot.infra.graph_client import GraphClient
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
 from pancakebot.infra.klines_store import KlinesStore
-from pancakebot.infra.binance_us_client import BinanceUsClient
-from pancakebot.infra.klines_sync import ensure_klines_coverage
 from pancakebot.domain.klines_cache import RollingKlinesCache
-from pancakebot.domain.types import Bet, Kline, Round
-from pancakebot.domain.features.schema import max_required_context_klines_size, max_required_prior_context_rounds_size
-from pancakebot.domain.contiguity import check_klines_contiguous, check_rounds_contiguous
-from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionContract
-from pancakebot.domain.strategy.dislocation_engine import (
-    build_dislocation_engine_from_config,
-)
-from pancakebot.domain.strategy.direct_action_policy import DirectActionPolicy
-from pancakebot.domain.strategy.flow_candidate_adapter import FlowCandidateAdapter
-from pancakebot.domain.strategy.ml_candidate_adapter import MlCandidateAdapter
-from pancakebot.domain.strategy.pipeline import StrategyPipeline, required_pipeline_warmup_rounds
-from pancakebot.domain.strategy.router import StrategyRouter, StrategyRouterConfig
-from pancakebot.domain.strategy.window_controller import WindowController
+from pancakebot.domain.types import Round
+from pancakebot.infra.onchain.web3_prediction_contract import RoundData, Web3PredictionContract
+from pancakebot.domain.strategy.momentum_gate import MomentumGate
+from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline
 from pancakebot.runtime.claim_manager import claim_scan_cursor
-from pancakebot.runtime.bootstrap_snapshot import (
-    load_runtime_pipeline_snapshot,
-    runtime_pipeline_snapshot_compatibility_key,
-    save_runtime_pipeline_snapshot,
-)
-from pancakebot.runtime.settlement import settle_bet_against_closed_round
+from pancakebot.runtime.settlement import settle_from_round_data
 from pancakebot.runtime.sleep import sleep_seconds
-from pancakebot.core.errors import InvariantError, TransientGraphError, TransientRpcError
-from pancakebot.core.logging import error, info, warn
+from pancakebot.core.errors import InvariantError, TransientRpcError
+from pancakebot.core.logging import info, warn
 from pancakebot.core.time import now_ts
 from pancakebot.core.money import bankroll_suffix, format_bankroll, usd_suffix
 
@@ -71,20 +48,22 @@ _BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 _ONE_MINUTE_MS = 60_000
-_KLINE_WARMUP_MARGIN_MINUTES = 5
 _DRY_RUNTIME_ARCHIVE_ROOT = Path(__file__).resolve().parents[2].parent / "PancakeBot_var_exp"
 
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
-    # Graph
-    graph_client: GraphClient
-    round_store: ClosedRoundsStore
+    # Closed rounds store (JSONL; used by backtest only; None in live/dry)
+    round_store: ClosedRoundsStore | None
 
-    # Binance US klines
-    klines_store: KlinesStore
-    binance_us_client: BinanceUsClient
-    binance_us_symbol: str
+    # Klines store (OKX data; used by backtest kline cache only; None in live/dry)
+    klines_store: KlinesStore | None
+
+    # Momentum strategy config (always present)
+    momentum_gate_config: object  # MomentumGateConfig
+
+    # Momentum gate (OKX 1m live client; None in backtest mode)
+    momentum_gate: MomentumGate | None
 
     # On-chain / identity
     contract: Web3PredictionContract
@@ -93,17 +72,10 @@ class RuntimeConfig:
     # Feature cutoff
     cutoff_seconds: int
 
-    # Strategy config
-    strategy_cfg: StrategyConfig
-
     # Protocol constants (cached at startup)
     min_bet_amount_bnb: float
     treasury_fee_fraction: float
     buffer_seconds: int
-
-    # Optional on-chain bet-event replacement for target-round bets at cutoff.
-    use_onchain_event_bets: bool
-    event_lookback_blocks: int
 
     # Runtime latency telemetry.
     latency_log_path: str
@@ -113,21 +85,6 @@ class RuntimeConfig:
 
     # Execution
     dry: bool
-
-    # Optional persisted feature cache store for backtest/inspection acceleration.
-    feature_cache_store: object | None = None
-
-    # Optional SQLite market-data mirror used by backtests/inspection.
-    market_data_store: object | None = None
-
-    # Optional persistent final-pool projection cache used by ML adapter.
-    projection_cache_store: object | None = None
-
-    # Optional run registry store for experiment bookkeeping.
-    run_registry_store: object | None = None
-
-    # Backtest-only state snapshot cache root directory.
-    backtest_state_cache_dir: str = "../PancakeBot_var_exp/backtest_state_cache"
 
     # Mutable runtime state paths used by live/dry loops.
     runtime_state_paths: RuntimeStatePathsConfig = RuntimeStatePathsConfig(
@@ -144,15 +101,11 @@ class RuntimeConfig:
 
 @dataclass(slots=True)
 class _ClosedState:
-    cache: RollingClosedRoundsCache
-    disk_latest_epoch: int
-    klines_cache: RollingKlinesCache
-    strategy_pipeline: StrategyPipeline | None = None
+    strategy_pipeline: MomentumOnlyPipeline | None = None
     claim_scan_initialized: bool = False
     simulated_bankroll_bnb: float | None = None
     dry_bets_by_epoch: dict[int, dict[str, object]] | None = None
     dry_settled_epochs: set[int] | None = None
-    pipeline_snapshot_saved_epoch: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,37 +189,16 @@ def _archive_dry_runtime_state(
     return archive_dir
 
 
-def _build_context_klines(*, klines_cache: RollingKlinesCache, target_round: Round, cutoff_seconds: int) -> list[Kline]:
-    kk = int(max_required_context_klines_size())
-    if target_round.lock_at is None:
-        raise InvariantError("target_round_lock_at_missing")
-    lock_ts = int(target_round.lock_at)
-    cutoff_ts = int(lock_ts) - int(cutoff_seconds)
-    anchor_ms = int(cutoff_ts) * 1000
-    latest_close_ms = klines_cache.latest_close_time_ms()
-    if latest_close_ms is None:
-        raise InvariantError("klines_cache_empty")
-    if int(latest_close_ms) < int(anchor_ms):
-        anchor_ms = int(latest_close_ms)
-    return klines_cache.get_context_klines(anchor_close_time_ms=int(anchor_ms), size=int(kk))
 
-
-def _with_lock_at(round_t: Round, lock_at: int) -> Round:
-    if int(lock_at) <= 0:
-        raise InvariantError("lock_at_invalid")
-    if round_t.lock_at is not None and int(round_t.lock_at) != int(lock_at):
-        raise InvariantError("round_lock_at_mismatch")
-    return Round(
-        epoch=int(round_t.epoch),
-        start_at=int(round_t.start_at),
-        lock_at=int(lock_at),
-        close_at=round_t.close_at,
-        lock_price=round_t.lock_price,
-        close_price=round_t.close_price,
-        position=round_t.position,
-        failed=round_t.failed,
-        bets=round_t.bets,
-    )
+def _fetch_current_bnb_price_usd(cfg: RuntimeConfig) -> float:
+    """Fetch approximate BNB/USD price from contract (best-effort; 0.0 on failure)."""
+    try:
+        epoch = int(cfg.contract.current_epoch())
+        rd = cfg.contract.round_data(epoch - 1)
+        price = float(rd.lock_price_usd)
+        return price if price > 0.0 else 0.0
+    except Exception:
+        return 0.0
 
 
 def run_live_loop(cfg: RuntimeConfig) -> None:
@@ -277,8 +209,7 @@ def run_live_loop(cfg: RuntimeConfig) -> None:
     try:
         closed_state = _init_closed_state(cfg)
 
-        # After sync, USD conversion uses the latest closed round close_price.
-        bnbusd_price = closed_state.cache.rounds[-1].close_price
+        bnbusd_price = _fetch_current_bnb_price_usd(cfg)
         if cfg.dry:
             if closed_state.simulated_bankroll_bnb is None:
                 raise InvariantError("dry_bankroll_uninitialized")
@@ -298,26 +229,6 @@ def run_live_loop(cfg: RuntimeConfig) -> None:
         while True:
             try:
                 _run_one_iteration(cfg, closed_state)
-            except TransientGraphError as e:
-                info(
-                    "CORE",
-                    "RUN",
-                    "RETRY",
-                    msg=(
-                        "Caught TransientGraphError during runtime loop: "
-                        f"retrying after delay err={str(e)}"
-                    ),
-                )
-                info(
-                    "CORE",
-                    "LOOP",
-                    "SLEEP",
-                    msg=(
-                        f"duration={int(_TRANSIENT_NETWORK_DELAY_SECONDS)}s "
-                        "reason=delay_after_transient_network_error"
-                    ),
-                )
-                sleep_seconds(int(_TRANSIENT_NETWORK_DELAY_SECONDS))
             except TransientRpcError as e:
                 info(
                     "CORE",
@@ -382,193 +293,6 @@ def _write_json_file_atomic(path: str, record: dict[str, object]) -> None:
 def _mono_ms() -> float:
     return float(time.perf_counter() * 1000.0)
 
-
-def _runtime_pipeline_snapshot_path(cfg: RuntimeConfig) -> str:
-    if bool(cfg.dry):
-        return str(cfg.runtime_state_paths.dry_pipeline_bootstrap_state_path)
-    return str(cfg.runtime_state_paths.live_pipeline_bootstrap_state_path)
-
-
-def _runtime_pipeline_snapshot_last_saved_epoch(closed: _ClosedState) -> int | None:
-    return None if closed.pipeline_snapshot_saved_epoch is None else int(closed.pipeline_snapshot_saved_epoch)
-
-
-def _runtime_pipeline_snapshot_compatibility_key(cfg: RuntimeConfig) -> str:
-    return str(
-        runtime_pipeline_snapshot_compatibility_key(
-            strategy_cfg=cfg.strategy_cfg,
-            cutoff_seconds=int(cfg.cutoff_seconds),
-            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-            round_store_path=str(cfg.round_store.path_jsonl),
-            klines_store_path=str(cfg.klines_store.path),
-        )
-    )
-
-
-def _save_runtime_pipeline_snapshot(
-    *,
-    cfg: RuntimeConfig,
-    closed: _ClosedState,
-) -> int | None:
-    if closed.strategy_pipeline is None:
-        raise InvariantError("strategy_pipeline_missing")
-
-    pipeline_state = closed.strategy_pipeline.export_bootstrap_state()
-    last_settled_epoch_raw = pipeline_state.get("last_settled_epoch")
-    last_settled_epoch = None if last_settled_epoch_raw is None else int(last_settled_epoch_raw)
-    last_round = None if last_settled_epoch is None else closed.cache.get_round(int(last_settled_epoch))
-    save_runtime_pipeline_snapshot(
-        path=_runtime_pipeline_snapshot_path(cfg),
-        compatibility_key=_runtime_pipeline_snapshot_compatibility_key(cfg),
-        pipeline_state=pipeline_state,
-        last_settled_round=last_round,
-    )
-    closed.pipeline_snapshot_saved_epoch = last_settled_epoch
-    return None if last_settled_epoch is None else int(last_settled_epoch)
-
-
-def _bootstrap_strategy_pipeline_from_runtime_snapshot(
-    *,
-    cfg: RuntimeConfig,
-    closed: _ClosedState,
-    rounds_all: list[Round],
-    warmup_rounds: list[Round],
-) -> None:
-    if closed.strategy_pipeline is None:
-        raise InvariantError("strategy_pipeline_missing")
-    if not rounds_all:
-        raise InvariantError("closed_rounds_empty_for_runtime_bootstrap")
-    if not warmup_rounds:
-        raise InvariantError("warmup_rounds_empty_for_runtime_bootstrap")
-
-    rounds_by_epoch = {int(round_t.epoch): round_t for round_t in rounds_all}
-    snapshot_path = _runtime_pipeline_snapshot_path(cfg)
-    compatibility_key = _runtime_pipeline_snapshot_compatibility_key(cfg)
-    snapshot = load_runtime_pipeline_snapshot(
-        path=str(snapshot_path),
-        compatibility_key=str(compatibility_key),
-        rounds_by_epoch=rounds_by_epoch,
-    )
-
-    if isinstance(snapshot, dict):
-        pipeline_state = snapshot.get("pipeline_state")
-        if not isinstance(pipeline_state, dict):
-            raise InvariantError("runtime_pipeline_snapshot_state_missing")
-        closed.strategy_pipeline.import_bootstrap_state(state=pipeline_state)
-        restored_epoch = closed.strategy_pipeline.last_settled_epoch
-        if restored_epoch is None:
-            raise InvariantError("runtime_pipeline_snapshot_last_settled_epoch_missing")
-        delta_rounds = [
-            round_t
-            for round_t in rounds_all
-            if int(round_t.epoch) > int(restored_epoch)
-        ]
-        info(
-            "CORE",
-            "CACHE",
-            "HIT",
-            msg=(
-                f"path={str(snapshot_path)} restored_epoch={int(restored_epoch)} "
-                f"delta_rounds={int(len(delta_rounds))}"
-            ),
-        )
-        if delta_rounds:
-            closed.strategy_pipeline.bootstrap_from_closed_rounds(rounds=list(delta_rounds))
-            _save_runtime_pipeline_snapshot(cfg=cfg, closed=closed)
-        else:
-            closed.pipeline_snapshot_saved_epoch = int(restored_epoch)
-        return
-
-    info(
-        "CORE",
-        "CACHE",
-        "MISS",
-        msg=f"path={str(snapshot_path)} warmup_rounds={int(len(warmup_rounds))}",
-    )
-    closed.strategy_pipeline.bootstrap_from_closed_rounds(rounds=list(warmup_rounds))
-    _save_runtime_pipeline_snapshot(cfg=cfg, closed=closed)
-
-
-def _maybe_persist_runtime_pipeline_snapshot(
-    *,
-    cfg: RuntimeConfig,
-    closed: _ClosedState,
-) -> None:
-    if closed.strategy_pipeline is None:
-        raise InvariantError("strategy_pipeline_missing")
-    current_epoch = closed.strategy_pipeline.last_settled_epoch
-    if current_epoch is None:
-        return
-    saved_epoch = _runtime_pipeline_snapshot_last_saved_epoch(closed)
-    if saved_epoch is not None and int(current_epoch) <= int(saved_epoch):
-        return
-    _save_runtime_pipeline_snapshot(cfg=cfg, closed=closed)
-
-
-def _replace_open_round_bets_from_events(
-    *,
-    cfg: RuntimeConfig,
-    open_round: Round,
-    cutoff_ts: int,
-) -> tuple[Round | None, str | None]:
-    if not bool(cfg.use_onchain_event_bets):
-        return open_round, None
-
-    head_block = int(cfg.contract.latest_block_number())
-    head_ts = int(cfg.contract.block_timestamp(int(head_block)))
-    if int(head_ts) < int(cutoff_ts):
-        return None, "event_chain_head_behind_cutoff"
-
-    lookback_blocks = int(cfg.event_lookback_blocks)
-    if lookback_blocks <= 0:
-        raise InvariantError("event_lookback_blocks_nonpositive")
-
-    from_block = int(max(1, int(head_block) - int(lookback_blocks)))
-    from_block_ts = int(cfg.contract.block_timestamp(int(from_block)))
-    if int(from_block_ts) > int(open_round.start_at):
-        return None, "event_lookback_insufficient_for_round_start"
-
-    events = cfg.contract.fetch_bet_events_for_epoch(
-        epoch=int(open_round.epoch),
-        from_block=int(from_block),
-        to_block=int(head_block),
-    )
-    event_bets = tuple(
-        Bet(
-            wallet_address=str(ev.wallet_address),
-            amount_wei=int(ev.amount_wei),
-            position=str(ev.position),
-            created_at=int(ev.block_timestamp),
-        )
-        for ev in events
-    )
-
-    out = Round(
-        epoch=int(open_round.epoch),
-        start_at=int(open_round.start_at),
-        lock_at=open_round.lock_at,
-        close_at=open_round.close_at,
-        lock_price=open_round.lock_price,
-        close_price=open_round.close_price,
-        position=open_round.position,
-        failed=open_round.failed,
-        bets=event_bets,
-    )
-
-    info(
-        "RUN",
-        "DATA",
-        "EVENTBETS",
-        msg=(
-            f"epoch={int(open_round.epoch)} "
-            f"events={int(len(event_bets))} "
-            f"from_block={int(from_block)} "
-            f"to_block={int(head_block)} "
-            f"head_ts={int(head_ts)} "
-            f"cutoff_ts={int(cutoff_ts)}"
-        ),
-    )
-    return out, None
 
 
 def _load_dry_bets(path: str) -> dict[int, dict[str, object]]:
@@ -921,220 +645,6 @@ def _append_dry_audit_row(path: str, row: dict[str, object]) -> None:
         w.writerow([row.get(c, "") for c in cols])
 
 
-def _controller_profile_label(name: str) -> str:
-    text = str(name).strip()
-    aliases = {
-        "disloc_stageB_bullonly_recent8pct_v1": "stageB",
-        "disloc_stageG2_bullonly_recent5pct_v1": "stageG2",
-        "disloc_altB_20260227_x80": "altB",
-    }
-    if text in aliases:
-        return str(aliases[text])
-    if text.startswith("disloc_"):
-        return str(text[len("disloc_") :])
-    return str(text)
-
-
-def _parse_controller_metric_map(raw: str | object) -> dict[str, float]:
-    if isinstance(raw, dict):
-        data = raw
-    else:
-        text = str(raw or "").strip()
-        if text == "":
-            return {}
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            return {}
-    if not isinstance(data, dict):
-        return {}
-    out: dict[str, float] = {}
-    for key, value in data.items():
-        try:
-            out[str(key)] = float(value)
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
-def _controller_decision_log_suffix(
-    *,
-    decision: object | None,
-    final_action: str,
-    final_skip_reason: str | None = None,
-) -> str:
-    if decision is None:
-        return ""
-    mode = str(getattr(decision, "controller_mode", "") or "").strip()
-    if mode == "":
-        return ""
-    estimator_mode = str(getattr(decision, "controller_estimator_mode", "") or "").strip()
-    window_index = getattr(decision, "controller_window_index", None)
-    lookback_windows_used = getattr(decision, "controller_lookback_windows_used", None)
-    selected_action = str(getattr(decision, "controller_selected_action", "") or "").strip()
-    selected_profile = str(getattr(decision, "controller_selected_profile", "") or "").strip()
-    selected_per_500 = getattr(decision, "controller_estimated_per_500", None)
-    selected_score_per_500 = getattr(decision, "controller_estimated_score_per_500", None)
-    selected_bet_rate = getattr(decision, "controller_estimated_selected_bet_rate", None)
-    per_500_map = _parse_controller_metric_map(
-        getattr(decision, "controller_estimated_profiles_per_500_json", "")
-    )
-    score_map = _parse_controller_metric_map(
-        getattr(decision, "controller_estimated_profiles_score_per_500_json", "")
-    )
-    bet_rate_map = _parse_controller_metric_map(
-        getattr(decision, "controller_estimated_profiles_bet_rate_json", "")
-    )
-    names = set(per_500_map) | set(score_map) | set(bet_rate_map)
-    if selected_profile != "":
-        names.add(str(selected_profile))
-    ordered_names = sorted(
-        names,
-        key=lambda name: (
-            0 if str(name) == str(selected_profile) and str(selected_profile) != "" else 1,
-            -float(score_map.get(str(name), float("-inf"))),
-            str(name),
-        ),
-    )
-    profile_parts: list[str] = []
-    for name in ordered_names:
-        label = _controller_profile_label(str(name))
-        prefix = "*" if str(name) == str(selected_profile) and str(selected_profile) != "" else ""
-        part = (
-            f"{prefix}{label}:"
-            f"{float(per_500_map.get(str(name), 0.0)):+.4f}/"
-            f"{float(score_map.get(str(name), 0.0)):+.4f}/"
-            f"{100.0 * float(bet_rate_map.get(str(name), 0.0)):.1f}%"
-        )
-        profile_parts.append(part)
-    suffix_parts = [
-        f"mode={mode}",
-        (f"estimator={estimator_mode}" if estimator_mode != "" else None),
-        (f"win={int(window_index)}" if window_index is not None else None),
-        (
-            f"hist={int(lookback_windows_used)}"
-            if lookback_windows_used is not None
-            else None
-        ),
-        f"ctrl={selected_action or 'off'}",
-        (
-            f"pick={_controller_profile_label(selected_profile)}"
-            if selected_profile != ""
-            else "pick=skip"
-        ),
-        (
-            f"est500={float(selected_per_500):+.4f}"
-            if isinstance(selected_per_500, (int, float))
-            else None
-        ),
-        (
-            f"score500={float(selected_score_per_500):+.4f}"
-            if isinstance(selected_score_per_500, (int, float))
-            else None
-        ),
-        (
-            f"rate={100.0 * float(selected_bet_rate):.1f}%"
-            if isinstance(selected_bet_rate, (int, float))
-            else None
-        ),
-        f"final={str(final_action)}",
-        (
-            f"reason={str(final_skip_reason)}"
-            if final_skip_reason is not None and str(final_skip_reason).strip() != ""
-            else None
-        ),
-        ("profiles=" + ",".join(profile_parts) if profile_parts else None),
-    ]
-    return " ctrl[" + " ".join(part for part in suffix_parts if part) + "]"
-
-
-def _log_controller_decision(
-    *,
-    current_epoch: int,
-    decision: object | None,
-    final_action: str,
-    final_skip_reason: str | None = None,
-) -> None:
-    suffix = _controller_decision_log_suffix(
-        decision=decision,
-        final_action=str(final_action),
-        final_skip_reason=(None if final_skip_reason is None else str(final_skip_reason)),
-    )
-    if suffix == "":
-        return
-    info("RUN", "CTRL", "DECIDE", msg=f"Epoch {int(current_epoch)}{suffix}")
-
-
-def _direct_action_decision_log_suffix(
-    *,
-    decision: object | None,
-    final_action: str,
-    final_skip_reason: str | None = None,
-) -> str:
-    if decision is None:
-        return ""
-    mode = str(getattr(decision, "direct_action_mode", "") or "").strip()
-    if mode == "":
-        return ""
-    action_id = str(getattr(decision, "direct_action_action_id", "") or "").strip()
-    action_label = str(getattr(decision, "direct_action_action_label", "") or "").strip()
-    score_bnb = getattr(decision, "direct_action_score_bnb", None)
-    q50_bnb = getattr(decision, "direct_action_q50_bnb", None)
-    top_raw = str(getattr(decision, "direct_action_top_actions_json", "") or "").strip()
-    top_parts: list[str] = []
-    if top_raw != "":
-        try:
-            rows = json.loads(top_raw)
-        except json.JSONDecodeError:
-            rows = []
-        if isinstance(rows, list):
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                label = str(row.get("label", row.get("action_id", ""))).strip()
-                if label == "":
-                    continue
-                try:
-                    score_value = float(row.get("score_bnb", row.get("q10_net_bnb", 0.0)))
-                    q10_value = float(row.get("q10_net_bnb", 0.0))
-                    q50_value = float(row.get("q50_net_bnb", 0.0))
-                except (TypeError, ValueError):
-                    continue
-                top_parts.append(f"{label}:{score_value:+.4f}/{q10_value:+.4f}/{q50_value:+.4f}")
-    suffix_parts = [
-        f"mode={mode}",
-        (f"pick={action_label}" if action_label != "" else None),
-        (f"id={action_id}" if action_id != "" else None),
-        (f"score={float(score_bnb):+.4f}" if isinstance(score_bnb, (int, float)) else None),
-        (f"q50={float(q50_bnb):+.4f}" if isinstance(q50_bnb, (int, float)) else None),
-        f"final={str(final_action)}",
-        (
-            f"reason={str(final_skip_reason)}"
-            if final_skip_reason is not None and str(final_skip_reason).strip() != ""
-            else None
-        ),
-        ("top=" + ",".join(top_parts) if top_parts else None),
-    ]
-    return " dap[" + " ".join(part for part in suffix_parts if part) + "]"
-
-
-def _log_direct_action_decision(
-    *,
-    current_epoch: int,
-    decision: object | None,
-    final_action: str,
-    final_skip_reason: str | None = None,
-) -> None:
-    suffix = _direct_action_decision_log_suffix(
-        decision=decision,
-        final_action=str(final_action),
-        final_skip_reason=(None if final_skip_reason is None else str(final_skip_reason)),
-    )
-    if suffix == "":
-        return
-    info("RUN", "DAP", "DECIDE", msg=f"Epoch {int(current_epoch)}{suffix}")
-
-
 def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
     header_cols = [
         "cycle_ts",
@@ -1159,27 +669,8 @@ def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         "cutoff_used_bear_bets",
         "router_mode",
         "pipeline_last_settled_epoch",
-        "controller_mode",
-        "controller_estimator_mode",
-        "controller_window_index",
-        "controller_lookback_windows_used",
-        "controller_selected_profile",
-        "controller_selected_action",
-        "controller_estimated_per_500",
-        "controller_estimated_score_per_500",
-        "controller_estimated_selected_bet_rate",
-        "controller_estimated_profiles_per_500_json",
-        "controller_estimated_profiles_score_per_500_json",
-        "controller_estimated_profiles_bet_rate_json",
-        "direct_action_mode",
-        "direct_action_action_id",
-        "direct_action_action_label",
-        "direct_action_score_bnb",
-        "direct_action_q50_bnb",
-        "direct_action_top_actions_json",
         "action",
         "decision_stage",
-        "selected_strategy",
         "bet_side",
         "bet_size_bnb",
         "p_bull",
@@ -1293,76 +784,12 @@ def _record_dry_cycle_audit(
         if closed.strategy_pipeline.last_settled_epoch is not None:
             pipeline_last_settled_epoch = int(closed.strategy_pipeline.last_settled_epoch)
 
-    selected_strategy: str | object = ""
-    controller_mode: str | object = ""
-    controller_estimator_mode: str | object = ""
-    controller_window_index: int | str = ""
-    controller_lookback_windows_used: int | str = ""
-    controller_selected_profile: str | object = ""
-    controller_selected_action: str | object = ""
-    controller_estimated_per_500: float | str = ""
-    controller_estimated_score_per_500: float | str = ""
-    controller_estimated_selected_bet_rate: float | str = ""
-    controller_estimated_profiles_per_500_json: str | object = ""
-    controller_estimated_profiles_score_per_500_json: str | object = ""
-    controller_estimated_profiles_bet_rate_json: str | object = ""
-    direct_action_mode: str | object = ""
-    direct_action_action_id: str | object = ""
-    direct_action_action_label: str | object = ""
-    direct_action_score_bnb: float | str = ""
-    direct_action_q50_bnb: float | str = ""
-    direct_action_top_actions_json: str | object = ""
     bet_side: str | object = ""
     bet_size_bnb: float | str = ""
     p_bull: float | str = ""
     expected_profit_bnb: float | str = ""
     selector_score_bnb: float | str = ""
     if decision is not None:
-        selected_strategy = getattr(decision, "selected_strategy", "") or ""
-        controller_mode = getattr(decision, "controller_mode", "") or ""
-        controller_estimator_mode = getattr(decision, "controller_estimator_mode", "") or ""
-        controller_window_raw = getattr(decision, "controller_window_index", None)
-        if controller_window_raw is not None:
-            controller_window_index = int(controller_window_raw)
-        controller_lookback_used_raw = getattr(decision, "controller_lookback_windows_used", None)
-        if controller_lookback_used_raw is not None:
-            controller_lookback_windows_used = int(controller_lookback_used_raw)
-        controller_selected_profile = getattr(decision, "controller_selected_profile", "") or ""
-        controller_selected_action = getattr(decision, "controller_selected_action", "") or ""
-        controller_estimated_raw = getattr(decision, "controller_estimated_per_500", None)
-        if isinstance(controller_estimated_raw, (int, float)):
-            controller_estimated_per_500 = float(controller_estimated_raw)
-        controller_estimated_score_raw = getattr(decision, "controller_estimated_score_per_500", None)
-        if isinstance(controller_estimated_score_raw, (int, float)):
-            controller_estimated_score_per_500 = float(controller_estimated_score_raw)
-        controller_estimated_bet_rate_raw = getattr(
-            decision,
-            "controller_estimated_selected_bet_rate",
-            None,
-        )
-        if isinstance(controller_estimated_bet_rate_raw, (int, float)):
-            controller_estimated_selected_bet_rate = float(controller_estimated_bet_rate_raw)
-        controller_estimated_profiles_per_500_json = (
-            getattr(decision, "controller_estimated_profiles_per_500_json", "") or ""
-        )
-        controller_estimated_profiles_score_per_500_json = (
-            getattr(decision, "controller_estimated_profiles_score_per_500_json", "") or ""
-        )
-        controller_estimated_profiles_bet_rate_json = (
-            getattr(decision, "controller_estimated_profiles_bet_rate_json", "") or ""
-        )
-        direct_action_mode = getattr(decision, "direct_action_mode", "") or ""
-        direct_action_action_id = getattr(decision, "direct_action_action_id", "") or ""
-        direct_action_action_label = getattr(decision, "direct_action_action_label", "") or ""
-        direct_action_score_raw = getattr(decision, "direct_action_score_bnb", None)
-        if isinstance(direct_action_score_raw, (int, float)):
-            direct_action_score_bnb = float(direct_action_score_raw)
-        direct_action_q50_raw = getattr(decision, "direct_action_q50_bnb", None)
-        if isinstance(direct_action_q50_raw, (int, float)):
-            direct_action_q50_bnb = float(direct_action_q50_raw)
-        direct_action_top_actions_json = (
-            getattr(decision, "direct_action_top_actions_json", "") or ""
-        )
         bet_side = getattr(decision, "bet_side", "") or ""
         bet_size_raw = getattr(decision, "bet_size_bnb", "")
         if isinstance(bet_size_raw, (int, float)):
@@ -1414,27 +841,8 @@ def _record_dry_cycle_audit(
             "cutoff_used_bear_bets": cutoff_used_pool["cutoff_used_bear_bets"],
             "router_mode": router_mode,
             "pipeline_last_settled_epoch": pipeline_last_settled_epoch,
-            "controller_mode": controller_mode,
-            "controller_estimator_mode": controller_estimator_mode,
-            "controller_window_index": controller_window_index,
-            "controller_lookback_windows_used": controller_lookback_windows_used,
-            "controller_selected_profile": controller_selected_profile,
-            "controller_selected_action": controller_selected_action,
-            "controller_estimated_per_500": controller_estimated_per_500,
-            "controller_estimated_score_per_500": controller_estimated_score_per_500,
-            "controller_estimated_selected_bet_rate": controller_estimated_selected_bet_rate,
-            "controller_estimated_profiles_per_500_json": controller_estimated_profiles_per_500_json,
-            "controller_estimated_profiles_score_per_500_json": controller_estimated_profiles_score_per_500_json,
-            "controller_estimated_profiles_bet_rate_json": controller_estimated_profiles_bet_rate_json,
-            "direct_action_mode": direct_action_mode,
-            "direct_action_action_id": direct_action_action_id,
-            "direct_action_action_label": direct_action_action_label,
-            "direct_action_score_bnb": direct_action_score_bnb,
-            "direct_action_q50_bnb": direct_action_q50_bnb,
-            "direct_action_top_actions_json": direct_action_top_actions_json,
             "action": str(action),
             "decision_stage": str(decision_stage),
-            "selected_strategy": selected_strategy,
             "bet_side": bet_side,
             "bet_size_bnb": bet_size_bnb,
             "p_bull": p_bull,
@@ -1460,14 +868,19 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
     if closed.dry_bets_by_epoch is None or closed.dry_settled_epochs is None:
         raise InvariantError("dry_state_uninitialized")
 
-    # Settle any bet epochs that are now present as closed rounds in cache.
     for epoch, bet in sorted(closed.dry_bets_by_epoch.items()):
         e = int(epoch)
         if e in closed.dry_settled_epochs:
             continue
-        r = closed.cache.get_round(e)
-        if r is None or r.lock_at is None or r.position is None:
-            continue  # not closed/usable yet in cache
+
+        # Fetch round data from contract; skip if not yet finalized.
+        try:
+            rd = cfg.contract.round_data(e)
+        except Exception:
+            continue  # transient RPC failure — will retry next iteration
+
+        if not rd.oracle_called and rd.close_ts > int(now_ts()):
+            continue  # round not yet closed on-chain
 
         bet_bnb_raw = bet.get("bet_bnb", 0.0)
         if isinstance(bet_bnb_raw, (int, float)):
@@ -1475,8 +888,8 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         elif isinstance(bet_bnb_raw, str):
             try:
                 bet_bnb = float(bet_bnb_raw)
-            except ValueError as e:
-                raise InvariantError("dry_bet_bnb_parse_failed") from e
+            except ValueError as exc:
+                raise InvariantError("dry_bet_bnb_parse_failed") from exc
         else:
             raise InvariantError("dry_bet_bnb_type_invalid")
         if bet_bnb <= 0:
@@ -1484,10 +897,14 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             _append_dry_settled_epoch(str(cfg.runtime_state_paths.dry_settled_epochs_path), e)
             continue
 
-        settle = settle_bet_against_closed_round(
+        settle = settle_from_round_data(
             bet_bnb=bet_bnb,
             bet_side=str(bet.get("bet_side", "")),
-            round_closed=r,
+            lock_price_usd=float(rd.lock_price_usd),
+            close_price_usd=float(rd.close_price_usd),
+            bull_amount_wei=int(rd.bull_amount_wei),
+            bear_amount_wei=int(rd.bear_amount_wei),
+            oracle_called=bool(rd.oracle_called),
             treasury_fee_fraction=cfg.treasury_fee_fraction,
         )
 
@@ -1498,10 +915,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         closed.simulated_bankroll_bnb += float(credit_bnb)
         bankroll_after_settle = closed.simulated_bankroll_bnb
 
-        settle_price = r.close_price if r.close_price is not None else r.lock_price
-        if settle_price is None:
-            raise InvariantError("dry_settle_missing_bnbusd_price")
-        bnbusd_price = settle_price
+        bnbusd_price = float(rd.close_price_usd) if float(rd.close_price_usd) > 0 else float(rd.lock_price_usd)
 
         # Brief INFO log (no key=value fields)
         if str(outcome) == "win":
@@ -1586,102 +1000,18 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         )
 
 
+_MOMENTUM_CACHE_N = 10  # retained for sync_mode compatibility
+
+
 def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
-    """Startup-only closed rounds sync + in-memory cache load."""
-    k = int(max_required_prior_context_rounds_size())
-    warmup_rounds = int(required_pipeline_warmup_rounds(strategy_cfg=cfg.strategy_cfg))
-    if warmup_rounds <= 0:
-        raise InvariantError("pipeline_warmup_rounds_nonpositive")
+    """Initialise live/dry runtime state. No disk sync — pure RPC + OKX."""
+    info("CORE", "RUN", "SETUP", msg="Core setup: strategy=momentum_gate mode=rpc_only")
 
-    if k <= 0:
-        context_desc = "target_only"
-    else:
-        context_desc = f"prior_context_rounds[{int(k)}]"
+    strategy_pipeline = _build_momentum_pipeline(cfg=cfg, klines_cache=None)
+    # No warmup rounds needed: OKX gate fetches live at decision time.
+    strategy_pipeline.bootstrap_from_closed_rounds(rounds=[])
 
-    cache_n = max(2, int(warmup_rounds))
-
-    info(
-        "CORE",
-        "RUN",
-        "SETUP",
-        msg=(
-            f"Core setup: prior_context_rounds_required={int(k)} context={context_desc} "
-            f"strategy=shared_pipeline warmup_rounds={int(warmup_rounds)} "
-            f"inference_closed_cache_needed={int(cache_n)}"
-        ),
-    )
-
-    info(
-        "CORE",
-        "STORE",
-        "SYNC",
-        msg=f"Syncing closed rounds: cache_n={int(cache_n)}",
-    )
-    while True:
-        try:
-            sync_closed_rounds(graph=cfg.graph_client, store=cfg.round_store, cache_n=cache_n)
-            break
-        except TransientGraphError as e:
-            info(
-                "CORE",
-                "STORE",
-                "RETRY",
-                msg=(
-                    "Caught TransientGraphError during initial sync: "
-                    f"retrying after delay err={str(e)}"
-                ),
-            )
-            info(
-                "CORE",
-                "LOOP",
-                "SLEEP",
-                msg=(
-                    f"duration={int(_TRANSIENT_NETWORK_DELAY_SECONDS)}s "
-                    "reason=delay_after_transient_network_error"
-                ),
-            )
-            sleep_seconds(int(_TRANSIENT_NETWORK_DELAY_SECONDS))
-
-    # Load from disk exactly once at startup.
-    rounds_all = list(cfg.round_store.iter_closed_rounds())
-    stored_n = int(len(rounds_all))
-    if not rounds_all:
-        raise InvariantError("closed_rounds_store_empty_after_sync")
-
-    # Rolling trim (memory only).
-    if len(rounds_all) > cache_n:
-        rounds_all = rounds_all[-cache_n:]
-
-    cache = RollingClosedRoundsCache(rounds=rounds_all, capacity=cache_n)
-    cache_lo = int(cache.rounds[0].epoch)
-    cache_hi = int(cache.rounds[-1].epoch)
-    info(
-        "CORE",
-        "STORE",
-        "SYNC",
-        msg=f"Closed rounds sync complete: stored_n={int(stored_n)} cache_epochs=[{int(cache_lo)}..{int(cache_hi)}]",
-    )
-
-    if len(cache.rounds) < 2:
-        raise InvariantError("insufficient_closed_rounds_for_dislocation_strategy")
-
-    disk_latest_epoch = int(cache.rounds[-1].epoch)
-
-    klines_cache = _init_klines_cache(cfg=cfg, closed_cache=cache)
-    strategy_pipeline = _build_strategy_pipeline(cfg=cfg, klines_cache=klines_cache)
-
-    closed = _ClosedState(
-        cache=cache,
-        disk_latest_epoch=disk_latest_epoch,
-        klines_cache=klines_cache,
-        strategy_pipeline=strategy_pipeline,
-    )
-    _bootstrap_strategy_pipeline_from_runtime_snapshot(
-        cfg=cfg,
-        closed=closed,
-        rounds_all=list(rounds_all),
-        warmup_rounds=list(cache.rounds),
-    )
+    closed = _ClosedState(strategy_pipeline=strategy_pipeline)
 
     if cfg.dry:
         archived = _archive_dry_runtime_state(
@@ -1724,22 +1054,8 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     return closed
 
 
-def required_runtime_sync_cache_n(*, strategy_cfg: StrategyConfig) -> int:
-    warmup_rounds = int(required_pipeline_warmup_rounds(strategy_cfg=strategy_cfg))
-    if warmup_rounds <= 0:
-        raise InvariantError("pipeline_warmup_rounds_nonpositive")
-    return max(2, int(warmup_rounds))
-
-
-def required_klines_window_for_closed_cache(
-    *,
-    closed_cache: RollingClosedRoundsCache,
-    cutoff_seconds: int,
-) -> tuple[int, int]:
-    return _required_klines_window(
-        closed_cache=closed_cache,
-        cutoff_seconds=int(cutoff_seconds),
-    )
+def required_runtime_sync_cache_n() -> int:
+    return _MOMENTUM_CACHE_N
 
 
 def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
@@ -1767,7 +1083,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 current_epoch=int(current_epoch),
                 now_ts=int(now_ts()),
                 buffer_seconds=int(cfg.buffer_seconds),
-                get_close_ts=closed.cache.get_close_ts,
+                get_close_ts=cfg.contract.close_ts,
                 page_size=100,
                 gas_limit=int(GAS_LIMIT_CLAIM),
                 claim_batch_size=int(_CLAIM_BATCH_SIZE),
@@ -1777,12 +1093,18 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _dry_settle_available_bets(cfg, closed)
             closed.claim_scan_initialized = True
 
-        # Step 3: Update strategy pipeline state from newly-closed rounds.
+        # Step 3: Update strategy pipeline with the latest known settled epoch.
         if closed.strategy_pipeline is None:
             raise InvariantError("strategy_pipeline_missing")
-        closed.strategy_pipeline.refresh_klines(klines=list(closed.klines_cache.klines))
-        closed.strategy_pipeline.settle_closed_rounds(rounds=list(closed.cache.rounds))
-        _maybe_persist_runtime_pipeline_snapshot(cfg=cfg, closed=closed)
+        # Pass a stub for the most recently closed epoch (locked_epoch - 1).
+        if locked_epoch > 1:
+            _settled_stub = Round(
+                epoch=int(locked_epoch) - 1,
+                start_at=0, lock_at=None, close_at=None,
+                lock_price=None, close_price=None,
+                position=None, failed=False, bets=(),
+            )
+            closed.strategy_pipeline.settle_closed_rounds(rounds=[_settled_stub])
 
         # Step 4: Fetch lock_ts(t) (RPC) for open epoch.
         lock_ts_t = int(cfg.contract.lock_ts(int(current_epoch)))
@@ -1843,141 +1165,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if lock_ts_t <= 0:
             raise InvariantError("lock_ts_t_invalid")
 
-        # Step 7: Fetch open round (Graph) by epoch.
-        # Note that during epoch shifts, Graph may temporarily return 0 or >1 open rounds.
-        # This is treated as retryable alignment noise with bounded backoff.
-        open_round: Round | None = None
-        retries_remaining = len(_BACKOFF_SECONDS)
-        while True:
-            try:
-                open_round = cfg.graph_client.fetch_open_round(int(current_epoch))
-                open_round = _with_lock_at(open_round, int(lock_ts_t))
-                break
-            except InvariantError:
-                if retries_remaining <= 0:
-                    raise
-                warn(
-                    "CORE",
-                    "LOOP",
-                    "RETRY",
-                    reason="graph_round_missing_or_ambiguous",
-                    check="open_round",
-                    retries_remaining=int(retries_remaining),
-                )
-                dur = int(_BACKOFF_SECONDS[len(_BACKOFF_SECONDS) - retries_remaining])
-                sleep_seconds(dur)
+        # Step 7: Build open round stub from contract data (replaces Graph fetch).
+        # The open round only needs epoch + timestamps for downstream logic.
+        open_round = _open_round2
 
-                # If alignment shifted while we waited, restart anchoring.
-                locked_round3, _open_round3, current_epoch3 = _epoch_handshake(cfg, closed)
-                if int(current_epoch3) != int(current_epoch):
-                    current_epoch = int(current_epoch3)
-                    locked_round = locked_round3
-                    break
-
-                retries_remaining -= 1
-
-        if open_round is None:
-            # Alignment moved; restart anchoring.
-            continue
-
-        open_round, event_skip = _replace_open_round_bets_from_events(
-            cfg=cfg,
-            open_round=open_round,
-            cutoff_ts=int(cutoff_ts_t),
-        )
-        if event_skip is not None:
-            _record_dry_cycle_audit(
-                cfg,
-                closed,
-                current_epoch=int(current_epoch),
-                locked_epoch=int(locked_epoch),
-                lock_ts=int(lock_ts_t),
-                cutoff_ts=int(cutoff_ts_t),
-                locked_price_bnbusd=float(bnbusd_price),
-                action="SKIP",
-                decision_stage="event_gate",
-                open_round=open_round,
-                bankroll_before_action_bnb=closed.simulated_bankroll_bnb,
-                bankroll_after_action_bnb=closed.simulated_bankroll_bnb,
-                skip_reason=str(event_skip),
-            )
-            info("RUN", "ACT", "SKIP", msg=f"Skip epoch {int(current_epoch)}: {str(event_skip)}")
-            _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
-            return
-        if open_round is None:
-            raise InvariantError("event_bets_open_round_missing")
-
-        # Step 8: Build context guards before deciding.
-        k = int(max_required_prior_context_rounds_size())
-        if int(k) <= 0:
-            prior_context_rounds: list[Round] = []
-        else:
-            if locked_round is None:
-                raise InvariantError("locked_round_missing")
-            prior_context_prefix_needed = max(0, int(k) - 1)
-            prior_context_prefix = (
-                []
-                if prior_context_prefix_needed == 0
-                else list(closed.cache.rounds[-prior_context_prefix_needed:])
-            )
-            prior_context_rounds = list(prior_context_prefix) + [locked_round]
-
-        if len(prior_context_rounds) != int(k):
-            raise InvariantError(
-                f"prior_context_rounds_len_mismatch: got={len(prior_context_rounds)} expected={int(k)}"
-            )
-
-        rounds_ok, rounds_reason = check_rounds_contiguous(
-            prior_context_rounds=prior_context_rounds,
-            target_round=open_round,
-            buffer_seconds=int(cfg.buffer_seconds),
-        )
-        if not rounds_ok:
-            _record_dry_cycle_audit(
-                cfg,
-                closed,
-                current_epoch=int(current_epoch),
-                locked_epoch=int(locked_epoch),
-                lock_ts=int(lock_ts_t),
-                cutoff_ts=int(cutoff_ts_t),
-                locked_price_bnbusd=float(bnbusd_price),
-                action="SKIP",
-                decision_stage="round_guard",
-                open_round=open_round,
-                bankroll_before_action_bnb=closed.simulated_bankroll_bnb,
-                bankroll_after_action_bnb=closed.simulated_bankroll_bnb,
-                skip_reason=str(rounds_reason),
-            )
-            info("RUN", "ACT", "SKIP", msg=f"Skip epoch {int(current_epoch)}: {rounds_reason}")
-            _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
-            return
-
-        context_klines = _build_context_klines(
-            klines_cache=closed.klines_cache,
-            target_round=open_round,
-            cutoff_seconds=int(cfg.cutoff_seconds),
-        )
-        klines_ok, klines_reason = check_klines_contiguous(context_klines=context_klines)
-        if not klines_ok:
-            _record_dry_cycle_audit(
-                cfg,
-                closed,
-                current_epoch=int(current_epoch),
-                locked_epoch=int(locked_epoch),
-                lock_ts=int(lock_ts_t),
-                cutoff_ts=int(cutoff_ts_t),
-                locked_price_bnbusd=float(bnbusd_price),
-                action="SKIP",
-                decision_stage="kline_guard",
-                open_round=open_round,
-                bankroll_before_action_bnb=closed.simulated_bankroll_bnb,
-                bankroll_after_action_bnb=closed.simulated_bankroll_bnb,
-                skip_reason=str(klines_reason),
-            )
-            info("RUN", "ACT", "SKIP", msg=f"Skip epoch {int(current_epoch)}: {klines_reason}")
-            _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
-            return
-
+        # Step 8: Decide.
         t_features_start_ms = _mono_ms()
         pred_p_final = 0.5
         if cfg.dry:
@@ -2003,18 +1195,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             if reason == "":
                 raise InvariantError("policy_skip_missing_reason")
 
-            _log_controller_decision(
-                current_epoch=int(current_epoch),
-                decision=decision,
-                final_action="SKIP",
-                final_skip_reason=str(reason),
-            )
-            _log_direct_action_decision(
-                current_epoch=int(current_epoch),
-                decision=decision,
-                final_action="SKIP",
-                final_skip_reason=str(reason),
-            )
             _record_dry_cycle_audit(
                 cfg,
                 closed,
@@ -2036,20 +1216,52 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
+        # Step 10b: OKX momentum gate (optional, applied after pipeline BET decision).
+        if cfg.momentum_gate is not None and bool(cfg.momentum_gate.enabled):
+            from pancakebot.domain.strategy.momentum_gate import MomentumGateResult
+            gate_result: MomentumGateResult = cfg.momentum_gate.evaluate(
+                cutoff_ts_ms=int(cutoff_ts_t) * 1000,
+                pipeline_bet_side=str(decision.bet_side) if decision.bet_side else None,
+            )
+            if gate_result.skip_reason is not None:
+                _record_dry_cycle_audit(
+                    cfg,
+                    closed,
+                    current_epoch=int(current_epoch),
+                    locked_epoch=int(locked_epoch),
+                    lock_ts=int(lock_ts_t),
+                    cutoff_ts=int(cutoff_ts_t),
+                    locked_price_bnbusd=float(bnbusd_price),
+                    action="SKIP",
+                    decision_stage="momentum_gate",
+                    open_round=open_round,
+                    bankroll_before_action_bnb=float(bankroll_bnb),
+                    bankroll_after_action_bnb=float(bankroll_bnb),
+                    decision=decision,
+                    skip_reason=str(gate_result.skip_reason),
+                    decision_latency_ms=float(t_decision_ready_ms) - float(t_features_start_ms),
+                )
+                info(
+                    "RUN",
+                    "ACT",
+                    "SKIP",
+                    msg=f"Skip epoch {int(current_epoch)}: {gate_result.skip_reason}",
+                    gate_ret_1m=gate_result.ret_1m,
+                    gate_signal=gate_result.signal,
+                )
+                _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
+                return
+            # In override mode the gate signal replaces the pipeline bet_side.
+            if (
+                cfg.momentum_gate._cfg.mode == "override"
+                and gate_result.signal is not None
+                and gate_result.signal != decision.bet_side
+            ):
+                from dataclasses import replace as _dc_replace
+                decision = _dc_replace(decision, bet_side=str(gate_result.signal))
+
         # Step 11: Execution timing guard.
         if now_ts() >= lock_ts_t - _LOCK_SAFETY_MARGIN_SECONDS:
-            _log_controller_decision(
-                current_epoch=int(current_epoch),
-                decision=decision,
-                final_action="SKIP",
-                final_skip_reason="too_close_to_lock_for_bet",
-            )
-            _log_direct_action_decision(
-                current_epoch=int(current_epoch),
-                decision=decision,
-                final_action="SKIP",
-                final_skip_reason="too_close_to_lock_for_bet",
-            )
             _record_dry_cycle_audit(
                 cfg,
                 closed,
@@ -2081,18 +1293,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if amount_wei <= 0:
             raise InvariantError("bet_amount_wei_nonpositive")
 
-        _log_controller_decision(
-            current_epoch=int(current_epoch),
-            decision=decision,
-            final_action="BET",
-            final_skip_reason=None,
-        )
-        _log_direct_action_decision(
-            current_epoch=int(current_epoch),
-            decision=decision,
-            final_action="BET",
-            final_skip_reason=None,
-        )
         tx_submit = None
         if not cfg.dry:
             gas_price_wei = cfg.contract.suggest_gas_price_wei()
@@ -2223,471 +1423,85 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         return
 
 
-def _append_newly_closed_rounds(cfg: RuntimeConfig, closed: _ClosedState) -> int:
-    """Append forward from disk_latest_epoch to latest usable closed epoch (Graph).
-
-    No disk reads: uses `closed.disk_latest_epoch` as the authoritative latest-on-disk.
-    """
-    latest_usable_closed_epoch = int(cfg.graph_client.fetch_latest_usable_closed_epoch())
-    if latest_usable_closed_epoch <= int(closed.disk_latest_epoch):
-        return int(closed.disk_latest_epoch)
-
-    start_epoch = int(closed.disk_latest_epoch) + 1
-    end_epoch = int(latest_usable_closed_epoch)
-
-    span = int(end_epoch) - int(start_epoch) + 1
-    if span <= 0:
-        return int(closed.disk_latest_epoch)
-
-    prev_epoch = int(closed.disk_latest_epoch)
-    earliest_fetched_round: Round | None = None
-    latest_fetched_round: Round | None = None
-
-    page_size = 1000
-    window_start = int(start_epoch)
-    while window_start <= int(end_epoch):
-        window_end = int(window_start) + int(page_size) - 1
-        if window_end > int(end_epoch):
-            window_end = int(end_epoch)
-
-        page = cfg.graph_client.fetch_closed_rounds(
-            order="asc",
-            epoch_gte=int(window_start),
-            epoch_lte=int(window_end),
-            first=int(page_size),
-            skip=0,
-        )
-
-        if page:
-            prev_in_page: int | None = None
-            for idx, r in enumerate(page):
-                e = int(r.epoch)
-                if e < int(window_start) or e > int(window_end):
-                    raise InvariantError(
-                        f"closed_rounds_epoch_out_of_requested_bounds: idx={idx} got={e} range=[{int(window_start)}..{int(window_end)}]"
-                    )
-                if prev_in_page is not None and e <= int(prev_in_page):
-                    raise InvariantError(f"closed_rounds_not_strictly_increasing: idx={idx} got={e} prev={prev_in_page}")
-                prev_in_page = e
-
-            filtered = [r for r in page if int(r.epoch) > int(prev_epoch)]
-            if filtered:
-                prev_epoch = int(cfg.round_store.append_rounds_after(int(prev_epoch), filtered))
-                closed.cache.extend(list(filtered))
-                if earliest_fetched_round is None:
-                    earliest_fetched_round = filtered[0]
-                latest_fetched_round = filtered[-1]
-
-        window_start = int(window_end) + 1
-
-    if earliest_fetched_round is not None and latest_fetched_round is not None:
-        _append_newly_closed_klines(
-            cfg=cfg,
-            closed=closed,
-            earliest_round=earliest_fetched_round,
-            latest_round=latest_fetched_round,
-        )
-
-    return int(prev_epoch)
-
-
-def _last_closed_kline_open_ms(*, cutoff_ts: int) -> int:
-    cutoff_ms = int(cutoff_ts) * 1000
-    minute_open_ms = (int(cutoff_ms) // int(_ONE_MINUTE_MS)) * int(_ONE_MINUTE_MS)
-    return int(minute_open_ms) - int(_ONE_MINUTE_MS)
-
-
-def _required_klines_window(
-    *,
-    closed_cache: RollingClosedRoundsCache,
-    cutoff_seconds: int,
-) -> tuple[int, int]:
-    if not closed_cache.rounds:
-        raise InvariantError("closed_round_cache_empty")
-
-    return _required_klines_window_for_round_bounds(
-        earliest_round=closed_cache.rounds[0],
-        latest_round=closed_cache.rounds[-1],
-        cutoff_seconds=int(cutoff_seconds),
-        warmup_margin_minutes=int(_KLINE_WARMUP_MARGIN_MINUTES),
-    )
-
-
-def _required_klines_window_for_round_bounds(
-    *,
-    earliest_round: Round,
-    latest_round: Round,
-    cutoff_seconds: int,
-    warmup_margin_minutes: int,
-) -> tuple[int, int]:
-    if earliest_round.lock_at is None or latest_round.lock_at is None:
-        raise InvariantError("closed_round_missing_lock_at")
-    if int(earliest_round.epoch) > int(latest_round.epoch):
-        raise InvariantError("round_bounds_epoch_invalid")
-    if int(warmup_margin_minutes) < 0:
-        raise InvariantError("kline_warmup_margin_negative")
-
-    kk = int(max_required_context_klines_size())
-    if kk <= 0:
-        raise InvariantError("context_klines_size_invalid")
-
-    earliest_cutoff_ts = int(earliest_round.lock_at) - int(cutoff_seconds)
-    latest_cutoff_ts = int(latest_round.lock_at) - int(cutoff_seconds)
-
-    earliest_anchor_open_ms = _last_closed_kline_open_ms(cutoff_ts=int(earliest_cutoff_ts))
-    latest_anchor_open_ms = _last_closed_kline_open_ms(cutoff_ts=int(latest_cutoff_ts))
-
-    warmup_minutes = int(kk - 1) + int(warmup_margin_minutes)
-    start_open_ms = int(earliest_anchor_open_ms) - int(warmup_minutes) * int(_ONE_MINUTE_MS)
-    if start_open_ms < 0:
-        start_open_ms = 0
-
-    end_open_ms = int(latest_anchor_open_ms) + int(_ONE_MINUTE_MS)
-    if int(end_open_ms) <= int(start_open_ms):
-        raise InvariantError("required_klines_window_invalid")
-    return int(start_open_ms), int(end_open_ms)
-
-
-def _init_klines_cache(cfg: RuntimeConfig, *, closed_cache: RollingClosedRoundsCache) -> RollingKlinesCache:
-    start_open_ms, end_open_ms = _required_klines_window(
-        closed_cache=closed_cache,
-        cutoff_seconds=int(cfg.cutoff_seconds),
-    )
-
-    ensure_klines_coverage(
-        client=cfg.binance_us_client,
-        store=cfg.klines_store,
-        symbol=cfg.binance_us_symbol,
-        start_open_time_ms=int(start_open_ms),
-        end_open_time_ms=int(end_open_ms),
-    )
-
-    klines = cfg.klines_store.get_klines_between(
-        start_open_time_ms=int(start_open_ms),
-        end_open_time_ms=int(end_open_ms),
-    )
+def _init_klines_cache(cfg: RuntimeConfig) -> RollingKlinesCache:
+    """Load all klines from the pre-populated klines store."""
+    if cfg.klines_store is None:
+        raise InvariantError("klines_store_missing")
+    klines = list(cfg.klines_store.iter_klines())
     if not klines:
         raise InvariantError("klines_cache_init_empty")
+    return RollingKlinesCache(klines=klines, capacity=len(klines))
 
-    return RollingKlinesCache(klines=list(klines), capacity=len(klines))
 
-
-def _build_strategy_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesCache) -> StrategyPipeline:
-    """Build shared strategy pipeline from runtime config."""
-
-    needs_pool_projection_model = any(
-        str(c.pool_total_gate_mode) == "projected_final_model_only"
-        or str(c.stake_mode) in ("ev_scaled_projected", "ev_optimal_projected")
-        or bool(c.late_model_veto_enabled)
-        for c in cfg.strategy_cfg.dislocation.candidates
-    )
-    ml_adapter: MlCandidateAdapter | None = None
-    if bool(cfg.strategy_cfg.ml_candidate.enabled) or bool(needs_pool_projection_model):
-        ml_adapter = MlCandidateAdapter(
-            config=cfg.strategy_cfg.ml_candidate,
-            cutoff_seconds=int(cfg.cutoff_seconds),
-            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-            klines_store_like=klines_cache,
-            feature_cache_store=cfg.feature_cache_store,
-            projection_cache_store=cfg.projection_cache_store,
-        )
-    flow_adapter: FlowCandidateAdapter | None = None
-    if bool(cfg.strategy_cfg.flow_candidate.enabled):
-        flow_adapter = FlowCandidateAdapter(
-            config=cfg.strategy_cfg.flow_candidate,
-            cutoff_seconds=int(cfg.cutoff_seconds),
-            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-        )
-
-    dislocation_engine = build_dislocation_engine_from_config(
-        selector_cfg=cfg.strategy_cfg.dislocation.selector,
-        candidate_cfgs=cfg.strategy_cfg.dislocation.candidates,
-        treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+def _build_momentum_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesCache | None) -> MomentumOnlyPipeline:
+    """Build momentum-only strategy pipeline."""
+    from pancakebot.domain.strategy.momentum_gate import MomentumGateConfig
+    gate_config: MomentumGateConfig = cfg.momentum_gate_config  # type: ignore[assignment]
+    pipeline = MomentumOnlyPipeline(
+        config=gate_config,
+        gate=cfg.momentum_gate,
         cutoff_seconds=int(cfg.cutoff_seconds),
-        projected_pool_provider=ml_adapter,
+        min_bet_amount_bnb=float(cfg.min_bet_amount_bnb),
     )
-
-    router_cfg = StrategyRouterConfig(
-        mode=str(cfg.strategy_cfg.router.mode),
-        score_threshold_bnb=float(cfg.strategy_cfg.router.score_threshold_bnb),
-        online_warmup_rounds=int(cfg.strategy_cfg.router.online_warmup_rounds),
-        online_num_quantile_bins=int(cfg.strategy_cfg.router.online_num_quantile_bins),
-        online_min_cell_obs=int(cfg.strategy_cfg.router.online_min_cell_obs),
-        online_score_threshold_bnb=float(cfg.strategy_cfg.router.online_score_threshold_bnb),
-        online_use_direction_split=bool(cfg.strategy_cfg.router.online_use_direction_split),
-    )
-    router = StrategyRouter(config=router_cfg)
-
-    pipeline = StrategyPipeline(
-        dislocation_engine=dislocation_engine,
-        router=router,
-        treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-        ml_candidate_adapter=ml_adapter,
-        flow_candidate_adapter=flow_adapter,
-        direct_action_policy=(
-            DirectActionPolicy(
-                cutoff_seconds=int(cfg.cutoff_seconds),
-                treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-                klines_store_like=klines_cache,
-                feature_cache_store=cfg.feature_cache_store,
-                model_bundle_path=str(cfg.strategy_cfg.direct_action_policy.model_bundle_path),
-            )
-            if bool(cfg.strategy_cfg.direct_action_policy.enabled)
-            else None
-        ),
-        window_controller=(
-            WindowController(config=cfg.strategy_cfg.window_controller)
-            if bool(cfg.strategy_cfg.window_controller.enabled)
-            else None
-        ),
-    )
-    pipeline.refresh_klines(klines=list(klines_cache.klines))
+    if klines_cache is not None:
+        pipeline.refresh_klines(klines=list(klines_cache.klines))
     return pipeline
 
 
-def _append_newly_closed_klines(
-    cfg: RuntimeConfig,
-    closed: _ClosedState,
-    *,
-    earliest_round: Round,
-    latest_round: Round,
-) -> None:
-    start_open_ms, end_open_ms = _required_klines_window_for_round_bounds(
-        earliest_round=earliest_round,
-        latest_round=latest_round,
-        cutoff_seconds=int(cfg.cutoff_seconds),
-        warmup_margin_minutes=int(_KLINE_WARMUP_MARGIN_MINUTES),
-    )
-
-    ensure_klines_coverage(
-        client=cfg.binance_us_client,
-        store=cfg.klines_store,
-        symbol=cfg.binance_us_symbol,
-        start_open_time_ms=int(start_open_ms),
-        end_open_time_ms=int(end_open_ms),
-    )
-
-    latest_open = closed.klines_cache.latest_open_time_ms()
-    if latest_open is None:
-        raise InvariantError("klines_cache_empty")
-    next_open = max(int(start_open_ms), int(latest_open) + int(_ONE_MINUTE_MS))
-    if int(next_open) >= int(end_open_ms):
-        return
-
-    new_klines = cfg.klines_store.get_klines_between(
-        start_open_time_ms=int(next_open),
-        end_open_time_ms=int(end_open_ms),
-    )
-    if new_klines:
-        closed.klines_cache.extend(list(new_klines))
-
-
 def _epoch_handshake(cfg: RuntimeConfig, closed: _ClosedState) -> tuple[Round, Round, int]:
-    """Epoch alignment handshake (shift-aware) with bounded exponential backoff.
+    """RPC-only epoch alignment. Returns (locked_round_stub, open_round_stub, current_epoch).
 
-    Returns:
-      locked_round, open_round, current_epoch (RPC)
+    Replaces the old Graph-based handshake. Uses contract.current_epoch() and
+    contract.round_data() exclusively — no Graph API, no closed-rounds cache.
     """
-    def _error(*, reason: str, check: str, **fields: object) -> NoReturn:
-        error(
-            "CORE",
-            "LOOP",
-            "ALIGN",
-            err="InvariantError",
-            reason=str(reason),
-            check=str(check),
-            retries_remaining=0,
-            **fields,
-        )
-        raise TransientGraphError(f"epoch_alignment_failed: reason={reason} check={check} fields={fields}")
+    for idx, delay_seconds in enumerate([0] + list(_BACKOFF_SECONDS)):
+        if delay_seconds > 0:
+            sleep_seconds(int(delay_seconds))
+        try:
+            current_epoch = int(cfg.contract.current_epoch())
+        except TransientRpcError as e:
+            warn("CORE", "LOOP", "RETRY", reason="rpc_current_epoch", attempt=idx, err=str(e))
+            continue
 
-    retries_remaining = len(_BACKOFF_SECONDS)
-
-    while retries_remaining >= 0:
-        closed.disk_latest_epoch = _append_newly_closed_rounds(cfg, closed)
-        closed_epoch = int(closed.cache.latest_epoch)
+        locked_epoch = current_epoch - 1
+        if locked_epoch <= 0:
+            warn("CORE", "LOOP", "RETRY", reason="locked_epoch_nonpositive", attempt=idx)
+            continue
 
         try:
-            locked_round = cfg.graph_client.fetch_latest_locked_round()
-            open_round = cfg.graph_client.fetch_latest_open_round()
-        except InvariantError as e:
-            msg = str(e)
-            if retries_remaining <= 0:
-                _error(reason="graph_rounds_missing_or_ambiguous", check="graph_fetch_locked_and_open", err=msg)
-            warn(
-                "CORE",
-                "LOOP",
-                "RETRY",
-                reason="graph_rounds_missing_or_ambiguous",
-                check="graph_fetch_locked_and_open",
-                retries_remaining=int(retries_remaining),
-            )
-            dur = int(_BACKOFF_SECONDS[len(_BACKOFF_SECONDS) - retries_remaining])
-            sleep_seconds(dur)
-            retries_remaining -= 1
+            locked_rd = cfg.contract.round_data(locked_epoch)
+            open_rd = cfg.contract.round_data(current_epoch)
+        except TransientRpcError as e:
+            warn("CORE", "LOOP", "RETRY", reason="rpc_round_data", attempt=idx, err=str(e))
             continue
 
-        locked_epoch = int(locked_round.epoch)
-        open_epoch = int(open_round.epoch)
-        current_epoch = int(cfg.contract.current_epoch())
-
-        # A) Closed vs Locked
-        if locked_epoch > closed_epoch + 1:
-            if retries_remaining <= 0:
-                _error(
-                    reason="epoch_shift_persisted",
-                    check="closed_vs_locked",
-                    closed=int(closed_epoch),
-                    locked=int(locked_epoch),
-                )
-            warn(
-                "CORE",
-                "LOOP",
-                "RETRY",
-                reason="epoch_shift",
-                check="closed_vs_locked",
-                retries_remaining=int(retries_remaining),
-                closed=int(closed_epoch),
-                locked=int(locked_epoch),
-            )
-            dur = int(_BACKOFF_SECONDS[len(_BACKOFF_SECONDS) - retries_remaining])
-            sleep_seconds(dur)
-            retries_remaining -= 1
+        if int(locked_rd.lock_ts) <= 0:
+            warn("CORE", "LOOP", "RETRY", reason="locked_lock_ts_zero", attempt=idx)
             continue
 
-        if locked_epoch <= closed_epoch:
-            if retries_remaining <= 0:
-                _error(
-                    reason="locked_not_after_closed",
-                    check="closed_vs_locked",
-                    closed=int(closed_epoch),
-                    locked=int(locked_epoch),
-                )
-            warn(
-                "CORE",
-                "LOOP",
-                "RETRY",
-                reason="locked_not_after_closed",
-                check="closed_vs_locked",
-                retries_remaining=int(retries_remaining),
-                closed=int(closed_epoch),
-                locked=int(locked_epoch),
-            )
-            dur = int(_BACKOFF_SECONDS[len(_BACKOFF_SECONDS) - retries_remaining])
-            sleep_seconds(dur)
-            retries_remaining -= 1
-            continue
-
-        # B) Locked vs Open (Graph)
-        if open_epoch > locked_epoch + 1:
-            if retries_remaining <= 0:
-                _error(
-                    reason="epoch_shift_persisted",
-                    check="locked_vs_open",
-                    closed=int(closed_epoch),
-                    locked=int(locked_epoch),
-                    open=int(open_epoch),
-                )
-            warn(
-                "CORE",
-                "LOOP",
-                "RETRY",
-                reason="epoch_shift",
-                check="locked_vs_open",
-                retries_remaining=int(retries_remaining),
-                closed=int(closed_epoch),
-                locked=int(locked_epoch),
-                open=int(open_epoch),
-            )
-            dur = int(_BACKOFF_SECONDS[len(_BACKOFF_SECONDS) - retries_remaining])
-            sleep_seconds(dur)
-            retries_remaining -= 1
-            continue
-
-        if open_epoch <= locked_epoch:
-            if retries_remaining <= 0:
-                _error(
-                    reason="open_not_after_locked",
-                    check="locked_vs_open",
-                    closed=int(closed_epoch),
-                    locked=int(locked_epoch),
-                    open=int(open_epoch),
-                )
-            warn(
-                "CORE",
-                "LOOP",
-                "RETRY",
-                reason="open_not_after_locked",
-                check="locked_vs_open",
-                retries_remaining=int(retries_remaining),
-                closed=int(closed_epoch),
-                locked=int(locked_epoch),
-                open=int(open_epoch),
-            )
-            dur = int(_BACKOFF_SECONDS[len(_BACKOFF_SECONDS) - retries_remaining])
-            sleep_seconds(dur)
-            retries_remaining -= 1
-            continue
-
-        # C) Open (Graph) vs RPC
-        if open_epoch == current_epoch:
-            return locked_round, open_round, int(current_epoch)
-
-        if open_epoch > current_epoch:
-            if retries_remaining <= 0:
-                _error(
-                    reason="rpc_behind_open_persisted",
-                    check="open_vs_rpc",
-                    closed=int(closed_epoch),
-                    locked=int(locked_epoch),
-                    open=int(open_epoch),
-                    rpc=int(current_epoch),
-                )
-            warn(
-                "CORE",
-                "LOOP",
-                "RETRY",
-                reason="rpc_behind_open",
-                check="open_vs_rpc",
-                retries_remaining=int(retries_remaining),
-                closed=int(closed_epoch),
-                locked=int(locked_epoch),
-                open=int(open_epoch),
-                rpc=int(current_epoch),
-            )
-            dur = int(_BACKOFF_SECONDS[len(_BACKOFF_SECONDS) - retries_remaining])
-            sleep_seconds(dur)
-            retries_remaining -= 1
-            continue
-
-        if open_epoch < current_epoch:
-            if retries_remaining <= 0:
-                _error(
-                    reason="rpc_ahead_of_open_persisted",
-                    check="open_vs_rpc",
-                    closed=int(closed_epoch),
-                    locked=int(locked_epoch),
-                    open=int(open_epoch),
-                    rpc=int(current_epoch),
-                )
-            warn(
-                "CORE",
-                "LOOP",
-                "RETRY",
-                reason="rpc_ahead_of_open",
-                check="open_vs_rpc",
-                retries_remaining=int(retries_remaining),
-                closed=int(closed_epoch),
-                locked=int(locked_epoch),
-                open=int(open_epoch),
-                rpc=int(current_epoch),
-            )
-            dur = int(_BACKOFF_SECONDS[len(_BACKOFF_SECONDS) - retries_remaining])
-            sleep_seconds(dur)
-            retries_remaining -= 1
-            continue
-
-        raise InvariantError("epoch_handshake_unreachable")
+        locked_round = Round(
+            epoch=int(locked_epoch),
+            start_at=int(locked_rd.start_ts),
+            lock_at=int(locked_rd.lock_ts),
+            close_at=int(locked_rd.close_ts),
+            lock_price=float(locked_rd.lock_price_usd),
+            close_price=None,
+            position=None,
+            failed=False,
+            bets=(),
+        )
+        open_round = Round(
+            epoch=int(current_epoch),
+            start_at=int(open_rd.start_ts),
+            lock_at=int(open_rd.lock_ts),
+            close_at=int(open_rd.close_ts),
+            lock_price=None,
+            close_price=None,
+            position=None,
+            failed=False,
+            bets=(),
+        )
+        return locked_round, open_round, int(current_epoch)
 
     raise InvariantError("epoch_handshake_exhausted")
 
@@ -2713,7 +1527,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
         current_epoch=int(current_epoch2),
         now_ts=int(now_ts()),
         buffer_seconds=int(cfg.buffer_seconds),
-        get_close_ts=closed.cache.get_close_ts,
+        get_close_ts=cfg.contract.close_ts,
         page_size=100,
         gas_limit=int(GAS_LIMIT_CLAIM),
         claim_batch_size=int(_CLAIM_BATCH_SIZE),

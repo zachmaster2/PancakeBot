@@ -22,16 +22,10 @@ class RunSyncModeTests(unittest.TestCase):
         fake_cfg = SimpleNamespace(
             closed_rounds_path="var/closed_rounds.jsonl",
             klines_path="var/klines.jsonl",
-            feature_cache_path="var/feature_cache.db",
-            backtest_state_cache_dir="../PancakeBot_var_exp/backtest_state_cache",
             market_data_db_path="../PancakeBot_var_exp/market_data.db",
-            projection_cache_db_path="../PancakeBot_var_exp/projection_cache.db",
-            run_registry_db_path="../PancakeBot_var_exp/run_registry.db",
             abi_json_path="abi/predictionv2.json",
             cutoff_seconds=12,
             random_seed=1,
-            use_onchain_event_bets=False,
-            event_lookback_blocks=20,
             latency_log_path="var/latency.log",
             dry_initial_bankroll_bnb=50.0,
             wait_for_bet_receipt=False,
@@ -46,15 +40,13 @@ class RunSyncModeTests(unittest.TestCase):
                 dry_pipeline_bootstrap_state_path="var/runtime/dry_pipeline.pkl.gz",
                 live_pipeline_bootstrap_state_path="var/runtime/live_pipeline.pkl.gz",
             ),
-            strategy=MagicMock(),
+            momentum_gate=MagicMock(),
             backtest=MagicMock(),
         )
         with (
             patch("pancakebot.integration.app.load_app_config", return_value=fake_cfg),
             patch("pancakebot.integration.app.set_global_determinism"),
             patch("pancakebot.integration.app.ClosedRoundsStore"),
-            patch("pancakebot.integration.app.KlinesStore"),
-            patch("pancakebot.integration.app.BinanceUsClient"),
             patch("pancakebot.integration.app.load_env"),
             patch("pancakebot.integration.app.require_env", return_value="graph-key") as require_env_mock,
             patch("pancakebot.integration.app.GraphClient"),
@@ -66,7 +58,6 @@ class RunSyncModeTests(unittest.TestCase):
                 stored_closed_round_count=100,
                 earliest_closed_epoch=1,
                 latest_closed_epoch=100,
-                kline_changed_count=10,
             )
             run_from_config(config_path="config.toml", dry=False, backtest=False, sync_only=True)
 

@@ -19,6 +19,23 @@ from pancakebot.core.errors import InvariantError, TransientRpcError
 
 _T = TypeVar("_T")
 
+# Chainlink oracle price scale: BNB/USD feed uses 8 decimal places.
+_ORACLE_PRICE_SCALE = 1e8
+
+
+@dataclass(frozen=True, slots=True)
+class RoundData:
+    """Structured round data fetched from the on-chain rounds() call."""
+    epoch: int
+    start_ts: int
+    lock_ts: int
+    close_ts: int
+    lock_price_usd: float   # Chainlink oracle price / 1e8
+    close_price_usd: float
+    bull_amount_wei: int
+    bear_amount_wei: int
+    oracle_called: bool
+
 
 def _load_abi_list(path: str) -> list[dict[str, Any]]:
     """Load ABI JSON from a file.
@@ -147,6 +164,28 @@ class Web3PredictionContract:
     def close_ts(self, epoch: int) -> int:
         r = self._rpc_call(op="close_ts", fn=lambda: self._contract.functions.rounds(int(epoch)).call())
         return int(r[3])
+
+    def round_data(self, epoch: int) -> "RoundData":
+        """Fetch structured round data for a given epoch.
+
+        Tuple indices for PredictionV2 rounds():
+          [0]=epoch  [1]=startTs  [2]=lockTs  [3]=closeTs
+          [4]=lockPrice  [5]=closePrice  [6]=lockOracleId  [7]=closeOracleId
+          [8]=totalAmount  [9]=bullAmount  [10]=bearAmount
+          [11]=rewardBaseCalAmount  [12]=rewardAmount  [13]=oracleCalled
+        """
+        r = self._rpc_call(op="round_data", fn=lambda: self._contract.functions.rounds(int(epoch)).call())
+        return RoundData(
+            epoch=int(r[0]),
+            start_ts=int(r[1]),
+            lock_ts=int(r[2]),
+            close_ts=int(r[3]),
+            lock_price_usd=float(r[4]) / _ORACLE_PRICE_SCALE,
+            close_price_usd=float(r[5]) / _ORACLE_PRICE_SCALE,
+            bull_amount_wei=int(r[9]),
+            bear_amount_wei=int(r[10]),
+            oracle_called=bool(r[13]),
+        )
 
     def latest_block_number(self) -> int:
         try:
