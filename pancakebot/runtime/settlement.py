@@ -8,6 +8,62 @@ from pancakebot.domain.features.pool_amounts import compute_pool_amounts_wei_at_
 from pancakebot.core.errors import InvariantError
 
 
+def settle_from_round_data(
+    *,
+    bet_bnb: float,
+    bet_side: str,
+    lock_price_usd: float,
+    close_price_usd: float,
+    bull_amount_wei: int,
+    bear_amount_wei: int,
+    oracle_called: bool,
+    treasury_fee_fraction: float,
+) -> "SettlementResult":
+    """Compute settlement from on-chain round data (no bets list needed).
+
+    Used by dry-mode settlement via contract RPC (replaces settle_bet_against_closed_round
+    in the live/dry loop where bets are not available).
+    """
+    if bet_bnb < 0.0:
+        raise InvariantError("settle_bet_bnb_negative")
+    if not (0.0 <= float(treasury_fee_fraction) < 1.0):
+        raise InvariantError("settle_treasury_fee_fraction_out_of_range")
+
+    bet_side_u = str(bet_side).upper()
+    if bet_side_u not in ("BULL", "BEAR"):
+        raise InvariantError("settle_bet_side_invalid")
+
+    if not bool(oracle_called):
+        return SettlementResult(outcome="refund", credit_bnb=float(bet_bnb) - float(GAS_COST_CLAIM_BNB), payout_multiple_after_fee=0.0)
+
+    if float(close_price_usd) > float(lock_price_usd):
+        winner_u = "BULL"
+    elif float(close_price_usd) < float(lock_price_usd):
+        winner_u = "BEAR"
+    else:
+        # Prices equal → house wins → treat as refund
+        return SettlementResult(outcome="refund", credit_bnb=float(bet_bnb) - float(GAS_COST_CLAIM_BNB), payout_multiple_after_fee=0.0)
+
+    if winner_u != bet_side_u:
+        return SettlementResult(outcome="loss", credit_bnb=0.0, payout_multiple_after_fee=0.0)
+
+    bull_bnb = float(bull_amount_wei) / float(BNB_WEI)
+    bear_bnb = float(bear_amount_wei) / float(BNB_WEI)
+
+    # Apply our simulated bet impact to pools.
+    bull_after = float(bull_bnb) + (float(bet_bnb) if bet_side_u == "BULL" else 0.0)
+    bear_after = float(bear_bnb) + (float(bet_bnb) if bet_side_u == "BEAR" else 0.0)
+    total_after = float(bull_after) + float(bear_after)
+
+    denom = float(bull_after) if bet_side_u == "BULL" else float(bear_after)
+    if denom <= 0.0 or total_after <= 0.0:
+        return SettlementResult(outcome="win", credit_bnb=-float(GAS_COST_CLAIM_BNB), payout_multiple_after_fee=0.0)
+
+    mult = (float(total_after) * (1.0 - float(treasury_fee_fraction))) / float(denom)
+    credit = float(bet_bnb) * float(mult) - float(GAS_COST_CLAIM_BNB)
+    return SettlementResult(outcome="win", credit_bnb=float(credit), payout_multiple_after_fee=float(mult))
+
+
 @dataclass(frozen=True, slots=True)
 class SettlementResult:
     outcome: str  # "win" | "loss" | "refund"

@@ -12,13 +12,10 @@ from pancakebot.core.constants import (
     RPC_TIMEOUT_SECONDS,
     RPC_URLS,
 )
-from pancakebot.infra.binance_us_client import BinanceUsClient
-from pancakebot.infra.klines_store import KlinesStore
+from pancakebot.infra.okx_client import OkxClient
+from pancakebot.domain.strategy.momentum_gate import MomentumGate
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
-from pancakebot.infra.feature_cache_store import FeatureCacheStore
 from pancakebot.infra.market_data_db import MarketDataDb, SqliteKlinesStore
-from pancakebot.infra.projection_cache_store import ProjectionCacheStore
-from pancakebot.infra.run_registry_store import RunRegistryStore
 from pancakebot.infra.graph_client import GraphClient
 from pancakebot.infra.rpc_pool import choose_rpc_url
 from pancakebot.infra.onchain.web3_contract_config import Web3ContractConfig
@@ -31,7 +28,8 @@ from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
 
 
-_BINANCE_US_SYMBOL = "BNBUSDT"
+
+
 
 
 def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: bool) -> None:
@@ -42,43 +40,28 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: b
     if selected_modes > 1:
         raise InvariantError("run_modes_mutually_exclusive")
 
-    round_store = ClosedRoundsStore(cfg.closed_rounds_path)
-    klines_store = KlinesStore(cfg.klines_path)
-    binance_us_client = BinanceUsClient(timeout_seconds=10.0)
-
     if backtest:
+        round_store = ClosedRoundsStore(cfg.closed_rounds_path)
         constants = load_contract_constants()
         market_data_store = MarketDataDb(cfg.market_data_db_path)
-        feature_cache_store = FeatureCacheStore(cfg.feature_cache_path)
-        projection_cache_store = ProjectionCacheStore(cfg.projection_cache_db_path)
-        run_registry_store = RunRegistryStore(cfg.run_registry_db_path)
         try:
             market_data_store.ensure_sources_synced(
                 rounds_jsonl_path=str(cfg.closed_rounds_path),
                 klines_jsonl_path=str(cfg.klines_path),
             )
             runtime_cfg = RuntimeConfig(
-                graph_client=None,
                 round_store=round_store,
                 klines_store=SqliteKlinesStore(market_data_db=market_data_store),
-                binance_us_client=binance_us_client,
-                binance_us_symbol=_BINANCE_US_SYMBOL,
                 contract=None,
                 wallet_address="",
                 cutoff_seconds=cfg.cutoff_seconds,
-                use_onchain_event_bets=False,
-                event_lookback_blocks=cfg.event_lookback_blocks,
                 latency_log_path=cfg.latency_log_path,
                 dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
                 wait_for_bet_receipt=False,
                 bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
-                strategy_cfg=cfg.strategy,
+                momentum_gate_config=cfg.momentum_gate,
+                momentum_gate=None,
                 dry=dry,
-                feature_cache_store=feature_cache_store,
-                market_data_store=market_data_store,
-                projection_cache_store=projection_cache_store,
-                run_registry_store=run_registry_store,
-                backtest_state_cache_dir=cfg.backtest_state_cache_dir,
                 runtime_state_paths=cfg.runtime_state_paths,
                 min_bet_amount_bnb=float(constants.min_bet_amount_bnb),
                 treasury_fee_fraction=float(constants.treasury_fee_fraction),
@@ -86,18 +69,6 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: b
             )
             run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var"))
         finally:
-            try:
-                feature_cache_store.close()
-            except Exception:
-                pass
-            try:
-                projection_cache_store.close()
-            except Exception:
-                pass
-            try:
-                run_registry_store.close()
-            except Exception:
-                pass
             try:
                 market_data_store.close()
             except Exception:
@@ -108,13 +79,11 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: b
         load_env()
         graph_api_key = require_env("THE_GRAPH_API_KEY")
         graph = GraphClient(endpoint=PREDICTION_V2_GRAPH_ENDPOINT, api_key=graph_api_key)
+        round_store = ClosedRoundsStore(cfg.closed_rounds_path)
         summary = sync_runtime_market_data(
             cfg=cfg,
             graph=graph,
             round_store=round_store,
-            klines_store=klines_store,
-            binance_us_client=binance_us_client,
-            binance_us_symbol=_BINANCE_US_SYMBOL,
         )
         info(
             "CORE",
@@ -122,22 +91,18 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: b
             "DONE",
             msg=(
                 f"closed_rounds={int(summary.stored_closed_round_count)} "
-                f"epochs=[{int(summary.earliest_closed_epoch)}..{int(summary.latest_closed_epoch)}] "
-                f"klines_changed={int(summary.kline_changed_count)}"
+                f"epochs=[{int(summary.earliest_closed_epoch)}..{int(summary.latest_closed_epoch)}]"
             ),
         )
         return
 
     load_env()
-    graph_api_key = require_env("THE_GRAPH_API_KEY")
     private_key = require_env("BSC_WALLET_PRIVATE_KEY")
     rpc_url = choose_rpc_url(
         RPC_URLS,
         expected_chain_id=int(EXPECTED_CHAIN_ID),
         timeout_seconds=int(RPC_TIMEOUT_SECONDS),
     )
-
-    graph = GraphClient(endpoint=PREDICTION_V2_GRAPH_ENDPOINT, api_key=graph_api_key)
 
     contract_cfg = Web3ContractConfig(
         rpc_url=rpc_url,
@@ -157,32 +122,28 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync_only: b
         )
     )
 
+    momentum_gate = None
+    if bool(cfg.momentum_gate.enabled):
+        okx_client = OkxClient(timeout_seconds=10.0)
+        momentum_gate = MomentumGate(config=cfg.momentum_gate, okx_client=okx_client)
+
     runtime_cfg = RuntimeConfig(
-        graph_client=graph,
-        round_store=round_store,
-        klines_store=klines_store,
-        binance_us_client=binance_us_client,
-        binance_us_symbol=_BINANCE_US_SYMBOL,
+        round_store=None,
+        klines_store=None,
         contract=contract,
         wallet_address=contract.wallet_address,
         cutoff_seconds=cfg.cutoff_seconds,
-        use_onchain_event_bets=cfg.use_onchain_event_bets,
-        event_lookback_blocks=cfg.event_lookback_blocks,
         latency_log_path=cfg.latency_log_path,
         dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
         wait_for_bet_receipt=cfg.wait_for_bet_receipt,
         bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
-        strategy_cfg=cfg.strategy,
+        momentum_gate_config=cfg.momentum_gate,
         dry=dry,
-        feature_cache_store=None,
-        market_data_store=None,
-        projection_cache_store=None,
-        run_registry_store=None,
-        backtest_state_cache_dir=cfg.backtest_state_cache_dir,
         runtime_state_paths=cfg.runtime_state_paths,
         min_bet_amount_bnb=float(min_bet_amount_bnb),
         treasury_fee_fraction=treasury_fee_fraction,
         buffer_seconds=buffer_seconds,
+        momentum_gate=momentum_gate,
     )
 
     run_live_loop(runtime_cfg)
