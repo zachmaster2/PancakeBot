@@ -536,6 +536,9 @@ class SqliteKlinesStore:
     def path(self) -> str:
         return self._path
 
+    def iter_klines(self) -> list[Kline]:
+        return list(self._klines)
+
     def latest_open_time_ms(self) -> int | None:
         return int(self._open_times[-1]) if self._open_times else None
 

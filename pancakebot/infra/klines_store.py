@@ -120,6 +120,9 @@ class KlinesStore:
         self._open_times = [int(k.open_time_ms) for k in klines] + self._open_times
         return int(len(klines))
 
+    def iter_klines(self) -> list[Kline]:
+        return list(self._klines)
+
     def latest_open_time_ms(self) -> int | None:
         return int(self._open_times[-1]) if self._open_times else None
 
