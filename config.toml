@@ -1,59 +1,31 @@
 # PancakeBot configuration
 #
-# This file defines the single production pipeline used by live, dry, and
-# backtest modes.
-#
 # No backward compatibility is supported: unknown keys are treated as errors.
 
 [paths]
-# Path to closed-round history JSONL (epoch-ascending).
-closed_rounds_path = "../PancakeBot_var_data/closed_rounds.jsonl"
-
-# Path to minute kline history JSONL.
-klines_path = "../PancakeBot_var_data/klines_okx.jsonl"
-
-# Path to SQLite mirror for canonical rounds/bets/klines used by backtests.
-market_data_db_path = "../PancakeBot_var_exp/market_data_v1.sqlite"
-
-# Mutable runtime state paths for live/dry loops.
-claim_scan_cursor_path = "../PancakeBot_var_data/runtime/claim_scan_cursor.txt"
-dry_bets_path = "../PancakeBot_var_data/runtime/dry_bets.jsonl"
-dry_settled_epochs_path = "../PancakeBot_var_data/runtime/dry_settled_epochs.txt"
-dry_audit_trades_path = "../PancakeBot_var_data/runtime/dry_audit_trades.csv"
-dry_cycle_audit_path = "../PancakeBot_var_data/runtime/dry_cycle_audit.csv"
-dry_bankroll_state_path = "../PancakeBot_var_data/runtime/dry_bankroll_state.json"
-dry_pipeline_bootstrap_state_path = "../PancakeBot_var_data/runtime/dry_pipeline_bootstrap_state.pkl.gz"
-live_pipeline_bootstrap_state_path = "../PancakeBot_var_data/runtime/live_pipeline_bootstrap_state.pkl.gz"
+closed_rounds_path = "var/closed_rounds.jsonl"
+klines_path = "var/klines_okx.jsonl"
+market_data_db_path = "var/market_data.sqlite"
+claim_scan_cursor_path = "var/runtime/claim_scan_cursor.txt"
+dry_bets_path = "var/runtime/dry_bets.jsonl"
+dry_settled_epochs_path = "var/runtime/dry_settled_epochs.txt"
+dry_audit_trades_path = "var/runtime/dry_audit_trades.csv"
+dry_cycle_audit_path = "var/runtime/dry_cycle_audit.csv"
+dry_bankroll_state_path = "var/runtime/dry_bankroll_state.json"
+dry_pipeline_bootstrap_state_path = "var/runtime/dry_pipeline_bootstrap_state.pkl.gz"
+live_pipeline_bootstrap_state_path = "var/runtime/live_pipeline_bootstrap_state.pkl.gz"
 
 [graph]
-# ABI filepath (must contain ABI array JSON).
 abi_json_path = "abi/prediction_v2_abi.json"
 
 [runtime]
-# Seconds before round lock for cutoff-time snapshotting.
 cutoff_seconds = 17
-
-# Deterministic seed used for all reproducible operations.
-random_seed = 1337
-
-# Path for live latency telemetry JSONL.
-latency_log_path = "../PancakeBot_var_data/live_latency.jsonl"
-
-# Optional starting bankroll for dry-mode smoke tests when no meaningful
-# persisted dry state exists yet. Keeps restarts deterministic after cleanup.
+latency_log_path = "var/live_latency.jsonl"
 dry_initial_bankroll_bnb = 50.0
-
-# If true, wait for bet receipt confirmation in live mode.
 wait_for_bet_receipt = true
-
-# Receipt timeout in seconds when wait_for_bet_receipt=true.
 bet_receipt_timeout_seconds = 45
 
 [momentum_gate]
-# OKX 1m momentum gate. Applied after the strategy pipeline decision, before
-# bet placement. Fetches the last confirmed 1m BNB/USDT kline from OKX at
-# cutoff time and computes ret_1m = (close/open) - 1.
-#
 enabled = true
 symbol = "BNB-USDT"
 threshold = 0.0001
@@ -61,14 +33,5 @@ max_staleness_seconds = 120
 bet_size_bnb = 0.05
 
 [backtest]
-# Number of most-recent closed rounds to replay.
 simulation_size = 20000
-
-# Starting bankroll for backtest replay.
 initial_bankroll_bnb = 50.0
-
-# Backtest reset mode: continuous | chunk_reset
-reset_mode = "continuous"
-
-# Reset interval in rounds when reset_mode="chunk_reset".
-reset_every_rounds = 0

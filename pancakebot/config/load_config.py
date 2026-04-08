@@ -229,7 +229,6 @@ def load_app_config(path: str) -> AppConfig:
 
     allowed_runtime_keys = {
         "cutoff_seconds",
-        "random_seed",
         "latency_log_path",
         "dry_initial_bankroll_bnb",
         "wait_for_bet_receipt",
@@ -240,10 +239,6 @@ def load_app_config(path: str) -> AppConfig:
     cutoff_seconds = _req_int(runtime, "cutoff_seconds")
     if cutoff_seconds <= 0:
         raise InvariantError("cutoff_seconds_must_be_positive")
-
-    random_seed = _req_int(runtime, "random_seed")
-    if random_seed < 0:
-        raise InvariantError("random_seed_must_be_nonnegative")
 
     latency_log_path = _opt_str(runtime, "latency_log_path", "var/live_latency.jsonl")
 
@@ -320,7 +315,6 @@ def load_app_config(path: str) -> AppConfig:
         market_data_db_path=market_data_db_path,
         abi_json_path=abi_json_path,
         cutoff_seconds=int(cutoff_seconds),
-        random_seed=int(random_seed),
         latency_log_path=str(latency_log_path),
         dry_initial_bankroll_bnb=(
             None if dry_initial_bankroll_bnb is None else float(dry_initial_bankroll_bnb)
