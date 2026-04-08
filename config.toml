@@ -32,6 +32,14 @@ threshold = 0.0001
 max_staleness_seconds = 120
 bet_size_bnb = 0.05
 
+[contract]
+# PancakeSwap Prediction V2 protocol constants.
+# Verified on-chain at startup in live/dry mode and saved to var/contract_constants.json.
+# Used directly in backtest mode (no on-chain connection required).
+min_bet_amount_bnb = 0.001
+treasury_fee_fraction = 0.03
+buffer_seconds = 30
+
 [backtest]
 simulation_size = 20000
 initial_bankroll_bnb = 50.0

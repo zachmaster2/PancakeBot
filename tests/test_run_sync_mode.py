@@ -8,21 +8,21 @@ import run
 
 
 class RunSyncModeTests(unittest.TestCase):
-    def test_parse_args_accepts_sync_only(self) -> None:
-        args = run._parse_args(["--sync-only"])
-        self.assertTrue(bool(args.sync_only))
+    def test_parse_args_accepts_sync(self) -> None:
+        args = run._parse_args(["--sync"])
+        self.assertTrue(bool(args.sync))
         self.assertFalse(bool(args.dry))
         self.assertFalse(bool(args.backtest))
 
     def test_parse_args_rejects_multiple_modes(self) -> None:
         with self.assertRaises(SystemExit):
-            run._parse_args(["--dry", "--sync-only"])
+            run._parse_args(["--dry", "--sync"])
 
-    def test_run_from_config_sync_only_dispatches_without_private_key(self) -> None:
+    def test_run_from_config_sync_dispatches_without_private_key(self) -> None:
         fake_cfg = SimpleNamespace(
             closed_rounds_path="var/closed_rounds.jsonl",
             klines_path="var/klines.jsonl",
-            market_data_db_path="../PancakeBot_var_exp/market_data.db",
+            market_data_db_path="var/market_data.sqlite",
             abi_json_path="abi/predictionv2.json",
             cutoff_seconds=12,
             latency_log_path="var/latency.log",
@@ -56,8 +56,10 @@ class RunSyncModeTests(unittest.TestCase):
                 stored_closed_round_count=100,
                 earliest_closed_epoch=1,
                 latest_closed_epoch=100,
+                klines_total=288000,
+                klines_appended=10,
             )
-            run_from_config(config_path="config.toml", dry=False, backtest=False, sync_only=True)
+            run_from_config(config_path="config.toml", dry=False, backtest=False, sync=True)
 
         require_env_mock.assert_called_once_with("THE_GRAPH_API_KEY")
         sync_mock.assert_called_once()

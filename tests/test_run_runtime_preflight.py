@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from inspection.run_runtime_preflight import collect_preflight_checks
+from preflight import collect_preflight_checks
 
 
 class RuntimePreflightTests(unittest.TestCase):

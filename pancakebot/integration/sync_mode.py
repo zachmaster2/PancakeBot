@@ -9,6 +9,7 @@ from pancakebot.domain.closed_rounds_cache import RollingClosedRoundsCache
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
 from pancakebot.infra.closed_rounds_sync import sync_closed_rounds
 from pancakebot.infra.graph_client import GraphClient
+from pancakebot.infra.okx_klines_sync import sync_okx_klines
 from pancakebot.runtime.runtime_loop import required_runtime_sync_cache_n
 from pancakebot.runtime.sleep import sleep_seconds
 
@@ -22,6 +23,8 @@ class SyncSummary:
     stored_closed_round_count: int
     earliest_closed_epoch: int
     latest_closed_epoch: int
+    klines_total: int
+    klines_appended: int
 
 
 def sync_runtime_market_data(
@@ -78,10 +81,17 @@ def sync_runtime_market_data(
         ),
     )
 
+    klines_result = sync_okx_klines(
+        out_path=str(cfg.klines_path),
+        tail_days=200,
+    )
+
     return SyncSummary(
         warmup_rounds=int(warmup_rounds),
         cache_n=int(cache_n),
         stored_closed_round_count=int(stored_closed_round_count),
         earliest_closed_epoch=int(earliest_closed_epoch),
         latest_closed_epoch=int(latest_closed_epoch),
+        klines_total=int(klines_result.get("total_candles", 0)),
+        klines_appended=int(klines_result.get("appended", 0)),
     )
