@@ -276,6 +276,8 @@ def load_app_config(path: str) -> AppConfig:
         "reset_mode",
         "reset_every_rounds",
         "tail_offset_rounds",
+        "epoch_start",
+        "epoch_end",
     }
     _validate_unknown_keys("backtest", backtest, allowed_bt_keys)
 
@@ -296,12 +298,19 @@ def load_app_config(path: str) -> AppConfig:
     reset_every_rounds = _opt_int(backtest, "reset_every_rounds", 0)
     tail_offset_rounds = _opt_int(backtest, "tail_offset_rounds", 0)
 
+    epoch_start_raw = backtest.get("epoch_start")
+    epoch_end_raw = backtest.get("epoch_end")
+    epoch_start = None if epoch_start_raw is None else int(epoch_start_raw)
+    epoch_end = None if epoch_end_raw is None else int(epoch_end_raw)
+
     backtest_cfg = BacktestConfig(
         simulation_size=simulation_size_v,
         initial_bankroll_bnb=initial_bankroll_bnb,
         reset_mode=str(reset_mode),
         reset_every_rounds=int(reset_every_rounds),
         tail_offset_rounds=int(tail_offset_rounds),
+        epoch_start=epoch_start,
+        epoch_end=epoch_end,
     )
     backtest_cfg.validate()
 

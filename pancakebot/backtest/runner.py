@@ -77,15 +77,28 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
 
     all_klines = _load_all_klines(runtime_cfg)
 
-    # Apply tail_offset and select simulation window.
-    effective_end = len(all_rounds) - int(tail_offset_rounds)
-    if effective_end <= 0:
-        raise InvariantError("backtest_tail_offset_exceeds_rounds")
-    sim_rounds = all_rounds[max(0, effective_end - simulation_size): effective_end]
-    if len(sim_rounds) < simulation_size:
-        raise InvariantError(
-            f"backtest_insufficient_rounds: need={simulation_size} have={len(sim_rounds)}"
-        )
+    # Select simulation window: epoch range takes priority over tail window.
+    epoch_start = backtest_cfg.epoch_start
+    epoch_end = backtest_cfg.epoch_end
+    if epoch_start is not None or epoch_end is not None:
+        sim_rounds = [
+            r for r in all_rounds
+            if (epoch_start is None or int(r.epoch) >= int(epoch_start))
+            and (epoch_end is None or int(r.epoch) <= int(epoch_end))
+        ]
+        if not sim_rounds:
+            raise InvariantError(
+                f"backtest_no_rounds_in_epoch_range: start={epoch_start} end={epoch_end}"
+            )
+    else:
+        effective_end = len(all_rounds) - int(tail_offset_rounds)
+        if effective_end <= 0:
+            raise InvariantError("backtest_tail_offset_exceeds_rounds")
+        sim_rounds = all_rounds[max(0, effective_end - simulation_size): effective_end]
+        if len(sim_rounds) < simulation_size:
+            raise InvariantError(
+                f"backtest_insufficient_rounds: need={simulation_size} have={len(sim_rounds)}"
+            )
 
     first_epoch = int(sim_rounds[0].epoch)
     last_epoch = int(sim_rounds[-1].epoch)
