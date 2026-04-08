@@ -15,6 +15,20 @@ EPS = 1e-12
 WEI_PER_BNB = 1_000_000_000_000_000_000
 
 
+def _coerce_finite_float(value: Any) -> float:
+    try:
+        numeric = pd.to_numeric(value, errors="coerce")
+    except Exception:
+        return float("nan")
+    try:
+        result = float(numeric)
+    except Exception:
+        return float("nan")
+    if not np.isfinite(result):
+        return float("nan")
+    return float(result)
+
+
 @dataclass(frozen=True, slots=True)
 class FlowBuildConfig:
     cutoff_seconds: int = 17
@@ -132,11 +146,11 @@ def _normalize_bets(bets: Any) -> list[dict[str, Any]]:
     for raw in bets:
         if not isinstance(raw, dict):
             continue
-        created_at = pd.to_numeric(raw.get("createdAt", raw.get("created_at")), errors="coerce")
+        created_at = _coerce_finite_float(raw.get("createdAt", raw.get("created_at")))
         if not np.isfinite(created_at):
             continue
-        amount = pd.to_numeric(raw.get("amount"), errors="coerce")
-        amount_wei = pd.to_numeric(raw.get("amountWei", raw.get("amount_wei")), errors="coerce")
+        amount = _coerce_finite_float(raw.get("amount"))
+        amount_wei = _coerce_finite_float(raw.get("amountWei", raw.get("amount_wei")))
         if not np.isfinite(amount) and np.isfinite(amount_wei):
             amount = float(amount_wei) / float(WEI_PER_BNB)
         if not np.isfinite(amount):
@@ -235,12 +249,12 @@ def _parse_bets(bets: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     amounts: list[float] = []
     side: list[int] = []
     for bet in bets:
-        amount = pd.to_numeric(bet.get("amount"), errors="coerce")
+        amount = _coerce_finite_float(bet.get("amount"))
         if not np.isfinite(amount):
-            amount_wei = pd.to_numeric(bet.get("amountWei", bet.get("amount_wei")), errors="coerce")
+            amount_wei = _coerce_finite_float(bet.get("amountWei", bet.get("amount_wei")))
             if np.isfinite(amount_wei):
                 amount = float(amount_wei) / float(WEI_PER_BNB)
-        ts_raw = pd.to_numeric(bet.get("createdAt"), errors="coerce")
+        ts_raw = _coerce_finite_float(bet.get("createdAt"))
         pos = str(bet.get("position", "")).strip().lower()
         if not np.isfinite(amount) or not np.isfinite(ts_raw):
             continue

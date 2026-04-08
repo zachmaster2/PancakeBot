@@ -7,7 +7,7 @@ from pathlib import Path
 from pancakebot.core.errors import InvariantError
 
 
-_DEFAULT_PATH = Path("var/contract_constants.json")
+_DEFAULT_PATH = Path("../PancakeBot_var_data/contract_constants.json")
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,4 +60,3 @@ def save_contract_constants(*, constants: ContractConstants, path: Path | None =
     }
     cache_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     return cache_path
-
