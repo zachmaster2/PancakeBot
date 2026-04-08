@@ -1216,50 +1216,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
-        # Step 10b: OKX momentum gate (optional, applied after pipeline BET decision).
-        if cfg.momentum_gate is not None and bool(cfg.momentum_gate.enabled):
-            from pancakebot.domain.strategy.momentum_gate import MomentumGateResult
-            gate_result: MomentumGateResult = cfg.momentum_gate.evaluate(
-                cutoff_ts_ms=int(cutoff_ts_t) * 1000,
-                pipeline_bet_side=str(decision.bet_side) if decision.bet_side else None,
-            )
-            if gate_result.skip_reason is not None:
-                _record_dry_cycle_audit(
-                    cfg,
-                    closed,
-                    current_epoch=int(current_epoch),
-                    locked_epoch=int(locked_epoch),
-                    lock_ts=int(lock_ts_t),
-                    cutoff_ts=int(cutoff_ts_t),
-                    locked_price_bnbusd=float(bnbusd_price),
-                    action="SKIP",
-                    decision_stage="momentum_gate",
-                    open_round=open_round,
-                    bankroll_before_action_bnb=float(bankroll_bnb),
-                    bankroll_after_action_bnb=float(bankroll_bnb),
-                    decision=decision,
-                    skip_reason=str(gate_result.skip_reason),
-                    decision_latency_ms=float(t_decision_ready_ms) - float(t_features_start_ms),
-                )
-                info(
-                    "RUN",
-                    "ACT",
-                    "SKIP",
-                    msg=f"Skip epoch {int(current_epoch)}: {gate_result.skip_reason}",
-                    gate_ret_1m=gate_result.ret_1m,
-                    gate_signal=gate_result.signal,
-                )
-                _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
-                return
-            # In override mode the gate signal replaces the pipeline bet_side.
-            if (
-                cfg.momentum_gate._cfg.mode == "override"
-                and gate_result.signal is not None
-                and gate_result.signal != decision.bet_side
-            ):
-                from dataclasses import replace as _dc_replace
-                decision = _dc_replace(decision, bet_side=str(gate_result.signal))
-
         # Step 11: Execution timing guard.
         if now_ts() >= lock_ts_t - _LOCK_SAFETY_MARGIN_SECONDS:
             _record_dry_cycle_audit(

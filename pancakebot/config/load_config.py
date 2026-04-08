@@ -293,16 +293,13 @@ def load_app_config(path: str) -> AppConfig:
     backtest_cfg.validate()
 
     _validate_unknown_keys("momentum_gate", momentum_gate_raw, {
-        "enabled", "symbol", "threshold", "mode", "max_staleness_seconds", "bet_size_bnb",
+        "enabled", "symbol", "threshold", "max_staleness_seconds", "bet_size_bnb",
     })
     mg_enabled = _opt_bool(momentum_gate_raw, "enabled", False)
     mg_symbol = _opt_str(momentum_gate_raw, "symbol", "BNB-USDT")
     mg_threshold = _opt_float(momentum_gate_raw, "threshold", 0.0001)
     if float(mg_threshold) <= 0:
         raise InvariantError("momentum_gate_threshold_must_be_positive")
-    mg_mode = _opt_str(momentum_gate_raw, "mode", "override")
-    if str(mg_mode) not in ("filter", "override"):
-        raise InvariantError(f"momentum_gate_invalid_mode: {mg_mode}")
     mg_max_staleness = _opt_int(momentum_gate_raw, "max_staleness_seconds", 120)
     if int(mg_max_staleness) <= 0:
         raise InvariantError("momentum_gate_max_staleness_must_be_positive")
@@ -313,7 +310,6 @@ def load_app_config(path: str) -> AppConfig:
         enabled=bool(mg_enabled),
         symbol=str(mg_symbol),
         threshold=float(mg_threshold),
-        mode=str(mg_mode),
         max_staleness_seconds=int(mg_max_staleness),
         bet_size_bnb=float(mg_bet_size_bnb),
     )
