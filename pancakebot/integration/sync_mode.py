@@ -34,13 +34,13 @@ def sync_runtime_market_data(
     round_store: ClosedRoundsStore,
 ) -> SyncSummary:
     warmup_rounds = int(required_runtime_sync_cache_n())
-    cache_n = int(warmup_rounds)
+    cache_n = max(int(warmup_rounds), int(cfg.backtest.simulation_size))
 
     info(
         "CORE",
         "SYNC",
         "START",
-        msg=f"Sync setup: warmup_rounds={int(warmup_rounds)} closed_cache_needed={int(cache_n)}",
+        msg=f"Sync setup: warmup_rounds={int(warmup_rounds)} simulation_size={int(cfg.backtest.simulation_size)} closed_cache_needed={int(cache_n)}",
     )
 
     while True:
