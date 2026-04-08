@@ -7,10 +7,10 @@
 
 [paths]
 # Path to closed-round history JSONL (epoch-ascending).
-closed_rounds_path = "var/closed_rounds.jsonl"
+closed_rounds_path = "../PancakeBot_var_data/closed_rounds.jsonl"
 
 # Path to minute kline history JSONL.
-klines_path = "var/klines.jsonl"
+klines_path = "../PancakeBot_var_data/klines.jsonl"
 
 # Path to persisted feature-vector cache used by backtest/inspection ML runs.
 feature_cache_path = "../PancakeBot_var_exp/feature_cache_v8.sqlite"
@@ -28,14 +28,14 @@ projection_cache_db_path = "../PancakeBot_var_exp/projection_cache_v1.sqlite"
 run_registry_db_path = "../PancakeBot_var_exp/run_registry_v1.sqlite"
 
 # Mutable runtime state paths for live/dry loops.
-claim_scan_cursor_path = "var/runtime/claim_scan_cursor.txt"
-dry_bets_path = "var/runtime/dry_bets.jsonl"
-dry_settled_epochs_path = "var/runtime/dry_settled_epochs.txt"
-dry_audit_trades_path = "var/runtime/dry_audit_trades.csv"
-dry_cycle_audit_path = "var/runtime/dry_cycle_audit.csv"
-dry_bankroll_state_path = "var/runtime/dry_bankroll_state.json"
-dry_pipeline_bootstrap_state_path = "var/runtime/dry_pipeline_bootstrap_state.pkl.gz"
-live_pipeline_bootstrap_state_path = "var/runtime/live_pipeline_bootstrap_state.pkl.gz"
+claim_scan_cursor_path = "../PancakeBot_var_data/runtime/claim_scan_cursor.txt"
+dry_bets_path = "../PancakeBot_var_data/runtime/dry_bets.jsonl"
+dry_settled_epochs_path = "../PancakeBot_var_data/runtime/dry_settled_epochs.txt"
+dry_audit_trades_path = "../PancakeBot_var_data/runtime/dry_audit_trades.csv"
+dry_cycle_audit_path = "../PancakeBot_var_data/runtime/dry_cycle_audit.csv"
+dry_bankroll_state_path = "../PancakeBot_var_data/runtime/dry_bankroll_state.json"
+dry_pipeline_bootstrap_state_path = "../PancakeBot_var_data/runtime/dry_pipeline_bootstrap_state.pkl.gz"
+live_pipeline_bootstrap_state_path = "../PancakeBot_var_data/runtime/live_pipeline_bootstrap_state.pkl.gz"
 
 [graph]
 # ABI filepath (must contain ABI array JSON).
@@ -55,7 +55,7 @@ use_onchain_event_bets = false
 event_lookback_blocks = 600
 
 # Path for live latency telemetry JSONL.
-latency_log_path = "var/live_latency.jsonl"
+latency_log_path = "../PancakeBot_var_data/live_latency.jsonl"
 
 # Optional starting bankroll for dry-mode smoke tests when no meaningful
 # persisted dry state exists yet. Keeps restarts deterministic after cleanup.
