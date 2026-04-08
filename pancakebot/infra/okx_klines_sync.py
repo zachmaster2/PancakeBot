@@ -38,7 +38,7 @@ def sync_okx_klines(*, out_path: str, tail_days: float = 200) -> dict[str, objec
 
     # Phase 1: Backfill history backwards if needed
     if head_ms is None or head_ms > target_start_ms + _BAR_MS:
-        info("SYNC", "KLINES", "BACKFILL", msg=f"Backfilling from {_fmt(target_start_ms)}")
+        info("SYNC", "KLINES", "BKFILL", msg=f"Backfilling from {_fmt(target_start_ms)}")
         collected: list[dict] = []
         after_ms = int(head_ms) if head_ms is not None else None
         batch_count = 0
@@ -50,7 +50,7 @@ def sync_okx_klines(*, out_path: str, tail_days: float = 200) -> dict[str, objec
             oldest = batch[0]["open_time_ms"]
             collected.extend(c for c in batch if c["open_time_ms"] >= target_start_ms)
             if batch_count % 50 == 0:
-                info("SYNC", "KLINES", "BACKFILL_PROG",
+                info("SYNC", "KLINES", "BKFILL_PROG",
                      msg=f"batch={batch_count} at={_fmt(oldest)} collected={len(collected):,}")
             if oldest <= target_start_ms:
                 break
@@ -70,9 +70,9 @@ def sync_okx_klines(*, out_path: str, tail_days: float = 200) -> dict[str, objec
                     for c in collected:
                         fh.write(json.dumps(c, separators=(",", ":"), sort_keys=True) + "\n")
             tail_ms = _read_tail(path)
-            info("SYNC", "KLINES", "BACKFILL_DONE", msg=f"wrote {len(collected):,} historical candles")
+            info("SYNC", "KLINES", "BKFILL_DONE", msg=f"wrote {len(collected):,} historical candles")
     else:
-        info("SYNC", "KLINES", "BACKFILL_SKIP", msg="History already covers target start")
+        info("SYNC", "KLINES", "BKFILL_SKIP", msg="History already covers target start")
 
     # Phase 2: Forward-fill from tail to now
     tail_ms = _read_tail(path)
