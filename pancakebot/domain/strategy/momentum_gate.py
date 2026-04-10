@@ -221,8 +221,22 @@ def compute_signal_from_klines(
     btc_klines: list[list] | None,
     cutoff_ms: int,
 ) -> MomentumGateResult:
-    """Compute signal from raw kline arrays (backtest path)."""
-    return _compute_signal(bnb_klines, btc_klines, cutoff_ms, age_seconds=0.0)
+    """Compute signal from raw kline arrays (backtest path).
+
+    Anchors on the newest BNB kline at or before *cutoff_ms*, matching
+    the live path which anchors on ``newest_ts_ms``.  Without this the
+    backtest uses an exact calculated timestamp while the live path uses
+    the actual latest available kline, causing 0-1 s drift that flips
+    marginal signals near the threshold.
+    """
+    # Find newest BNB kline at or before cutoff_ms (mirrors live newest_ts_ms)
+    anchor_ms = cutoff_ms
+    for k in reversed(bnb_klines):
+        ts = int(k[0]) if isinstance(k, list) else int(k["open_time_ms"])
+        if ts <= cutoff_ms:
+            anchor_ms = ts
+            break
+    return _compute_signal(bnb_klines, btc_klines, anchor_ms, age_seconds=0.0)
 
 
 def _compute_signal(
