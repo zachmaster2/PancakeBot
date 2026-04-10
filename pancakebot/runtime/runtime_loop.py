@@ -26,8 +26,6 @@ from pancakebot.core.constants import (
     GAS_COST_BET_BNB,
 )
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
-from pancakebot.infra.klines_store import KlinesStore
-from pancakebot.domain.klines_cache import RollingKlinesCache
 from pancakebot.domain.types import Round
 from pancakebot.infra.onchain.web3_prediction_contract import RoundData, Web3PredictionContract
 from pancakebot.domain.strategy.momentum_gate import MomentumGate
@@ -58,13 +56,10 @@ class RuntimeConfig:
     # Closed rounds store (JSONL; used by backtest only; None in live/dry)
     round_store: ClosedRoundsStore | None
 
-    # Klines store (OKX data; used by backtest kline cache only; None in live/dry)
-    klines_store: KlinesStore | None
-
     # Momentum strategy config (always present)
     momentum_gate_config: object  # MomentumGateConfig
 
-    # Momentum gate (OKX 1m live client; None in backtest mode)
+    # Momentum gate (OKX 1s live client; None in backtest mode)
     momentum_gate: MomentumGate | None
 
     # On-chain / identity
@@ -120,24 +115,24 @@ class _DryBankrollState:
 
 def _dry_runtime_state_files(paths: RuntimeStatePathsConfig) -> list[Path]:
     return [
-        Path(str(paths.claim_scan_cursor_path)),
-        Path(str(paths.dry_bets_path)),
-        Path(str(paths.dry_settled_epochs_path)),
-        Path(str(paths.dry_audit_trades_path)),
-        Path(str(paths.dry_cycle_audit_path)),
-        Path(str(paths.dry_bankroll_state_path)),
-        Path(str(paths.dry_pipeline_bootstrap_state_path)),
+        Path(paths.claim_scan_cursor_path),
+        Path(paths.dry_bets_path),
+        Path(paths.dry_settled_epochs_path),
+        Path(paths.dry_audit_trades_path),
+        Path(paths.dry_cycle_audit_path),
+        Path(paths.dry_bankroll_state_path),
+        Path(paths.dry_pipeline_bootstrap_state_path),
     ]
 
 
 def _unique_archive_dir(root: Path, *, ts: int, reason: str) -> Path:
-    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(int(ts)))
-    base = root / f"dry_run_archive_{stamp}_{str(reason)}"
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(ts))
+    base = root / f"dry_run_archive_{stamp}_{reason}"
     if not base.exists():
         return base
     suffix = 1
     while True:
-        cand = root / f"dry_run_archive_{stamp}_{str(reason)}_{int(suffix)}"
+        cand = root / f"dry_run_archive_{stamp}_{reason}_{suffix}"
         if not cand.exists():
             return cand
         suffix += 1
@@ -155,32 +150,32 @@ def _archive_dry_runtime_state(
     archive_root = _DRY_RUNTIME_ARCHIVE_ROOT.resolve()
     archive_root.mkdir(parents=True, exist_ok=True)
     ts_now = int(now_ts())
-    archive_dir = _unique_archive_dir(archive_root, ts=ts_now, reason=str(reason))
+    archive_dir = _unique_archive_dir(archive_root, ts=ts_now, reason=reason)
     archive_dir.mkdir(parents=True, exist_ok=False)
     file_meta: list[dict[str, object]] = []
     for src in existing:
         dest = archive_dir / src.name
         stat = src.stat()
-        if bool(move_files):
+        if move_files:
             shutil.move(str(src), str(dest))
         else:
             shutil.copy2(str(src), str(dest))
         file_meta.append(
             {
-                "name": str(src.name),
+                "name": src.name,
                 "source_path": str(src),
                 "archive_path": str(dest),
-                "size_bytes": int(stat.st_size),
+                "size_bytes": stat.st_size,
                 "source_mtime_ts": int(stat.st_mtime),
             }
         )
     (archive_dir / "archive_meta.json").write_text(
         json.dumps(
             {
-                "reason": str(reason),
-                "created_ts": int(ts_now),
-                "move_files": bool(move_files),
-                "file_count": int(len(file_meta)),
+                "reason": reason,
+                "created_ts": ts_now,
+                "move_files": move_files,
+                "file_count": len(file_meta),
                 "files": file_meta,
             },
             indent=2,
@@ -206,7 +201,7 @@ def _fetch_current_bnb_price_usd(cfg: RuntimeConfig) -> float:
 def run_live_loop(cfg: RuntimeConfig) -> None:
     if not cfg.wallet_address:
         raise InvariantError("wallet_address_required")
-    if float(cfg.min_bet_amount_bnb) <= 0.0:
+    if cfg.min_bet_amount_bnb <= 0.0:
         raise InvariantError("runtime_min_bet_amount_nonpositive")
     try:
         closed_state = _init_closed_state(cfg)
@@ -246,13 +241,13 @@ def run_live_loop(cfg: RuntimeConfig) -> None:
                     "LOOP",
                     "SLEEP",
                     msg=(
-                        f"duration={int(_TRANSIENT_NETWORK_DELAY_SECONDS)}s "
+                        f"duration={_TRANSIENT_NETWORK_DELAY_SECONDS}s "
                         "reason=delay_after_transient_network_error"
                     ),
                 )
-                sleep_seconds(int(_TRANSIENT_NETWORK_DELAY_SECONDS))
+                sleep_seconds(_TRANSIENT_NETWORK_DELAY_SECONDS)
     finally:
-        if bool(cfg.dry):
+        if cfg.dry:
             archived = _archive_dry_runtime_state(
                 cfg.runtime_state_paths,
                 reason="shutdown_snapshot",
@@ -263,15 +258,13 @@ def run_live_loop(cfg: RuntimeConfig) -> None:
                     "RUN",
                     "DRY",
                     "ARCHIVE",
-                    msg=f"Saved shutdown dry-state snapshot to {str(archived)}",
+                    msg=f"Saved shutdown dry-state snapshot to {archived}",
                 )
 
 
 def _ensure_parent_dir(path: str) -> None:
-    p = Path(path)
-    parent = p.parent
-    if parent and not parent.exists():
-        parent.mkdir(parents=True, exist_ok=True)
+    from pancakebot.core.path import ensure_parent_dir
+    ensure_parent_dir(path)
 
 
 def _append_jsonl(path: str, record: dict[str, object]) -> None:
@@ -299,7 +292,7 @@ def _write_json_file_atomic(path: str, record: dict[str, object]) -> None:
 
 
 def _mono_ms() -> float:
-    return float(time.perf_counter() * 1000.0)
+    return time.perf_counter() * 1000.0
 
 
 
@@ -322,7 +315,7 @@ def _load_dry_bets(path: str) -> dict[int, dict[str, object]]:
             epoch = int(rec["epoch"])
         except Exception as e:
             raise InvariantError(f"dry_bets_epoch_invalid: path={path} line={lineno}") from e
-        if int(epoch) in bets:
+        if epoch in bets:
             raise InvariantError(f"dry_bets_epoch_duplicate_on_load: path={path} epoch={epoch}")
         bets[epoch] = rec
     return bets
@@ -383,7 +376,7 @@ def _load_dry_bankroll_state(path: str) -> _DryBankrollState | None:
         raise InvariantError(f"dry_bankroll_state_bankroll_invalid: path={path}")
     if not isinstance(updated_ts_raw, int):
         raise InvariantError(f"dry_bankroll_state_updated_ts_invalid: path={path}")
-    if not isinstance(source_raw, str) or str(source_raw).strip() == "":
+    if not isinstance(source_raw, str) or source_raw.strip() == "":
         raise InvariantError(f"dry_bankroll_state_source_invalid: path={path}")
     epoch: int | None = None
     if epoch_raw is not None:
@@ -394,12 +387,12 @@ def _load_dry_bankroll_state(path: str) -> _DryBankrollState | None:
     bankroll_bnb = float(bankroll_raw)
     if bankroll_bnb < 0.0:
         raise InvariantError(f"dry_bankroll_state_bankroll_negative: path={path}")
-    if int(updated_ts_raw) < 0:
+    if updated_ts_raw < 0:
         raise InvariantError(f"dry_bankroll_state_updated_ts_negative: path={path}")
     return _DryBankrollState(
-        simulated_bankroll_bnb=float(bankroll_bnb),
-        updated_ts=int(updated_ts_raw),
-        source=str(source_raw).strip(),
+        simulated_bankroll_bnb=bankroll_bnb,
+        updated_ts=updated_ts_raw,
+        source=source_raw.strip(),
         epoch=epoch,
     )
 
@@ -412,26 +405,26 @@ def _save_dry_bankroll_state(
     epoch: int | None,
     updated_ts: int,
 ) -> _DryBankrollState:
-    if float(bankroll_bnb) < 0.0:
+    if bankroll_bnb < 0.0:
         raise InvariantError("dry_bankroll_state_bankroll_negative")
-    if int(updated_ts) < 0:
+    if updated_ts < 0:
         raise InvariantError("dry_bankroll_state_updated_ts_negative")
-    source_name = str(source).strip()
+    source_name = source.strip()
     if source_name == "":
         raise InvariantError("dry_bankroll_state_source_empty")
     state = _DryBankrollState(
-        simulated_bankroll_bnb=float(bankroll_bnb),
-        updated_ts=int(updated_ts),
-        source=str(source_name),
-        epoch=(None if epoch is None else int(epoch)),
+        simulated_bankroll_bnb=bankroll_bnb,
+        updated_ts=updated_ts,
+        source=source_name,
+        epoch=epoch,
     )
     _write_json_file_atomic(
         path,
         {
-            "simulated_bankroll_bnb": float(state.simulated_bankroll_bnb),
-            "updated_ts": int(state.updated_ts),
-            "source": str(state.source),
-            "epoch": (None if state.epoch is None else int(state.epoch)),
+            "simulated_bankroll_bnb": state.simulated_bankroll_bnb,
+            "updated_ts": state.updated_ts,
+            "source": state.source,
+            "epoch": state.epoch,
         },
     )
     return state
@@ -444,7 +437,7 @@ def _recover_dry_bankroll_state_from_logs(
 ) -> _DryBankrollState | None:
     latest_state: _DryBankrollState | None = None
 
-    for rec in _load_dry_bets(str(dry_bets_path)).values():
+    for rec in _load_dry_bets(dry_bets_path).values():
         placed_ts_raw = rec.get("placed_ts")
         bankroll_raw = rec.get("bankroll_after_bet_bnb")
         epoch_raw = rec.get("epoch")
@@ -459,10 +452,10 @@ def _recover_dry_bankroll_state_from_logs(
             source="recover_from_dry_bet",
             epoch=epoch,
         )
-        if latest_state is None or int(state.updated_ts) > int(latest_state.updated_ts):
+        if latest_state is None or state.updated_ts > latest_state.updated_ts:
             latest_state = state
 
-    audit_path = Path(str(dry_audit_trades_path))
+    audit_path = Path(dry_audit_trades_path)
     if audit_path.exists():
         with audit_path.open("r", newline="", encoding="utf-8") as f:
             for lineno, row in enumerate(csv.DictReader(f), start=2):
@@ -480,49 +473,49 @@ def _recover_dry_bankroll_state_from_logs(
                 epoch_raw = str(row.get("epoch", "")).strip()
                 epoch = int(epoch_raw) if epoch_raw != "" else None
                 state = _DryBankrollState(
-                    simulated_bankroll_bnb=float(bankroll_bnb),
-                    updated_ts=int(settled_ts),
+                    simulated_bankroll_bnb=bankroll_bnb,
+                    updated_ts=settled_ts,
                     source="recover_from_dry_settle",
                     epoch=epoch,
                 )
-                if latest_state is None or int(state.updated_ts) > int(latest_state.updated_ts):
+                if latest_state is None or state.updated_ts > latest_state.updated_ts:
                     latest_state = state
 
     return latest_state
 
 
 def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState:
-    persisted = _load_dry_bankroll_state(str(cfg.runtime_state_paths.dry_bankroll_state_path))
+    persisted = _load_dry_bankroll_state(cfg.runtime_state_paths.dry_bankroll_state_path)
     recovered = _recover_dry_bankroll_state_from_logs(
-        dry_bets_path=str(cfg.runtime_state_paths.dry_bets_path),
-        dry_audit_trades_path=str(cfg.runtime_state_paths.dry_audit_trades_path),
+        dry_bets_path=cfg.runtime_state_paths.dry_bets_path,
+        dry_audit_trades_path=cfg.runtime_state_paths.dry_audit_trades_path,
     )
-    configured_init = None if cfg.dry_initial_bankroll_bnb is None else float(cfg.dry_initial_bankroll_bnb)
+    configured_init = cfg.dry_initial_bankroll_bnb
     can_override_persisted_seed = (
         configured_init is not None
         and persisted is not None
         and recovered is None
         and persisted.epoch is None
-        and str(persisted.source) in {"wallet_init", "configured_init"}
+        and persisted.source in {"wallet_init", "configured_init"}
     )
     if (
         persisted is not None
-        and not bool(can_override_persisted_seed)
-        and (recovered is None or int(persisted.updated_ts) >= int(recovered.updated_ts))
+        and not can_override_persisted_seed
+        and (recovered is None or persisted.updated_ts >= recovered.updated_ts)
     ):
         return persisted
     if recovered is not None:
         return _save_dry_bankroll_state(
-            str(cfg.runtime_state_paths.dry_bankroll_state_path),
-            bankroll_bnb=float(recovered.simulated_bankroll_bnb),
+            cfg.runtime_state_paths.dry_bankroll_state_path,
+            bankroll_bnb=recovered.simulated_bankroll_bnb,
             source="recovered",
             epoch=recovered.epoch,
-            updated_ts=int(recovered.updated_ts),
+            updated_ts=recovered.updated_ts,
         )
     if configured_init is not None:
         return _save_dry_bankroll_state(
-            str(cfg.runtime_state_paths.dry_bankroll_state_path),
-            bankroll_bnb=float(configured_init),
+            cfg.runtime_state_paths.dry_bankroll_state_path,
+            bankroll_bnb=configured_init,
             source="configured_init",
             epoch=None,
             updated_ts=int(now_ts()),
@@ -532,8 +525,8 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
         reason="dry_wallet_bootstrap",
     )
     return _save_dry_bankroll_state(
-        str(cfg.runtime_state_paths.dry_bankroll_state_path),
-        bankroll_bnb=float(wallet_bnb),
+        cfg.runtime_state_paths.dry_bankroll_state_path,
+        bankroll_bnb=wallet_bnb,
         source="wallet_init",
         epoch=None,
         updated_ts=int(now_ts()),
@@ -554,8 +547,8 @@ def _fetch_wallet_balance_bnb_with_retries(
                 "RUN",
                 "RETRY",
                 msg=(
-                    f"Caught TransientRpcError during {str(reason)}: "
-                    f"retrying after delay err={str(e)}"
+                    f"Caught TransientRpcError during {reason}: "
+                    f"retrying after delay err={e}"
                 ),
             )
             info(
@@ -563,18 +556,18 @@ def _fetch_wallet_balance_bnb_with_retries(
                 "LOOP",
                 "SLEEP",
                 msg=(
-                    f"duration={int(delay_seconds)}s "
+                    f"duration={delay_seconds}s "
                     "reason=delay_after_transient_network_error"
                 ),
             )
-            sleep_seconds(int(delay_seconds))
+            sleep_seconds(delay_seconds)
     return float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
 
 
 def _append_dry_settled_epoch(path: str, epoch: int) -> None:
     _ensure_parent_dir(path)
     with open(path, "a") as f:
-        f.write(str(int(epoch)))
+        f.write(str(epoch))
         f.write("\n")
 
 
@@ -590,28 +583,28 @@ def _dry_record_bet(
     bankroll_before_bet_bnb: float,
     bankroll_after_bet_bnb: float,
 ) -> None:
-    if int(epoch) in closed.dry_bets_by_epoch:
-        raise InvariantError(f"dry_bet_duplicate_epoch: epoch={int(epoch)}")
+    if epoch in closed.dry_bets_by_epoch:
+        raise InvariantError(f"dry_bet_duplicate_epoch: epoch={epoch}")
     placed_ts = int(now_ts())
     rec = {
-        "epoch": int(epoch),
-        "placed_ts": int(placed_ts),
-        "bet_side": str(side),
-        "bet_bnb": float(amount_bnb),
-        "p_final": float(p_final),
-        "pred_win_probability": float(p_final),
-        "expected_profit_bnb": float(expected_profit_bnb),
-        "bankroll_before_bet_bnb": float(bankroll_before_bet_bnb),
-        "bankroll_after_bet_bnb": float(bankroll_after_bet_bnb),
+        "epoch": epoch,
+        "placed_ts": placed_ts,
+        "bet_side": side,
+        "bet_bnb": amount_bnb,
+        "p_final": p_final,
+        "pred_win_probability": p_final,
+        "expected_profit_bnb": expected_profit_bnb,
+        "bankroll_before_bet_bnb": bankroll_before_bet_bnb,
+        "bankroll_after_bet_bnb": bankroll_after_bet_bnb,
     }
-    closed.dry_bets_by_epoch[int(epoch)] = rec
-    _append_jsonl(str(cfg.runtime_state_paths.dry_bets_path), rec)
+    closed.dry_bets_by_epoch[epoch] = rec
+    _append_jsonl(cfg.runtime_state_paths.dry_bets_path, rec)
     _save_dry_bankroll_state(
-        str(cfg.runtime_state_paths.dry_bankroll_state_path),
-        bankroll_bnb=float(bankroll_after_bet_bnb),
+        cfg.runtime_state_paths.dry_bankroll_state_path,
+        bankroll_bnb=bankroll_after_bet_bnb,
         source="bet",
-        epoch=int(epoch),
-        updated_ts=int(placed_ts),
+        epoch=epoch,
+        updated_ts=placed_ts,
     )
 
 
@@ -689,7 +682,7 @@ def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         "skip_reason",
     ]
     p = Path(path)
-    if bool(reset) or not p.exists():
+    if reset or not p.exists():
         _ensure_parent_dir(path)
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
@@ -725,36 +718,36 @@ def _round_pool_snapshot(
     bull_bets = 0
     bear_bets = 0
     for bet in round_t.bets:
-        if cutoff_ts is not None and int(bet.created_at) > int(cutoff_ts):
+        if cutoff_ts is not None and bet.created_at > cutoff_ts:
             continue
-        if str(bet.position) == "Bull":
-            bull_wei += int(bet.amount_wei)
+        if bet.position == "Bull":
+            bull_wei += bet.amount_wei
             bull_bets += 1
-        elif str(bet.position) == "Bear":
-            bear_wei += int(bet.amount_wei)
+        elif bet.position == "Bear":
+            bear_wei += bet.amount_wei
             bear_bets += 1
         else:
             raise InvariantError(f"unexpected_round_bet_side: {bet.position}")
 
-    bull_bnb = float(bull_wei) / float(BNB_WEI)
-    bear_bnb = float(bear_wei) / float(BNB_WEI)
+    bull_bnb = bull_wei / BNB_WEI
+    bear_bnb = bear_wei / BNB_WEI
     return {
-        f"{prefix}_total_pool_bnb": float(bull_bnb + bear_bnb),
-        f"{prefix}_bull_pool_bnb": float(bull_bnb),
-        f"{prefix}_bear_pool_bnb": float(bear_bnb),
-        f"{prefix}_total_bets": int(bull_bets + bear_bets),
-        f"{prefix}_bull_bets": int(bull_bets),
-        f"{prefix}_bear_bets": int(bear_bets),
+        f"{prefix}_total_pool_bnb": bull_bnb + bear_bnb,
+        f"{prefix}_bull_pool_bnb": bull_bnb,
+        f"{prefix}_bear_pool_bnb": bear_bnb,
+        f"{prefix}_total_bets": bull_bets + bear_bets,
+        f"{prefix}_bull_bets": bull_bets,
+        f"{prefix}_bear_bets": bear_bets,
     }
 
 
 def _selected_side_probability(*, p_bull: float | None, bet_side: str | None) -> float | str:
     if p_bull is None or bet_side is None:
         return ""
-    if str(bet_side) == "Bull":
-        return float(p_bull)
-    if str(bet_side) == "Bear":
-        return float(1.0 - float(p_bull))
+    if bet_side == "Bull":
+        return p_bull
+    if bet_side == "Bear":
+        return 1.0 - p_bull
     return ""
 
 
@@ -776,21 +769,21 @@ def _record_dry_cycle_audit(
     skip_reason: str | None = None,
     decision_latency_ms: float | None = None,
 ) -> None:
-    if not bool(cfg.dry):
+    if not cfg.dry:
         return
 
     observed_pool = _round_pool_snapshot(open_round, prefix="observed")
     cutoff_used_pool = _round_pool_snapshot(
         open_round,
         prefix="cutoff_used",
-        cutoff_ts=int(cutoff_ts),
+        cutoff_ts=cutoff_ts,
     )
     router_mode: str | object = ""
     pipeline_last_settled_epoch: int | str = ""
     if closed.strategy_pipeline is not None:
-        router_mode = str(closed.strategy_pipeline.router_mode)
+        router_mode = closed.strategy_pipeline.router_mode
         if closed.strategy_pipeline.last_settled_epoch is not None:
-            pipeline_last_settled_epoch = int(closed.strategy_pipeline.last_settled_epoch)
+            pipeline_last_settled_epoch = closed.strategy_pipeline.last_settled_epoch
 
     bet_side: str | object = ""
     bet_size_bnb: float | str = ""
@@ -825,14 +818,14 @@ def _record_dry_cycle_audit(
         else float(bankroll_after_action_bnb)
     )
     _append_dry_cycle_audit_row(
-        str(cfg.runtime_state_paths.dry_cycle_audit_path),
+        cfg.runtime_state_paths.dry_cycle_audit_path,
         {
             "cycle_ts": int(now_ts()),
-            "current_epoch": int(current_epoch),
-            "locked_epoch": int(locked_epoch),
-            "lock_ts": int(lock_ts),
-            "cutoff_ts": int(cutoff_ts),
-            "locked_price_bnbusd": float(locked_price_bnbusd),
+            "current_epoch": current_epoch,
+            "locked_epoch": locked_epoch,
+            "lock_ts": lock_ts,
+            "cutoff_ts": cutoff_ts,
+            "locked_price_bnbusd": locked_price_bnbusd,
             "bankroll_before_action_bnb": bankroll_before,
             "bankroll_after_action_bnb": bankroll_after,
             "observed_total_pool_bnb": observed_pool["observed_total_pool_bnb"],
@@ -849,21 +842,21 @@ def _record_dry_cycle_audit(
             "cutoff_used_bear_bets": cutoff_used_pool["cutoff_used_bear_bets"],
             "router_mode": router_mode,
             "pipeline_last_settled_epoch": pipeline_last_settled_epoch,
-            "action": str(action),
-            "decision_stage": str(decision_stage),
+            "action": action,
+            "decision_stage": decision_stage,
             "bet_side": bet_side,
             "bet_size_bnb": bet_size_bnb,
             "p_bull": p_bull,
             "selected_side_probability": _selected_side_probability(
-                p_bull=None if p_bull == "" else float(p_bull),
-                bet_side=None if bet_side == "" else str(bet_side),
+                p_bull=None if p_bull == "" else p_bull,
+                bet_side=None if bet_side == "" else bet_side,
             ),
             "expected_profit_bnb": expected_profit_bnb,
             "selector_score_bnb": selector_score_bnb,
             "decision_latency_ms": (
-                "" if decision_latency_ms is None else float(decision_latency_ms)
+                "" if decision_latency_ms is None else decision_latency_ms
             ),
-            "skip_reason": "" if skip_reason is None else str(skip_reason),
+            "skip_reason": "" if skip_reason is None else skip_reason,
         },
     )
 
@@ -876,8 +869,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
     if closed.dry_bets_by_epoch is None or closed.dry_settled_epochs is None:
         raise InvariantError("dry_state_uninitialized")
 
-    for epoch, bet in sorted(closed.dry_bets_by_epoch.items()):
-        e = int(epoch)
+    for e, bet in sorted(closed.dry_bets_by_epoch.items()):
         if e in closed.dry_settled_epochs:
             continue
 
@@ -887,7 +879,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         except Exception:
             continue  # transient RPC failure — will retry next iteration
 
-        if not rd.oracle_called and rd.close_ts > int(now_ts()):
+        if not rd.oracle_called and rd.close_ts > now_ts():
             continue  # round not yet closed on-chain
 
         bet_bnb_raw = bet.get("bet_bnb", 0.0)
@@ -902,31 +894,31 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             raise InvariantError("dry_bet_bnb_type_invalid")
         if bet_bnb <= 0:
             closed.dry_settled_epochs.add(e)
-            _append_dry_settled_epoch(str(cfg.runtime_state_paths.dry_settled_epochs_path), e)
+            _append_dry_settled_epoch(cfg.runtime_state_paths.dry_settled_epochs_path, e)
             continue
 
         settle = settle_from_round_data(
             bet_bnb=bet_bnb,
             bet_side=str(bet.get("bet_side", "")),
-            lock_price_usd=float(rd.lock_price_usd),
-            close_price_usd=float(rd.close_price_usd),
-            bull_amount_wei=int(rd.bull_amount_wei),
-            bear_amount_wei=int(rd.bear_amount_wei),
-            oracle_called=bool(rd.oracle_called),
+            lock_price_usd=rd.lock_price_usd,
+            close_price_usd=rd.close_price_usd,
+            bull_amount_wei=rd.bull_amount_wei,
+            bear_amount_wei=rd.bear_amount_wei,
+            oracle_called=rd.oracle_called,
             treasury_fee_fraction=cfg.treasury_fee_fraction,
         )
 
-        outcome = str(settle.outcome)
+        outcome = settle.outcome
         credit_bnb = settle.credit_bnb
 
         bankroll_before_settle = closed.simulated_bankroll_bnb
-        closed.simulated_bankroll_bnb += float(credit_bnb)
+        closed.simulated_bankroll_bnb += credit_bnb
         bankroll_after_settle = closed.simulated_bankroll_bnb
 
-        bnbusd_price = float(rd.close_price_usd) if float(rd.close_price_usd) > 0 else float(rd.lock_price_usd)
+        bnbusd_price = rd.close_price_usd if rd.close_price_usd > 0 else rd.lock_price_usd
 
         # Brief INFO log (no key=value fields)
-        if str(outcome) == "win":
+        if outcome == "win":
             info(
                 "RUN",
                 "ACT",
@@ -938,7 +930,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
                     + bankroll_suffix(bankroll_bnb=bankroll_after_settle, bnbusd_price=bnbusd_price)
                 ),
             )
-        elif str(outcome) == "refund":
+        elif outcome == "refund":
             info(
                 "RUN",
                 "ACT",
@@ -967,19 +959,19 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
 
         placed_raw = bet.get("placed_ts")
         if isinstance(placed_raw, int):
-            placed_ts_val: int | str = int(placed_raw)
+            placed_ts_val: int | str = placed_raw
         elif isinstance(placed_raw, str) and placed_raw.isdigit():
             placed_ts_val = int(placed_raw)
         else:
             placed_ts_val = ""
 
         _append_dry_audit_row(
-            str(cfg.runtime_state_paths.dry_audit_trades_path),
+            cfg.runtime_state_paths.dry_audit_trades_path,
             {
-                "epoch": int(e),
+                "epoch": e,
                 "placed_ts": placed_ts_val,
                 "bet_side": str(bet.get("bet_side", "")),
-                "bet_bnb": float(bet_bnb),
+                "bet_bnb": bet_bnb,
                 "pred_win_probability": bet.get("pred_win_probability", ""),
                 "p_final": bet.get("p_final", ""),
                 "expected_profit_bnb": bet.get("expected_profit_bnb", ""),
@@ -987,24 +979,24 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
                 "cutoff_bear_bnb": bet.get("cutoff_bear_bnb", ""),
                 "final_bull_bnb": bet.get("final_bull_bnb", ""),
                 "final_bear_bnb": bet.get("final_bear_bnb", ""),
-                "settled_ts": int(settled_ts),
-                "outcome": str(outcome),
-                "pnl_bnb": float(credit_bnb),
+                "settled_ts": settled_ts,
+                "outcome": outcome,
+                "pnl_bnb": credit_bnb,
                 "bankroll_before_bet_bnb": bet.get("bankroll_before_bet_bnb", ""),
                 "bankroll_after_bet_bnb": bet.get("bankroll_after_bet_bnb", ""),
-                "bankroll_before_settle_bnb": float(bankroll_before_settle),
-                "bankroll_after_settle_bnb": float(bankroll_after_settle),
+                "bankroll_before_settle_bnb": bankroll_before_settle,
+                "bankroll_after_settle_bnb": bankroll_after_settle,
             },
         )
 
         closed.dry_settled_epochs.add(e)
-        _append_dry_settled_epoch(str(cfg.runtime_state_paths.dry_settled_epochs_path), e)
+        _append_dry_settled_epoch(cfg.runtime_state_paths.dry_settled_epochs_path, e)
         _save_dry_bankroll_state(
-            str(cfg.runtime_state_paths.dry_bankroll_state_path),
-            bankroll_bnb=float(bankroll_after_settle),
+            cfg.runtime_state_paths.dry_bankroll_state_path,
+            bankroll_bnb=bankroll_after_settle,
             source="settle",
-            epoch=int(e),
-            updated_ts=int(settled_ts),
+            epoch=e,
+            updated_ts=settled_ts,
         )
 
 
@@ -1015,7 +1007,7 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     """Initialise live/dry runtime state. No disk sync — pure RPC + OKX."""
     info("CORE", "RUN", "SETUP", msg="Core setup: strategy=momentum_gate mode=rpc_only")
 
-    strategy_pipeline = _build_momentum_pipeline(cfg=cfg, klines_cache=None)
+    strategy_pipeline = _build_momentum_pipeline(cfg=cfg)
     # No warmup rounds needed: OKX gate fetches live at decision time.
     strategy_pipeline.bootstrap_from_closed_rounds(rounds=[])
 
@@ -1032,19 +1024,19 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
                 "RUN",
                 "DRY",
                 "ARCHIVE",
-                msg=f"Archived previous dry runtime state to {str(archived)}",
+                msg=f"Archived previous dry runtime state to {archived}",
             )
         bankroll_state = _resolve_initial_dry_bankroll_state(cfg)
-        closed.simulated_bankroll_bnb = float(bankroll_state.simulated_bankroll_bnb)
-        closed.dry_bets_by_epoch = _load_dry_bets(str(cfg.runtime_state_paths.dry_bets_path))
-        _ensure_dry_audit_csv(str(cfg.runtime_state_paths.dry_audit_trades_path))
+        closed.simulated_bankroll_bnb = bankroll_state.simulated_bankroll_bnb
+        closed.dry_bets_by_epoch = _load_dry_bets(cfg.runtime_state_paths.dry_bets_path)
+        _ensure_dry_audit_csv(cfg.runtime_state_paths.dry_audit_trades_path)
         _ensure_dry_cycle_audit_csv(
-            str(cfg.runtime_state_paths.dry_cycle_audit_path),
+            cfg.runtime_state_paths.dry_cycle_audit_path,
             reset=True,
         )
-        settled_epochs = _load_dry_settled_epochs(str(cfg.runtime_state_paths.dry_settled_epochs_path))
+        settled_epochs = _load_dry_settled_epochs(cfg.runtime_state_paths.dry_settled_epochs_path)
         settled_epochs.update(
-            _load_dry_settled_epochs_from_audit(str(cfg.runtime_state_paths.dry_audit_trades_path))
+            _load_dry_settled_epochs_from_audit(cfg.runtime_state_paths.dry_audit_trades_path)
         )
         closed.dry_settled_epochs = settled_epochs
         info(
@@ -1052,10 +1044,10 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
             "DRY",
             "STATE",
             msg=(
-                f"Loaded dry bankroll {float(bankroll_state.simulated_bankroll_bnb):.6f} BNB "
-                f"source={str(bankroll_state.source)} "
-                f"path={str(cfg.runtime_state_paths.dry_bankroll_state_path)} "
-                f"cycle_audit_path={str(cfg.runtime_state_paths.dry_cycle_audit_path)}"
+                f"Loaded dry bankroll {bankroll_state.simulated_bankroll_bnb:.6f} BNB "
+                f"source={bankroll_state.source} "
+                f"path={cfg.runtime_state_paths.dry_bankroll_state_path} "
+                f"cycle_audit_path={cfg.runtime_state_paths.dry_cycle_audit_path}"
             ),
         )
 
@@ -1071,8 +1063,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
     # take an action using a coherent epoch snapshot.
     while True:
         # Step 1: Epoch alignment handshake (shift-aware) with retries.
-        locked_round, _open_round, current_epoch = _epoch_handshake(cfg, closed)
-        locked_epoch = int(locked_round.epoch)
+        locked_round, _open_round, current_epoch, _open_rd = _epoch_handshake(cfg, closed)
+        locked_epoch = locked_round.epoch
 
         if locked_round.lock_price is None:
             raise InvariantError("locked_round_missing_lock_price")
@@ -1085,17 +1077,17 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             claim_scan_cursor(
                 contract=cfg.contract,
                 wallet_address=cfg.wallet_address,
-                dry=bool(cfg.dry),
-                cursor_path=str(cfg.runtime_state_paths.claim_scan_cursor_path),
-                locked_epoch=int(locked_epoch),
-                current_epoch=int(current_epoch),
+                dry=cfg.dry,
+                cursor_path=cfg.runtime_state_paths.claim_scan_cursor_path,
+                locked_epoch=locked_epoch,
+                current_epoch=current_epoch,
                 now_ts=int(now_ts()),
-                buffer_seconds=int(cfg.buffer_seconds),
+                buffer_seconds=cfg.buffer_seconds,
                 get_close_ts=cfg.contract.close_ts,
                 page_size=100,
-                gas_limit=int(GAS_LIMIT_CLAIM),
-                claim_batch_size=int(_CLAIM_BATCH_SIZE),
-                min_bet_with_gas_bnb=float(cfg.min_bet_amount_bnb) + float(GAS_COST_BET_BNB),
+                gas_limit=GAS_LIMIT_CLAIM,
+                claim_batch_size=_CLAIM_BATCH_SIZE,
+                min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
             )
 
             _dry_settle_available_bets(cfg, closed)
@@ -1107,75 +1099,95 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Pass a stub for the most recently closed epoch (locked_epoch - 1).
         if locked_epoch > 1:
             _settled_stub = Round(
-                epoch=int(locked_epoch) - 1,
+                epoch=locked_epoch - 1,
                 start_at=0, lock_at=None, close_at=None,
                 lock_price=None, close_price=None,
                 position=None, failed=False, bets=(),
             )
             closed.strategy_pipeline.settle_closed_rounds(rounds=[_settled_stub])
 
-        # Step 4: Fetch lock_ts(t) (RPC) for open epoch.
-        lock_ts_t = int(cfg.contract.lock_ts(int(current_epoch)))
+        # Step 4: lock_ts from the handshake (immutable on-chain value).
+        lock_ts_t = int(_open_round.lock_at)
         if lock_ts_t <= 0:
             raise InvariantError("lock_ts_t_invalid")
 
         # Step 5: cutoff_ts(t) = lock_ts(t) - cutoff_seconds.
-        cutoff_ts_t = int(lock_ts_t) - int(cfg.cutoff_seconds)
+        cutoff_ts_t = lock_ts_t - cfg.cutoff_seconds
 
         # If we missed the previous epoch's cutoff and are now targeting a newer epoch, the
         # just-closed locked epoch may become claimable before the next cutoff. In that case,
         # we must wake for claim first (no approximation).
-        prev_locked_epoch = int(locked_round.epoch) - 1
-        claim_ts = int(locked_round.lock_at) + int(cfg.buffer_seconds) + int(_CLAIM_CHECK_PADDING_SECONDS)
+        prev_locked_epoch = locked_round.epoch - 1
+        claim_ts = locked_round.lock_at + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
         if now_ts() < claim_ts < cutoff_ts_t:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
 
         # Step 6: Sleep until cutoff_ts(t).
-        _sleep_until_ts(int(cutoff_ts_t), reason="wait_for_cutoff", epoch=int(current_epoch))
+        _sleep_until_ts(cutoff_ts_t, reason="wait_for_cutoff", epoch=current_epoch)
 
-        # Step 6b: Refresh alignment immediately after waking; if the epoch shifted,
-        # re-anchor before taking any action.
-        locked_round2, _open_round2, current_epoch2 = _epoch_handshake(cfg, closed)
-        if int(current_epoch2) != int(current_epoch):
+        # Step 6a: Kick off OKX kline fetch immediately — runs in the
+        # background while Steps 6b–7 do RPC work, so the ~633 ms of
+        # OKX latency overlaps with ~450 ms of RPC calls instead of
+        # stacking on top.
+        okx_prefetched = None
+        if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, '_gate'):
+            gate = closed.strategy_pipeline._gate
+            if gate is not None:
+                okx_prefetched = gate.prefetch()
+
+        # Step 6b: Quick epoch check — just verify current_epoch hasn't
+        # shifted during the ~267 s sleep.  A full handshake (3 RPC calls,
+        # ~450 ms) is only needed on the rare occasion the epoch actually
+        # changed; a single current_epoch() call (~150 ms) suffices for
+        # the common case.
+        try:
+            current_epoch2 = int(cfg.contract.current_epoch())
+        except TransientRpcError:
+            # On transient failure, fall back to a full handshake.
+            current_epoch2 = None
+
+        if current_epoch2 is not None and current_epoch2 != current_epoch:
             _record_dry_cycle_audit(
                 cfg,
                 closed,
-                current_epoch=int(current_epoch),
-                locked_epoch=int(locked_epoch),
-                lock_ts=int(lock_ts_t),
-                cutoff_ts=int(cutoff_ts_t),
-                locked_price_bnbusd=float(bnbusd_price),
+                current_epoch=current_epoch,
+                locked_epoch=locked_epoch,
+                lock_ts=lock_ts_t,
+                cutoff_ts=cutoff_ts_t,
+                locked_price_bnbusd=bnbusd_price,
                 action="SKIP",
                 decision_stage="reanchor",
                 open_round=None,
                 bankroll_before_action_bnb=closed.simulated_bankroll_bnb,
                 bankroll_after_action_bnb=closed.simulated_bankroll_bnb,
-                skip_reason=f"epoch_shift_before_decision:new_epoch={int(current_epoch2)}",
+                skip_reason=f"epoch_shift_before_decision:new_epoch={current_epoch2}",
             )
             info(
                 "RUN",
                 "ACT",
                 "SKIP",
                 msg=(
-                    f"Skip epoch {int(current_epoch)}: "
-                    f"epoch_shift_before_decision:new_epoch={int(current_epoch2)}"
+                    f"Skip epoch {current_epoch}: "
+                    f"epoch_shift_before_decision:new_epoch={current_epoch2}"
                 ),
             )
             continue
 
-        locked_round = locked_round2
-        current_epoch = int(current_epoch2)
-        locked_epoch = int(locked_round.epoch)
-
-        # lock_ts can drift slightly; re-read for downstream timing guards.
-        lock_ts_t = int(cfg.contract.lock_ts(int(current_epoch)))
-        if lock_ts_t <= 0:
-            raise InvariantError("lock_ts_t_invalid")
-
-        # Step 7: Build open round stub from contract data (replaces Graph fetch).
-        # The open round only needs epoch + timestamps for downstream logic.
-        open_round = _open_round2
+        if current_epoch2 is None:
+            # Transient RPC failure — full re-handshake as fallback
+            locked_round, open_round, current_epoch, open_rd2 = _epoch_handshake(cfg, closed)
+            locked_epoch = locked_round.epoch
+            lock_ts_t = int(open_round.lock_at)
+            pool_bull_bnb = open_rd2.bull_amount_wei / BNB_WEI
+            pool_bear_bnb = open_rd2.bear_amount_wei / BNB_WEI
+        else:
+            # Common path: epoch unchanged — reuse open_round and lock_ts
+            # from Step 1/4, fetch only fresh pool amounts (1 RPC).
+            open_round = _open_round
+            open_rd2 = cfg.contract.round_data(current_epoch)
+            pool_bull_bnb = open_rd2.bull_amount_wei / BNB_WEI
+            pool_bear_bnb = open_rd2.bear_amount_wei / BNB_WEI
 
         # Step 8: Decide.
         t_features_start_ms = _mono_ms()
@@ -1189,71 +1201,69 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         if closed.strategy_pipeline is None:
             raise InvariantError("strategy_pipeline_missing")
-        # Fetch fresh pool data for pool-proportional sizing.
-        open_rd_snap = cfg.contract.round_data(int(current_epoch))
-        pool_bull_bnb = float(open_rd_snap.bull_amount_wei) / float(BNB_WEI)
-        pool_bear_bnb = float(open_rd_snap.bear_amount_wei) / float(BNB_WEI)
         decision = closed.strategy_pipeline.decide_open_round(
             round_t=open_round,
-            bankroll_bnb=float(bankroll_bnb),
+            bankroll_bnb=bankroll_bnb,
             allow_oracle_mode=False,
-            pool_bull_bnb=float(pool_bull_bnb),
-            pool_bear_bnb=float(pool_bear_bnb),
+            pool_bull_bnb=pool_bull_bnb,
+            pool_bear_bnb=pool_bear_bnb,
+            okx_prefetched=okx_prefetched,
         )
         if decision.p_bull is not None:
-            pred_p_final = float(decision.p_bull)
+            pred_p_final = decision.p_bull
         t_decision_ready_ms = _mono_ms()
 
         if decision.action != "BET":
-            reason = str(decision.skip_reason or "")
+            reason = decision.skip_reason or ""
             if reason == "":
                 raise InvariantError("policy_skip_missing_reason")
 
             _record_dry_cycle_audit(
                 cfg,
                 closed,
-                current_epoch=int(current_epoch),
-                locked_epoch=int(locked_epoch),
-                lock_ts=int(lock_ts_t),
-                cutoff_ts=int(cutoff_ts_t),
-                locked_price_bnbusd=float(bnbusd_price),
+                current_epoch=current_epoch,
+                locked_epoch=locked_epoch,
+                lock_ts=lock_ts_t,
+                cutoff_ts=cutoff_ts_t,
+                locked_price_bnbusd=bnbusd_price,
                 action="SKIP",
                 decision_stage="pipeline",
                 open_round=open_round,
-                bankroll_before_action_bnb=float(bankroll_bnb),
-                bankroll_after_action_bnb=float(bankroll_bnb),
+                bankroll_before_action_bnb=bankroll_bnb,
+                bankroll_after_action_bnb=bankroll_bnb,
                 decision=decision,
-                skip_reason=str(reason),
-                decision_latency_ms=float(t_decision_ready_ms) - float(t_features_start_ms),
+                skip_reason=reason,
+                decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
             )
-            info("RUN", "ACT", "SKIP", msg=f"Skip epoch {int(current_epoch)}: {reason}")
+            info("RUN", "ACT", "SKIP", msg=f"Skip epoch {current_epoch}: {reason}")
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
-        # Step 11: Execution timing guard.
-        if now_ts() >= lock_ts_t - _LOCK_SAFETY_MARGIN_SECONDS:
+        # Step 11: Execution timing guard (float precision — int truncation
+        # was randomly shaving 0–1 s off the budget).
+        if time.time() >= lock_ts_t - _LOCK_SAFETY_MARGIN_SECONDS:
             _record_dry_cycle_audit(
                 cfg,
                 closed,
-                current_epoch=int(current_epoch),
-                locked_epoch=int(locked_epoch),
-                lock_ts=int(lock_ts_t),
-                cutoff_ts=int(cutoff_ts_t),
-                locked_price_bnbusd=float(bnbusd_price),
+                current_epoch=current_epoch,
+                locked_epoch=locked_epoch,
+                lock_ts=lock_ts_t,
+                cutoff_ts=cutoff_ts_t,
+                locked_price_bnbusd=bnbusd_price,
                 action="SKIP",
                 decision_stage="timing_guard",
                 open_round=open_round,
-                bankroll_before_action_bnb=float(bankroll_bnb),
-                bankroll_after_action_bnb=float(bankroll_bnb),
+                bankroll_before_action_bnb=bankroll_bnb,
+                bankroll_after_action_bnb=bankroll_bnb,
                 decision=decision,
                 skip_reason="too_close_to_lock_for_bet",
-                decision_latency_ms=float(t_decision_ready_ms) - float(t_features_start_ms),
+                decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
             )
             info(
                 "RUN",
                 "ACT",
                 "SKIP",
-                msg=f"Skip epoch {int(current_epoch)}: too_close_to_lock_for_bet",
+                msg=f"Skip epoch {current_epoch}: too_close_to_lock_for_bet",
             )
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
@@ -1268,27 +1278,27 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             gas_price_wei = cfg.contract.suggest_gas_price_wei()
             if decision.bet_side == "Bull":
                 tx_submit = cfg.contract.bet_bull_timed(
-                    epoch=int(current_epoch),
-                    amount_wei=int(amount_wei),
-                    gas_limit=int(GAS_LIMIT_BET),
-                    gas_price_wei=int(gas_price_wei),
-                    wait_receipt=bool(cfg.wait_for_bet_receipt),
-                    receipt_timeout_seconds=int(cfg.bet_receipt_timeout_seconds),
+                    epoch=current_epoch,
+                    amount_wei=amount_wei,
+                    gas_limit=GAS_LIMIT_BET,
+                    gas_price_wei=gas_price_wei,
+                    wait_receipt=cfg.wait_for_bet_receipt,
+                    receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
                 )
             elif decision.bet_side == "Bear":
                 tx_submit = cfg.contract.bet_bear_timed(
-                    epoch=int(current_epoch),
-                    amount_wei=int(amount_wei),
-                    gas_limit=int(GAS_LIMIT_BET),
-                    gas_price_wei=int(gas_price_wei),
-                    wait_receipt=bool(cfg.wait_for_bet_receipt),
-                    receipt_timeout_seconds=int(cfg.bet_receipt_timeout_seconds),
+                    epoch=current_epoch,
+                    amount_wei=amount_wei,
+                    gas_limit=GAS_LIMIT_BET,
+                    gas_price_wei=gas_price_wei,
+                    wait_receipt=cfg.wait_for_bet_receipt,
+                    receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
                 )
             else:
                 raise InvariantError(f"unexpected_bet_side: {decision.bet_side}")
 
         # Step 13: Log bet with USD (BNB + USD suffixes).
-        amount_bnb = float(amount_wei) / float(BNB_WEI)
+        amount_bnb = amount_wei / BNB_WEI
 
         if not cfg.dry:
             bankroll_after_live = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
@@ -1297,9 +1307,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 "ACT",
                 "BET",
                 msg=(
-                    f"Betting {float(amount_bnb):.4f} BNB"
-                    + usd_suffix(amount_bnb=float(amount_bnb), bnbusd_price=bnbusd_price)
-                    + f" on {str(decision.bet_side)} for epoch {int(current_epoch)}"
+                    f"Betting {amount_bnb:.4f} BNB"
+                    + usd_suffix(amount_bnb=amount_bnb, bnbusd_price=bnbusd_price)
+                    + f" on {decision.bet_side} for epoch {current_epoch}"
                     + bankroll_suffix(bankroll_bnb=bankroll_after_live, bnbusd_price=bnbusd_price)
                 ),
             )
@@ -1311,42 +1321,38 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 else None
             )
             latency_record = {
-                "epoch": int(current_epoch),
-                "cutoff_ts": int(cutoff_ts_t),
-                "t_features_start_mono_ms": float(t_features_start_ms),
-                "t_decision_ready_mono_ms": float(t_decision_ready_ms),
-                "t_tx_signed_mono_ms": float(tx_submit.t_tx_signed_mono_ms),
-                "t_tx_hash_received_mono_ms": float(tx_submit.t_tx_hash_received_mono_ms),
+                "epoch": current_epoch,
+                "cutoff_ts": cutoff_ts_t,
+                "t_features_start_mono_ms": t_features_start_ms,
+                "t_decision_ready_mono_ms": t_decision_ready_ms,
+                "t_tx_signed_mono_ms": tx_submit.t_tx_signed_mono_ms,
+                "t_tx_hash_received_mono_ms": tx_submit.t_tx_hash_received_mono_ms,
                 "t_receipt_confirmed_mono_ms": receipt_confirmed_ms,
-                "tx_hash": str(tx_submit.tx_hash),
-                "tx_included_block_number": int(tx_submit.included_block_number)
-                if tx_submit.included_block_number is not None
-                else None,
-                "tx_included_block_timestamp": int(tx_submit.included_block_timestamp)
-                if tx_submit.included_block_timestamp is not None
-                else None,
-                "latency_features_ms": float(t_decision_ready_ms) - float(t_features_start_ms),
-                "latency_sign_ms": float(tx_submit.t_tx_signed_mono_ms) - float(t_decision_ready_ms),
-                "latency_broadcast_ms": float(tx_submit.t_tx_hash_received_mono_ms) - float(tx_submit.t_tx_signed_mono_ms),
+                "tx_hash": tx_submit.tx_hash,
+                "tx_included_block_number": tx_submit.included_block_number,
+                "tx_included_block_timestamp": tx_submit.included_block_timestamp,
+                "latency_features_ms": t_decision_ready_ms - t_features_start_ms,
+                "latency_sign_ms": tx_submit.t_tx_signed_mono_ms - t_decision_ready_ms,
+                "latency_broadcast_ms": tx_submit.t_tx_hash_received_mono_ms - tx_submit.t_tx_signed_mono_ms,
                 "latency_mempool_ms": (
-                    float(receipt_confirmed_ms) - float(tx_submit.t_tx_hash_received_mono_ms)
+                    receipt_confirmed_ms - tx_submit.t_tx_hash_received_mono_ms
                     if receipt_confirmed_ms is not None
                     else None
                 ),
                 "latency_e2e_ms": (
-                    float(receipt_confirmed_ms) - float(t_features_start_ms)
+                    receipt_confirmed_ms - t_features_start_ms
                     if receipt_confirmed_ms is not None
                     else None
                 ),
             }
-            _append_jsonl(str(cfg.latency_log_path), latency_record)
+            _append_jsonl(cfg.latency_log_path, latency_record)
         else:
             # Step 14: Dry bookkeeping (including gas proxy) + record.
             if closed.simulated_bankroll_bnb is None:
                 raise InvariantError("dry_bankroll_uninitialized")
 
             bankroll_before_bet = closed.simulated_bankroll_bnb
-            closed.simulated_bankroll_bnb -= float(amount_bnb) + float(GAS_COST_BET_BNB)
+            closed.simulated_bankroll_bnb -= amount_bnb + GAS_COST_BET_BNB
             bankroll_after_bet = closed.simulated_bankroll_bnb
 
             info(
@@ -1354,38 +1360,38 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 "ACT",
                 "BET",
                 msg=(
-                    f"Betting {float(amount_bnb):.4f} BNB"
-                    + usd_suffix(amount_bnb=float(amount_bnb), bnbusd_price=bnbusd_price)
-                    + f" on {str(decision.bet_side)} for epoch {int(current_epoch)}"
+                    f"Betting {amount_bnb:.4f} BNB"
+                    + usd_suffix(amount_bnb=amount_bnb, bnbusd_price=bnbusd_price)
+                    + f" on {decision.bet_side} for epoch {current_epoch}"
                     + bankroll_suffix(bankroll_bnb=bankroll_after_bet, bnbusd_price=bnbusd_price)
                 ),
             )
             _dry_record_bet(
                 cfg,
                 closed,
-                epoch=int(current_epoch),
-                side=str(decision.bet_side),
-                amount_bnb=float(amount_bnb),
-                p_final=float(pred_p_final),
-                expected_profit_bnb=float(decision.expected_profit_bnb),
-                bankroll_before_bet_bnb=float(bankroll_before_bet),
-                bankroll_after_bet_bnb=float(bankroll_after_bet),
+                epoch=current_epoch,
+                side=decision.bet_side,
+                amount_bnb=amount_bnb,
+                p_final=pred_p_final,
+                expected_profit_bnb=decision.expected_profit_bnb,
+                bankroll_before_bet_bnb=bankroll_before_bet,
+                bankroll_after_bet_bnb=bankroll_after_bet,
             )
             _record_dry_cycle_audit(
                 cfg,
                 closed,
-                current_epoch=int(current_epoch),
-                locked_epoch=int(locked_epoch),
-                lock_ts=int(lock_ts_t),
-                cutoff_ts=int(cutoff_ts_t),
-                locked_price_bnbusd=float(bnbusd_price),
+                current_epoch=current_epoch,
+                locked_epoch=locked_epoch,
+                lock_ts=lock_ts_t,
+                cutoff_ts=cutoff_ts_t,
+                locked_price_bnbusd=bnbusd_price,
                 action="BET",
                 decision_stage="pipeline",
                 open_round=open_round,
-                bankroll_before_action_bnb=float(bankroll_before_bet),
-                bankroll_after_action_bnb=float(bankroll_after_bet),
+                bankroll_before_action_bnb=bankroll_before_bet,
+                bankroll_after_action_bnb=bankroll_after_bet,
                 decision=decision,
-                decision_latency_ms=float(t_decision_ready_ms) - float(t_features_start_ms),
+                decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
             )
 
         # Step 15: Sleep until claim + claim scan.
@@ -1393,41 +1399,29 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         return
 
 
-def _init_klines_cache(cfg: RuntimeConfig) -> RollingKlinesCache:
-    """Load all klines from the pre-populated klines store."""
-    if cfg.klines_store is None:
-        raise InvariantError("klines_store_missing")
-    klines = list(cfg.klines_store.iter_klines())
-    if not klines:
-        raise InvariantError("klines_cache_init_empty")
-    return RollingKlinesCache(klines=klines, capacity=len(klines))
-
-
-def _build_momentum_pipeline(*, cfg: RuntimeConfig, klines_cache: RollingKlinesCache | None) -> MomentumOnlyPipeline:
+def _build_momentum_pipeline(*, cfg: RuntimeConfig) -> MomentumOnlyPipeline:
     """Build momentum-only strategy pipeline."""
     from pancakebot.domain.strategy.momentum_gate import MomentumGateConfig
     gate_config: MomentumGateConfig = cfg.momentum_gate_config  # type: ignore[assignment]
-    pipeline = MomentumOnlyPipeline(
+    return MomentumOnlyPipeline(
         config=gate_config,
         gate=cfg.momentum_gate,
-        cutoff_seconds=int(cfg.cutoff_seconds),
-        min_bet_amount_bnb=float(cfg.min_bet_amount_bnb),
-        treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+        cutoff_seconds=cfg.cutoff_seconds,
+        min_bet_amount_bnb=cfg.min_bet_amount_bnb,
+        treasury_fee_fraction=cfg.treasury_fee_fraction,
     )
-    if klines_cache is not None:
-        pipeline.refresh_klines(klines=list(klines_cache.klines))
-    return pipeline
 
 
-def _epoch_handshake(cfg: RuntimeConfig, closed: _ClosedState) -> tuple[Round, Round, int]:
-    """RPC-only epoch alignment. Returns (locked_round_stub, open_round_stub, current_epoch).
+def _epoch_handshake(cfg: RuntimeConfig, closed: _ClosedState) -> tuple[Round, Round, int, object]:
+    """RPC-only epoch alignment.
 
-    Replaces the old Graph-based handshake. Uses contract.current_epoch() and
-    contract.round_data() exclusively — no Graph API, no closed-rounds cache.
+    Returns (locked_round_stub, open_round_stub, current_epoch, open_rd)
+    where open_rd is the raw RoundData for the open epoch (reusable for
+    pool amounts and lock_ts, avoiding duplicate RPC calls).
     """
     for idx, delay_seconds in enumerate([0] + list(_BACKOFF_SECONDS)):
         if delay_seconds > 0:
-            sleep_seconds(int(delay_seconds))
+            sleep_seconds(delay_seconds)
         try:
             current_epoch = int(cfg.contract.current_epoch())
         except TransientRpcError as e:
@@ -1446,82 +1440,79 @@ def _epoch_handshake(cfg: RuntimeConfig, closed: _ClosedState) -> tuple[Round, R
             warn("CORE", "LOOP", "RETRY", reason="rpc_round_data", attempt=idx, err=str(e))
             continue
 
-        if int(locked_rd.lock_ts) <= 0:
+        if locked_rd.lock_ts <= 0:
             warn("CORE", "LOOP", "RETRY", reason="locked_lock_ts_zero", attempt=idx)
             continue
 
         locked_round = Round(
-            epoch=int(locked_epoch),
-            start_at=int(locked_rd.start_ts),
-            lock_at=int(locked_rd.lock_ts),
-            close_at=int(locked_rd.close_ts),
-            lock_price=float(locked_rd.lock_price_usd),
+            epoch=locked_epoch,
+            start_at=locked_rd.start_ts,
+            lock_at=locked_rd.lock_ts,
+            close_at=locked_rd.close_ts,
+            lock_price=locked_rd.lock_price_usd,
             close_price=None,
             position=None,
             failed=False,
             bets=(),
         )
         open_round = Round(
-            epoch=int(current_epoch),
-            start_at=int(open_rd.start_ts),
-            lock_at=int(open_rd.lock_ts),
-            close_at=int(open_rd.close_ts),
+            epoch=current_epoch,
+            start_at=open_rd.start_ts,
+            lock_at=open_rd.lock_ts,
+            close_at=open_rd.close_ts,
             lock_price=None,
             close_price=None,
             position=None,
             failed=False,
             bets=(),
         )
-        return locked_round, open_round, int(current_epoch)
+        return locked_round, open_round, current_epoch, open_rd
 
     raise InvariantError("epoch_handshake_exhausted")
 
 
 def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int) -> None:
-    close_ts = int(cfg.contract.close_ts(int(claim_epoch)))
+    close_ts = int(cfg.contract.close_ts(claim_epoch))
     if close_ts <= 0:
         raise InvariantError("close_ts_invalid")
 
-    claim_ts = int(close_ts) + int(cfg.buffer_seconds) + int(_CLAIM_CHECK_PADDING_SECONDS)
-    _sleep_until_ts(int(claim_ts), reason="wait_for_claim", epoch=int(claim_epoch))
+    claim_ts = close_ts + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
+    _sleep_until_ts(claim_ts, reason="wait_for_claim", epoch=claim_epoch)
 
     # Refresh epochs after sleeping so the prior locked round can become closed.
-    locked_round2, _open_round2, current_epoch2 = _epoch_handshake(cfg, closed)
-    locked_epoch2 = int(locked_round2.epoch)
+    locked_round2, _open_round2, current_epoch2, _open_rd2 = _epoch_handshake(cfg, closed)
 
     claim_scan_cursor(
         contract=cfg.contract,
         wallet_address=cfg.wallet_address,
-        dry=bool(cfg.dry),
-        cursor_path=str(cfg.runtime_state_paths.claim_scan_cursor_path),
-        locked_epoch=int(locked_epoch2),
-        current_epoch=int(current_epoch2),
+        dry=cfg.dry,
+        cursor_path=cfg.runtime_state_paths.claim_scan_cursor_path,
+        locked_epoch=locked_round2.epoch,
+        current_epoch=current_epoch2,
         now_ts=int(now_ts()),
-        buffer_seconds=int(cfg.buffer_seconds),
+        buffer_seconds=cfg.buffer_seconds,
         get_close_ts=cfg.contract.close_ts,
         page_size=100,
-        gas_limit=int(GAS_LIMIT_CLAIM),
-        claim_batch_size=int(_CLAIM_BATCH_SIZE),
-        min_bet_with_gas_bnb=float(cfg.min_bet_amount_bnb) + float(GAS_COST_BET_BNB),
+        gas_limit=GAS_LIMIT_CLAIM,
+        claim_batch_size=_CLAIM_BATCH_SIZE,
+        min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
     )
 
     _dry_settle_available_bets(cfg, closed)
 
 
 def _sleep_until_ts(target_ts: int, *, reason: str, epoch: int | None = None) -> None:
-    now = now_ts()
-    remaining = float(target_ts) - float(now)
+    remaining = target_ts - time.time()
     if remaining <= 0:
         return
 
     msg = f"Sleeping {int(remaining)}s ({reason})"
     if epoch is not None:
-        msg = msg + f" epoch={int(epoch)}"
+        msg = msg + f" epoch={epoch}"
     info("RUN", "LOOP", "SLEEP", msg=msg)
 
     while True:
-        now2 = now_ts()
-        remaining2 = float(target_ts) - float(now2)
+        remaining2 = target_ts - time.time()
         if remaining2 <= 0:
             return
         sleep_seconds(min(1.0, remaining2))

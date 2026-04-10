@@ -24,7 +24,7 @@ class RollingClosedRoundsCache:
     capacity: int
 
     def __post_init__(self) -> None:
-        if int(self.capacity) <= 0:
+        if self.capacity <= 0:
             raise InvariantError("closed_round_cache_capacity_nonpositive")
         self._assert_strictly_increasing(self.rounds)
         self._trim_in_place()
@@ -33,19 +33,19 @@ class RollingClosedRoundsCache:
     def earliest_epoch(self) -> int:
         if not self.rounds:
             raise InvariantError("closed_round_cache_empty")
-        return int(self.rounds[0].epoch)
+        return self.rounds[0].epoch
 
     @property
     def latest_epoch(self) -> int:
         if not self.rounds:
             raise InvariantError("closed_round_cache_empty")
-        return int(self.rounds[-1].epoch)
+        return self.rounds[-1].epoch
 
     def tail(self, n: int) -> list[Round]:
         """Return the last n rounds in epoch-ascending order (oldest -> newest)."""
-        if int(n) <= 0:
+        if n <= 0:
             return []
-        return list(self.rounds[-int(n) :])
+        return list(self.rounds[-n:])
 
     def extend(self, new_rounds_asc: list[Round]) -> None:
         if not new_rounds_asc:
@@ -57,27 +57,25 @@ class RollingClosedRoundsCache:
             self._trim_in_place()
             return
 
-        prev = int(self.rounds[-1].epoch)
+        prev = self.rounds[-1].epoch
         for idx, r in enumerate(new_rounds_asc):
-            e = int(r.epoch)
-            if e <= prev:
-                raise InvariantError(f"cache_extend_not_strictly_increasing: idx={idx} got={e} prev={prev}")
-            prev = e
+            if r.epoch <= prev:
+                raise InvariantError(f"cache_extend_not_strictly_increasing: idx={idx} got={r.epoch} prev={prev}")
+            prev = r.epoch
 
         self.rounds.extend(new_rounds_asc)
         self._trim_in_place()
 
     def get_round(self, epoch: int) -> Round | None:
         """Return the cached Round for epoch, or None if not present."""
-        e = int(epoch)
         lo = 0
         hi = len(self.rounds) - 1
         while lo <= hi:
             mid = (lo + hi) // 2
-            me = int(self.rounds[mid].epoch)
-            if me == e:
+            me = self.rounds[mid].epoch
+            if me == epoch:
                 return self.rounds[mid]
-            if me < e:
+            if me < epoch:
                 lo = mid + 1
             else:
                 hi = mid - 1
@@ -85,27 +83,21 @@ class RollingClosedRoundsCache:
 
     def get_close_ts(self, epoch: int) -> int | None:
         """Return close_at for a cached epoch, or None if not present."""
-        r = self.get_round(int(epoch))
+        r = self.get_round(epoch)
         if r is None:
             return None
-        ca = r.close_at
-        if ca is None:
-            return None
-        return int(ca)
+        return r.close_at
 
     def _trim_in_place(self) -> None:
-        if len(self.rounds) <= int(self.capacity):
+        if len(self.rounds) <= self.capacity:
             return
-        drop = len(self.rounds) - int(self.capacity)
-        if drop <= 0:
-            return
+        drop = len(self.rounds) - self.capacity
         self.rounds = self.rounds[drop:]
 
     @staticmethod
     def _assert_strictly_increasing(rounds_asc: list[Round]) -> None:
         prev: int | None = None
         for idx, r in enumerate(rounds_asc):
-            e = int(r.epoch)
-            if prev is not None and e <= prev:
-                raise InvariantError(f"cache_not_strictly_increasing: idx={idx} got={e} prev={prev}")
-            prev = e
+            if prev is not None and r.epoch <= prev:
+                raise InvariantError(f"cache_not_strictly_increasing: idx={idx} got={r.epoch} prev={prev}")
+            prev = r.epoch

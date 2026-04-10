@@ -82,18 +82,18 @@ def _opt_float_or_none(obj: dict[str, Any], key: str) -> float | None:
 
 def _opt_bool(obj: dict[str, Any], key: str, default: bool) -> bool:
     if key not in obj:
-        return bool(default)
+        return default
     v = obj[key]
     if not isinstance(v, bool):
         raise InvariantError(f"config_key_not_bool: {key}")
-    return bool(v)
+    return v
 
 
 def _req_bool(obj: dict[str, Any], key: str) -> bool:
     v = _req(obj, key)
     if not isinstance(v, bool):
         raise InvariantError(f"config_key_not_bool: {key}")
-    return bool(v)
+    return v
 
 
 def _validate_unknown_keys(section_name: str, obj: dict[str, Any], allowed: set[str]) -> None:
@@ -155,7 +155,6 @@ def load_app_config(path: str) -> AppConfig:
 
     allowed_path_keys = {
         "closed_rounds_path",
-        "klines_path",
         "market_data_db_path",
         "claim_scan_cursor_path",
         "dry_bets_path",
@@ -169,7 +168,6 @@ def load_app_config(path: str) -> AppConfig:
     _validate_unknown_keys("paths", paths, allowed_path_keys)
 
     closed_rounds_path = _req_str(paths, "closed_rounds_path")
-    klines_path = _opt_str(paths, "klines_path", "var/klines.jsonl")
     market_data_db_path = _opt_str(
         paths,
         "market_data_db_path",
@@ -321,40 +319,37 @@ def load_app_config(path: str) -> AppConfig:
     mg_symbol = _opt_str(momentum_gate_raw, "symbol", "BNB-USDT")
     mg_btc_symbol = _opt_str(momentum_gate_raw, "btc_symbol", "BTC-USDT")
     mg_max_staleness = _opt_int(momentum_gate_raw, "max_staleness_seconds", 120)
-    if int(mg_max_staleness) <= 0:
+    if mg_max_staleness <= 0:
         raise InvariantError("momentum_gate_max_staleness_must_be_positive")
     momentum_gate_cfg = MomentumGateConfig(
-        enabled=bool(mg_enabled),
-        symbol=str(mg_symbol),
-        btc_symbol=str(mg_btc_symbol),
-        max_staleness_seconds=int(mg_max_staleness),
+        enabled=mg_enabled,
+        symbol=mg_symbol,
+        btc_symbol=mg_btc_symbol,
+        max_staleness_seconds=mg_max_staleness,
     )
 
     return AppConfig(
         closed_rounds_path=closed_rounds_path,
-        klines_path=klines_path,
         market_data_db_path=market_data_db_path,
         abi_json_path=abi_json_path,
-        cutoff_seconds=int(cutoff_seconds),
-        latency_log_path=str(latency_log_path),
-        dry_initial_bankroll_bnb=(
-            None if dry_initial_bankroll_bnb is None else float(dry_initial_bankroll_bnb)
-        ),
-        wait_for_bet_receipt=bool(wait_for_bet_receipt),
-        bet_receipt_timeout_seconds=int(bet_receipt_timeout_seconds),
+        cutoff_seconds=cutoff_seconds,
+        latency_log_path=latency_log_path,
+        dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
+        wait_for_bet_receipt=wait_for_bet_receipt,
+        bet_receipt_timeout_seconds=bet_receipt_timeout_seconds,
         runtime_state_paths=RuntimeStatePathsConfig(
-            claim_scan_cursor_path=str(claim_scan_cursor_path),
-            dry_bets_path=str(dry_bets_path),
-            dry_settled_epochs_path=str(dry_settled_epochs_path),
-            dry_audit_trades_path=str(dry_audit_trades_path),
-            dry_cycle_audit_path=str(dry_cycle_audit_path),
-            dry_bankroll_state_path=str(dry_bankroll_state_path),
-            dry_pipeline_bootstrap_state_path=str(dry_pipeline_bootstrap_state_path),
-            live_pipeline_bootstrap_state_path=str(live_pipeline_bootstrap_state_path),
+            claim_scan_cursor_path=claim_scan_cursor_path,
+            dry_bets_path=dry_bets_path,
+            dry_settled_epochs_path=dry_settled_epochs_path,
+            dry_audit_trades_path=dry_audit_trades_path,
+            dry_cycle_audit_path=dry_cycle_audit_path,
+            dry_bankroll_state_path=dry_bankroll_state_path,
+            dry_pipeline_bootstrap_state_path=dry_pipeline_bootstrap_state_path,
+            live_pipeline_bootstrap_state_path=live_pipeline_bootstrap_state_path,
         ),
         momentum_gate=momentum_gate_cfg,
-        min_bet_amount_bnb=float(min_bet_amount_bnb),
-        treasury_fee_fraction=float(treasury_fee_fraction),
-        buffer_seconds=int(buffer_seconds_cfg),
+        min_bet_amount_bnb=min_bet_amount_bnb,
+        treasury_fee_fraction=treasury_fee_fraction,
+        buffer_seconds=buffer_seconds_cfg,
         backtest=backtest_cfg,
     )

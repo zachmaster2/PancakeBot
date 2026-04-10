@@ -26,7 +26,6 @@ class AppConfig:
 
     # Paths
     closed_rounds_path: str
-    klines_path: str
     market_data_db_path: str
     abi_json_path: str
 

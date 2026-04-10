@@ -26,42 +26,41 @@ def settle_from_round_data(
     """
     if bet_bnb < 0.0:
         raise InvariantError("settle_bet_bnb_negative")
-    if not (0.0 <= float(treasury_fee_fraction) < 1.0):
+    if not (0.0 <= treasury_fee_fraction < 1.0):
         raise InvariantError("settle_treasury_fee_fraction_out_of_range")
 
-    bet_side_u = str(bet_side).upper()
+    bet_side_u = bet_side.upper()
     if bet_side_u not in ("BULL", "BEAR"):
         raise InvariantError("settle_bet_side_invalid")
 
-    if not bool(oracle_called):
-        return SettlementResult(outcome="refund", credit_bnb=float(bet_bnb) - float(GAS_COST_CLAIM_BNB), payout_multiple_after_fee=0.0)
+    if not oracle_called:
+        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
-    if float(close_price_usd) > float(lock_price_usd):
+    if close_price_usd > lock_price_usd:
         winner_u = "BULL"
-    elif float(close_price_usd) < float(lock_price_usd):
+    elif close_price_usd < lock_price_usd:
         winner_u = "BEAR"
     else:
-        # Prices equal → house wins → treat as refund
-        return SettlementResult(outcome="refund", credit_bnb=float(bet_bnb) - float(GAS_COST_CLAIM_BNB), payout_multiple_after_fee=0.0)
+        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
     if winner_u != bet_side_u:
         return SettlementResult(outcome="loss", credit_bnb=0.0, payout_multiple_after_fee=0.0)
 
-    bull_bnb = float(bull_amount_wei) / float(BNB_WEI)
-    bear_bnb = float(bear_amount_wei) / float(BNB_WEI)
+    bull_bnb = bull_amount_wei / BNB_WEI
+    bear_bnb = bear_amount_wei / BNB_WEI
 
     # Apply our simulated bet impact to pools.
-    bull_after = float(bull_bnb) + (float(bet_bnb) if bet_side_u == "BULL" else 0.0)
-    bear_after = float(bear_bnb) + (float(bet_bnb) if bet_side_u == "BEAR" else 0.0)
-    total_after = float(bull_after) + float(bear_after)
+    bull_after = bull_bnb + (bet_bnb if bet_side_u == "BULL" else 0.0)
+    bear_after = bear_bnb + (bet_bnb if bet_side_u == "BEAR" else 0.0)
+    total_after = bull_after + bear_after
 
-    denom = float(bull_after) if bet_side_u == "BULL" else float(bear_after)
+    denom = bull_after if bet_side_u == "BULL" else bear_after
     if denom <= 0.0 or total_after <= 0.0:
-        return SettlementResult(outcome="win", credit_bnb=-float(GAS_COST_CLAIM_BNB), payout_multiple_after_fee=0.0)
+        return SettlementResult(outcome="win", credit_bnb=-GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
-    mult = (float(total_after) * (1.0 - float(treasury_fee_fraction))) / float(denom)
-    credit = float(bet_bnb) * float(mult) - float(GAS_COST_CLAIM_BNB)
-    return SettlementResult(outcome="win", credit_bnb=float(credit), payout_multiple_after_fee=float(mult))
+    mult = (total_after * (1.0 - treasury_fee_fraction)) / denom
+    credit = bet_bnb * mult - GAS_COST_CLAIM_BNB
+    return SettlementResult(outcome="win", credit_bnb=credit, payout_multiple_after_fee=mult)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,22 +99,22 @@ def settle_bet_against_closed_round(
         raise InvariantError("settle_bet_bnb_negative")
     if round_closed.lock_at is None or round_closed.position is None:
         raise InvariantError("settle_round_not_closed")
-    if not (0.0 <= float(treasury_fee_fraction) < 1.0):
+    if not (0.0 <= treasury_fee_fraction < 1.0):
         raise InvariantError("settle_treasury_fee_fraction_out_of_range")
 
-    bet_side_u = str(bet_side).upper()
+    bet_side_u = bet_side.upper()
     if bet_side_u not in ("BULL", "BEAR"):
         raise InvariantError("settle_bet_side_invalid")
 
-    winner_u = str(round_closed.position).upper()
+    winner_u = round_closed.position.upper()
 
     # Final pools at lock time (all bets are in by lock_at).
-    pools_wei = compute_pool_amounts_wei_at_or_before(bets=round_closed.bets, cutoff_ts=int(round_closed.lock_at))
-    bull_pool_bnb = float(pools_wei.bull_wei) / float(BNB_WEI)
-    bear_pool_bnb = float(pools_wei.bear_wei) / float(BNB_WEI)
+    pools_wei = compute_pool_amounts_wei_at_or_before(bets=round_closed.bets, cutoff_ts=round_closed.lock_at)
+    bull_pool_bnb = pools_wei.bull_wei / BNB_WEI
+    bear_pool_bnb = pools_wei.bear_wei / BNB_WEI
 
-    if bool(round_closed.failed):
-        return SettlementResult(outcome="refund", credit_bnb=float(bet_bnb) - float(GAS_COST_CLAIM_BNB), payout_multiple_after_fee=0.0)
+    if round_closed.failed:
+        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
     if winner_u not in ("BULL", "BEAR", "HOUSE"):
         raise InvariantError("settle_winner_invalid")
@@ -124,15 +123,14 @@ def settle_bet_against_closed_round(
         return SettlementResult(outcome="loss", credit_bnb=0.0, payout_multiple_after_fee=0.0)
 
     # Apply our simulated bet impact to pools (live-consistent settlement math).
-    bull_after = float(bull_pool_bnb) + (float(bet_bnb) if bet_side_u == "BULL" else 0.0)
-    bear_after = float(bear_pool_bnb) + (float(bet_bnb) if bet_side_u == "BEAR" else 0.0)
-    total_after = float(bull_after) + float(bear_after)
+    bull_after = bull_pool_bnb + (bet_bnb if bet_side_u == "BULL" else 0.0)
+    bear_after = bear_pool_bnb + (bet_bnb if bet_side_u == "BEAR" else 0.0)
+    total_after = bull_after + bear_after
 
-    denom = float(bull_after) if bet_side_u == "BULL" else float(bear_after)
+    denom = bull_after if bet_side_u == "BULL" else bear_after
     if denom <= 0.0 or total_after <= 0.0:
-        # Degenerate pools; still paid claim gas.
-        return SettlementResult(outcome="win", credit_bnb=-float(GAS_COST_CLAIM_BNB), payout_multiple_after_fee=0.0)
+        return SettlementResult(outcome="win", credit_bnb=-GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
-    mult = (float(total_after) * (1.0 - float(treasury_fee_fraction))) / float(denom)
-    credit = float(bet_bnb) * float(mult) - float(GAS_COST_CLAIM_BNB)
-    return SettlementResult(outcome="win", credit_bnb=float(credit), payout_multiple_after_fee=float(mult))
+    mult = (total_after * (1.0 - treasury_fee_fraction)) / denom
+    credit = bet_bnb * mult - GAS_COST_CLAIM_BNB
+    return SettlementResult(outcome="win", credit_bnb=credit, payout_multiple_after_fee=mult)

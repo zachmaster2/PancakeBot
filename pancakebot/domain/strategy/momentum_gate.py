@@ -1,6 +1,6 @@
 """OKX dual-asset momentum gate.
 
-Signal architecture (validated +10.2 BNB / 5000 rounds):
+Signal architecture:
 
   Tier 1 — BNB Acceleration
     Two BNB 1s-return lookback pairs agree on direction and
@@ -15,11 +15,12 @@ Both tiers use OKX public 1s candles (no auth required).
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 from pancakebot.infra.okx_client import OkxClient
 from pancakebot.core.errors import InvariantError
-from pancakebot.core.logging import warn
+from pancakebot.core.logging import info, warn
 
 # Tuned constants — these were optimized together; do not change independently.
 _ACCEL_PAIRS: list[tuple[int, int]] = [(7, 10), (5, 10), (5, 7)]
@@ -50,39 +51,99 @@ class MomentumGate:
     """Stateless dual-asset momentum gate: fetches BNB + BTC 1s klines."""
 
     def __init__(self, *, config: MomentumGateConfig, okx_client: OkxClient) -> None:
-        if int(config.max_staleness_seconds) <= 0:
+        if config.max_staleness_seconds <= 0:
             raise InvariantError("momentum_gate_max_staleness_must_be_positive")
         self._cfg = config
         self._client = okx_client
 
     @property
     def enabled(self) -> bool:
-        return bool(self._cfg.enabled)
+        return self._cfg.enabled
 
-    def evaluate(self, *, cutoff_ts_ms: int) -> MomentumGateResult:
-        """Fetch BNB + BTC 1s klines and compute signal at cutoff time."""
-        if not bool(self._cfg.enabled):
+    # ------------------------------------------------------------------
+    # Prefetch / evaluate split
+    # ------------------------------------------------------------------
+    # The timing budget between wakeup and the lock safety guard is
+    # only ~1 s (cutoff_seconds − safety_margin = 4 − 3).  Several RPC
+    # calls (epoch handshake, lock_ts, round_data) consume ~450 ms of
+    # that budget *before* the gate is even called.
+    #
+    # To avoid exceeding the budget, the runtime loop calls prefetch()
+    # immediately after waking — the two OKX HTTP requests run in
+    # background threads while the RPC work proceeds.  By the time
+    # evaluate() is called the data is already waiting.
+    # ------------------------------------------------------------------
+
+    def prefetch(self) -> tuple[Future, Future] | None:
+        """Kick off BNB + BTC kline fetches in the background.
+
+        Call this immediately after waking from sleep, *before* the
+        RPC calls (epoch handshake, lock_ts, round_data).  Returns a
+        pair of Futures that evaluate() will collect, or None when the
+        gate is disabled.
+        """
+        if not self._cfg.enabled:
+            return None
+        pool = ThreadPoolExecutor(max_workers=2)
+        bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, 20)
+        btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, 40)
+        pool.shutdown(wait=False)   # let threads finish on their own
+        return bnb_fut, btc_fut
+
+    def evaluate(
+        self,
+        *,
+        cutoff_ts_ms: int,
+        prefetched: tuple[Future, Future] | None = None,
+    ) -> MomentumGateResult:
+        """Compute signal from current OKX data.
+
+        If *prefetched* is provided (from an earlier prefetch() call),
+        the already-completed futures are collected instantly.  Otherwise
+        the klines are fetched inline (parallel) as a fallback.
+
+        In live mode the theoretical cutoff_ts_ms (lock_at − cutoff_seconds)
+        is a *future* timestamp — the round hasn't locked yet.  We anchor
+        the signal on the newest available kline, which correctly measures
+        momentum as of right now.
+        """
+        if not self._cfg.enabled:
             return MomentumGateResult(
                 signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
                 skip_reason=None, kline_age_seconds=None,
             )
 
-        # Fetch BNB 1s klines (need up to 10s lookback + buffer)
-        bnb_klines = self._fetch_klines(str(self._cfg.symbol), count=15)
+        # Collect klines — either from prefetch or inline fallback
+        if prefetched is not None:
+            bnb_klines = prefetched[0].result()
+            btc_klines = prefetched[1].result()
+        else:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, 20)
+                btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, 40)
+                bnb_klines = bnb_fut.result()
+                btc_klines = btc_fut.result()
+
         if bnb_klines is None or len(bnb_klines) < 12:
             return self._skip("gate_bnb_fetch_failed")
 
-        # Check staleness
+        # Anchor signal on the newest kline — this is the actual "now"
         newest_ts_ms = int(bnb_klines[-1]["open_time_ms"])
-        age_seconds = float((int(cutoff_ts_ms) - newest_ts_ms) / 1000)
-        if age_seconds > float(self._cfg.max_staleness_seconds):
+        age_seconds = max(0.0, (cutoff_ts_ms - newest_ts_ms) / 1000)
+        if age_seconds > self._cfg.max_staleness_seconds:
             return self._skip(f"gate_stale_kline:age={age_seconds:.1f}s")
 
-        # Fetch BTC 1s klines (need 30s lookback + buffer)
-        btc_klines = self._fetch_klines(str(self._cfg.btc_symbol), count=35)
+        # Compute signal anchored on the newest kline, not the future cutoff
+        result = _compute_signal(bnb_klines, btc_klines, newest_ts_ms, age_seconds)
 
-        # Compute signal
-        return _compute_signal(bnb_klines, btc_klines, cutoff_ts_ms, age_seconds)
+        # Diagnostic: log why signal did/didn't fire so dry-run progress is visible
+        if result.signal is not None:
+            info("GATE", "SIGNAL", "FIRE", tier=result.tier, side=result.signal,
+                 btc_ag=result.btc_agrees, age=f"{age_seconds:.1f}s")
+        else:
+            _log_no_signal(bnb_klines, btc_klines, newest_ts_ms, age_seconds)
+
+        return result
 
     def _fetch_klines(self, symbol: str, count: int) -> list[dict] | None:
         try:
@@ -97,6 +158,38 @@ class MomentumGate:
             signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
             skip_reason=reason, kline_age_seconds=None,
         )
+
+
+def _log_no_signal(
+    bnb_klines: list[dict],
+    btc_klines: list[dict] | None,
+    cutoff_ms: int,
+    age_seconds: float,
+) -> None:
+    """Log diagnostic when signal doesn't fire — shows why."""
+    # BNB price and unique count
+    prices = {k["close_price"] for k in bnb_klines} if bnb_klines else set()
+    bnb_price = bnb_klines[-1]["close_price"] if bnb_klines else 0.0
+
+    # Best BNB return across all lookback pairs
+    max_ret = 0.0
+    for short, long in _ACCEL_PAIRS:
+        for lb in (short, long):
+            r = _get_return(bnb_klines, cutoff_ms, lb)
+            if r is not None:
+                max_ret = max(max_ret, abs(r))
+
+    # BTC 30s return
+    btc_ret = _get_return(btc_klines, cutoff_ms, _BTC_LOOKBACK) if btc_klines else None
+    btc_str = f"{abs(btc_ret):.6f}" if btc_ret is not None else "N/A"
+
+    info("GATE", "DIAG", "NO_SIGNAL",
+         bnb=f"${bnb_price:.1f}",
+         max_ret=f"{max_ret:.7f}",
+         thresh=f"{_ACCEL_THRESH}",
+         uniq=len(prices),
+         btc30=btc_str,
+         age=f"{age_seconds:.1f}s")
 
 
 def _find_closest_price(klines: list, target_ms: int) -> float | None:

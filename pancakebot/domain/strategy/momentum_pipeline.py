@@ -19,7 +19,7 @@ from pancakebot.domain.strategy.momentum_gate import (
     MomentumGateResult,
     compute_signal_from_klines,
 )
-from pancakebot.domain.types import Kline, Round
+from pancakebot.domain.types import Round
 
 # Sizing constants — tuned together on 5000 rounds; do not change independently.
 _BASE_FRAC = 0.06
@@ -113,9 +113,6 @@ class MomentumOnlyPipeline:
         # Backtest: 1s klines per epoch {epoch: [[ts_ms, o, h, l, c, vol], ...]}
         self._spot_klines_by_epoch: dict[int, list[list]] = {}
         self._btc_klines_by_epoch: dict[int, list[list]] = {}
-        # Legacy 1m klines (kept for interface compat but unused for signal)
-        self._klines: list[Kline] = []
-        self._kline_open_times: list[int] = []
 
     # ------------------------------------------------------------------
     # Required interface: StrategyPipeline-compatible
@@ -131,11 +128,6 @@ class MomentumOnlyPipeline:
 
     def selector_ready(self) -> bool:
         return True
-
-    def refresh_klines(self, *, klines: list[Kline]) -> None:
-        """Update the local 1m kline cache (kept for interface compat)."""
-        self._klines = list(klines)
-        self._kline_open_times = [int(k.open_time_ms) for k in self._klines]
 
     def refresh_spot_klines(self, *, spot_klines_by_epoch: dict[int, list[list]]) -> None:
         """Load pre-fetched BNB 1s kline arrays keyed by epoch (backtest mode)."""
@@ -175,6 +167,7 @@ class MomentumOnlyPipeline:
         allow_oracle_mode: bool,
         pool_bull_bnb: float = 0.0,
         pool_bear_bnb: float = 0.0,
+        okx_prefetched: object | None = None,
     ) -> StrategyPipelineDecision:
         """Return BET or SKIP based on dual-asset momentum signal."""
 
@@ -182,8 +175,11 @@ class MomentumOnlyPipeline:
         cutoff_ts_ms = (lock_at - self._cutoff_seconds) * 1000
 
         if self._gate is not None:
-            # Live/dry: fetch from OKX
-            result = self._gate.evaluate(cutoff_ts_ms=int(cutoff_ts_ms))
+            # Live/dry: fetch from OKX (use prefetched data if available)
+            result = self._gate.evaluate(
+                cutoff_ts_ms=int(cutoff_ts_ms),
+                prefetched=okx_prefetched,
+            )
         else:
             # Backtest: use cached 1s klines
             result = self._evaluate_from_cache(
@@ -200,12 +196,12 @@ class MomentumOnlyPipeline:
             return self._skip("gate_no_signal")
 
         bet_size = _compute_bet_size(
-            signal=str(result.signal),
-            tier=str(result.tier or "accel"),
-            btc_agrees=bool(result.btc_agrees),
-            btc_disagrees=bool(result.btc_disagrees),
-            pool_bull_bnb=float(pool_bull_bnb),
-            pool_bear_bnb=float(pool_bear_bnb),
+            signal=result.signal,
+            tier=result.tier or "accel",
+            btc_agrees=result.btc_agrees,
+            btc_disagrees=result.btc_disagrees,
+            pool_bull_bnb=pool_bull_bnb,
+            pool_bear_bnb=pool_bear_bnb,
             treasury_fee_fraction=self._treasury_fee_fraction,
         )
 

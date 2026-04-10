@@ -93,7 +93,7 @@ def collect_preflight_checks(
         PreflightCheck(
             name="momentum_gate_enabled",
             passed=bool(cfg.momentum_gate.enabled),
-            detail=f"symbol={cfg.momentum_gate.symbol} threshold={cfg.momentum_gate.threshold}",
+            detail=f"symbol={cfg.momentum_gate.symbol} btc_symbol={cfg.momentum_gate.btc_symbol}",
         ),
     ]
     if bool(check_env):
