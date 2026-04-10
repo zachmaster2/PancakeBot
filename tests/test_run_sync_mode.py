@@ -21,7 +21,6 @@ class RunSyncModeTests(unittest.TestCase):
     def test_run_from_config_sync_dispatches_without_private_key(self) -> None:
         fake_cfg = SimpleNamespace(
             closed_rounds_path="var/closed_rounds.jsonl",
-            klines_path="var/klines.jsonl",
             market_data_db_path="var/market_data.sqlite",
             abi_json_path="abi/predictionv2.json",
             cutoff_seconds=12,
@@ -56,8 +55,8 @@ class RunSyncModeTests(unittest.TestCase):
                 stored_closed_round_count=100,
                 earliest_closed_epoch=1,
                 latest_closed_epoch=100,
-                klines_total=288000,
-                klines_appended=10,
+                spot_klines_synced=50,
+                btc_klines_synced=50,
             )
             run_from_config(config_path="config.toml", dry=False, backtest=False, sync=True)
 

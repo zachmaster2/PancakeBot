@@ -4,7 +4,6 @@
 
 [paths]
 closed_rounds_path = "var/closed_rounds.jsonl"
-klines_path = "var/klines_okx.jsonl"
 market_data_db_path = "var/market_data.sqlite"
 claim_scan_cursor_path = "var/runtime/claim_scan_cursor.txt"
 dry_bets_path = "var/runtime/dry_bets.jsonl"

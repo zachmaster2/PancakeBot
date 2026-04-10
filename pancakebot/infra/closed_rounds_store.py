@@ -25,7 +25,7 @@ class ClosedRoundsStore:
     def __init__(self, path_jsonl: str):
         if not path_jsonl:
             raise InvariantError("ClosedRoundsStore_requires_path")
-        self._path = str(path_jsonl)
+        self._path = path_jsonl
 
     @property
     def path_jsonl(self) -> str:
@@ -57,7 +57,7 @@ class ClosedRoundsStore:
 
     def load_earliest_epoch(self) -> int | None:
         for r in self.iter_closed_rounds():
-            return int(r.epoch)
+            return r.epoch
         return None
 
     def load_latest_epoch(self) -> int | None:
@@ -96,10 +96,9 @@ class ClosedRoundsStore:
 
         prev: int | None = None
         for idx, r in enumerate(rounds_asc):
-            e = int(r.epoch)
-            if prev is not None and e <= prev:
-                raise InvariantError(f"new_store_not_strictly_increasing: idx={idx} got={e} prev={prev}")
-            prev = e
+            if prev is not None and r.epoch <= prev:
+                raise InvariantError(f"new_store_not_strictly_increasing: idx={idx} got={r.epoch} prev={prev}")
+            prev = r.epoch
 
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         with open(self._path, "w") as f:
@@ -122,7 +121,7 @@ class ClosedRoundsStore:
         latest = self.load_latest_epoch()
         if latest is None:
             raise InvariantError("store_latest_epoch_missing")
-        self.append_rounds_after(int(latest), rounds_asc)
+        self.append_rounds_after(latest, rounds_asc)
 
     def append_rounds_after(self, prev_epoch: int, rounds_asc: Sequence[Round]) -> int:
         """Append rounds without reading the file.
@@ -135,20 +134,19 @@ class ClosedRoundsStore:
           - the latest epoch after the append.
         """
         if not rounds_asc:
-            return int(prev_epoch)
-        prev = int(prev_epoch)
+            return prev_epoch
+        prev = prev_epoch
         for idx, r in enumerate(rounds_asc):
-            e = int(r.epoch)
-            if e <= prev:
-                raise InvariantError(f"append_not_strictly_increasing: idx={idx} got={e} prev={prev}")
-            prev = e
+            if r.epoch <= prev:
+                raise InvariantError(f"append_not_strictly_increasing: idx={idx} got={r.epoch} prev={prev}")
+            prev = r.epoch
 
         # Use r+ so the file must already exist.
         with open(self._path, "r+") as f:
             f.seek(0, os.SEEK_END)
             for r in rounds_asc:
                 f.write(json.dumps(r.to_json(), separators=(",", ":")) + "\n")
-        return int(prev)
+        return prev
 
     def replace_with_prepended_chunk(self, chunk_asc: Sequence[Round], *, replace_path: str) -> None:
         """Prepend a strictly-older chunk by atomic replacement."""
@@ -163,12 +161,11 @@ class ClosedRoundsStore:
 
         prev: int | None = None
         for idx, r in enumerate(chunk_asc):
-            e = int(r.epoch)
-            if prev is not None and e <= prev:
-                raise InvariantError(f"prepend_chunk_not_increasing: idx={idx} got={e} prev={prev}")
-            prev = e
+            if prev is not None and r.epoch <= prev:
+                raise InvariantError(f"prepend_chunk_not_increasing: idx={idx} got={r.epoch} prev={prev}")
+            prev = r.epoch
 
-        if prev is None or prev >= int(earliest):
+        if prev is None or prev >= earliest:
             raise InvariantError("prepend_chunk_not_strictly_older_than_store")
 
         os.makedirs(os.path.dirname(replace_path) or ".", exist_ok=True)

@@ -78,11 +78,11 @@ def _fmt_fields(fields: dict[str, Any]) -> str:
 def _emit(level: str, sys_name: str, sub: str, event: str, *, msg: str | None = None, **fields: Any) -> None:
     ts = _ts_hundredths()
 
-    if len(str(sys_name)) > int(_SYS_NAME_W):
+    if len(sys_name) > _SYS_NAME_W:
         raise InvariantError("log_label_too_long_sys")
-    if len(str(sub)) > int(_SUB_W):
+    if len(sub) > _SUB_W:
         raise InvariantError("log_label_too_long_sub")
-    if len(str(event)) > int(_EVENT_W):
+    if len(event) > _EVENT_W:
         raise InvariantError("log_label_too_long_event")
 
     # Fixed-width columns for readability (spaces only; no tabs).

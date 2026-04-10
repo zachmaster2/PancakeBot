@@ -34,10 +34,10 @@ class Bet:
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "wallet": str(self.wallet_address),
-            "amountWei": int(self.amount_wei),
-            "position": str(self.position),
-            "createdAt": int(self.created_at),
+            "wallet": self.wallet_address,
+            "amountWei": self.amount_wei,
+            "position": self.position,
+            "createdAt": self.created_at,
         }
 
 
@@ -84,10 +84,10 @@ class Round:
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "epoch": int(self.epoch),
-            "startAt": int(self.start_at),
-            "lockAt": int(self.lock_at) if self.lock_at is not None else None,
-            "closeAt": int(self.close_at) if self.close_at is not None else None,
+            "epoch": self.epoch,
+            "startAt": self.start_at,
+            "lockAt": self.lock_at,
+            "closeAt": self.close_at,
             "lockPrice": self.lock_price,
             "closePrice": self.close_price,
             "position": self.position,
@@ -96,46 +96,3 @@ class Round:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class Kline:
-    """An OKX 1m kline (candle) record (fully CLOSED).
-
-    Times are in milliseconds since epoch.
-    """
-
-    open_time_ms: int
-    close_time_ms: int
-    open_price: float
-    high_price: float
-    low_price: float
-    close_price: float
-    volume: float
-    quote_asset_volume: float
-
-    @staticmethod
-    def from_json(rec: dict[str, Any]) -> "Kline":
-        try:
-            return Kline(
-                open_time_ms=int(rec["open_time_ms"]),
-                close_time_ms=int(rec["close_time_ms"]),
-                open_price=float(rec["open_price"]),
-                high_price=float(rec["high_price"]),
-                low_price=float(rec["low_price"]),
-                close_price=float(rec["close_price"]),
-                volume=float(rec["volume"]),
-                quote_asset_volume=float(rec["quote_asset_volume"]),
-            )
-        except Exception as e:
-            raise InvariantError(f"kline_parse_error: {e}")
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "open_time_ms": int(self.open_time_ms),
-            "close_time_ms": int(self.close_time_ms),
-            "open_price": float(self.open_price),
-            "high_price": float(self.high_price),
-            "low_price": float(self.low_price),
-            "close_price": float(self.close_price),
-            "volume": float(self.volume),
-            "quote_asset_volume": float(self.quote_asset_volume),
-        }

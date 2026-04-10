@@ -21,17 +21,13 @@ def compute_pool_amounts_wei(*, bets: Iterable[Bet]) -> PoolAmountsWei:
       - Do not query {total,bull,bear}Amount from The Graph.
       - The feature builder computes totals from bets.
       - Enforce bull_amt + bear_amt <= total_amt.
-
-    Notes:
-      - Bets are expected to have positions in {Bull,Bear}.
-      - If a bet position outside {Bull,Bear} appears, treat as an invariant violation.
     """
     total = 0
     bull = 0
     bear = 0
 
     for b in bets:
-        amt = int(b.amount_wei)
+        amt = b.amount_wei
         if amt <= 0:
             raise InvariantError("bet_amount_wei_nonpositive")
 
@@ -46,7 +42,7 @@ def compute_pool_amounts_wei(*, bets: Iterable[Bet]) -> PoolAmountsWei:
     if bull + bear > total:
         raise InvariantError("bull_bear_exceed_total")
 
-    return PoolAmountsWei(total_wei=int(total), bull_wei=int(bull), bear_wei=int(bear))
+    return PoolAmountsWei(total_wei=total, bull_wei=bull, bear_wei=bear)
 
 
 def compute_pool_amounts_wei_at_or_before(*, bets: Iterable[Bet], cutoff_ts: int) -> PoolAmountsWei:
@@ -54,5 +50,5 @@ def compute_pool_amounts_wei_at_or_before(*, bets: Iterable[Bet], cutoff_ts: int
 
     Spec: a bet is cutoff-eligible iff created_at <= cutoff_ts (inclusive).
     """
-    eligible = (b for b in bets if int(b.created_at) <= int(cutoff_ts))
+    eligible = (b for b in bets if b.created_at <= cutoff_ts)
     return compute_pool_amounts_wei(bets=eligible)

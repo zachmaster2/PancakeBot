@@ -8,7 +8,7 @@ from pancakebot.core.errors import InvariantError, TransientRpcError
 def _eth_chain_id(rpc_url: str, *, timeout_seconds: int) -> int:
     payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}
     try:
-        resp = requests.post(rpc_url, json=payload, timeout=int(timeout_seconds))
+        resp = requests.post(rpc_url, json=payload, timeout=timeout_seconds)
     except requests.RequestException as e:
         raise TransientRpcError(f"rpc_http_error: {e}") from e
 
@@ -51,7 +51,7 @@ def choose_rpc_url(urls: list[str], *, expected_chain_id: int, timeout_seconds: 
         except TransientRpcError:
             continue
 
-        if int(cid) != int(expected_chain_id):
+        if cid != expected_chain_id:
             continue
 
         return url

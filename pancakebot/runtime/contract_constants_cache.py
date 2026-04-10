@@ -54,9 +54,9 @@ def save_contract_constants(*, constants: ContractConstants, path: Path | None =
     cache_path = _DEFAULT_PATH if path is None else Path(path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "min_bet_amount_bnb": float(constants.min_bet_amount_bnb),
-        "treasury_fee_fraction": float(constants.treasury_fee_fraction),
-        "buffer_seconds": int(constants.buffer_seconds),
+        "min_bet_amount_bnb": constants.min_bet_amount_bnb,
+        "treasury_fee_fraction": constants.treasury_fee_fraction,
+        "buffer_seconds": constants.buffer_seconds,
     }
     cache_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     return cache_path

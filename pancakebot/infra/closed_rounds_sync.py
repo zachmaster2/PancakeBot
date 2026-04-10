@@ -40,7 +40,7 @@ def sync_closed_rounds(*, graph: GraphClient, store: ClosedRoundsStore, cache_n:
         # Append the estimated minimum rounds needed (or all newer rounds).
         _fetch_and_append_range(graph=graph, store=store, start_epoch=start_epoch, end_epoch=end_epoch, fetch_type=fetch_type)
 
-    stored_n = int(store.count_rounds())
+    stored_n = store.count_rounds()
     if stored_n >= cache_n:
         return
     if stored_n <= 0:
@@ -67,7 +67,7 @@ def sync_closed_rounds(*, graph: GraphClient, store: ClosedRoundsStore, cache_n:
     # Append the estimated minimum older rounds needed to the temp file.
     _fetch_and_append_range(graph=graph, store=tmp_store, start_epoch=older_start, end_epoch=older_end, fetch_type=fetch_type)
 
-    missing_n = needed_n - int(tmp_store.count_rounds())
+    missing_n = needed_n - tmp_store.count_rounds()
     if missing_n > 0:
         info(
             "CORE",
@@ -100,26 +100,26 @@ def _ensure_min_count_by_scanning_older(*, graph: GraphClient, store: ClosedRoun
     No approximation: we never synthesize rounds; we only ingest returned usable rounds.
     """
     page_size = 1000
-    stored_n = int(store.count_rounds())
+    stored_n = store.count_rounds()
     scan_end = store.load_earliest_epoch() - 1
 
     while stored_n < needed_n:
         if scan_end <= 0:
             raise InvariantError("sync_insufficient_closed_rounds")
 
-        scan_start = max(scan_end - int(page_size) + 1, 1)
+        scan_start = max(scan_end - page_size + 1, 1)
 
         info(
             "CORE",
             "STORE",
             "SYNC",
-            msg=f"Fetching additional older closed rounds: range=[{int(scan_start)}..{int(scan_end)}]",
+            msg=f"Fetching additional older closed rounds: range=[{scan_start}..{scan_end}]",
         )
         rounds = graph.fetch_closed_rounds(
             order="asc",
-            epoch_gte=int(scan_start),
-            epoch_lte=int(scan_end),
-            first=int(page_size),
+            epoch_gte=scan_start,
+            epoch_lte=scan_end,
+            first=page_size,
             skip=0,
         )
 
@@ -128,19 +128,18 @@ def _ensure_min_count_by_scanning_older(*, graph: GraphClient, store: ClosedRoun
 
             prev: int | None = None
             for idx, r in enumerate(rounds):
-                e = int(r.epoch)
-                if prev is not None and e <= prev:
-                    raise InvariantError(f"older_scan_not_increasing: idx={idx} got={e} prev={prev}")
-                if e >= int(earliest_on_disk):
+                if prev is not None and r.epoch <= prev:
+                    raise InvariantError(f"older_scan_not_increasing: idx={idx} got={r.epoch} prev={prev}")
+                if r.epoch >= earliest_on_disk:
                     raise InvariantError("older_scan_overlaps_store")
-                prev = e
+                prev = r.epoch
 
             replace_path = str(Path(store.path_jsonl).with_suffix(".prepend.tmp"))
             store.replace_with_prepended_chunk(rounds, replace_path=replace_path)
-            stored_n = int(store.count_rounds())
+            stored_n = store.count_rounds()
 
         # Always advance the scan window, even if this window returned 0 usable rounds.
-        scan_end = int(scan_start) - 1
+        scan_end = scan_start - 1
 
 
 def _fetch_and_append_range(*, graph: GraphClient, store: ClosedRoundsStore, start_epoch: int, end_epoch: int, fetch_type: str) -> int:
@@ -163,54 +162,53 @@ def _fetch_and_append_range(*, graph: GraphClient, store: ClosedRoundsStore, sta
         if prev_epoch_on_disk is None:
             raise InvariantError("append_requires_existing_store")
 
-    window_start = int(start_epoch)
-    while window_start <= int(end_epoch):
-        window_end = int(window_start) + int(page_size) - 1
-        if window_end > int(end_epoch):
-            window_end = int(end_epoch)
+    window_start = start_epoch
+    while window_start <= end_epoch:
+        window_end = window_start + page_size - 1
+        if window_end > end_epoch:
+            window_end = end_epoch
 
         info(
             "CORE",
             "STORE",
             "SYNC",
-            msg=f"Fetching {fetch_type} closed rounds: range=[{int(window_start)}..{int(window_end)}]",
+            msg=f"Fetching {fetch_type} closed rounds: range=[{window_start}..{window_end}]",
         )
         rounds = graph.fetch_closed_rounds(
             order="asc",
-            epoch_gte=int(window_start),
-            epoch_lte=int(window_end),
-            first=int(page_size),
+            epoch_gte=window_start,
+            epoch_lte=window_end,
+            first=page_size,
             skip=0,
         )
 
         if rounds:
             prev: int | None = None
             for idx, r in enumerate(rounds):
-                e = int(r.epoch)
-                if e < int(window_start) or e > int(window_end):
+                if r.epoch < window_start or r.epoch > window_end:
                     raise InvariantError(
-                        f"closed_rounds_epoch_out_of_requested_bounds: idx={idx} got={e} range=[{int(window_start)}..{int(window_end)}]"
+                        f"closed_rounds_epoch_out_of_requested_bounds: idx={idx} got={r.epoch} range=[{window_start}..{window_end}]"
                     )
-                if prev is not None and e <= prev:
-                    raise InvariantError(f"closed_rounds_not_strictly_increasing: idx={idx} got={e} prev={prev}")
-                prev = e
+                if prev is not None and r.epoch <= prev:
+                    raise InvariantError(f"closed_rounds_not_strictly_increasing: idx={idx} got={r.epoch} prev={prev}")
+                prev = r.epoch
 
             if prev_epoch_on_disk is None:
                 filtered = rounds
             else:
-                filtered = [r for r in rounds if int(r.epoch) > int(prev_epoch_on_disk)]
+                filtered = [r for r in rounds if r.epoch > prev_epoch_on_disk]
 
             if filtered:
                 if is_new_store:
                     store.write_new_store(filtered)
                     is_new_store = False
-                    prev_epoch_on_disk = int(filtered[-1].epoch)
+                    prev_epoch_on_disk = filtered[-1].epoch
                 else:
                     if prev_epoch_on_disk is None:
                         raise InvariantError("append_requires_existing_store")
-                    prev_epoch_on_disk = store.append_rounds_after(int(prev_epoch_on_disk), filtered)
+                    prev_epoch_on_disk = store.append_rounds_after(prev_epoch_on_disk, filtered)
                 fetched_total += len(filtered)
 
-        window_start = int(window_end) + 1
+        window_start = window_end + 1
 
-    return int(fetched_total)
+    return fetched_total

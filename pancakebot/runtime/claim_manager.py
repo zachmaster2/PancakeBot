@@ -87,10 +87,9 @@ def claim_scan_cursor(
     claimed_total = 0
     pending_claims: list[tuple[int, int]] = []
 
-    batch_size = int(claim_batch_size)
-    if batch_size <= 0:
+    if claim_batch_size <= 0:
         raise InvariantError("claim_batch_size_nonpositive")
-    floor_bnb = float(min_bet_with_gas_bnb) if min_bet_with_gas_bnb is not None else None
+    floor_bnb = min_bet_with_gas_bnb
     if floor_bnb is not None and floor_bnb <= 0.0:
         raise InvariantError("claim_min_bet_with_gas_nonpositive")
 
@@ -101,18 +100,18 @@ def claim_scan_cursor(
         if force_all:
             n = len(pending_claims)
         else:
-            n = (len(pending_claims) // batch_size) * batch_size
+            n = (len(pending_claims) // claim_batch_size) * claim_batch_size
         if n <= 0:
             return
-        to_claim = [int(epoch) for epoch, _ in pending_claims[:n]]
-        for i in range(0, len(to_claim), batch_size):
-            chunk = [int(e) for e in to_claim[i : i + batch_size]]
-            chunk_gas_limit = int(max(int(gas_limit), int(gas_limit) * int(len(chunk))))
+        to_claim = [epoch for epoch, _ in pending_claims[:n]]
+        for i in range(0, len(to_claim), claim_batch_size):
+            chunk = to_claim[i : i + claim_batch_size]
+            chunk_gas_limit = gas_limit * len(chunk)
             t0 = time.perf_counter()
             gas_price_wei = contract.suggest_gas_price_wei()
             tx = contract.claim(
                 epochs=chunk,
-                gas_limit=int(chunk_gas_limit),
+                gas_limit=chunk_gas_limit,
                 gas_price_wei=gas_price_wei,
             )
             claim_ms = int((time.perf_counter() - t0) * 1000)
@@ -120,14 +119,14 @@ def claim_scan_cursor(
                 "NET",
                 "RPC",
                 "CLAIM",
-                epoch=int(chunk[0]),
-                tx=str(tx),
+                epoch=chunk[0],
+                tx=tx,
                 claim_ms=f"{claim_ms}ms",
-                batch_n=int(len(chunk)),
-                last_epoch=int(chunk[-1]),
-                gas_limit=int(chunk_gas_limit),
+                batch_n=len(chunk),
+                last_epoch=chunk[-1],
+                gas_limit=chunk_gas_limit,
             )
-            claimed_total += int(len(chunk))
+            claimed_total += len(chunk)
         pending_claims = pending_claims[n:]
 
     while True:
@@ -167,7 +166,7 @@ def claim_scan_cursor(
             claimable = contract.claimable(epoch=e, wallet_address=wallet_address)
             refundable = contract.refundable(epoch=e, wallet_address=wallet_address)
             if claimable or refundable:
-                pending_claims.append((int(e), int(cursor + scanned - 1)))
+                pending_claims.append((e, cursor + scanned - 1))
                 _flush_pending(force_all=False)
 
         scanned_total += scanned
@@ -183,7 +182,7 @@ def claim_scan_cursor(
         should_force_flush = False
         if floor_bnb is not None:
             wallet_bnb = float(contract.wallet_balance_bnb(wallet_address))
-            should_force_flush = float(wallet_bnb) < float(floor_bnb)
+            should_force_flush = wallet_bnb < floor_bnb
             info(
                 "NET",
                 "RPC",
@@ -191,8 +190,8 @@ def claim_scan_cursor(
                 msg=(
                     f"claim_batch_pending={len(pending_claims)} "
                     f"wallet_bnb={wallet_bnb:.6f} "
-                    f"min_bet_with_gas_bnb={float(floor_bnb):.6f} "
-                    f"force_small_batch={str(bool(should_force_flush)).lower()}"
+                    f"min_bet_with_gas_bnb={floor_bnb:.6f} "
+                    f"force_small_batch={str(should_force_flush).lower()}"
                 ),
             )
         else:
@@ -200,6 +199,6 @@ def claim_scan_cursor(
         if should_force_flush:
             _flush_pending(force_all=True)
         if pending_claims:
-            cursor = int(pending_claims[0][1])
+            cursor = pending_claims[0][1]
     _write_int_file_atomic(path, cursor)
     return ClaimScanResult(scanned_n=scanned_total, claimed_n=claimed_total)

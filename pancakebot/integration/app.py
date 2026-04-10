@@ -15,7 +15,6 @@ from pancakebot.core.constants import (
 from pancakebot.infra.okx_client import OkxClient
 from pancakebot.domain.strategy.momentum_gate import MomentumGate
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
-from pancakebot.infra.market_data_db import MarketDataDb, SqliteKlinesStore
 from pancakebot.infra.graph_client import GraphClient
 from pancakebot.infra.rpc_pool import choose_rpc_url
 from pancakebot.infra.onchain.web3_contract_config import Web3ContractConfig
@@ -34,42 +33,30 @@ from pancakebot.core.logging import info
 def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) -> None:
     cfg = load_app_config(config_path)
 
-    selected_modes = int(bool(dry)) + int(bool(backtest)) + int(bool(sync))
+    selected_modes = int(dry) + int(backtest) + int(sync)
     if selected_modes > 1:
         raise InvariantError("run_modes_mutually_exclusive")
 
     if backtest:
         round_store = ClosedRoundsStore(cfg.closed_rounds_path)
-        market_data_store = MarketDataDb(cfg.market_data_db_path)
-        try:
-            market_data_store.ensure_sources_synced(
-                rounds_jsonl_path=str(cfg.closed_rounds_path),
-                klines_jsonl_path=str(cfg.klines_path),
-            )
-            runtime_cfg = RuntimeConfig(
-                round_store=round_store,
-                klines_store=SqliteKlinesStore(market_data_db=market_data_store),
-                contract=None,
-                wallet_address="",
-                cutoff_seconds=cfg.cutoff_seconds,
-                latency_log_path=cfg.latency_log_path,
-                dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
-                wait_for_bet_receipt=False,
-                bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
-                momentum_gate_config=cfg.momentum_gate,
-                momentum_gate=None,
-                dry=dry,
-                runtime_state_paths=cfg.runtime_state_paths,
-                min_bet_amount_bnb=float(cfg.min_bet_amount_bnb),
-                treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-                buffer_seconds=int(cfg.buffer_seconds),
-            )
-            run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var"))
-        finally:
-            try:
-                market_data_store.close()
-            except Exception:
-                pass
+        runtime_cfg = RuntimeConfig(
+            round_store=round_store,
+            contract=None,
+            wallet_address="",
+            cutoff_seconds=cfg.cutoff_seconds,
+            latency_log_path=cfg.latency_log_path,
+            dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
+            wait_for_bet_receipt=False,
+            bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
+            momentum_gate_config=cfg.momentum_gate,
+            momentum_gate=None,
+            dry=dry,
+            runtime_state_paths=cfg.runtime_state_paths,
+            min_bet_amount_bnb=float(cfg.min_bet_amount_bnb),
+            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+            buffer_seconds=int(cfg.buffer_seconds),
+        )
+        run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var"))
         return
 
     if sync:
@@ -89,7 +76,8 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
             msg=(
                 f"closed_rounds={int(summary.stored_closed_round_count)} "
                 f"epochs=[{int(summary.earliest_closed_epoch)}..{int(summary.latest_closed_epoch)}] "
-                f"klines={int(summary.klines_total)} klines_new={int(summary.klines_appended)}"
+                f"spot_klines_synced={int(summary.spot_klines_synced)} "
+                f"btc_klines_synced={int(summary.btc_klines_synced)}"
             ),
         )
         return
@@ -114,20 +102,19 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
     min_bet_amount_bnb = float(contract.min_bet_amount()) / float(BNB_WEI)
     save_contract_constants(
         constants=ContractConstants(
-            min_bet_amount_bnb=float(min_bet_amount_bnb),
-            treasury_fee_fraction=float(treasury_fee_fraction),
-            buffer_seconds=int(buffer_seconds),
+            min_bet_amount_bnb=min_bet_amount_bnb,
+            treasury_fee_fraction=treasury_fee_fraction,
+            buffer_seconds=buffer_seconds,
         )
     )
 
     momentum_gate = None
-    if bool(cfg.momentum_gate.enabled):
+    if cfg.momentum_gate.enabled:
         okx_client = OkxClient(timeout_seconds=10.0)
         momentum_gate = MomentumGate(config=cfg.momentum_gate, okx_client=okx_client)
 
     runtime_cfg = RuntimeConfig(
         round_store=None,
-        klines_store=None,
         contract=contract,
         wallet_address=contract.wallet_address,
         cutoff_seconds=cfg.cutoff_seconds,

@@ -17,7 +17,7 @@ from pancakebot.core.constants import GAS_COST_BET_BNB
 from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
 from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline
-from pancakebot.domain.types import Kline, Round
+from pancakebot.domain.types import Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
 _SPOT_KLINES_PATH = Path("var/cutoff_spot_prices.jsonl")
@@ -37,12 +37,12 @@ class _BacktestStats:
     skip_counts_by_reason: dict[str, int] = field(default_factory=dict)
 
     def count_skip(self, reason: str) -> None:
-        key = str(reason).strip() or "unknown_skip_reason"
+        key = reason.strip() or "unknown_skip_reason"
         self.skip_counts_by_reason[key] = self.skip_counts_by_reason.get(key, 0) + 1
 
 
 def _safe_rate(num: int, den: int) -> float:
-    return float(num) / float(den) if int(den) > 0 else 0.0
+    return num / den if den > 0 else 0.0
 
 
 def _load_all_rounds(runtime_cfg) -> list[Round]:
@@ -53,16 +53,6 @@ def _load_all_rounds(runtime_cfg) -> list[Round]:
     if runtime_cfg.round_store is not None:
         return list(runtime_cfg.round_store.iter_closed_rounds())
     raise InvariantError("backtest_no_round_store_available")
-
-
-def _load_all_klines(runtime_cfg) -> list[Kline]:
-    """Load all klines from klines_store."""
-    if runtime_cfg.klines_store is None:
-        raise InvariantError("backtest_klines_store_missing")
-    klines = list(runtime_cfg.klines_store.iter_klines())
-    if not klines:
-        raise InvariantError("backtest_klines_store_empty")
-    return klines
 
 
 def _load_spot_klines_from(path: Path) -> dict[int, list[list]]:
@@ -87,9 +77,9 @@ def _load_spot_klines_from(path: Path) -> dict[int, list[list]]:
 def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) -> None:
     backtest_cfg.validate()
 
-    simulation_size = int(backtest_cfg.simulation_size)
-    tail_offset_rounds = int(backtest_cfg.tail_offset_rounds)
-    initial_bankroll_bnb = float(backtest_cfg.initial_bankroll_bnb)
+    simulation_size = backtest_cfg.simulation_size
+    tail_offset_rounds = backtest_cfg.tail_offset_rounds
+    initial_bankroll_bnb = backtest_cfg.initial_bankroll_bnb
 
     info("BACK", "SETUP", "START", msg="Loading closed rounds and klines")
     t0 = time.perf_counter()
@@ -98,23 +88,21 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     if not all_rounds:
         raise InvariantError("backtest_no_closed_rounds")
 
-    all_klines = _load_all_klines(runtime_cfg)
-
     # Select simulation window: epoch range takes priority over tail window.
     epoch_start = backtest_cfg.epoch_start
     epoch_end = backtest_cfg.epoch_end
     if epoch_start is not None or epoch_end is not None:
         sim_rounds = [
             r for r in all_rounds
-            if (epoch_start is None or int(r.epoch) >= int(epoch_start))
-            and (epoch_end is None or int(r.epoch) <= int(epoch_end))
+            if (epoch_start is None or r.epoch >= epoch_start)
+            and (epoch_end is None or r.epoch <= epoch_end)
         ]
         if not sim_rounds:
             raise InvariantError(
                 f"backtest_no_rounds_in_epoch_range: start={epoch_start} end={epoch_end}"
             )
     else:
-        effective_end = len(all_rounds) - int(tail_offset_rounds)
+        effective_end = len(all_rounds) - tail_offset_rounds
         if effective_end <= 0:
             raise InvariantError("backtest_tail_offset_exceeds_rounds")
         sim_rounds = all_rounds[max(0, effective_end - simulation_size): effective_end]
@@ -123,15 +111,15 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
                 f"backtest_insufficient_rounds: need={simulation_size} have={len(sim_rounds)}"
             )
 
-    first_epoch = int(sim_rounds[0].epoch)
-    last_epoch = int(sim_rounds[-1].epoch)
-    elapsed_load = float(time.perf_counter()) - float(t0)
+    first_epoch = sim_rounds[0].epoch
+    last_epoch = sim_rounds[-1].epoch
+    elapsed_load = time.perf_counter() - t0
     info(
         "BACK",
         "SETUP",
         "LOADED",
         msg=(
-            f"rounds={len(all_rounds)} klines={len(all_klines)} "
+            f"rounds={len(all_rounds)} "
             f"sim_rounds={len(sim_rounds)} epochs=[{first_epoch}..{last_epoch}] "
             f"load_elapsed={elapsed_load:.1f}s"
         ),
@@ -154,11 +142,10 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     pipeline = MomentumOnlyPipeline(
         config=gate_config,
         gate=None,
-        cutoff_seconds=int(runtime_cfg.cutoff_seconds),
-        min_bet_amount_bnb=float(runtime_cfg.min_bet_amount_bnb),
-        treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
+        cutoff_seconds=runtime_cfg.cutoff_seconds,
+        min_bet_amount_bnb=runtime_cfg.min_bet_amount_bnb,
+        treasury_fee_fraction=runtime_cfg.treasury_fee_fraction,
     )
-    pipeline.refresh_klines(klines=list(all_klines))
     pipeline.refresh_spot_klines(spot_klines_by_epoch=spot_klines)
     pipeline.refresh_btc_klines(btc_klines_by_epoch=btc_klines)
     info("BACK", "SETUP", "PIPELINE", msg="MomentumOnlyPipeline ready (backtest/dual-asset mode)")
@@ -168,7 +155,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     trades_path = out_dir / "backtest_trades.csv"
     summary_path = out_dir / "backtest_summary.json"
 
-    bankroll = float(initial_bankroll_bnb)
+    bankroll = initial_bankroll_bnb
     stats = _BacktestStats()
 
     t_sim_start = time.perf_counter()
@@ -190,26 +177,25 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
         for i, round_t in enumerate(sim_rounds):
             decision = pipeline.decide_open_round(
                 round_t=round_t,
-                bankroll_bnb=float(bankroll),
+                bankroll_bnb=bankroll,
                 allow_oracle_mode=True,
             )
 
             profit = 0.0
-            if decision.action == "BET" and float(decision.bet_size_bnb) > 0.0:
-                bet_side = str(decision.bet_side)
+            if decision.action == "BET" and decision.bet_size_bnb > 0.0:
+                bet_side = decision.bet_side
                 if bet_side not in ("Bull", "Bear"):
                     raise InvariantError("backtest_bet_side_invalid")
 
-                bankroll -= float(decision.bet_size_bnb) + float(GAS_COST_BET_BNB)
+                bankroll -= decision.bet_size_bnb + GAS_COST_BET_BNB
                 outcome = settle_bet_against_closed_round(
-                    bet_bnb=float(decision.bet_size_bnb),
-                    bet_side=str(bet_side),
+                    bet_bnb=decision.bet_size_bnb,
+                    bet_side=bet_side,
                     round_closed=round_t,
-                    treasury_fee_fraction=float(runtime_cfg.treasury_fee_fraction),
+                    treasury_fee_fraction=runtime_cfg.treasury_fee_fraction,
                 )
-                credit_bnb = float(outcome.credit_bnb)
-                bankroll += float(credit_bnb)
-                profit = float(credit_bnb) - float(decision.bet_size_bnb) - float(GAS_COST_BET_BNB)
+                bankroll += outcome.credit_bnb
+                profit = outcome.credit_bnb - decision.bet_size_bnb - GAS_COST_BET_BNB
 
                 stats.num_bets += 1
                 if bet_side == "Bull":
@@ -217,30 +203,30 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
                 else:
                     stats.num_bets_bear += 1
 
-                if str(outcome.outcome) == "win":
+                if outcome.outcome == "win":
                     stats.num_wins += 1
                     if bet_side == "Bull":
                         stats.num_wins_bull += 1
                     else:
                         stats.num_wins_bear += 1
 
-                if float(profit) > 0.0:
-                    stats.gross_profit_bnb += float(profit)
-                elif float(profit) < 0.0:
-                    stats.gross_loss_bnb += -float(profit)
+                if profit > 0.0:
+                    stats.gross_profit_bnb += profit
+                elif profit < 0.0:
+                    stats.gross_loss_bnb += -profit
             else:
-                stats.count_skip(str(decision.skip_reason or "unknown_skip_reason"))
+                stats.count_skip(decision.skip_reason or "unknown_skip_reason")
 
             trades_w.writerow(
                 [
-                    int(round_t.epoch),
-                    str(decision.action),
-                    str(decision.skip_reason or ""),
-                    str(decision.bet_side or ""),
-                    float(decision.bet_size_bnb),
-                    float(decision.p_bull) if decision.p_bull is not None else "",
-                    float(profit),
-                    float(bankroll),
+                    round_t.epoch,
+                    decision.action,
+                    decision.skip_reason or "",
+                    decision.bet_side or "",
+                    decision.bet_size_bnb,
+                    decision.p_bull if decision.p_bull is not None else "",
+                    profit,
+                    bankroll,
                 ]
             )
 
@@ -254,12 +240,12 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
                     msg=f"idx={i+1}/{len(sim_rounds)} bankroll={bankroll:.4f} BNB",
                 )
 
-    elapsed_sim = float(time.perf_counter()) - float(t_sim_start)
+    elapsed_sim = time.perf_counter() - t_sim_start
 
     # Summary statistics.
     total_rounds = len(sim_rounds)
-    total_skips = int(total_rounds) - int(stats.num_bets)
-    net_pnl = float(bankroll) - float(initial_bankroll_bnb)
+    total_skips = total_rounds - stats.num_bets
+    net_pnl = bankroll - initial_bankroll_bnb
     win_rate = _safe_rate(stats.num_wins, stats.num_bets)
     bet_rate = _safe_rate(stats.num_bets, total_rounds)
 
@@ -276,28 +262,27 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
         ),
     )
 
-    import json
     skip_detail = dict(sorted(stats.skip_counts_by_reason.items(), key=lambda x: -x[1]))
     summary = {
-        "simulation_size": int(total_rounds),
-        "first_epoch": int(first_epoch),
-        "last_epoch": int(last_epoch),
-        "initial_bankroll_bnb": float(initial_bankroll_bnb),
-        "final_bankroll_bnb": float(bankroll),
-        "net_pnl_bnb": float(net_pnl),
-        "num_bets": int(stats.num_bets),
-        "num_bets_bull": int(stats.num_bets_bull),
-        "num_bets_bear": int(stats.num_bets_bear),
-        "num_wins": int(stats.num_wins),
-        "num_wins_bull": int(stats.num_wins_bull),
-        "num_wins_bear": int(stats.num_wins_bear),
-        "num_skips": int(total_skips),
-        "win_rate": float(win_rate),
-        "bet_rate": float(bet_rate),
-        "gross_profit_bnb": float(stats.gross_profit_bnb),
-        "gross_loss_bnb": float(stats.gross_loss_bnb),
-        "skip_counts_by_reason": dict(skip_detail),
-        "elapsed_sim_seconds": float(elapsed_sim),
+        "simulation_size": total_rounds,
+        "first_epoch": first_epoch,
+        "last_epoch": last_epoch,
+        "initial_bankroll_bnb": initial_bankroll_bnb,
+        "final_bankroll_bnb": bankroll,
+        "net_pnl_bnb": net_pnl,
+        "num_bets": stats.num_bets,
+        "num_bets_bull": stats.num_bets_bull,
+        "num_bets_bear": stats.num_bets_bear,
+        "num_wins": stats.num_wins,
+        "num_wins_bull": stats.num_wins_bull,
+        "num_wins_bear": stats.num_wins_bear,
+        "num_skips": total_skips,
+        "win_rate": win_rate,
+        "bet_rate": bet_rate,
+        "gross_profit_bnb": stats.gross_profit_bnb,
+        "gross_loss_bnb": stats.gross_loss_bnb,
+        "skip_counts_by_reason": skip_detail,
+        "elapsed_sim_seconds": elapsed_sim,
     }
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
