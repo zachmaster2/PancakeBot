@@ -225,7 +225,7 @@ class MomentumOnlyPipeline:
         if bnb_klines is None or len(bnb_klines) == 0:
             return MomentumGateResult(
                 signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-                skip_reason="gate_no_spot_klines", kline_age_seconds=None,
+                skip_reason="gate_no_spot_klines",
             )
         btc_klines = self._btc_klines_by_epoch.get(epoch)
         return compute_signal_from_klines(bnb_klines, btc_klines, cutoff_ts_ms)

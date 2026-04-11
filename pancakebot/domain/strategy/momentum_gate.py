@@ -11,6 +11,11 @@ Signal architecture:
     direction with |BTC ret| >= 0.0003.
 
 Both tiers use OKX public 1s candles (no auth required).
+
+Kline window: 40 contiguous 1s candles covering [lockAt-44, lockAt-4).
+The newest candle (index -1) has open_time = cutoff - 1 and its
+close_price is the price at cutoff.  Lookbacks use direct indexing:
+the price N seconds before cutoff is ``closes[-(N+1)]``.
 """
 
 from __future__ import annotations
@@ -19,8 +24,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 from pancakebot.infra.okx_client import OkxClient
-from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info, warn
+
+# Number of 1s candles fetched and used by all modes (live, sync, backtest).
+_CANDLE_COUNT = 40
 
 # Tuned constants — these were optimized together; do not change independently.
 _ACCEL_PAIRS: list[tuple[int, int]] = [(7, 10), (5, 10), (5, 7)]
@@ -43,7 +50,6 @@ class MomentumGateResult:
     btc_agrees: bool
     btc_disagrees: bool
     skip_reason: str | None
-    kline_age_seconds: float | None
 
 
 class MomentumGate:
@@ -86,8 +92,8 @@ class MomentumGate:
         if not self._cfg.enabled:
             return None
         pool = ThreadPoolExecutor(max_workers=2)
-        bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, _LIVE_FETCH_COUNT, cutoff_ts_ms)
-        btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _LIVE_FETCH_COUNT, cutoff_ts_ms)
+        bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, _CANDLE_COUNT, cutoff_ts_ms)
+        btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _CANDLE_COUNT, cutoff_ts_ms)
         pool.shutdown(wait=False)   # let threads finish on their own
         return bnb_fut, btc_fut
 
@@ -102,15 +108,11 @@ class MomentumGate:
         If *kline_futures* is provided (from fetch_klines_async()),
         the already-completed futures are collected instantly.  Otherwise
         the klines are fetched inline (parallel) as a fallback.
-
-        All klines are guaranteed completed (open_time < cutoff_ts_ms)
-        because the OKX ``after`` parameter excludes the in-progress bar
-        at fetch time.  The anchor is simply the newest kline.
         """
         if not self._cfg.enabled:
             return MomentumGateResult(
                 signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-                skip_reason=None, kline_age_seconds=None,
+                skip_reason=None,
             )
 
         # Collect klines — from async fetch or inline fallback
@@ -119,37 +121,28 @@ class MomentumGate:
             btc_klines = kline_futures[1].result()
         else:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, _LIVE_FETCH_COUNT, cutoff_ts_ms)
-                btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _LIVE_FETCH_COUNT, cutoff_ts_ms)
+                bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, _CANDLE_COUNT, cutoff_ts_ms)
+                btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _CANDLE_COUNT, cutoff_ts_ms)
                 bnb_klines = bnb_fut.result()
                 btc_klines = btc_fut.result()
 
-        if bnb_klines is None or len(bnb_klines) < 12:
-            return self._skip("gate_bnb_fetch_failed")
+        # Validate: we expect exactly _CANDLE_COUNT contiguous 1s candles
+        # ending at cutoff - 1.  Reject if the response is incomplete.
+        bnb_reason = _validate_klines(bnb_klines, cutoff_ts_ms, "bnb")
+        if bnb_reason is not None:
+            return self._skip(bnb_reason)
 
-        # All klines have open_time < cutoff (the after= parameter
-        # excluded the in-progress bar at fetch time).  The anchor is
-        # the newest candle, which should be at cutoff - 1 (covering
-        # the interval [cutoff-1, cutoff)).
-        anchor_ts_ms = int(bnb_klines[-1]["open_time_ms"])
+        bnb_closes = [k["close_price"] for k in bnb_klines]
+        btc_closes = [k["close_price"] for k in btc_klines] if btc_klines and len(btc_klines) >= _CANDLE_COUNT else None
 
-        # Staleness guard: the anchor must be at cutoff - 1.  Anything
-        # older means we're missing recent data and the signal cannot
-        # be trusted.
-        if anchor_ts_ms < cutoff_ts_ms - 1000:
-            age_s = (cutoff_ts_ms - anchor_ts_ms) / 1000
-            return self._skip(f"gate_stale_kline:age={age_s:.0f}s")
-
-        age_seconds = (cutoff_ts_ms - anchor_ts_ms) / 1000
-
-        result = _compute_signal(bnb_klines, btc_klines, anchor_ts_ms, age_seconds)
+        result = _compute_signal(bnb_closes, btc_closes)
 
         # Diagnostic: log why signal did/didn't fire so dry-run progress is visible
         if result.signal is not None:
             info("GATE", "SIGNAL", "FIRE", tier=result.tier, side=result.signal,
-                 btc_ag=result.btc_agrees, age=f"{age_seconds:.1f}s")
+                 btc_ag=result.btc_agrees)
         else:
-            _log_no_signal(bnb_klines, btc_klines, anchor_ts_ms, age_seconds)
+            _log_no_signal(bnb_closes, btc_closes)
 
         return result
 
@@ -164,64 +157,85 @@ class MomentumGate:
     def _skip(reason: str) -> MomentumGateResult:
         return MomentumGateResult(
             signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-            skip_reason=reason, kline_age_seconds=None,
+            skip_reason=reason,
         )
 
 
+def _validate_klines(
+    klines: list[dict] | None, cutoff_ts_ms: int, label: str,
+) -> str | None:
+    """Verify we received the expected kline window.
+
+    Returns a skip reason string on failure, or None if valid.
+    """
+    if klines is None or len(klines) < _CANDLE_COUNT:
+        n = 0 if klines is None else len(klines)
+        return f"gate_{label}_fetch_failed:got={n}"
+
+    # Newest candle must be at cutoff - 1 (the last completed second)
+    newest_ts = int(klines[-1]["open_time_ms"])
+    expected_ts = cutoff_ts_ms - 1000
+    if newest_ts != expected_ts:
+        return f"gate_{label}_unexpected_newest:got={newest_ts},expected={expected_ts}"
+
+    return None
+
+
+def _validate_klines_raw(
+    klines: list[list], cutoff_ms: int, label: str,
+) -> str | None:
+    """Validate raw kline arrays (backtest path, list-of-lists format)."""
+    if not klines or len(klines) < _CANDLE_COUNT:
+        n = 0 if not klines else len(klines)
+        return f"gate_{label}_insufficient:got={n}"
+
+    newest_ts = int(klines[-1][0])
+    expected_ts = cutoff_ms - 1000
+    if newest_ts != expected_ts:
+        return f"gate_{label}_unexpected_newest:got={newest_ts},expected={expected_ts}"
+
+    return None
+
+
+def _get_return(closes: list[float], lookback: int) -> float | None:
+    """Return over *lookback* seconds using direct indexing.
+
+    closes[-1] is the price at cutoff.  closes[-(lookback+1)] is the
+    price *lookback* seconds before cutoff.
+    """
+    if len(closes) < lookback + 1:
+        return None
+    now = closes[-1]
+    ago = closes[-(lookback + 1)]
+    if ago <= 0:
+        return None
+    return (now / ago) - 1.0
+
+
 def _log_no_signal(
-    bnb_klines: list[dict],
-    btc_klines: list[dict] | None,
-    cutoff_ms: int,
-    age_seconds: float,
+    bnb_closes: list[float],
+    btc_closes: list[float] | None,
 ) -> None:
     """Log diagnostic when signal doesn't fire — shows why."""
-    # BNB price and unique count
-    prices = {k["close_price"] for k in bnb_klines} if bnb_klines else set()
-    bnb_price = bnb_klines[-1]["close_price"] if bnb_klines else 0.0
+    bnb_price = bnb_closes[-1] if bnb_closes else 0.0
+    uniq = len(set(bnb_closes)) if bnb_closes else 0
 
-    # Best BNB return across all lookback pairs
     max_ret = 0.0
     for short, long in _ACCEL_PAIRS:
         for lb in (short, long):
-            r = _get_return(bnb_klines, cutoff_ms, lb)
+            r = _get_return(bnb_closes, lb)
             if r is not None:
                 max_ret = max(max_ret, abs(r))
 
-    # BTC 30s return
-    btc_ret = _get_return(btc_klines, cutoff_ms, _BTC_LOOKBACK) if btc_klines else None
+    btc_ret = _get_return(btc_closes, _BTC_LOOKBACK) if btc_closes else None
     btc_str = f"{abs(btc_ret):.6f}" if btc_ret is not None else "N/A"
 
     info("GATE", "DIAG", "NO_SIGNAL",
          bnb=f"${bnb_price:.1f}",
          max_ret=f"{max_ret:.7f}",
          thresh=f"{_ACCEL_THRESH}",
-         uniq=len(prices),
-         btc30=btc_str,
-         age=f"{age_seconds:.1f}s")
-
-
-def _find_closest_price(klines: list, target_ms: int) -> float | None:
-    """Find close price of kline closest to target_ms (within 2s)."""
-    best_price = None
-    best_dist = float("inf")
-    for k in klines:
-        ts = int(k[0]) if isinstance(k, list) else int(k["open_time_ms"])
-        dist = abs(ts - target_ms)
-        if dist < best_dist:
-            best_dist = dist
-            best_price = float(k[4]) if isinstance(k, list) else float(k["close_price"])
-    if best_dist <= 2000:
-        return best_price
-    return None
-
-
-def _get_return(klines: list, cutoff_ms: int, lookback_s: int) -> float | None:
-    """Compute return between cutoff and cutoff - lookback_s."""
-    now = _find_closest_price(klines, cutoff_ms)
-    ago = _find_closest_price(klines, cutoff_ms - lookback_s * 1000)
-    if now is None or ago is None or ago <= 0:
-        return None
-    return (now / ago) - 1.0
+         uniq=uniq,
+         btc30=btc_str)
 
 
 def compute_signal_from_klines(
@@ -231,86 +245,63 @@ def compute_signal_from_klines(
 ) -> MomentumGateResult:
     """Compute signal from raw kline arrays (backtest path).
 
-    Simulates the live environment by:
-      1. Trimming klines to only completed candles before *cutoff_ms*
-         (the candle AT cutoff_ms would be in-progress during a live
-         fetch, so it's excluded — matching ``evaluate()``'s drop).
-      2. Keeping only the last 20 BNB / 40 BTC candles to match the
-         live fetch window.
-      3. Anchoring on the newest remaining BNB kline.
+    Trims klines to the same window the live path fetches, validates
+    the result, then computes the signal using direct indexing.
     """
-    # Trim to match live fetch window (completed candles only, strict <)
-    bnb_klines = _trim_to_live_window(bnb_klines, cutoff_ms, _USABLE_CANDLE_COUNT)
+    bnb_klines = _trim_to_window(bnb_klines, cutoff_ms)
     if btc_klines is not None:
-        btc_klines = _trim_to_live_window(btc_klines, cutoff_ms, _USABLE_CANDLE_COUNT)
+        btc_klines = _trim_to_window(btc_klines, cutoff_ms)
 
-    if not bnb_klines:
+    bnb_reason = _validate_klines_raw(bnb_klines, cutoff_ms, "bnb")
+    if bnb_reason is not None:
         return MomentumGateResult(
             signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-            skip_reason="gate_no_spot_klines", kline_age_seconds=None,
+            skip_reason=bnb_reason,
         )
 
-    # Anchor on newest completed BNB kline (mirrors live anchor logic)
-    anchor_ms = int(bnb_klines[-1][0]) if isinstance(bnb_klines[-1], list) else int(bnb_klines[-1]["open_time_ms"])
+    bnb_closes = [k[4] for k in bnb_klines]
+    btc_closes = None
+    if btc_klines and len(btc_klines) >= _CANDLE_COUNT:
+        btc_closes = [k[4] for k in btc_klines]
 
-    # Same guard as live path: anchor must be at cutoff - 1
-    if anchor_ms < cutoff_ms - 1000:
-        age_s = (cutoff_ms - anchor_ms) / 1000
-        return MomentumGateResult(
-            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-            skip_reason=f"gate_stale_kline:age={age_s:.0f}s", kline_age_seconds=age_s,
-        )
-
-    return _compute_signal(bnb_klines, btc_klines, anchor_ms, age_seconds=0.0)
+    return _compute_signal(bnb_closes, btc_closes)
 
 
-# Candle window — 40 completed candles for both BNB and BTC.
-# Live path uses OKX after= parameter to exclude the in-progress bar,
-# so all 40 fetched candles are completed with final close prices.
-# Backtest path trims with strict < to match.
-_LIVE_FETCH_COUNT = 40
-_USABLE_CANDLE_COUNT = 40
-
-
-def _trim_to_live_window(klines: list[list], cutoff_ms: int, count: int) -> list[list]:
-    """Keep only the *count* completed candles before cutoff_ms.
-
-    Uses strict ``<`` because the candle at *cutoff_ms* would still be
-    in-progress when fetched live — its close price is an ephemeral
-    mid-second snapshot.  The live path drops the in-progress bar
-    (see ``evaluate()``), so the backtest must exclude it too.
-    """
+def _trim_to_window(klines: list[list], cutoff_ms: int) -> list[list]:
+    """Keep only the *_CANDLE_COUNT* completed candles before cutoff_ms."""
     before = [k for k in klines if int(k[0]) < cutoff_ms]
-    return before[-count:] if len(before) > count else before
+    return before[-_CANDLE_COUNT:] if len(before) > _CANDLE_COUNT else before
 
 
 def _compute_signal(
-    bnb_klines: list,
-    btc_klines: list | None,
-    cutoff_ms: int,
-    age_seconds: float,
+    bnb_closes: list[float],
+    btc_closes: list[float] | None,
 ) -> MomentumGateResult:
-    """Core signal logic shared by live and backtest paths."""
+    """Core signal logic shared by live and backtest paths.
+
+    Takes pre-extracted close price arrays.  Lookbacks use direct
+    indexing: closes[-(N+1)] is the price N seconds before cutoff.
+    """
 
     # --- Tier 1: BNB Acceleration ---
     for short, long in _ACCEL_PAIRS:
-        rs = _get_return(bnb_klines, cutoff_ms, short)
-        rl = _get_return(bnb_klines, cutoff_ms, long)
+        rs = _get_return(bnb_closes, short)
+        rl = _get_return(bnb_closes, long)
         if rs and rl and rs != 0 and rl != 0 and (rs > 0) == (rl > 0):
             if max(abs(rs), abs(rl)) >= _ACCEL_THRESH:
                 d = "Bull" if rs > 0 else "Bear"
-                btc_ag, btc_dis = _check_btc(btc_klines, cutoff_ms, d)
+                btc_ag, btc_dis = _check_btc(btc_closes, d)
                 return MomentumGateResult(
                     signal=d, tier="accel",
                     btc_agrees=btc_ag, btc_disagrees=btc_dis,
-                    skip_reason=None, kline_age_seconds=age_seconds,
+                    skip_reason=None,
                 )
 
     # --- Tier 2: BNB Any Move + BTC Confirmation ---
-    if btc_klines is not None:
-        bnb_r = _get_return(bnb_klines, cutoff_ms, 7)
+    if btc_closes is not None:
+        bnb_r = _get_return(bnb_closes, 7)
         if bnb_r is not None and bnb_r != 0:
-            btc_r = _get_return(btc_klines, cutoff_ms, _BTC_LOOKBACK)
+            btc_r = _get_return(btc_closes, _BTC_LOOKBACK)
             if btc_r is not None and abs(btc_r) >= _BTC_THRESH:
                 bnb_dir = "Bull" if bnb_r > 0 else "Bear"
                 btc_dir = "Bull" if btc_r > 0 else "Bear"
@@ -318,22 +309,22 @@ def _compute_signal(
                     return MomentumGateResult(
                         signal=bnb_dir, tier="any+btc",
                         btc_agrees=True, btc_disagrees=False,
-                        skip_reason=None, kline_age_seconds=age_seconds,
+                        skip_reason=None,
                     )
 
     return MomentumGateResult(
         signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-        skip_reason="gate_no_signal", kline_age_seconds=age_seconds,
+        skip_reason="gate_no_signal",
     )
 
 
 def _check_btc(
-    btc_klines: list | None, cutoff_ms: int, bnb_dir: str,
+    btc_closes: list[float] | None, bnb_dir: str,
 ) -> tuple[bool, bool]:
     """Check if BTC 30s return agrees/disagrees with BNB direction."""
-    if btc_klines is None:
+    if btc_closes is None:
         return False, False
-    btc_r = _get_return(btc_klines, cutoff_ms, _BTC_LOOKBACK)
+    btc_r = _get_return(btc_closes, _BTC_LOOKBACK)
     if btc_r is None or abs(btc_r) < _BTC_THRESH:
         return False, False
     btc_dir = "Bull" if btc_r > 0 else "Bear"
