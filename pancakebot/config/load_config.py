@@ -313,19 +313,15 @@ def load_app_config(path: str) -> AppConfig:
     backtest_cfg.validate()
 
     _validate_unknown_keys("momentum_gate", momentum_gate_raw, {
-        "enabled", "symbol", "btc_symbol", "max_staleness_seconds",
+        "enabled", "symbol", "btc_symbol",
     })
     mg_enabled = _opt_bool(momentum_gate_raw, "enabled", False)
     mg_symbol = _opt_str(momentum_gate_raw, "symbol", "BNB-USDT")
     mg_btc_symbol = _opt_str(momentum_gate_raw, "btc_symbol", "BTC-USDT")
-    mg_max_staleness = _opt_int(momentum_gate_raw, "max_staleness_seconds", 120)
-    if mg_max_staleness <= 0:
-        raise InvariantError("momentum_gate_max_staleness_must_be_positive")
     momentum_gate_cfg = MomentumGateConfig(
         enabled=mg_enabled,
         symbol=mg_symbol,
         btc_symbol=mg_btc_symbol,
-        max_staleness_seconds=mg_max_staleness,
     )
 
     return AppConfig(

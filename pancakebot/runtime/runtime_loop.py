@@ -1130,11 +1130,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # background while Steps 6b–7 do RPC work, so the ~633 ms of
         # OKX latency overlaps with ~450 ms of RPC calls instead of
         # stacking on top.
-        okx_prefetched = None
+        okx_kline_futures = None
         if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, '_gate'):
             gate = closed.strategy_pipeline._gate
             if gate is not None:
-                okx_prefetched = gate.prefetch()
+                okx_kline_futures = gate.fetch_klines_async(cutoff_ts_ms=int(cutoff_ts_t * 1000))
 
         # Step 6b: Quick epoch check — just verify current_epoch hasn't
         # shifted during the ~267 s sleep.  A full handshake (3 RPC calls,
@@ -1207,7 +1207,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             allow_oracle_mode=False,
             pool_bull_bnb=pool_bull_bnb,
             pool_bear_bnb=pool_bear_bnb,
-            okx_prefetched=okx_prefetched,
+            okx_kline_futures=okx_kline_futures,
         )
         if decision.p_bull is not None:
             pred_p_final = decision.p_bull

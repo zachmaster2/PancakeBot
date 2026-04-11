@@ -28,7 +28,6 @@ bet_receipt_timeout_seconds = 45
 enabled = true
 symbol = "BNB-USDT"
 btc_symbol = "BTC-USDT"
-max_staleness_seconds = 120
 
 [contract]
 # PancakeSwap Prediction V2 protocol constants.

@@ -167,7 +167,7 @@ class MomentumOnlyPipeline:
         allow_oracle_mode: bool,
         pool_bull_bnb: float = 0.0,
         pool_bear_bnb: float = 0.0,
-        okx_prefetched: object | None = None,
+        okx_kline_futures: object | None = None,
     ) -> StrategyPipelineDecision:
         """Return BET or SKIP based on dual-asset momentum signal."""
 
@@ -175,10 +175,10 @@ class MomentumOnlyPipeline:
         cutoff_ts_ms = (lock_at - self._cutoff_seconds) * 1000
 
         if self._gate is not None:
-            # Live/dry: fetch from OKX (use prefetched data if available)
+            # Live/dry: fetch from OKX (use async-fetched data if available)
             result = self._gate.evaluate(
                 cutoff_ts_ms=int(cutoff_ts_ms),
-                prefetched=okx_prefetched,
+                kline_futures=okx_kline_futures,
             )
         else:
             # Backtest: use cached 1s klines
