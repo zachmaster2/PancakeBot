@@ -3,6 +3,11 @@
 Signal: dual-asset BNB+BTC momentum gate (OKX 1s candles).
 Sizing: pool-proportional with BTC/payout adjustments.
 
+Pre-signal filters (applied before sizing):
+  - Evening exclusion: skip 18:00–23:59 UTC (55% WR vs 63% in other hours).
+  - Pool confirmation: skip when the pool majority disagrees with the
+    momentum signal and the imbalance is >= 10% of total pool.
+
 Live/dry mode: MomentumGate fetches live 1s klines from OKX at cutoff.
 Backtest mode: uses pre-fetched 1s kline arrays from JSONL caches.
 """
@@ -31,6 +36,11 @@ _PAYOUT_HI_THRESH = 2.0
 _PAYOUT_HI_MULT = 1.7
 _PAYOUT_LO_THRESH = 1.7
 _PAYOUT_LO_MULT = 0.9
+
+# Pre-signal filters — tuned on 5000 rounds alongside sizing constants.
+_EVENING_SKIP_START_UTC = 18   # skip hours [18, 24) UTC
+_EVENING_SKIP_END_UTC = 24
+_POOL_CONFIRM_IMBALANCE_THRESH = 0.10  # skip when pool disagrees at >= 10%
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +184,11 @@ class MomentumOnlyPipeline:
         lock_at = int(round_t.lock_at)
         cutoff_ts_ms = (lock_at - self._cutoff_seconds) * 1000
 
+        # Pre-signal filter: skip evening hours (18:00–23:59 UTC).
+        hour_utc = (lock_at % 86400) // 3600
+        if _EVENING_SKIP_START_UTC <= hour_utc < _EVENING_SKIP_END_UTC:
+            return self._skip("evening_utc_skip")
+
         if self._gate is not None:
             # Live/dry: fetch from OKX (use async-fetched data if available)
             result = self._gate.evaluate(
@@ -194,6 +209,14 @@ class MomentumOnlyPipeline:
             return self._skip(str(result.skip_reason))
         if result.signal is None:
             return self._skip("gate_no_signal")
+
+        # Pre-signal filter: skip when pool majority disagrees with signal.
+        pool_total = pool_bull_bnb + pool_bear_bnb
+        if pool_total > 0:
+            pool_imbalance = (pool_bull_bnb - pool_bear_bnb) / pool_total
+            pool_dir = "Bull" if pool_imbalance > 0 else "Bear"
+            if abs(pool_imbalance) >= _POOL_CONFIRM_IMBALANCE_THRESH and pool_dir != result.signal:
+                return self._skip("pool_disagrees")
 
         bet_size = _compute_bet_size(
             signal=result.signal,
