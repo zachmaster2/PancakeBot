@@ -34,7 +34,6 @@ class MomentumGateConfig:
     enabled: bool
     symbol: str              # "BNB-USDT"
     btc_symbol: str          # "BTC-USDT"
-    max_staleness_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +50,6 @@ class MomentumGate:
     """Stateless dual-asset momentum gate: fetches BNB + BTC 1s klines."""
 
     def __init__(self, *, config: MomentumGateConfig, okx_client: OkxClient) -> None:
-        if config.max_staleness_seconds <= 0:
-            raise InvariantError("momentum_gate_max_staleness_must_be_positive")
         self._cfg = config
         self._client = okx_client
 
@@ -61,32 +58,36 @@ class MomentumGate:
         return self._cfg.enabled
 
     # ------------------------------------------------------------------
-    # Prefetch / evaluate split
+    # Async fetch / evaluate split
     # ------------------------------------------------------------------
     # The timing budget between wakeup and the lock safety guard is
     # only ~1 s (cutoff_seconds − safety_margin = 4 − 3).  Several RPC
     # calls (epoch handshake, lock_ts, round_data) consume ~450 ms of
     # that budget *before* the gate is even called.
     #
-    # To avoid exceeding the budget, the runtime loop calls prefetch()
-    # immediately after waking — the two OKX HTTP requests run in
-    # background threads while the RPC work proceeds.  By the time
-    # evaluate() is called the data is already waiting.
+    # To avoid exceeding the budget, the runtime loop calls
+    # fetch_klines_async() immediately after waking — the two OKX HTTP
+    # requests run in background threads while the RPC work proceeds.
+    # By the time evaluate() is called the data is already waiting.
     # ------------------------------------------------------------------
 
-    def prefetch(self) -> tuple[Future, Future] | None:
-        """Kick off BNB + BTC kline fetches in the background.
+    def fetch_klines_async(self, *, cutoff_ts_ms: int) -> tuple[Future, Future] | None:
+        """Kick off BNB + BTC kline fetches in parallel background threads.
 
         Call this immediately after waking from sleep, *before* the
         RPC calls (epoch handshake, lock_ts, round_data).  Returns a
         pair of Futures that evaluate() will collect, or None when the
         gate is disabled.
+
+        *cutoff_ts_ms* is passed to OKX as the ``after`` parameter so
+        only completed candles (open_time < cutoff) are returned —
+        the in-progress bar is never fetched.
         """
         if not self._cfg.enabled:
             return None
         pool = ThreadPoolExecutor(max_workers=2)
-        bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, 20)
-        btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, 40)
+        bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, _LIVE_FETCH_COUNT, cutoff_ts_ms)
+        btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _LIVE_FETCH_COUNT, cutoff_ts_ms)
         pool.shutdown(wait=False)   # let threads finish on their own
         return bnb_fut, btc_fut
 
@@ -94,18 +95,17 @@ class MomentumGate:
         self,
         *,
         cutoff_ts_ms: int,
-        prefetched: tuple[Future, Future] | None = None,
+        kline_futures: tuple[Future, Future] | None = None,
     ) -> MomentumGateResult:
         """Compute signal from current OKX data.
 
-        If *prefetched* is provided (from an earlier prefetch() call),
+        If *kline_futures* is provided (from fetch_klines_async()),
         the already-completed futures are collected instantly.  Otherwise
         the klines are fetched inline (parallel) as a fallback.
 
-        In live mode the theoretical cutoff_ts_ms (lock_at − cutoff_seconds)
-        is a *future* timestamp — the round hasn't locked yet.  We anchor
-        the signal on the newest available kline, which correctly measures
-        momentum as of right now.
+        All klines are guaranteed completed (open_time < cutoff_ts_ms)
+        because the OKX ``after`` parameter excludes the in-progress bar
+        at fetch time.  The anchor is simply the newest kline.
         """
         if not self._cfg.enabled:
             return MomentumGateResult(
@@ -113,41 +113,49 @@ class MomentumGate:
                 skip_reason=None, kline_age_seconds=None,
             )
 
-        # Collect klines — either from prefetch or inline fallback
-        if prefetched is not None:
-            bnb_klines = prefetched[0].result()
-            btc_klines = prefetched[1].result()
+        # Collect klines — from async fetch or inline fallback
+        if kline_futures is not None:
+            bnb_klines = kline_futures[0].result()
+            btc_klines = kline_futures[1].result()
         else:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, 20)
-                btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, 40)
+                bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, _LIVE_FETCH_COUNT, cutoff_ts_ms)
+                btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _LIVE_FETCH_COUNT, cutoff_ts_ms)
                 bnb_klines = bnb_fut.result()
                 btc_klines = btc_fut.result()
 
         if bnb_klines is None or len(bnb_klines) < 12:
             return self._skip("gate_bnb_fetch_failed")
 
-        # Anchor signal on the newest kline — this is the actual "now"
-        newest_ts_ms = int(bnb_klines[-1]["open_time_ms"])
-        age_seconds = max(0.0, (cutoff_ts_ms - newest_ts_ms) / 1000)
-        if age_seconds > self._cfg.max_staleness_seconds:
-            return self._skip(f"gate_stale_kline:age={age_seconds:.1f}s")
+        # All klines have open_time < cutoff (the after= parameter
+        # excluded the in-progress bar at fetch time).  The anchor is
+        # the newest candle, which should be at cutoff - 1 (covering
+        # the interval [cutoff-1, cutoff)).
+        anchor_ts_ms = int(bnb_klines[-1]["open_time_ms"])
 
-        # Compute signal anchored on the newest kline, not the future cutoff
-        result = _compute_signal(bnb_klines, btc_klines, newest_ts_ms, age_seconds)
+        # Staleness guard: the anchor must be at cutoff - 1.  Anything
+        # older means we're missing recent data and the signal cannot
+        # be trusted.
+        if anchor_ts_ms < cutoff_ts_ms - 1000:
+            age_s = (cutoff_ts_ms - anchor_ts_ms) / 1000
+            return self._skip(f"gate_stale_kline:age={age_s:.0f}s")
+
+        age_seconds = (cutoff_ts_ms - anchor_ts_ms) / 1000
+
+        result = _compute_signal(bnb_klines, btc_klines, anchor_ts_ms, age_seconds)
 
         # Diagnostic: log why signal did/didn't fire so dry-run progress is visible
         if result.signal is not None:
             info("GATE", "SIGNAL", "FIRE", tier=result.tier, side=result.signal,
                  btc_ag=result.btc_agrees, age=f"{age_seconds:.1f}s")
         else:
-            _log_no_signal(bnb_klines, btc_klines, newest_ts_ms, age_seconds)
+            _log_no_signal(bnb_klines, btc_klines, anchor_ts_ms, age_seconds)
 
         return result
 
-    def _fetch_klines(self, symbol: str, count: int) -> list[dict] | None:
+    def _fetch_klines(self, symbol: str, count: int, after_ms: int | None = None) -> list[dict] | None:
         try:
-            return self._client.fetch_1s_klines(symbol=symbol, count=count)
+            return self._client.fetch_1s_klines(symbol=symbol, count=count, after_ms=after_ms)
         except Exception as e:
             warn("GATE", "OKX", "FETCH_FAIL", symbol=symbol, reason=str(e))
             return None
@@ -223,20 +231,57 @@ def compute_signal_from_klines(
 ) -> MomentumGateResult:
     """Compute signal from raw kline arrays (backtest path).
 
-    Anchors on the newest BNB kline at or before *cutoff_ms*, matching
-    the live path which anchors on ``newest_ts_ms``.  Without this the
-    backtest uses an exact calculated timestamp while the live path uses
-    the actual latest available kline, causing 0-1 s drift that flips
-    marginal signals near the threshold.
+    Simulates the live environment by:
+      1. Trimming klines to only completed candles before *cutoff_ms*
+         (the candle AT cutoff_ms would be in-progress during a live
+         fetch, so it's excluded — matching ``evaluate()``'s drop).
+      2. Keeping only the last 20 BNB / 40 BTC candles to match the
+         live fetch window.
+      3. Anchoring on the newest remaining BNB kline.
     """
-    # Find newest BNB kline at or before cutoff_ms (mirrors live newest_ts_ms)
-    anchor_ms = cutoff_ms
-    for k in reversed(bnb_klines):
-        ts = int(k[0]) if isinstance(k, list) else int(k["open_time_ms"])
-        if ts <= cutoff_ms:
-            anchor_ms = ts
-            break
+    # Trim to match live fetch window (completed candles only, strict <)
+    bnb_klines = _trim_to_live_window(bnb_klines, cutoff_ms, _USABLE_CANDLE_COUNT)
+    if btc_klines is not None:
+        btc_klines = _trim_to_live_window(btc_klines, cutoff_ms, _USABLE_CANDLE_COUNT)
+
+    if not bnb_klines:
+        return MomentumGateResult(
+            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
+            skip_reason="gate_no_spot_klines", kline_age_seconds=None,
+        )
+
+    # Anchor on newest completed BNB kline (mirrors live anchor logic)
+    anchor_ms = int(bnb_klines[-1][0]) if isinstance(bnb_klines[-1], list) else int(bnb_klines[-1]["open_time_ms"])
+
+    # Same guard as live path: anchor must be at cutoff - 1
+    if anchor_ms < cutoff_ms - 1000:
+        age_s = (cutoff_ms - anchor_ms) / 1000
+        return MomentumGateResult(
+            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
+            skip_reason=f"gate_stale_kline:age={age_s:.0f}s", kline_age_seconds=age_s,
+        )
+
     return _compute_signal(bnb_klines, btc_klines, anchor_ms, age_seconds=0.0)
+
+
+# Candle window — 40 completed candles for both BNB and BTC.
+# Live path uses OKX after= parameter to exclude the in-progress bar,
+# so all 40 fetched candles are completed with final close prices.
+# Backtest path trims with strict < to match.
+_LIVE_FETCH_COUNT = 40
+_USABLE_CANDLE_COUNT = 40
+
+
+def _trim_to_live_window(klines: list[list], cutoff_ms: int, count: int) -> list[list]:
+    """Keep only the *count* completed candles before cutoff_ms.
+
+    Uses strict ``<`` because the candle at *cutoff_ms* would still be
+    in-progress when fetched live — its close price is an ephemeral
+    mid-second snapshot.  The live path drops the in-progress bar
+    (see ``evaluate()``), so the backtest must exclude it too.
+    """
+    before = [k for k in klines if int(k[0]) < cutoff_ms]
+    return before[-count:] if len(before) > count else before
 
 
 def _compute_signal(

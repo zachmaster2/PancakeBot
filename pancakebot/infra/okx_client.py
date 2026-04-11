@@ -27,21 +27,31 @@ class OkxClient:
         *,
         symbol: str,
         count: int = 25,
+        after_ms: int | None = None,
     ) -> list[dict[str, float | int]] | None:
-        """Fetch the most recent `count` confirmed 1s klines from OKX.
+        """Fetch the most recent `count` 1s klines from OKX.
 
-        Uses /candles (live feed) so the response includes the current
-        in-progress 1s bar.  Returns oldest-first list of dicts with keys:
+        When *after_ms* is provided, only candles with open_time < after_ms
+        are returned (OKX ``after`` pagination parameter).  This excludes
+        the in-progress bar whose open_time equals the current second,
+        so all returned candles are completed with final close prices.
+
+        Without *after_ms*, the response includes the current in-progress
+        1s bar (whose close price is an ephemeral mid-second snapshot).
+
+        Returns oldest-first list of dicts with keys:
           open_time_ms, close_price
 
         Returns None on failure.
         """
         url = f"{_OKX_BASE_URL}/api/v5/market/candles"
-        params = {
+        params: dict[str, str] = {
             "instId": symbol,
             "bar": "1s",
             "limit": str(count),
         }
+        if after_ms is not None:
+            params["after"] = str(after_ms)
 
         try:
             r = requests.get(url, params=params, timeout=self._timeout_seconds)

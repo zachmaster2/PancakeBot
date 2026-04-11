@@ -25,7 +25,7 @@ from pancakebot.runtime.sleep import sleep_seconds
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 
 _OKX_BASE = "https://www.okx.com"
-_KLINES_PER_ROUND = 100
+_KLINES_PER_ROUND = 40  # lockAt-44 through lockAt-5 (40 completed candles)
 _REQUEST_DELAY = 0.13  # rate limit between OKX requests
 
 _SPOT_KLINES_PATH = Path("var/cutoff_spot_prices.jsonl")
@@ -162,7 +162,8 @@ def _sync_1s_klines(
                 continue
             lock_at_ms = int(lock_at) * 1000
 
-            klines = _fetch_1s_klines(inst_id=inst_id, anchor_ms=lock_at_ms)
+            cutoff_ms = lock_at_ms - 4000  # lockAt - cutoff_seconds
+            klines = _fetch_1s_klines(inst_id=inst_id, anchor_ms=cutoff_ms)
 
             if klines is None:
                 errors += 1
@@ -188,15 +189,17 @@ def _sync_1s_klines(
 
 
 def _fetch_1s_klines(*, inst_id: str, anchor_ms: int) -> list[list] | None:
-    """Fetch 100 1s klines ending at anchor_ms from OKX.
+    """Fetch 1s klines ending just before anchor_ms from OKX.
 
-    Tries the history-candles endpoint first (covers older data),
-    then falls back to the live candles endpoint.
+    Returns the *_KLINES_PER_ROUND* completed candles with open_time
+    < anchor_ms, matching exactly what the live path fetches via the
+    OKX ``after`` parameter.  Tries history-candles first, falls back
+    to the live candles endpoint.
 
     Returns list of [ts_ms, open, high, low, close, volume] sorted
     oldest-first, or None on failure.
     """
-    after_ms = anchor_ms + 1000
+    after_ms = anchor_ms
     for endpoint in ("history-candles", "candles"):
         url = (
             f"{_OKX_BASE}/api/v5/market/{endpoint}"
