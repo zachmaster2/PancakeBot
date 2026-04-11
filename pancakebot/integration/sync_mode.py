@@ -25,7 +25,7 @@ from pancakebot.runtime.sleep import sleep_seconds
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 
 _OKX_BASE = "https://www.okx.com"
-_KLINES_PER_ROUND = 40  # lockAt-44 through lockAt-5 (40 completed candles)
+_KLINES_PER_ROUND = 40  # Must match momentum_gate._CANDLE_COUNT
 _REQUEST_DELAY = 0.13  # rate limit between OKX requests
 
 _SPOT_KLINES_PATH = Path("var/cutoff_spot_prices.jsonl")
