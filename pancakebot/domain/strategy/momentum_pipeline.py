@@ -1,12 +1,17 @@
 """Momentum-only strategy pipeline.
 
 Signal: dual-asset BNB+BTC momentum gate (OKX 1s candles).
-Sizing: pool-proportional with BTC/payout adjustments.
+Sizing: pool-proportional with linear payout-proportional scaling.
 
 Pre-signal filters (applied before sizing):
-  - Evening exclusion: skip 18:00–23:59 UTC (55% WR vs 63% in other hours).
-  - Pool confirmation: skip when the pool majority disagrees with the
-    momentum signal and the imbalance is >= 10% of total pool.
+  - Low-liquidity hour exclusion: skip hours 03, 04, 19 UTC (poor WR,
+    statistically significant across 20k rounds).
+  - Payout floor: skip rounds where the payout multiplier on our
+    signal's side is below 1.85 (captures contrarian edge).
+
+Auxiliary signal — BTC contrarian:
+  When the main gate produces no signal, bet AGAINST BTC direction
+  if our side's payout multiplier >= 3.0.  Fixed small bet size.
 
 Live/dry mode: MomentumGate fetches live 1s klines from OKX at cutoff.
 Backtest mode: uses pre-fetched 1s kline arrays from JSONL caches.
@@ -23,24 +28,33 @@ from pancakebot.domain.strategy.momentum_gate import (
     MomentumGateConfig,
     MomentumGateResult,
     compute_signal_from_klines,
+    _get_return,
+    _BTC_LOOKBACK,
+    _BTC_THRESH,
 )
 from pancakebot.domain.types import Round
 
-# Sizing constants — tuned together on 5000 rounds; do not change independently.
+# Sizing constants — tuned together on 20k rounds; do not change independently.
 _BASE_FRAC = 0.06
-_FLOOR_BNB = 0.05
-_CAP_BNB = 0.35
-_BTC_AGREE_MULT = 1.25
-_BTC_DISAGREE_MULT = 0.6
-_PAYOUT_HI_THRESH = 2.0
-_PAYOUT_HI_MULT = 1.7
-_PAYOUT_LO_THRESH = 1.7
-_PAYOUT_LO_MULT = 0.9
+_FLOOR_BNB = 0.10
+_CAP_BNB = 2.0
+_BTC_AGREE_MULT = 1.5
+_BTC_DISAGREE_MULT = 0.7
 
-# Pre-signal filters — tuned on 5000 rounds alongside sizing constants.
-_EVENING_SKIP_START_UTC = 18   # skip hours [18, 24) UTC
-_EVENING_SKIP_END_UTC = 24
-_POOL_CONFIRM_IMBALANCE_THRESH = 0.10  # skip when pool disagrees at >= 10%
+# Linear payout-proportional sizing:
+#   bet_mult = _PAYOUT_LINEAR_BASE + _PAYOUT_LINEAR_SLOPE * (payout - 1.0)
+# Higher payout → bigger bet.  Replaces threshold-based payout bands.
+_PAYOUT_LINEAR_BASE = 0.1
+_PAYOUT_LINEAR_SLOPE = 1.0
+
+# Pre-signal filters — tuned on 20k rounds alongside sizing constants.
+_LOW_LIQ_SKIP_HOURS = (3, 4, 19)  # skip hours 03–04, 19 UTC (poor WR)
+_MIN_OUR_PAYOUT = 1.85           # skip if payout on our side < 1.85
+
+# BTC contrarian auxiliary signal — fires when main gate has no signal.
+_BTC_CONTRA_THRESH = 0.0003      # min |BTC 30s return| to trigger
+_BTC_CONTRA_MIN_PAYOUT = 3.0     # only fire if contrarian side payout >= 3.0
+_BTC_CONTRA_BET_BNB = 0.15       # fixed bet size for contrarian bets
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,21 +87,19 @@ def _compute_bet_size(
     pool_bear_bnb: float,
     treasury_fee_fraction: float,
 ) -> float:
-    """Pool-proportional sizing with BTC/payout adjustments."""
+    """Pool-proportional sizing with linear payout-proportional scaling."""
     pool_bnb = pool_bull_bnb + pool_bear_bnb
     if pool_bnb <= 0:
         return _FLOOR_BNB
 
     bet = max(_FLOOR_BNB, pool_bnb * _BASE_FRAC)
 
-    # Payout multiplier adjustment
+    # Linear payout-proportional adjustment: bet more when payout is higher.
     our_side = pool_bull_bnb if signal == "Bull" else pool_bear_bnb
     if our_side > 0:
         pm = pool_bnb * (1.0 - treasury_fee_fraction) / our_side
-        if pm >= _PAYOUT_HI_THRESH:
-            bet *= _PAYOUT_HI_MULT
-        elif pm < _PAYOUT_LO_THRESH:
-            bet *= _PAYOUT_LO_MULT
+        mult = max(0.3, _PAYOUT_LINEAR_BASE + _PAYOUT_LINEAR_SLOPE * (pm - 1.0))
+        bet *= mult
 
     # BTC confirmation boost
     if btc_agrees:
@@ -184,10 +196,10 @@ class MomentumOnlyPipeline:
         lock_at = int(round_t.lock_at)
         cutoff_ts_ms = (lock_at - self._cutoff_seconds) * 1000
 
-        # Pre-signal filter: skip evening hours (18:00–23:59 UTC).
+        # Pre-signal filter: skip low-liquidity hours (03:00–04:59 UTC).
         hour_utc = (lock_at % 86400) // 3600
-        if _EVENING_SKIP_START_UTC <= hour_utc < _EVENING_SKIP_END_UTC:
-            return self._skip("evening_utc_skip")
+        if hour_utc in _LOW_LIQ_SKIP_HOURS:
+            return self._skip("low_liquidity_hour_skip")
 
         if self._gate is not None:
             # Live/dry: fetch from OKX (use async-fetched data if available)
@@ -205,18 +217,32 @@ class MomentumOnlyPipeline:
             if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
                 pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, lock_at)
 
-        if result.skip_reason is not None:
+        pool_total = pool_bull_bnb + pool_bear_bnb
+
+        # If the main gate has no signal, try BTC contrarian auxiliary signal.
+        if result.signal is None and pool_total > 0:
+            btc_contra = self._try_btc_contrarian(
+                round_t=round_t,
+                cutoff_ts_ms=cutoff_ts_ms,
+                pool_bull_bnb=pool_bull_bnb,
+                pool_bear_bnb=pool_bear_bnb,
+                okx_kline_futures=okx_kline_futures,
+            )
+            if btc_contra is not None:
+                return btc_contra
+
+        if result.skip_reason is not None and result.signal is None:
             return self._skip(str(result.skip_reason))
         if result.signal is None:
             return self._skip("gate_no_signal")
 
-        # Pre-signal filter: skip when pool majority disagrees with signal.
-        pool_total = pool_bull_bnb + pool_bear_bnb
+        # Payout floor filter: skip if payout on our side is too low.
         if pool_total > 0:
-            pool_imbalance = (pool_bull_bnb - pool_bear_bnb) / pool_total
-            pool_dir = "Bull" if pool_imbalance > 0 else "Bear"
-            if abs(pool_imbalance) >= _POOL_CONFIRM_IMBALANCE_THRESH and pool_dir != result.signal:
-                return self._skip("pool_disagrees")
+            our_side = pool_bull_bnb if result.signal == "Bull" else pool_bear_bnb
+            if our_side > 0:
+                pm = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
+                if pm < _MIN_OUR_PAYOUT:
+                    return self._skip("payout_below_floor")
 
         bet_size = _compute_bet_size(
             signal=result.signal,
@@ -236,6 +262,76 @@ class MomentumOnlyPipeline:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _try_btc_contrarian(
+        self,
+        *,
+        round_t: Round,
+        cutoff_ts_ms: int,
+        pool_bull_bnb: float,
+        pool_bear_bnb: float,
+        okx_kline_futures: object | None = None,
+    ) -> StrategyPipelineDecision | None:
+        """Auxiliary signal: bet against BTC direction when payout is very high.
+
+        Only fires when the main gate produced no signal.  Checks the BTC
+        30s return and, if strong enough, bets the *opposite* direction —
+        capitalizing on rounds where the crowd followed BTC, leaving our
+        contrarian side with high payout (>= 3.0x).
+        """
+        pool_total = pool_bull_bnb + pool_bear_bnb
+        if pool_total <= 0:
+            return None
+
+        # Get BTC closes — from live gate's cached fetch or backtest cache
+        btc_closes = self._get_btc_closes(
+            epoch=int(round_t.epoch),
+            cutoff_ts_ms=cutoff_ts_ms,
+            okx_kline_futures=okx_kline_futures,
+        )
+        if btc_closes is None:
+            return None
+
+        btc_r = _get_return(btc_closes, _BTC_LOOKBACK)
+        if btc_r is None or abs(btc_r) < _BTC_CONTRA_THRESH:
+            return None
+
+        # Contrarian: bet AGAINST BTC direction
+        btc_dir = "Bull" if btc_r > 0 else "Bear"
+        contra_dir = "Bear" if btc_dir == "Bull" else "Bull"
+
+        # Check payout on the contrarian side
+        our_side = pool_bull_bnb if contra_dir == "Bull" else pool_bear_bnb
+        if our_side <= 0:
+            return None
+        pm = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
+        if pm < _BTC_CONTRA_MIN_PAYOUT:
+            return None
+
+        return self._bet(side=contra_dir, size_bnb=_BTC_CONTRA_BET_BNB)
+
+    def _get_btc_closes(
+        self,
+        *,
+        epoch: int,
+        cutoff_ts_ms: int,
+        okx_kline_futures: object | None,
+    ) -> list[float] | None:
+        """Extract BTC close prices from live gate cache or backtest cache."""
+        # Live/dry: gate.evaluate() already fetched and cached BTC closes.
+        if self._gate is not None:
+            return self._gate.last_btc_closes
+
+        # Backtest path: use cached BTC klines
+        btc_klines = self._btc_klines_by_epoch.get(epoch)
+        if btc_klines is None or len(btc_klines) == 0:
+            return None
+
+        from pancakebot.domain.strategy.momentum_gate import _trim_to_window, _CANDLE_COUNT
+        trimmed = _trim_to_window(btc_klines, cutoff_ts_ms)
+        if len(trimmed) < _CANDLE_COUNT:
+            return None
+        return [k[4] for k in trimmed]
 
     def _evaluate_from_cache(
         self,

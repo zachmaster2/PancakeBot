@@ -58,6 +58,9 @@ class MomentumGate:
     def __init__(self, *, config: MomentumGateConfig, okx_client: OkxClient) -> None:
         self._cfg = config
         self._client = okx_client
+        # Cached after each evaluate() so the pipeline can use BTC data
+        # for auxiliary signals (e.g. BTC contrarian) without re-fetching.
+        self.last_btc_closes: list[float] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -134,6 +137,9 @@ class MomentumGate:
 
         bnb_closes = [k["close_price"] for k in bnb_klines]
         btc_closes = [k["close_price"] for k in btc_klines] if btc_klines and len(btc_klines) >= _CANDLE_COUNT else None
+
+        # Cache BTC closes for pipeline auxiliary signals (BTC contrarian).
+        self.last_btc_closes = btc_closes
 
         result = _compute_signal(bnb_closes, btc_closes)
 
