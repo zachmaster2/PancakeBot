@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pancakebot.core.constants import BNB_WEI, GAS_COST_BET_BNB, GAS_COST_CLAIM_BNB
-from pancakebot.domain.pool_amounts import compute_pool_amounts_wei_at_or_before
+from pancakebot.domain.pool_amounts import compute_pool_amounts_wei, compute_pool_amounts_wei_at_or_before
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
 
 # ---- Data loading (cached across runs in same process) ----
@@ -91,7 +91,9 @@ def _trim_klines(klines, cutoff_ms):
 # ---- Settlement (exact match of production) ----
 
 def settle(bet_bnb, bet_side, round_t, treasury_fee=0.03):
-    pools_wei = compute_pool_amounts_wei_at_or_before(bets=round_t.bets, cutoff_ts=round_t.lock_at)
+    # Use ALL bets in the round (no timestamp filter) — matches on-chain
+    # settlement which uses the final pool totals regardless of bet timing.
+    pools_wei = compute_pool_amounts_wei(bets=round_t.bets)
     bull_bnb = pools_wei.bull_wei / BNB_WEI
     bear_bnb = pools_wei.bear_wei / BNB_WEI
 
