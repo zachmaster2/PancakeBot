@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from pancakebot.core.constants import BNB_WEI, GAS_COST_CLAIM_BNB
 from pancakebot.domain.types import Round
-from pancakebot.domain.pool_amounts import compute_pool_amounts_wei_at_or_before
+from pancakebot.domain.pool_amounts import compute_pool_amounts_wei, compute_pool_amounts_wei_at_or_before
 from pancakebot.core.errors import InvariantError
 
 
@@ -108,8 +108,9 @@ def settle_bet_against_closed_round(
 
     winner_u = round_closed.position.upper()
 
-    # Final pools at lock time (all bets are in by lock_at).
-    pools_wei = compute_pool_amounts_wei_at_or_before(bets=round_closed.bets, cutoff_ts=round_closed.lock_at)
+    # Use ALL bets in the round (no timestamp filter) — matches on-chain
+    # settlement which uses the final pool totals regardless of bet timing.
+    pools_wei = compute_pool_amounts_wei(bets=round_closed.bets)
     bull_pool_bnb = pools_wei.bull_wei / BNB_WEI
     bear_pool_bnb = pools_wei.bear_wei / BNB_WEI
 
