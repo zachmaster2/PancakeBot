@@ -214,6 +214,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
                     stats.gross_profit_bnb += profit
                 elif profit < 0.0:
                     stats.gross_loss_bnb += -profit
+
             else:
                 stats.count_skip(decision.skip_reason or "unknown_skip_reason")
 

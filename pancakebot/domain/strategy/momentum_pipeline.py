@@ -48,13 +48,14 @@ _PAYOUT_LINEAR_BASE = 0.1
 _PAYOUT_LINEAR_SLOPE = 1.0
 
 # Pre-signal filters — tuned on 20k rounds alongside sizing constants.
-_LOW_LIQ_SKIP_HOURS = (3, 4, 19)  # skip hours 03–04, 19 UTC (poor WR)
+_LOW_LIQ_SKIP_HOURS = (3, 4, 7, 19)  # skip hours 03–04, 07, 19 UTC (poor WR)
 _MIN_OUR_PAYOUT = 1.85           # skip if payout on our side < 1.85
 
 # BTC contrarian auxiliary signal — fires when main gate has no signal.
 _BTC_CONTRA_THRESH = 0.0003      # min |BTC 30s return| to trigger
 _BTC_CONTRA_MIN_PAYOUT = 3.0     # only fire if contrarian side payout >= 3.0
 _BTC_CONTRA_BET_BNB = 0.15       # fixed bet size for contrarian bets
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,7 +172,9 @@ class MomentumOnlyPipeline:
         self.settle_closed_rounds(rounds=rounds)
 
     def export_bootstrap_state(self) -> dict:
-        return {"last_settled_epoch": self._last_settled_epoch}
+        return {
+            "last_settled_epoch": self._last_settled_epoch,
+        }
 
     def import_bootstrap_state(self, *, state: dict) -> None:
         raw = state.get("last_settled_epoch")
@@ -216,7 +219,6 @@ class MomentumOnlyPipeline:
             # Compute pools from round bets if not provided externally
             if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
                 pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, lock_at)
-
         pool_total = pool_bull_bnb + pool_bear_bnb
 
         # If the main gate has no signal, try BTC contrarian auxiliary signal.
