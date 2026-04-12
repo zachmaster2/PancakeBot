@@ -2,15 +2,14 @@
 
 Signal architecture:
 
-  Tier 1 — BNB Acceleration
+  BNB Acceleration
     Two BNB 1s-return lookback pairs agree on direction and
     max(|ret|) >= 0.0002.  Pairs tried in order: (7,10), (5,10), (5,7).
 
-  Tier 2 — BNB + BTC Confirmation
-    Any nonzero BNB 7s return confirmed by BTC 30s return in the same
-    direction with |BTC ret| >= 0.0003.
+  BTC is used for confirmation/sizing only (btc_agrees / btc_disagrees),
+  not as a standalone signal trigger.
 
-Both tiers use OKX public 1s candles (no auth required).
+Uses OKX public 1s candles (no auth required).
 
 Kline window: 40 contiguous 1s candles covering [lockAt-44, lockAt-4).
 The newest candle (index -1) has open_time = cutoff - 1 and its
@@ -58,9 +57,10 @@ class MomentumGate:
     def __init__(self, *, config: MomentumGateConfig, okx_client: OkxClient) -> None:
         self._cfg = config
         self._client = okx_client
-        # Cached after each evaluate() so the pipeline can use BTC data
-        # for auxiliary signals (e.g. BTC contrarian) without re-fetching.
+        # Cached after each evaluate() so the pipeline can use BTC/BNB data
+        # for auxiliary signals and regime-adaptive sizing without re-fetching.
         self.last_btc_closes: list[float] | None = None
+        self.last_bnb_closes: list[float] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -138,7 +138,8 @@ class MomentumGate:
         bnb_closes = [k["close_price"] for k in bnb_klines]
         btc_closes = [k["close_price"] for k in btc_klines] if btc_klines and len(btc_klines) >= _CANDLE_COUNT else None
 
-        # Cache BTC closes for pipeline auxiliary signals (BTC contrarian).
+        # Cache closes for pipeline auxiliary signals and regime-adaptive sizing.
+        self.last_bnb_closes = bnb_closes
         self.last_btc_closes = btc_closes
 
         result = _compute_signal(bnb_closes, btc_closes)
@@ -302,21 +303,6 @@ def _compute_signal(
                     btc_agrees=btc_ag, btc_disagrees=btc_dis,
                     skip_reason=None,
                 )
-
-    # --- Tier 2: BNB Any Move + BTC Confirmation ---
-    if btc_closes is not None:
-        bnb_r = _get_return(bnb_closes, 7)
-        if bnb_r is not None and bnb_r != 0:
-            btc_r = _get_return(btc_closes, _BTC_LOOKBACK)
-            if btc_r is not None and abs(btc_r) >= _BTC_THRESH:
-                bnb_dir = "Bull" if bnb_r > 0 else "Bear"
-                btc_dir = "Bull" if btc_r > 0 else "Bear"
-                if bnb_dir == btc_dir:
-                    return MomentumGateResult(
-                        signal=bnb_dir, tier="any+btc",
-                        btc_agrees=True, btc_disagrees=False,
-                        skip_reason=None,
-                    )
 
     return MomentumGateResult(
         signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
