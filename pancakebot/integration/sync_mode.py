@@ -32,7 +32,7 @@ _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 
 _OKX_BASE = "https://www.okx.com"
 _KLINES_PER_ROUND = 40  # Must match momentum_gate._CANDLE_COUNT
-_FETCH_WORKERS = 2      # concurrent OKX fetches per asset (4 total with both assets)
+_FETCH_WORKERS = 4      # concurrent OKX fetches per asset (8 total with both assets)
 _FETCH_RETRIES = 3      # retry failed OKX requests
 _RETRY_DELAY_S = 1.0    # base delay between retries (doubles each attempt)
 
@@ -126,6 +126,81 @@ def sync_runtime_market_data(
         spot_synced = spot_fut.result()
         btc_synced = btc_fut.result()
 
+    # Phase 3: Integrity — trim all stores to the exact intersection so
+    # every closed round has klines in BOTH stores.  Retry transient
+    # failures first, then trim any epochs that genuinely have no data.
+    _MAX_RETRY_PASSES = 3
+
+    for retry_pass in range(_MAX_RETRY_PASSES):
+        spot_epochs = spot_store.load_done_epochs()
+        btc_epochs = btc_store.load_done_epochs()
+        covered_epochs = spot_epochs & btc_epochs
+
+        all_epochs = {int(r.epoch) for r in tail_rounds}
+        uncovered = all_epochs - covered_epochs
+        if not uncovered:
+            break
+
+        info(
+            "CORE", "SYNC", "INTEGRITY",
+            msg=(
+                f"Retry pass {retry_pass + 1}/{_MAX_RETRY_PASSES}: "
+                f"{len(uncovered)} rounds still missing klines "
+                f"(epochs {min(uncovered)}..{max(uncovered)})"
+            ),
+        )
+        uncovered_rounds = [r for r in tail_rounds if int(r.epoch) in uncovered]
+        _sync_1s_klines(
+            rounds=uncovered_rounds, inst_id="BNB-USDT",
+            store=spot_store, label="BNB-retry",
+        )
+        _sync_1s_klines(
+            rounds=uncovered_rounds, inst_id="BTC-USDT",
+            store=btc_store, label="BTC-retry",
+        )
+
+    # After retries, trim all three stores to the exact intersection.
+    spot_epochs = spot_store.load_done_epochs()
+    btc_epochs = btc_store.load_done_epochs()
+    all_epochs = {int(r.epoch) for r in tail_rounds}
+    valid_epochs = all_epochs & spot_epochs & btc_epochs
+
+    trimmed_rounds = len(all_epochs) - len(valid_epochs)
+    trimmed_spot = len(spot_epochs) - len(valid_epochs)
+    trimmed_btc = len(btc_epochs) - len(valid_epochs)
+
+    if trimmed_rounds > 0:
+        _trim_closed_rounds(round_store, valid_epochs)
+    if trimmed_spot > 0:
+        _trim_kline_store(spot_store, valid_epochs)
+    if trimmed_btc > 0:
+        _trim_kline_store(btc_store, valid_epochs)
+
+    # Re-read final state after any trimming.
+    final_rounds = list(round_store.iter_closed_rounds())
+    final_spot = spot_store.load_done_epochs()
+    final_btc = btc_store.load_done_epochs()
+    final_round_epochs = {int(r.epoch) for r in final_rounds}
+
+    if final_round_epochs != final_spot or final_round_epochs != final_btc:
+        raise InvariantError(
+            f"sync_integrity_mismatch: rounds={len(final_round_epochs)} "
+            f"spot={len(final_spot)} btc={len(final_btc)}"
+        )
+
+    info(
+        "CORE", "SYNC", "INTEGRITY",
+        msg=(
+            f"Stores aligned: {len(final_round_epochs)} epochs "
+            f"[{min(final_round_epochs)}..{max(final_round_epochs)}] "
+            f"(trimmed {trimmed_rounds} rounds, {trimmed_spot} spot, {trimmed_btc} btc)"
+        ),
+    )
+
+    stored_closed_round_count = len(final_rounds)
+    earliest_closed_epoch = int(final_rounds[0].epoch)
+    latest_closed_epoch = int(final_rounds[-1].epoch)
+
     return SyncSummary(
         warmup_rounds=int(warmup_rounds),
         cache_n=int(cache_n),
@@ -137,6 +212,38 @@ def sync_runtime_market_data(
     )
 
 
+def _trim_closed_rounds(store: ClosedRoundsStore, valid_epochs: set[int]) -> None:
+    """Remove closed rounds whose epochs are not in valid_epochs (atomic)."""
+    import os as _os
+
+    all_rounds = list(store.iter_closed_rounds())
+    kept = [r for r in all_rounds if int(r.epoch) in valid_epochs]
+    kept.sort(key=lambda r: int(r.epoch))
+
+    tmp = store._path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in kept:
+            f.write(json.dumps(r.to_json(), separators=(",", ":")) + "\n")
+    _os.replace(tmp, store._path)
+
+    info("CORE", "SYNC", "TRIM",
+         msg=f"Trimmed closed rounds: {len(all_rounds)} -> {len(kept)}")
+
+
+def _trim_kline_store(store: KlineStore, valid_epochs: set[int]) -> None:
+    """Remove kline records whose epochs are not in valid_epochs (atomic)."""
+    all_records = list(store.iter_records())
+    kept = [r for r in all_records if int(r["epoch"]) in valid_epochs]
+    kept.sort(key=lambda r: int(r["epoch"]))
+    store.rewrite(kept)
+
+    info("CORE", "SYNC", "TRIM",
+         msg=f"Trimmed kline store: {len(all_records)} -> {len(kept)}")
+
+
+_BATCH_SIZE = 50  # fetch+flush in small ordered batches for resumability
+
+
 def _sync_1s_klines(
     *,
     rounds: list,
@@ -146,10 +253,14 @@ def _sync_1s_klines(
 ) -> int:
     """Fetch 1s OKX klines for rounds not yet in the store. Returns count synced.
 
-    Uses _FETCH_WORKERS concurrent threads for fetching, then sorts results
-    by epoch and appends to the store in strict ascending order.
-    Only successfully-fetched records are written; previous error records
-    are purged on startup so they get retried.
+    Split into two passes to avoid O(n²) merge-rewrites:
+      1. **Append pass** — epochs AFTER the store's latest: fetched in small
+         ordered batches, each appended and flushed immediately (resumable).
+      2. **Prepend pass** — epochs BEFORE the store's earliest: fetched in
+         batches into a staging file, then prepended atomically at the end.
+
+    Both passes survive interruption: the append pass writes incrementally,
+    and the prepend staging file is resumed on restart.
     """
     # Purge any legacy error records so those epochs get retried.
     purged = store.purge_and_rewrite()
@@ -162,82 +273,207 @@ def _sync_1s_klines(
         info("SYNC", "1S_KL", label, msg=f"All {len(done_epochs)} epochs already synced")
         return 0
 
+    remaining.sort(key=lambda r: int(r.epoch))
+
+    earliest_on_disk = store.load_earliest_epoch()
+    latest_on_disk = store.load_latest_epoch()
+
+    # Split into prepend (older) and append (newer) groups.
+    if latest_on_disk is not None:
+        prepend_rounds = [r for r in remaining if int(r.epoch) < earliest_on_disk]
+        append_rounds = [r for r in remaining if int(r.epoch) > latest_on_disk]
+    else:
+        # Fresh store — everything goes into append.
+        prepend_rounds = []
+        append_rounds = remaining
+
+    total_to_fetch = len(prepend_rounds) + len(append_rounds)
     info(
-        "SYNC",
-        "1S_KL",
-        label,
-        msg=f"Fetching {len(remaining)} rounds ({len(done_epochs)} already done) workers={_FETCH_WORKERS}",
+        "SYNC", "1S_KL", label,
+        msg=f"Fetching {total_to_fetch} rounds ({len(done_epochs)} already done) "
+            f"append={len(append_rounds)} prepend={len(prepend_rounds)} "
+            f"workers={_FETCH_WORKERS} batch_size={_BATCH_SIZE}",
     )
 
-    def _fetch_one(rnd) -> dict | None:
-        epoch = int(rnd.epoch)
-        lock_at = rnd.lock_at
-        if lock_at is None:
-            return None
-        cutoff_ms = int(lock_at) * 1000 - 4000
-        klines = _fetch_1s_klines(inst_id=inst_id, anchor_ms=cutoff_ms)
-        if klines is None:
-            return None
-        return {"epoch": epoch, "lock_at": int(lock_at), "klines_1s": klines}
+    total_synced = 0
+    total_errors = 0
 
-    # Fetch in parallel, collect all results.
-    fetched: list[dict] = []
+    # --- Pass 1: Append (epochs after existing store) ---
+    if append_rounds:
+        synced, errors = _fetch_and_append(
+            rounds_asc=append_rounds, inst_id=inst_id, store=store, label=label,
+            latest_on_disk=latest_on_disk, done_count=len(done_epochs),
+        )
+        total_synced += synced
+        total_errors += errors
+
+    # --- Pass 2: Prepend (epochs before existing store) ---
+    if prepend_rounds:
+        staging_path = store.path_jsonl + f".prepend_staging"
+        synced, errors = _fetch_to_staging(
+            rounds_asc=prepend_rounds, inst_id=inst_id,
+            staging_path=staging_path, label=label,
+        )
+        total_errors += errors
+        if synced > 0:
+            _prepend_staging_to_store(store=store, staging_path=staging_path, label=label)
+            total_synced += synced
+
+    if total_errors > 0:
+        info("SYNC", "1S_KL", label,
+             msg=f"WARNING: {total_errors} epochs failed — re-run sync to retry them")
+
+    info("SYNC", "1S_KL", label, msg=f"Done: {total_synced} synced, {total_errors} failed")
+    return total_synced
+
+
+def _fetch_and_append(
+    *, rounds_asc: list, inst_id: str, store: KlineStore, label: str,
+    latest_on_disk: int | None, done_count: int,
+) -> tuple[int, int]:
+    """Fetch epochs in ordered batches and append each to store immediately."""
+    synced = 0
+    errors = 0
+    prev_epoch = latest_on_disk if latest_on_disk is not None else 0
+
+    for batch_start in range(0, len(rounds_asc), _BATCH_SIZE):
+        batch = rounds_asc[batch_start : batch_start + _BATCH_SIZE]
+        if batch_start > 0:
+            time.sleep(1.0)
+
+        results, batch_errors = _fetch_batch(batch, inst_id)
+        errors += batch_errors
+        if not results:
+            continue
+
+        results.sort(key=lambda r: int(r["epoch"]))
+
+        # Filter to only records strictly after prev_epoch (skip gaps).
+        appendable = [r for r in results if int(r["epoch"]) > prev_epoch]
+        if not appendable:
+            continue
+
+        if not store.exists():
+            store.write_new(appendable)
+        else:
+            store.append_after(prev_epoch, appendable)
+
+        prev_epoch = int(appendable[-1]["epoch"])
+        synced += len(appendable)
+
+        if (batch_start + _BATCH_SIZE) % 200 < _BATCH_SIZE:
+            info("SYNC", "1S_KL", label,
+                 msg=f"  append: {done_count + synced} done, {errors} errors")
+
+    return synced, errors
+
+
+def _fetch_to_staging(
+    *, rounds_asc: list, inst_id: str, staging_path: str, label: str,
+) -> tuple[int, int]:
+    """Fetch older epochs into a staging file (resumable append-only)."""
+    import os as _os
+
+    # Load what's already in the staging file from a prior interrupted run.
+    staged_epochs: set[int] = set()
+    if _os.path.exists(staging_path):
+        with open(staging_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    staged_epochs.add(int(json.loads(line)["epoch"]))
+        info("SYNC", "1S_KL", label,
+             msg=f"  prepend staging: {len(staged_epochs)} already staged from prior run")
+
+    still_needed = [r for r in rounds_asc if int(r.epoch) not in staged_epochs]
+    if not still_needed:
+        return len(staged_epochs), 0
+
+    synced = len(staged_epochs)
     errors = 0
 
+    # Append to staging file incrementally (batch by batch).
+    _os.makedirs(_os.path.dirname(staging_path) or ".", exist_ok=True)
+    with open(staging_path, "a", encoding="utf-8") as staging_f:
+        for batch_start in range(0, len(still_needed), _BATCH_SIZE):
+            batch = still_needed[batch_start : batch_start + _BATCH_SIZE]
+            if batch_start > 0:
+                time.sleep(1.0)
+
+            results, batch_errors = _fetch_batch(batch, inst_id)
+            errors += batch_errors
+
+            for rec in results:
+                staging_f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                staging_f.flush()
+                synced += 1
+
+            if (batch_start + _BATCH_SIZE) % 200 < _BATCH_SIZE:
+                info("SYNC", "1S_KL", label,
+                     msg=f"  prepend staging: {synced} staged, {errors} errors")
+
+    return synced, errors
+
+
+def _prepend_staging_to_store(*, store: KlineStore, staging_path: str, label: str) -> None:
+    """Merge staging file (older epochs) in front of existing store atomically."""
+    import os as _os
+
+    # Read staging records, sort by epoch.
+    staging_records: list[dict] = []
+    with open(staging_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                staging_records.append(json.loads(line))
+    staging_records.sort(key=lambda r: int(r["epoch"]))
+
+    # Read existing store.
+    existing_records = list(store.iter_records())
+    existing_epochs = {int(r["epoch"]) for r in existing_records}
+
+    # Merge: staged (older) + existing, deduplicating.
+    merged = [r for r in staging_records if int(r["epoch"]) not in existing_epochs]
+    merged.extend(existing_records)
+    merged.sort(key=lambda r: int(r["epoch"]))
+
+    # Atomic rewrite.
+    store.rewrite(merged)
+
+    # Clean up staging file.
+    _os.remove(staging_path)
+    info("SYNC", "1S_KL", label,
+         msg=f"  prepended {len(staging_records)} older epochs into store")
+
+
+def _fetch_batch(batch: list, inst_id: str) -> tuple[list[dict], int]:
+    """Fetch a batch of rounds in parallel. Returns (results, error_count)."""
+    results: list[dict] = []
+    errors = 0
     with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one, rnd): rnd for rnd in remaining}
-        completed = 0
+        futures = {pool.submit(_fetch_one_kline, rnd, inst_id): rnd for rnd in batch}
         for fut in as_completed(futures):
-            completed += 1
             try:
                 rec = fut.result()
-            except Exception as exc:
+            except Exception:
                 errors += 1
-                info("SYNC", "1S_KL", label, msg=f"Worker error: {exc}")
                 continue
             if rec is None:
                 errors += 1
                 continue
-            fetched.append(rec)
-            if completed % 200 == 0:
-                info(
-                    "SYNC", "1S_KL", label,
-                    msg=f"  {completed}/{len(remaining)} fetched ({errors} errors)",
-                )
+            results.append(rec)
+    return results, errors
 
-    if not fetched:
-        if errors > 0:
-            info("SYNC", "1S_KL", label,
-                 msg=f"WARNING: all {errors} epochs failed — re-run sync to retry")
-        return 0
 
-    # Sort by epoch for ordered insertion.
-    fetched.sort(key=lambda r: int(r["epoch"]))
-
-    latest_on_disk = store.load_latest_epoch()
-
-    if latest_on_disk is None and not store.exists():
-        # Fresh store — write all fetched records.
-        store.write_new(fetched)
-    elif all(int(r["epoch"]) > (latest_on_disk or 0) for r in fetched):
-        # All new records are strictly after what's on disk — simple append.
-        prev = latest_on_disk if latest_on_disk is not None else 0
-        store.append_after(prev, fetched)
-    else:
-        # Some records fill gaps before latest_on_disk — merge and rewrite.
-        existing = list(store.iter_records())
-        existing_epochs = {int(r["epoch"]) for r in existing}
-        merged = existing + [r for r in fetched if int(r["epoch"]) not in existing_epochs]
-        merged.sort(key=lambda r: int(r["epoch"]))
-        store.rewrite(merged)
-        info("SYNC", "1S_KL", label, msg=f"Merged {len(fetched)} new records into store (gap-fill)")
-
-    if errors > 0:
-        info("SYNC", "1S_KL", label,
-             msg=f"WARNING: {errors} epochs failed — re-run sync to retry them")
-
-    info("SYNC", "1S_KL", label, msg=f"Done: {len(fetched)} synced, {errors} failed")
-    return len(fetched)
+def _fetch_one_kline(rnd, inst_id: str) -> dict | None:
+    """Fetch 1s klines for a single round. Returns record dict or None."""
+    epoch = int(rnd.epoch)
+    lock_at = rnd.lock_at
+    if lock_at is None:
+        return None
+    cutoff_ms = int(lock_at) * 1000 - 4000
+    klines = _fetch_1s_klines(inst_id=inst_id, anchor_ms=cutoff_ms)
+    if klines is None:
+        return None
+    return {"epoch": epoch, "lock_at": int(lock_at), "klines_1s": klines}
 
 
 def _fetch_1s_klines(*, inst_id: str, anchor_ms: int) -> list[list] | None:
@@ -264,6 +500,13 @@ def _fetch_1s_klines(*, inst_id: str, anchor_ms: int) -> list[list] | None:
                 req = urllib.request.Request(url, headers={"User-Agent": "PancakeBot/1.0"})
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     body = json.loads(resp.read())
+            except urllib.error.HTTPError as he:
+                if he.code == 429:
+                    # Rate limited — back off aggressively (5s, 10s, 20s)
+                    time.sleep(5.0 * (2 ** attempt))
+                    continue
+                time.sleep(_RETRY_DELAY_S * (2 ** attempt))
+                continue
             except (urllib.error.URLError, TimeoutError, OSError):
                 time.sleep(_RETRY_DELAY_S * (2 ** attempt))
                 continue
