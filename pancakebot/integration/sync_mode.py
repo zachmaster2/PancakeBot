@@ -159,13 +159,17 @@ def sync_runtime_market_data(
             store=btc_store, label="BTC-retry",
         )
 
-    # After retries, trim all three stores to the exact intersection.
+    # After retries, trim stores to the exact three-way intersection:
+    # every round must have klines in BOTH stores, and every kline must
+    # belong to an existing round.  Never trim data just because it's
+    # older than the simulation window — only trim records that genuinely
+    # fail integrity (missing counterpart in another store).
     spot_epochs = spot_store.load_done_epochs()
     btc_epochs = btc_store.load_done_epochs()
-    all_epochs = {int(r.epoch) for r in tail_rounds}
-    valid_epochs = all_epochs & spot_epochs & btc_epochs
+    all_round_epochs = {int(r.epoch) for r in rounds_all}
+    valid_epochs = all_round_epochs & spot_epochs & btc_epochs
 
-    trimmed_rounds = len(all_epochs) - len(valid_epochs)
+    trimmed_rounds = len(all_round_epochs) - len(valid_epochs)
     trimmed_spot = len(spot_epochs) - len(valid_epochs)
     trimmed_btc = len(btc_epochs) - len(valid_epochs)
 
