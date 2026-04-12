@@ -38,5 +38,5 @@ treasury_fee_fraction = 0.03
 buffer_seconds = 30
 
 [backtest]
-simulation_size = 20000
+simulation_size = 49488
 initial_bankroll_bnb = 50.0
