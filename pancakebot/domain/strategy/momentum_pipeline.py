@@ -34,11 +34,12 @@ from pancakebot.domain.strategy.momentum_gate import (
 )
 from pancakebot.domain.types import Round
 
-# Sizing constants — tuned together on 20k rounds; do not change independently.
+# Sizing constants — tuned together on 34k clean rounds; do not change independently.
 _BASE_FRAC = 0.06
 _FLOOR_BNB = 0.10
 _CAP_BNB = 2.0
-_BTC_AGREE_MULT = 1.5
+_BTC_AGREE_MULT = 2.0
+_MAX_PAYOUT_DILUTION = 0.12     # cap bet if it would dilute our payout by > 12%
 _BTC_DISAGREE_MULT = 0.7
 
 # Linear payout-proportional sizing:
@@ -48,7 +49,7 @@ _PAYOUT_LINEAR_BASE = 0.1
 _PAYOUT_LINEAR_SLOPE = 1.0
 
 # Pre-signal filters — tuned on 20k rounds alongside sizing constants.
-_LOW_LIQ_SKIP_HOURS = (3, 4, 7, 19)  # skip hours 03–04, 07, 19 UTC (poor WR)
+_LOW_LIQ_SKIP_HOURS = (3, 4, 7, 10, 18, 19)  # skip hours with <52% WR on 34k rounds
 _MIN_OUR_PAYOUT = 1.85           # skip if payout on our side < 1.85
 
 # BTC contrarian auxiliary signal — fires when main gate has no signal.
@@ -255,6 +256,18 @@ class MomentumOnlyPipeline:
             pool_bear_bnb=pool_bear_bnb,
             treasury_fee_fraction=self._treasury_fee_fraction,
         )
+
+        # Dilution cap: reduce bet if it would dilute our payout by > 12%.
+        # Exact formula: max_bet = D * pool * our_side / ((1-D)*pool - our_side)
+        if pool_total > 0:
+            our_side = pool_bull_bnb if result.signal == "Bull" else pool_bear_bnb
+            if our_side > 0:
+                d = _MAX_PAYOUT_DILUTION
+                denom = (1.0 - d) * pool_total - our_side
+                if denom > 0:
+                    max_bet = d * pool_total * our_side / denom
+                    if bet_size > max_bet:
+                        bet_size = max_bet
 
         if bet_size < self._min_bet_amount_bnb:
             return self._skip("bet_size_below_min")
