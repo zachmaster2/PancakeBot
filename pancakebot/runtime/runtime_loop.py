@@ -1126,14 +1126,17 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Step 6: Sleep until cutoff_ts(t).
         _sleep_until_ts(cutoff_ts_t, reason="wait_for_cutoff", epoch=current_epoch)
 
-        # Step 6a: Kick off OKX kline fetch immediately — runs in the
-        # background while Steps 6b–7 do RPC work, so the ~633 ms of
-        # OKX latency overlaps with ~450 ms of RPC calls instead of
-        # stacking on top.
+        # Step 6a: Kick off OKX kline fetch after a short delay — gives
+        # OKX time to publish the latest 1s candle before we ask for it.
+        # The ~250 ms delay is absorbed by the RPC work in Steps 6b–7
+        # (~150–450 ms), so the futures are still ready by evaluate().
+        # Without the delay, ~2.5% of rounds fail with stale candle
+        # errors (OKX returning data 1 second behind expected).
         okx_kline_futures = None
         if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, '_gate'):
             gate = closed.strategy_pipeline._gate
             if gate is not None:
+                time.sleep(0.25)
                 okx_kline_futures = gate.fetch_klines_async(cutoff_ts_ms=int(cutoff_ts_t * 1000))
 
         # Step 6b: Quick epoch check — just verify current_epoch hasn't
