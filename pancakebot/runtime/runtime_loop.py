@@ -768,16 +768,39 @@ def _record_dry_cycle_audit(
     decision: object | None = None,
     skip_reason: str | None = None,
     decision_latency_ms: float | None = None,
+    pool_bull_bnb: float = 0.0,
+    pool_bear_bnb: float = 0.0,
 ) -> None:
     if not cfg.dry:
         return
 
-    observed_pool = _round_pool_snapshot(open_round, prefix="observed")
-    cutoff_used_pool = _round_pool_snapshot(
-        open_round,
-        prefix="cutoff_used",
-        cutoff_ts=cutoff_ts,
-    )
+    # Use RPC-fetched pool values when available (live/dry mode);
+    # fall back to round_t.bets snapshot (backtest / no RPC data).
+    if pool_bull_bnb > 0.0 or pool_bear_bnb > 0.0:
+        pool_total = pool_bull_bnb + pool_bear_bnb
+        observed_pool = {
+            "observed_total_pool_bnb": pool_total,
+            "observed_bull_pool_bnb": pool_bull_bnb,
+            "observed_bear_pool_bnb": pool_bear_bnb,
+            "observed_total_bets": "",
+            "observed_bull_bets": "",
+            "observed_bear_bets": "",
+        }
+        cutoff_used_pool = {
+            "cutoff_used_total_pool_bnb": pool_total,
+            "cutoff_used_bull_pool_bnb": pool_bull_bnb,
+            "cutoff_used_bear_pool_bnb": pool_bear_bnb,
+            "cutoff_used_total_bets": "",
+            "cutoff_used_bull_bets": "",
+            "cutoff_used_bear_bets": "",
+        }
+    else:
+        observed_pool = _round_pool_snapshot(open_round, prefix="observed")
+        cutoff_used_pool = _round_pool_snapshot(
+            open_round,
+            prefix="cutoff_used",
+            cutoff_ts=cutoff_ts,
+        )
     router_mode: str | object = ""
     pipeline_last_settled_epoch: int | str = ""
     if closed.strategy_pipeline is not None:
@@ -1237,6 +1260,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 decision=decision,
                 skip_reason=reason,
                 decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
+                pool_bull_bnb=pool_bull_bnb,
+                pool_bear_bnb=pool_bear_bnb,
             )
             info("RUN", "ACT", "SKIP", msg=f"Skip epoch {current_epoch}: {reason}")
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
@@ -1261,6 +1286,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 decision=decision,
                 skip_reason="too_close_to_lock_for_bet",
                 decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
+                pool_bull_bnb=pool_bull_bnb,
+                pool_bear_bnb=pool_bear_bnb,
             )
             info(
                 "RUN",
@@ -1395,6 +1422,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 bankroll_after_action_bnb=bankroll_after_bet,
                 decision=decision,
                 decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
+                pool_bull_bnb=pool_bull_bnb,
+                pool_bear_bnb=pool_bear_bnb,
             )
 
         # Step 15: Sleep until claim + claim scan.

@@ -204,9 +204,12 @@ class MomentumOnlyPipeline:
                 epoch=int(round_t.epoch),
                 cutoff_ts_ms=int(cutoff_ts_ms),
             )
-            # Compute pools from round bets if not provided externally
+            # Compute pools from round bets if not provided externally.
+            # Use cutoff_ts (not lock_at) — matches what the live bot sees
+            # via RPC at decision time.  Bets placed after cutoff are invisible.
             if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
-                pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, lock_at)
+                cutoff_ts = lock_at - self._cutoff_seconds
+                pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, cutoff_ts)
         pool_total = pool_bull_bnb + pool_bear_bnb
 
         if result.skip_reason is not None and result.signal is None:
@@ -305,12 +308,16 @@ class MomentumOnlyPipeline:
         return {}
 
 
-def _pools_from_bets(round_t: Round, lock_at: int) -> tuple[float, float]:
-    """Compute bull/bear pool BNB from round bets at or before lock_at."""
+def _pools_from_bets(round_t: Round, cutoff_ts: int) -> tuple[float, float]:
+    """Compute bull/bear pool BNB from bets placed at or before cutoff_ts.
+
+    Uses cutoff_ts (lock_at - cutoff_seconds) to match what the live bot
+    sees via RPC at decision time.  Bets placed after cutoff are excluded.
+    """
     bull_wei = 0
     bear_wei = 0
     for bet in round_t.bets:
-        if int(bet.created_at) > lock_at:
+        if int(bet.created_at) > cutoff_ts:
             continue
         if bet.position == "Bull":
             bull_wei += int(bet.amount_wei)
