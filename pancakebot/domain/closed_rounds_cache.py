@@ -81,12 +81,7 @@ class RollingClosedRoundsCache:
                 hi = mid - 1
         return None
 
-    def get_close_ts(self, epoch: int) -> int | None:
-        """Return close_at for a cached epoch, or None if not present."""
-        r = self.get_round(epoch)
-        if r is None:
-            return None
-        return r.close_at
+
 
     def _trim_in_place(self) -> None:
         if len(self.rounds) <= self.capacity:

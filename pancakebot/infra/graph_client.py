@@ -49,8 +49,6 @@ class GraphClient:
     where: {
       failed: false,
       startAt_not: null,
-      lockAt_not: null,
-      closeAt_not: null,
       lockPrice_not: null,
       closePrice_not: null,
       position_in: [\"Bull\", \"Bear\", \"House\"]
@@ -77,9 +75,7 @@ class GraphClient:
   rounds(
     where: {
       startAt_not: null,
-      lockAt: null,
       lockPrice: null,
-      closeAt: null,
       closePrice: null,
       failed: null,
       position: null
@@ -88,7 +84,7 @@ class GraphClient:
     orderBy: epoch,
     orderDirection: desc
   ) {
-    epoch startAt lockAt closeAt lockPrice closePrice position failed
+    epoch startAt lockPrice closePrice position failed
     bets(first: $first, skip: $skip, orderBy: createdAt, orderDirection: asc) {
       amount position createdAt user { id }
     }
@@ -106,9 +102,7 @@ class GraphClient:
   rounds(
     where: {
       startAt_not: null,
-      lockAt_not: null,
       lockPrice_not: null,
-      closeAt: null,
       closePrice: null,
       failed: null,
       position: null
@@ -117,7 +111,7 @@ class GraphClient:
     orderBy: epoch,
     orderDirection: desc
   ) {
-    epoch startAt lockAt closeAt lockPrice closePrice position failed
+    epoch startAt lockPrice closePrice position failed
     bets(first: $first, skip: $skip, orderBy: createdAt, orderDirection: asc) {
       amount position createdAt user { id }
     }
@@ -130,23 +124,19 @@ class GraphClient:
             raise
 
     def fetch_open_round(self, epoch: int) -> Round:
-        # Graph "open" invariant:
-        # closeAt/closePrice/failed/lockAt/lockPrice/position null; startAt non-null.
         query_first = """query OpenRoundFirst($epoch: BigInt!, $first: Int!, $skip: Int!) {
   rounds(
     where: {
       epoch: $epoch,
       startAt_not: null,
-      lockAt: null,
       lockPrice: null,
-      closeAt: null,
       closePrice: null,
       failed: null,
       position: null
     },
     first: 1
   ) {
-    epoch startAt lockAt closeAt lockPrice closePrice position failed
+    epoch startAt lockPrice closePrice position failed
     bets(first: $first, skip: $skip, orderBy: createdAt, orderDirection: asc) {
       amount position createdAt user { id }
     }
@@ -155,23 +145,19 @@ class GraphClient:
         return self._fetch_round_with_bets(epoch=epoch, state="open", query_first=query_first)
 
     def fetch_locked_round(self, epoch: int) -> Round:
-        # Graph "locked" invariant:
-        # lockAt/lockPrice non-null; closeAt/closePrice/failed/position null; startAt non-null.
         query_first = """query LockedRoundFirst($epoch: BigInt!, $first: Int!, $skip: Int!) {
   rounds(
     where: {
       epoch: $epoch,
       startAt_not: null,
-      lockAt_not: null,
       lockPrice_not: null,
-      closeAt: null,
       closePrice: null,
       failed: null,
       position: null
     },
     first: 1
   ) {
-    epoch startAt lockAt closeAt lockPrice closePrice position failed
+    epoch startAt lockPrice closePrice position failed
     bets(first: $first, skip: $skip, orderBy: createdAt, orderDirection: asc) {
       amount position createdAt user { id }
     }
@@ -198,8 +184,6 @@ class GraphClient:
         where_parts = [
             "failed: false",
             "startAt_not: null",
-            "lockAt_not: null",
-            "closeAt_not: null",
             "lockPrice_not: null",
             "closePrice_not: null",
             'position_in: ["Bull","Bear","House"]',
@@ -231,7 +215,7 @@ class GraphClient:
     orderBy: epoch,
     orderDirection: {order}
   ) {{
-    epoch startAt lockAt closeAt lockPrice closePrice position failed
+    epoch startAt lockPrice closePrice position failed
     bets(first: 1000, skip: 0, orderBy: createdAt, orderDirection: asc) {{
       amount position createdAt user {{ id }}
     }}
@@ -383,25 +367,23 @@ class GraphClient:
         return bets
 
     def _parse_round(self, r: dict[str, Any], *, state: RoundState, bets: list[Bet]) -> Round:
+        from pancakebot.core.constants import INTERVAL_SECONDS
+
         epoch = self._parse_int(r.get("epoch"), "round.epoch")
         start_at = self._parse_int(r.get("startAt"), "round.startAt")
 
-        lock_at = r.get("lockAt")
-        close_at = r.get("closeAt")
         lock_price = r.get("lockPrice")
         close_price = r.get("closePrice")
         position = r.get("position")
         failed = r.get("failed")
 
         if state == "open":
-            # all null except startAt
-            if any(x is not None for x in (lock_at, close_at, lock_price, close_price, position, failed)):
+            if any(x is not None for x in (lock_price, close_price, position, failed)):
                 raise InvariantError("open_round_invariant_violation")
             return Round(
                 epoch=epoch,
                 start_at=start_at,
-                lock_at=None,
-                close_at=None,
+                lock_at=start_at + INTERVAL_SECONDS,
                 lock_price=None,
                 close_price=None,
                 position=None,
@@ -410,15 +392,14 @@ class GraphClient:
             )
 
         if state == "locked":
-            if lock_at is None or lock_price is None:
-                raise InvariantError("locked_round_missing_lock_fields")
-            if any(x is not None for x in (close_at, close_price, position, failed)):
+            if lock_price is None:
+                raise InvariantError("locked_round_missing_lock_price")
+            if any(x is not None for x in (close_price, position, failed)):
                 raise InvariantError("locked_round_invariant_violation")
             return Round(
                 epoch=epoch,
                 start_at=start_at,
-                lock_at=self._parse_int(lock_at, "round.lockAt"),
-                close_at=None,
+                lock_at=start_at + INTERVAL_SECONDS,
                 lock_price=float(lock_price),
                 close_price=None,
                 position=None,
@@ -429,7 +410,7 @@ class GraphClient:
         # closed usable
         if failed is not False:
             raise InvariantError("closed_round_failed_not_false")
-        for k in ("lockAt", "closeAt", "lockPrice", "closePrice", "position"):
+        for k in ("lockPrice", "closePrice", "position"):
             if r.get(k) is None:
                 raise InvariantError(f"closed_round_missing_{k}")
 
@@ -440,8 +421,7 @@ class GraphClient:
         return Round(
             epoch=epoch,
             start_at=start_at,
-            lock_at=self._parse_int(lock_at, "round.lockAt"),
-            close_at=self._parse_int(close_at, "round.closeAt"),
+            lock_at=start_at + INTERVAL_SECONDS,
             lock_price=float(lock_price),
             close_price=float(close_price),
             position=pos,

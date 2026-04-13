@@ -17,6 +17,12 @@ PREDICTION_V2_CONTRACT_ADDRESS = "0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA"
 # The contract's treasury fee is expressed in basis points (bps).
 TREASURY_FEE_DIVISOR = 10_000
 
+# PancakeSwap Prediction V2 protocol timing constants (on-chain values).
+# intervalSeconds: time between round start and lock (also lock to close).
+# bufferSeconds: grace period after close before round expires.
+INTERVAL_SECONDS = 300
+BUFFER_SECONDS = 30
+
 # --- RPC (hardcoded list; failover is handled by RPC chooser) ---
 
 RPC_URLS: list[str] = [

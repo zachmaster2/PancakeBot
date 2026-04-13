@@ -105,8 +105,6 @@ class MarketDataDb:
                 SELECT
                     epoch,
                     start_at,
-                    lock_at,
-                    close_at,
                     lock_price,
                     close_price,
                     position,
@@ -156,12 +154,13 @@ class MarketDataDb:
             epoch = int(row["epoch"])
             failed_raw = row["failed"]
             failed = None if failed_raw is None else bool(int(failed_raw))
+            from pancakebot.core.constants import INTERVAL_SECONDS
+            start_at = int(row["start_at"])
             out.append(
                 Round(
                     epoch=epoch,
-                    start_at=int(row["start_at"]),
-                    lock_at=(None if row["lock_at"] is None else int(row["lock_at"])),
-                    close_at=(None if row["close_at"] is None else int(row["close_at"])),
+                    start_at=start_at,
+                    lock_at=start_at + INTERVAL_SECONDS,
                     lock_price=(None if row["lock_price"] is None else float(row["lock_price"])),
                     close_price=(None if row["close_price"] is None else float(row["close_price"])),
                     position=(None if row["position"] is None else str(row["position"])),
@@ -238,8 +237,8 @@ class MarketDataDb:
                             (
                                 int(round_t.epoch),
                                 int(round_t.start_at),
-                                (None if round_t.lock_at is None else int(round_t.lock_at)),
-                                (None if round_t.close_at is None else int(round_t.close_at)),
+                                None,  # lock_at: computed at runtime from start_at + INTERVAL_SECONDS
+                                None,  # close_at: removed
                                 (None if round_t.lock_price is None else float(round_t.lock_price)),
                                 (None if round_t.close_price is None else float(round_t.close_price)),
                                 (None if round_t.position is None else str(round_t.position)),

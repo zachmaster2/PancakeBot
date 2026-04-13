@@ -24,6 +24,7 @@ from pancakebot.runtime.runtime_loop import RuntimeConfig, run_live_loop
 from pancakebot.integration.sync_mode import sync_runtime_market_data
 from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
+from pancakebot.infra.pool_event_watcher import PoolEventWatcher
 
 
 
@@ -54,7 +55,6 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
             runtime_state_paths=cfg.runtime_state_paths,
             min_bet_amount_bnb=float(cfg.min_bet_amount_bnb),
             treasury_fee_fraction=float(cfg.treasury_fee_fraction),
-            buffer_seconds=int(cfg.buffer_seconds),
         )
         run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var"))
         return
@@ -98,13 +98,11 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
     contract = Web3PredictionContract(contract_cfg)
 
     treasury_fee_fraction = contract.treasury_fee_rate()
-    buffer_seconds = contract.buffer_seconds()
     min_bet_amount_bnb = float(contract.min_bet_amount()) / float(BNB_WEI)
     save_contract_constants(
         constants=ContractConstants(
             min_bet_amount_bnb=min_bet_amount_bnb,
             treasury_fee_fraction=treasury_fee_fraction,
-            buffer_seconds=buffer_seconds,
         )
     )
 
@@ -112,6 +110,11 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
     if cfg.momentum_gate.enabled:
         okx_client = OkxClient(timeout_seconds=10.0)
         momentum_gate = MomentumGate(config=cfg.momentum_gate, okx_client=okx_client)
+
+    # Pool event watcher: subscribes to confirmed BetBull/BetBear events
+    # via public WSS for accurate pool tracking (no signup required).
+    pool_watcher = PoolEventWatcher()
+    pool_watcher.start()
 
     runtime_cfg = RuntimeConfig(
         round_store=None,
@@ -127,8 +130,11 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
         runtime_state_paths=cfg.runtime_state_paths,
         min_bet_amount_bnb=float(min_bet_amount_bnb),
         treasury_fee_fraction=treasury_fee_fraction,
-        buffer_seconds=buffer_seconds,
         momentum_gate=momentum_gate,
+        pool_watcher=pool_watcher,
     )
 
-    run_live_loop(runtime_cfg)
+    try:
+        run_live_loop(runtime_cfg)
+    finally:
+        pool_watcher.stop()

@@ -45,7 +45,6 @@ class AppConfig:
     # Protocol constants (sourced from chain on first live run; kept in config for backtest).
     min_bet_amount_bnb: float
     treasury_fee_fraction: float
-    buffer_seconds: int
 
     # Backtest options. Live and dry ignore these.
     backtest: BacktestConfig
