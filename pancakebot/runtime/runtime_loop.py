@@ -36,7 +36,6 @@ from pancakebot.runtime.sleep import sleep_seconds
 from pancakebot.core.errors import InvariantError, TransientRpcError
 from pancakebot.core.logging import info, warn
 from pancakebot.core.time import now_ts
-from pancakebot.infra.mempool_watcher import MempoolWatcher
 from pancakebot.core.money import bankroll_suffix, format_bankroll, usd_suffix
 
 _LOCK_SAFETY_MARGIN_SECONDS = 3  # abort bet if wall-clock is within this many seconds of lock_at
@@ -83,9 +82,6 @@ class RuntimeConfig:
 
     # Execution
     dry: bool
-
-    # Optional mempool watcher for enhanced pool estimates (live/dry only)
-    mempool_watcher: MempoolWatcher | None = None
 
     # Mutable runtime state paths used by live/dry loops.
     runtime_state_paths: RuntimeStatePathsConfig = RuntimeStatePathsConfig(
@@ -1153,21 +1149,16 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Step 6: Sleep until cutoff_ts(t).
         _sleep_until_ts(cutoff_ts_t, reason="wait_for_cutoff", epoch=current_epoch)
 
-        # Step 6a: Kick off OKX kline fetch and mempool burst in parallel.
-        # Both run in background threads while RPC work proceeds.
-        # OKX delay (250ms): gives OKX time to publish the latest 1s candle.
-        # Mempool burst (3s): collects pending PancakeSwap bets from WSS.
+        # Step 6a: Kick off OKX kline fetch after a short delay — gives
+        # OKX time to publish the latest 1s candle before we ask for it.
+        # The ~250 ms delay is absorbed by the RPC work in Steps 6b–7
+        # (~150–450 ms), so the futures are still ready by evaluate().
         okx_kline_futures = None
-        mempool_done_event = None
         if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, '_gate'):
             gate = closed.strategy_pipeline._gate
             if gate is not None:
                 time.sleep(0.25)
                 okx_kline_futures = gate.fetch_klines_async(cutoff_ts_ms=int(cutoff_ts_t * 1000))
-        if cfg.mempool_watcher is not None:
-            mempool_done_event = cfg.mempool_watcher.burst_collect_async(
-                epoch=current_epoch, duration=3.0,
-            )
 
         # Step 6b: Quick epoch check — just verify current_epoch hasn't
         # shifted during the ~267 s sleep.  A full handshake (3 RPC calls,
@@ -1221,19 +1212,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             open_rd2 = cfg.contract.round_data(current_epoch)
             pool_bull_bnb = open_rd2.bull_amount_wei / BNB_WEI
             pool_bear_bnb = open_rd2.bear_amount_wei / BNB_WEI
-
-        # Step 7b: Enhance pool estimates with mempool pending bets.
-        # Wait for the burst to finish (started in Step 6a, runs ~3s).
-        if cfg.mempool_watcher is not None and mempool_done_event is not None:
-            mempool_done_event.wait(timeout=5.0)
-            d_bull, d_bear = cfg.mempool_watcher.get_pending_pool_delta(epoch=current_epoch)
-            if d_bull > 0 or d_bear > 0:
-                pool_bull_bnb += d_bull
-                pool_bear_bnb += d_bear
-                info("MEMPOOL", "POOL", "ENHANCED",
-                     epoch=current_epoch,
-                     d_bull=f"{d_bull:.4f}", d_bear=f"{d_bear:.4f}",
-                     total=f"{pool_bull_bnb + pool_bear_bnb:.4f}")
 
         # Step 8: Decide.
         t_features_start_ms = _mono_ms()
