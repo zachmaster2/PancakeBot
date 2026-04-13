@@ -35,7 +35,6 @@ btc_symbol = "BTC-USDT"
 # Used directly in backtest mode (no on-chain connection required).
 min_bet_amount_bnb = 0.001
 treasury_fee_fraction = 0.03
-buffer_seconds = 30
 
 [backtest]
 simulation_size = 163

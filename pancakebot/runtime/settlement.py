@@ -97,7 +97,7 @@ def settle_bet_against_closed_round(
     """
     if bet_bnb < 0.0:
         raise InvariantError("settle_bet_bnb_negative")
-    if round_closed.lock_at is None or round_closed.position is None:
+    if round_closed.position is None:
         raise InvariantError("settle_round_not_closed")
     if not (0.0 <= treasury_fee_fraction < 1.0):
         raise InvariantError("settle_treasury_fee_fraction_out_of_range")

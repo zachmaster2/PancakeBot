@@ -33,10 +33,12 @@ from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline
 from pancakebot.runtime.claim_manager import claim_scan_cursor
 from pancakebot.runtime.settlement import settle_from_round_data
 from pancakebot.runtime.sleep import sleep_seconds
+from pancakebot.core.constants import BUFFER_SECONDS, INTERVAL_SECONDS
 from pancakebot.core.errors import InvariantError, TransientRpcError
 from pancakebot.core.logging import info, warn
 from pancakebot.core.time import now_ts
 from pancakebot.core.money import bankroll_suffix, format_bankroll, usd_suffix
+from pancakebot.infra.pool_event_watcher import PoolEventWatcher
 
 _LOCK_SAFETY_MARGIN_SECONDS = 3  # abort bet if wall-clock is within this many seconds of lock_at
 
@@ -72,7 +74,6 @@ class RuntimeConfig:
     # Protocol constants (cached at startup)
     min_bet_amount_bnb: float
     treasury_fee_fraction: float
-    buffer_seconds: int
 
     # Runtime latency telemetry.
     latency_log_path: str
@@ -82,6 +83,9 @@ class RuntimeConfig:
 
     # Execution
     dry: bool
+
+    # Pool event watcher: accumulates BetBull/BetBear events for accurate pools
+    pool_watcher: PoolEventWatcher | None = None
 
     # Mutable runtime state paths used by live/dry loops.
     runtime_state_paths: RuntimeStatePathsConfig = RuntimeStatePathsConfig(
@@ -1105,7 +1109,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 locked_epoch=locked_epoch,
                 current_epoch=current_epoch,
                 now_ts=int(now_ts()),
-                buffer_seconds=cfg.buffer_seconds,
+                buffer_seconds=BUFFER_SECONDS,
                 get_close_ts=cfg.contract.close_ts,
                 page_size=100,
                 gas_limit=GAS_LIMIT_CLAIM,
@@ -1123,7 +1127,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if locked_epoch > 1:
             _settled_stub = Round(
                 epoch=locked_epoch - 1,
-                start_at=0, lock_at=None, close_at=None,
+                start_at=0, lock_at=None,
                 lock_price=None, close_price=None,
                 position=None, failed=False, bets=(),
             )
@@ -1141,7 +1145,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # just-closed locked epoch may become claimable before the next cutoff. In that case,
         # we must wake for claim first (no approximation).
         prev_locked_epoch = locked_round.epoch - 1
-        claim_ts = locked_round.lock_at + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
+        claim_ts = locked_round.lock_at + BUFFER_SECONDS + _CLAIM_CHECK_PADDING_SECONDS
         if now_ts() < claim_ts < cutoff_ts_t:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
@@ -1212,6 +1216,32 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             open_rd2 = cfg.contract.round_data(current_epoch)
             pool_bull_bnb = open_rd2.bull_amount_wei / BNB_WEI
             pool_bear_bnb = open_rd2.bear_amount_wei / BNB_WEI
+
+        # Step 7b: Use event-based pool data if available (more accurate
+        # than single-point RPC read which may lag 1-2 blocks behind).
+        # The event watcher accumulates confirmed BetBull/BetBear events
+        # in real time, so its pool state reflects the latest processed block.
+        if cfg.pool_watcher is not None and cfg.pool_watcher.connected:
+            evt_bull, evt_bear = cfg.pool_watcher.get_pool(epoch=current_epoch)
+            if evt_bull > 0 or evt_bear > 0:
+                rpc_total = pool_bull_bnb + pool_bear_bnb
+                evt_total = evt_bull + evt_bear
+                # Use event pools if they show >= RPC pools (more up-to-date).
+                # If event pools are smaller (missed events on reconnect),
+                # fall back to RPC as a safety net.
+                if evt_total >= rpc_total * 0.95:
+                    pool_bull_bnb = evt_bull
+                    pool_bear_bnb = evt_bear
+                    info("POOL", "WSS", "USE",
+                         epoch=current_epoch,
+                         evt=f"{evt_total:.4f}", rpc=f"{rpc_total:.4f}")
+                else:
+                    info("POOL", "WSS", "RPC",
+                         epoch=current_epoch,
+                         evt=f"{evt_total:.4f}", rpc=f"{rpc_total:.4f}")
+            # Clean up old epochs
+            if locked_epoch > 2:
+                cfg.pool_watcher.clear_old_epochs(keep_after=locked_epoch - 2)
 
         # Step 8: Decide.
         t_features_start_ms = _mono_ms()
@@ -1478,7 +1508,6 @@ def _epoch_handshake(cfg: RuntimeConfig, closed: _ClosedState) -> tuple[Round, R
             epoch=locked_epoch,
             start_at=locked_rd.start_ts,
             lock_at=locked_rd.lock_ts,
-            close_at=locked_rd.close_ts,
             lock_price=locked_rd.lock_price_usd,
             close_price=None,
             position=None,
@@ -1489,7 +1518,6 @@ def _epoch_handshake(cfg: RuntimeConfig, closed: _ClosedState) -> tuple[Round, R
             epoch=current_epoch,
             start_at=open_rd.start_ts,
             lock_at=open_rd.lock_ts,
-            close_at=open_rd.close_ts,
             lock_price=None,
             close_price=None,
             position=None,
@@ -1506,7 +1534,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     if close_ts <= 0:
         raise InvariantError("close_ts_invalid")
 
-    claim_ts = close_ts + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
+    claim_ts = close_ts + BUFFER_SECONDS + _CLAIM_CHECK_PADDING_SECONDS
     _sleep_until_ts(claim_ts, reason="wait_for_claim", epoch=claim_epoch)
 
     # Refresh epochs after sleeping so the prior locked round can become closed.
@@ -1520,7 +1548,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
         locked_epoch=locked_round2.epoch,
         current_epoch=current_epoch2,
         now_ts=int(now_ts()),
-        buffer_seconds=cfg.buffer_seconds,
+        buffer_seconds=BUFFER_SECONDS,
         get_close_ts=cfg.contract.close_ts,
         page_size=100,
         gas_limit=GAS_LIMIT_CLAIM,

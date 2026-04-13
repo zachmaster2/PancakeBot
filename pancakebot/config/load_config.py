@@ -256,7 +256,7 @@ def load_app_config(path: str) -> AppConfig:
         raise InvariantError("bet_receipt_timeout_seconds_must_be_positive")
 
     _validate_unknown_keys("contract", contract_raw, {
-        "min_bet_amount_bnb", "treasury_fee_fraction", "buffer_seconds",
+        "min_bet_amount_bnb", "treasury_fee_fraction",
     })
     min_bet_amount_bnb = _opt_float(contract_raw, "min_bet_amount_bnb", 0.001)
     if float(min_bet_amount_bnb) <= 0.0:
@@ -264,9 +264,6 @@ def load_app_config(path: str) -> AppConfig:
     treasury_fee_fraction = _opt_float(contract_raw, "treasury_fee_fraction", 0.03)
     if not (0.0 <= float(treasury_fee_fraction) < 1.0):
         raise InvariantError("contract_treasury_fee_fraction_out_of_range")
-    buffer_seconds_cfg = _opt_int(contract_raw, "buffer_seconds", 30)
-    if int(buffer_seconds_cfg) <= 0:
-        raise InvariantError("contract_buffer_seconds_must_be_positive")
 
     allowed_bt_keys = {
         "simulation_size",
@@ -346,6 +343,5 @@ def load_app_config(path: str) -> AppConfig:
         momentum_gate=momentum_gate_cfg,
         min_bet_amount_bnb=min_bet_amount_bnb,
         treasury_fee_fraction=treasury_fee_fraction,
-        buffer_seconds=buffer_seconds_cfg,
         backtest=backtest_cfg,
     )

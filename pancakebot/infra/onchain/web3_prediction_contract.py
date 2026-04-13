@@ -150,11 +150,6 @@ class Web3PredictionContract:
         fee_bps = int(self._rpc_call(op="treasury_fee_rate", fn=lambda: self._contract.functions.treasuryFee().call()))
         return float(fee_bps) / float(TREASURY_FEE_DIVISOR)
 
-    def buffer_seconds(self) -> int:
-        """Protocol bufferSeconds constant (seconds)."""
-        value = self._rpc_call(op="buffer_seconds", fn=lambda: self._contract.functions.bufferSeconds().call())
-        return int(value)
-
     def lock_ts(self, epoch: int) -> int:
         r = self._rpc_call(op="lock_ts", fn=lambda: self._contract.functions.rounds(int(epoch)).call())
         # Indices stable for PredictionV2 rounds tuple:

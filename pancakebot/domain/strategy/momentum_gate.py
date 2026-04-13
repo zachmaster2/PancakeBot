@@ -26,7 +26,7 @@ from pancakebot.infra.okx_client import OkxClient
 from pancakebot.core.logging import info, warn
 
 # Number of 1s candles fetched and used by all modes (live, sync, backtest).
-_CANDLE_COUNT = 40
+_CANDLE_COUNT = 31
 
 # Tuned constants — these were optimized together; do not change independently.
 _ACCEL_PAIRS: list[tuple[int, int]] = [(7, 10), (5, 10), (5, 7)]

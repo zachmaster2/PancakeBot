@@ -31,7 +31,7 @@ from pancakebot.runtime.sleep import sleep_seconds
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 
 _OKX_BASE = "https://www.okx.com"
-_KLINES_PER_ROUND = 40  # Must match momentum_gate._CANDLE_COUNT
+_KLINES_PER_ROUND = 31  # Must match momentum_gate._CANDLE_COUNT
 _FETCH_WORKERS = 4      # concurrent OKX fetches per asset (8 total with both assets)
 _FETCH_RETRIES = 3      # retry failed OKX requests
 _RETRY_DELAY_S = 1.0    # base delay between retries (doubles each attempt)
