@@ -36,6 +36,7 @@ from pancakebot.runtime.sleep import sleep_seconds
 from pancakebot.core.errors import InvariantError, TransientRpcError
 from pancakebot.core.logging import info, warn
 from pancakebot.core.time import now_ts
+from pancakebot.infra.mempool_watcher import MempoolWatcher
 from pancakebot.core.money import bankroll_suffix, format_bankroll, usd_suffix
 
 _LOCK_SAFETY_MARGIN_SECONDS = 3  # abort bet if wall-clock is within this many seconds of lock_at
@@ -82,6 +83,9 @@ class RuntimeConfig:
 
     # Execution
     dry: bool
+
+    # Optional mempool watcher for enhanced pool estimates (live/dry only)
+    mempool_watcher: MempoolWatcher | None = None
 
     # Mutable runtime state paths used by live/dry loops.
     runtime_state_paths: RuntimeStatePathsConfig = RuntimeStatePathsConfig(
@@ -1214,6 +1218,17 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             open_rd2 = cfg.contract.round_data(current_epoch)
             pool_bull_bnb = open_rd2.bull_amount_wei / BNB_WEI
             pool_bear_bnb = open_rd2.bear_amount_wei / BNB_WEI
+
+        # Step 7b: Enhance pool estimates with mempool pending bets.
+        if cfg.mempool_watcher is not None:
+            d_bull, d_bear = cfg.mempool_watcher.get_pending_pool_delta(epoch=current_epoch)
+            if d_bull > 0 or d_bear > 0:
+                pool_bull_bnb += d_bull
+                pool_bear_bnb += d_bear
+                info("MEMPOOL", "POOL", "ENHANCED",
+                     epoch=current_epoch,
+                     d_bull=f"{d_bull:.4f}", d_bear=f"{d_bear:.4f}",
+                     total=f"{pool_bull_bnb + pool_bear_bnb:.4f}")
 
         # Step 8: Decide.
         t_features_start_ms = _mono_ms()

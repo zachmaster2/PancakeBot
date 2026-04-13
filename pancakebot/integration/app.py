@@ -24,6 +24,7 @@ from pancakebot.runtime.runtime_loop import RuntimeConfig, run_live_loop
 from pancakebot.integration.sync_mode import sync_runtime_market_data
 from pancakebot.core.errors import InvariantError
 from pancakebot.core.logging import info
+from pancakebot.infra.mempool_watcher import MempoolWatcher
 
 
 
@@ -113,6 +114,15 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
         okx_client = OkxClient(timeout_seconds=10.0)
         momentum_gate = MomentumGate(config=cfg.momentum_gate, okx_client=okx_client)
 
+    # Optional mempool watcher: start if BSC_WSS_URL is configured.
+    mempool_watcher = None
+    import os
+    wss_url = os.getenv("BSC_WSS_URL", "").strip()
+    if wss_url:
+        mempool_watcher = MempoolWatcher(wss_url=wss_url)
+        mempool_watcher.start()
+        info("CORE", "RUN", "MEMPOOL", msg=f"Mempool watcher started (WSS endpoint configured)")
+
     runtime_cfg = RuntimeConfig(
         round_store=None,
         contract=contract,
@@ -129,6 +139,11 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
         treasury_fee_fraction=treasury_fee_fraction,
         buffer_seconds=buffer_seconds,
         momentum_gate=momentum_gate,
+        mempool_watcher=mempool_watcher,
     )
 
-    run_live_loop(runtime_cfg)
+    try:
+        run_live_loop(runtime_cfg)
+    finally:
+        if mempool_watcher is not None:
+            mempool_watcher.stop()
