@@ -135,19 +135,6 @@ class MomentumGate:
         # Validate: we expect exactly _CANDLE_COUNT contiguous 1s candles
         # ending at cutoff - 1.  Reject if the response is incomplete.
         bnb_reason = _validate_klines(bnb_klines, cutoff_ts_ms, "bnb")
-
-        # Retry once if OKX is exactly 1 second behind — the candle just
-        # hasn't been published yet.  A 300ms wait usually resolves it.
-        if bnb_reason is not None and _is_stale_by_one(bnb_klines, cutoff_ts_ms):
-            import time
-            time.sleep(0.3)
-            bnb_klines = self._fetch_klines(self._cfg.symbol, _CANDLE_COUNT, cutoff_ts_ms)
-            bnb_reason = _validate_klines(bnb_klines, cutoff_ts_ms, "bnb")
-            if bnb_reason is not None:
-                info("GATE", "OKX", "RETRY_FAIL", reason=bnb_reason)
-            else:
-                info("GATE", "OKX", "RETRY_OK", msg="stale candle recovered after 300ms")
-
         if bnb_reason is not None:
             return self._skip(bnb_reason)
 
@@ -202,15 +189,6 @@ def _validate_klines(
         return f"gate_{label}_unexpected_newest:got={newest_ts},expected={expected_ts}"
 
     return None
-
-
-def _is_stale_by_one(klines: list[dict] | None, cutoff_ts_ms: int) -> bool:
-    """True if klines are exactly 1 second behind expected (OKX latency)."""
-    if klines is None or len(klines) < _CANDLE_COUNT:
-        return False
-    newest_ts = int(klines[-1]["open_time_ms"])
-    expected_ts = cutoff_ts_ms - 1000
-    return newest_ts == expected_ts - 1000  # exactly 1s behind
 
 
 def _validate_klines_raw(
