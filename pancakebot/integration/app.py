@@ -114,14 +114,14 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
         okx_client = OkxClient(timeout_seconds=10.0)
         momentum_gate = MomentumGate(config=cfg.momentum_gate, okx_client=okx_client)
 
-    # Optional mempool watcher: start if BSC_WSS_URL is configured.
+    # Optional mempool watcher: create if BSC_WSS_URL is configured.
+    # Burst-mode: only connects around cutoff, not persistent.
     mempool_watcher = None
     import os
     wss_url = os.getenv("BSC_WSS_URL", "").strip()
     if wss_url:
         mempool_watcher = MempoolWatcher(wss_url=wss_url)
-        mempool_watcher.start()
-        info("CORE", "RUN", "MEMPOOL", msg=f"Mempool watcher started (WSS endpoint configured)")
+        info("CORE", "RUN", "MEMPOOL", msg="Mempool watcher configured (burst mode)")
 
     runtime_cfg = RuntimeConfig(
         round_store=None,
@@ -142,8 +142,4 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
         mempool_watcher=mempool_watcher,
     )
 
-    try:
-        run_live_loop(runtime_cfg)
-    finally:
-        if mempool_watcher is not None:
-            mempool_watcher.stop()
+    run_live_loop(runtime_cfg)
