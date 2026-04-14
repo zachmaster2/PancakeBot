@@ -40,7 +40,7 @@ from pancakebot.core.time import now_ts
 from pancakebot.core.money import bankroll_suffix, format_bankroll, usd_suffix
 from pancakebot.infra.pool_event_watcher import PoolEventWatcher
 
-_LOCK_SAFETY_MARGIN_SECONDS = 3  # abort bet if wall-clock is within this many seconds of lock_at
+_LOCK_SAFETY_MARGIN_SECONDS = 1  # abort bet if wall-clock is within this many seconds of lock_at
 
 # Extra cushion added to the claim-check wake time to avoid alignment retries near Graph/RPC boundaries.
 _CLAIM_CHECK_PADDING_SECONDS = 5
