@@ -174,19 +174,23 @@ def main():
     rounds_map = {int(r.epoch): r for r in store.iter_closed_rounds()}
     print(f"Loaded {len(rounds_map)} rounds from closed_rounds.jsonl")
 
-    # Verify BNB
-    bnb_ok = verify("BNB (cutoff_spot_prices)", "var/cutoff_spot_prices.jsonl", rounds_map)
-
-    # Verify BTC — check .new first (in-progress resync), then original
-    btc_path = "var/btc_spot_prices.jsonl"
-    btc_new = btc_path + ".new"
-    if Path(btc_new).exists():
-        print(f"\n  NOTE: .new file exists ({btc_new}), verifying both")
-        verify("BTC .new (in-progress)", btc_new, rounds_map)
-    btc_ok = verify("BTC (btc_spot_prices)", btc_path, rounds_map)
+    pairs = [
+        ("BNB", "var/cutoff_spot_prices.jsonl"),
+        ("BTC", "var/btc_spot_prices.jsonl"),
+        ("ETH", "var/eth_spot_prices.jsonl"),
+        ("SOL", "var/sol_spot_prices.jsonl"),
+    ]
+    results = {}
+    for label, path in pairs:
+        if Path(path).exists():
+            results[label] = verify(f"{label} ({Path(path).name})", path, rounds_map)
+        else:
+            print(f"\n  {label}: FILE NOT FOUND ({path})")
+            results[label] = False
 
     print(f"\n{'=' * 100}")
-    print(f"FINAL: BNB={'OK' if bnb_ok else 'FAIL'}  BTC={'OK' if btc_ok else 'FAIL'}")
+    summary = "  ".join(f"{k}={'OK' if v else 'FAIL'}" for k, v in results.items())
+    print(f"FINAL: {summary}")
     print(f"{'=' * 100}")
 
 
