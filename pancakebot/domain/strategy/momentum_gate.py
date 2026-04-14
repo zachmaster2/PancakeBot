@@ -33,7 +33,9 @@ _CANDLE_COUNT = 31
 
 # Multi-TF BTC lookbacks — all must agree in direction.
 _MTF_LOOKBACKS = (3, 7, 15)
-_MTF_THRESH = 0.0001  # min(|r3|, |r7|, |r15|) must exceed this
+# Signal fires at this threshold; the pipeline may apply a stricter
+# threshold for small pools (pool-adaptive logic in momentum_pipeline.py).
+_MTF_THRESH = 0.0001
 
 
 @dataclass(frozen=True, slots=True)
