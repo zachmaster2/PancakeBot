@@ -112,16 +112,17 @@ def sync_runtime_market_data(
     spot_store = KlineStore(str(_SPOT_KLINES_PATH))
     btc_store = KlineStore(str(_BTC_KLINES_PATH))
 
+    cutoff_s = int(cfg.cutoff_seconds)
     with ThreadPoolExecutor(max_workers=2) as pool:
         spot_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="BNB-USDT",
-            store=spot_store, label="BNB",
+            store=spot_store, label="BNB", cutoff_seconds=cutoff_s,
         )
         btc_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="BTC-USDT",
-            store=btc_store, label="BTC",
+            store=btc_store, label="BTC", cutoff_seconds=cutoff_s,
         )
         spot_synced = spot_fut.result()
         btc_synced = btc_fut.result()
@@ -152,11 +153,11 @@ def sync_runtime_market_data(
         uncovered_rounds = [r for r in tail_rounds if int(r.epoch) in uncovered]
         _sync_1s_klines(
             rounds=uncovered_rounds, inst_id="BNB-USDT",
-            store=spot_store, label="BNB-retry",
+            store=spot_store, label="BNB-retry", cutoff_seconds=cutoff_s,
         )
         _sync_1s_klines(
             rounds=uncovered_rounds, inst_id="BTC-USDT",
-            store=btc_store, label="BTC-retry",
+            store=btc_store, label="BTC-retry", cutoff_seconds=cutoff_s,
         )
 
     # After retries, trim stores to the exact three-way intersection:
@@ -254,6 +255,7 @@ def _sync_1s_klines(
     inst_id: str,
     store: KlineStore,
     label: str,
+    cutoff_seconds: int = 2,
 ) -> int:
     """Fetch 1s OKX klines for rounds not yet in the store. Returns count synced.
 
@@ -307,6 +309,7 @@ def _sync_1s_klines(
         synced, errors = _fetch_and_append(
             rounds_asc=append_rounds, inst_id=inst_id, store=store, label=label,
             latest_on_disk=latest_on_disk, done_count=len(done_epochs),
+            cutoff_seconds=cutoff_seconds,
         )
         total_synced += synced
         total_errors += errors
@@ -317,6 +320,7 @@ def _sync_1s_klines(
         synced, errors = _fetch_to_staging(
             rounds_asc=prepend_rounds, inst_id=inst_id,
             staging_path=staging_path, label=label,
+            cutoff_seconds=cutoff_seconds,
         )
         total_errors += errors
         if synced > 0:
@@ -333,7 +337,7 @@ def _sync_1s_klines(
 
 def _fetch_and_append(
     *, rounds_asc: list, inst_id: str, store: KlineStore, label: str,
-    latest_on_disk: int | None, done_count: int,
+    latest_on_disk: int | None, done_count: int, cutoff_seconds: int = 2,
 ) -> tuple[int, int]:
     """Fetch epochs in ordered batches and append each to store immediately."""
     synced = 0
@@ -345,7 +349,7 @@ def _fetch_and_append(
         if batch_start > 0:
             time.sleep(1.0)
 
-        results, batch_errors = _fetch_batch(batch, inst_id)
+        results, batch_errors = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds)
         errors += batch_errors
         if not results:
             continue
@@ -374,6 +378,7 @@ def _fetch_and_append(
 
 def _fetch_to_staging(
     *, rounds_asc: list, inst_id: str, staging_path: str, label: str,
+    cutoff_seconds: int = 2,
 ) -> tuple[int, int]:
     """Fetch older epochs into a staging file (resumable append-only)."""
     import os as _os
@@ -403,7 +408,7 @@ def _fetch_to_staging(
             if batch_start > 0:
                 time.sleep(1.0)
 
-            results, batch_errors = _fetch_batch(batch, inst_id)
+            results, batch_errors = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds)
             errors += batch_errors
 
             for rec in results:
@@ -448,12 +453,12 @@ def _prepend_staging_to_store(*, store: KlineStore, staging_path: str, label: st
          msg=f"  prepended {len(staging_records)} older epochs into store")
 
 
-def _fetch_batch(batch: list, inst_id: str) -> tuple[list[dict], int]:
+def _fetch_batch(batch: list, inst_id: str, cutoff_seconds: int = 2) -> tuple[list[dict], int]:
     """Fetch a batch of rounds in parallel. Returns (results, error_count)."""
     results: list[dict] = []
     errors = 0
     with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one_kline, rnd, inst_id): rnd for rnd in batch}
+        futures = {pool.submit(_fetch_one_kline, rnd, inst_id, cutoff_seconds): rnd for rnd in batch}
         for fut in as_completed(futures):
             try:
                 rec = fut.result()
@@ -467,13 +472,13 @@ def _fetch_batch(batch: list, inst_id: str) -> tuple[list[dict], int]:
     return results, errors
 
 
-def _fetch_one_kline(rnd, inst_id: str) -> dict | None:
+def _fetch_one_kline(rnd, inst_id: str, cutoff_seconds: int = 2) -> dict | None:
     """Fetch 1s klines for a single round. Returns record dict or None."""
     epoch = int(rnd.epoch)
     lock_at = rnd.lock_at
     if lock_at is None:
         return None
-    cutoff_ms = int(lock_at) * 1000 - 4000
+    cutoff_ms = int(lock_at) * 1000 - cutoff_seconds * 1000
     klines = _fetch_1s_klines(inst_id=inst_id, anchor_ms=cutoff_ms)
     if klines is None:
         return None

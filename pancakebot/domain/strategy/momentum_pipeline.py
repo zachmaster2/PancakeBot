@@ -205,11 +205,13 @@ class MomentumOnlyPipeline:
                 cutoff_ts_ms=int(cutoff_ts_ms),
             )
             # Compute pools from round bets if not provided externally.
-            # Use cutoff_ts (not lock_at) — matches what the live bot sees
-            # via RPC at decision time.  Bets placed after cutoff are invisible.
+            # Filter to bets with created_at <= lock_at - 6: matches what the
+            # live bot reliably sees via event subscription (bets from 6+ seconds
+            # ago are guaranteed to have propagated to our node).
             if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
-                cutoff_ts = lock_at - self._cutoff_seconds
-                pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, cutoff_ts)
+                from pancakebot.core.constants import POOL_CUTOFF_SECONDS
+                pool_cutoff_ts = lock_at - POOL_CUTOFF_SECONDS
+                pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, pool_cutoff_ts)
         pool_total = pool_bull_bnb + pool_bear_bnb
 
         if result.skip_reason is not None and result.signal is None:

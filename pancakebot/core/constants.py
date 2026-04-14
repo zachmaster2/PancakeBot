@@ -23,6 +23,11 @@ TREASURY_FEE_DIVISOR = 10_000
 INTERVAL_SECONDS = 300
 BUFFER_SECONDS = 30
 
+# Pool cutoff: only use bets with created_at <= lock_at - POOL_CUTOFF_SECONDS.
+# Bets placed this many seconds before lock are guaranteed to have propagated
+# to our node by decision time, ensuring consistency between live and backtest.
+POOL_CUTOFF_SECONDS = 6
+
 # --- RPC (hardcoded list; failover is handled by RPC chooser) ---
 
 RPC_URLS: list[str] = [
