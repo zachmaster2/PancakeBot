@@ -198,6 +198,71 @@ class PoolEventWatcher:
             info("POOL_WSS", "SUB", "OK",
                  msg=f"Subscribed to bet events + newHeads")
 
+            # Backfill: fetch recent bet events via eth_getLogs to catch
+            # bets placed before we subscribed.  Covers the current open
+            # round (~5 min = ~100 BSC blocks at 3s each).
+            try:
+                # Get current block number
+                bn_req = json.dumps({
+                    "jsonrpc": "2.0", "id": 10,
+                    "method": "eth_blockNumber", "params": [],
+                })
+                await ws.send(bn_req)
+                bn_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                if "result" in bn_resp:
+                    current_block = int(bn_resp["result"], 16)
+                    from_block = hex(max(0, current_block - 120))  # ~6 min of blocks
+
+                    backfill_req = json.dumps({
+                        "jsonrpc": "2.0", "id": 11,
+                        "method": "eth_getLogs",
+                        "params": [{
+                            "address": self._contract_addr,
+                            "topics": [[_BET_BULL_TOPIC, _BET_BEAR_TOPIC]],
+                            "fromBlock": from_block,
+                            "toBlock": "latest",
+                        }],
+                    })
+                    await ws.send(backfill_req)
+                    backfill_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                    if "result" in backfill_resp and isinstance(backfill_resp["result"], list):
+                        # Collect unique block numbers to fetch timestamps
+                        blocks_needed = set()
+                        for log in backfill_resp["result"]:
+                            try:
+                                bn = int(log.get("blockNumber", "0x0"), 16)
+                                if bn > 0:
+                                    blocks_needed.add(bn)
+                            except ValueError:
+                                pass
+
+                        # Fetch block timestamps for backfilled events
+                        for bn in blocks_needed:
+                            try:
+                                ts_req = json.dumps({
+                                    "jsonrpc": "2.0", "id": 12,
+                                    "method": "eth_getBlockByNumber",
+                                    "params": [hex(bn), False],
+                                })
+                                await ws.send(ts_req)
+                                ts_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+                                if "result" in ts_resp and ts_resp["result"]:
+                                    block_ts = int(ts_resp["result"]["timestamp"], 16)
+                                    with self._lock:
+                                        self._block_ts[bn] = block_ts
+                            except Exception:
+                                pass
+
+                        count = 0
+                        for log in backfill_resp["result"]:
+                            self._process_bet_event(log)
+                            count += 1
+                        if count > 0:
+                            info("POOL_WSS", "BACKFILL", "OK",
+                                 msg=f"Backfilled {count} bet events from {len(blocks_needed)} blocks")
+            except Exception as e:
+                warn("POOL_WSS", "BACKFILL", "FAIL", msg=f"Backfill failed: {e}")
+
             while not self._stop_event.is_set():
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
