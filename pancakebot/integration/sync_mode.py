@@ -117,7 +117,10 @@ def sync_runtime_market_data(
     sol_store = KlineStore(str(_SOL_KLINES_PATH))
 
     cutoff_s = int(cfg.cutoff_seconds)
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    # Sync in pairs of 2 to stay under OKX rate limit (20 req/2s per endpoint).
+    # Each _sync_1s_klines uses _FETCH_WORKERS=4 internal threads, so
+    # 2 pairs × 4 workers = 8 concurrent requests (safely under 10/s).
+    with ThreadPoolExecutor(max_workers=2) as pool:
         spot_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="BNB-USDT",
@@ -128,6 +131,11 @@ def sync_runtime_market_data(
             rounds=tail_rounds, inst_id="BTC-USDT",
             store=btc_store, label="BTC", cutoff_seconds=cutoff_s,
         )
+        spot_synced = spot_fut.result()
+        btc_synced = btc_fut.result()
+
+    # Second batch: ETH + SOL (after BNB + BTC finish).
+    with ThreadPoolExecutor(max_workers=2) as pool:
         eth_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="ETH-USDT",
@@ -138,9 +146,7 @@ def sync_runtime_market_data(
             rounds=tail_rounds, inst_id="SOL-USDT",
             store=sol_store, label="SOL", cutoff_seconds=cutoff_s,
         )
-        spot_synced = spot_fut.result()
-        btc_synced = btc_fut.result()
-        eth_fut.result()  # best-effort, don't block on ETH/SOL
+        eth_fut.result()
         sol_fut.result()
 
     # Phase 3: Integrity — trim all stores to the exact intersection so
