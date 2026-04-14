@@ -140,7 +140,7 @@ def _unique_archive_dir(root: Path, *, ts: int, reason: str) -> Path:
         suffix += 1
 
 
-_MIN_ROUNDS_TO_ARCHIVE = 10  # don't archive runs shorter than this
+_MIN_ROUNDS_TO_ARCHIVE = 5  # don't archive runs shorter than this
 
 
 def _archive_dry_runtime_state(
