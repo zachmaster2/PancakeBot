@@ -39,7 +39,7 @@ def load_data():
                 out[int(rec["epoch"])] = rec["klines_1s"]
         return out
 
-    return rounds, load_kl("var/cutoff_spot_prices.jsonl"), load_kl("var/btc_spot_prices.jsonl")
+    return rounds, load_kl("var/bnb_spot_prices.jsonl"), load_kl("var/btc_spot_prices.jsonl")
 
 
 def evaluate_signal(rounds, spot, btc, *, lookback_pairs, threshold, btc_lookback,

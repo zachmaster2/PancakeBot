@@ -131,7 +131,7 @@ class MomentumOnlyPipeline:
         self._treasury_fee_fraction = float(treasury_fee_fraction)
         self._last_settled_epoch: int | None = None
         # Backtest: 1s klines per epoch {epoch: [[ts_ms, o, h, l, c, vol], ...]}
-        self._spot_klines_by_epoch: dict[int, list[list]] = {}
+        self._bnb_klines_by_epoch: dict[int, list[list]] = {}
         self._btc_klines_by_epoch: dict[int, list[list]] = {}
         self._eth_klines_by_epoch: dict[int, list[list]] = {}
         self._sol_klines_by_epoch: dict[int, list[list]] = {}
@@ -151,9 +151,9 @@ class MomentumOnlyPipeline:
     def selector_ready(self) -> bool:
         return True
 
-    def refresh_spot_klines(self, *, spot_klines_by_epoch: dict[int, list[list]]) -> None:
+    def refresh_bnb_klines(self, *, bnb_klines_by_epoch: dict[int, list[list]]) -> None:
         """Load pre-fetched BNB 1s kline arrays keyed by epoch (backtest mode)."""
-        self._spot_klines_by_epoch = dict(spot_klines_by_epoch)
+        self._bnb_klines_by_epoch = dict(bnb_klines_by_epoch)
 
     def refresh_btc_klines(self, *, btc_klines_by_epoch: dict[int, list[list]]) -> None:
         """Load pre-fetched BTC 1s kline arrays keyed by epoch (backtest mode)."""
@@ -276,11 +276,11 @@ class MomentumOnlyPipeline:
         cutoff_ts_ms: int,
     ) -> MomentumGateResult:
         """Run signal logic on cached klines (backtest path)."""
-        bnb_klines = self._spot_klines_by_epoch.get(epoch)
+        bnb_klines = self._bnb_klines_by_epoch.get(epoch)
         if bnb_klines is None or len(bnb_klines) == 0:
             return MomentumGateResult(
                 signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-                skip_reason="gate_no_spot_klines",
+                skip_reason="gate_no_bnb_klines",
             )
         btc_klines = self._btc_klines_by_epoch.get(epoch)
         eth_klines = self._eth_klines_by_epoch.get(epoch)

@@ -48,7 +48,7 @@ def load_data():
                 out[int(rec["epoch"])] = rec["klines_1s"]
         return out
 
-    return rounds, load_kl("var/cutoff_spot_prices.jsonl"), load_kl("var/btc_spot_prices.jsonl")
+    return rounds, load_kl("var/bnb_spot_prices.jsonl"), load_kl("var/btc_spot_prices.jsonl")
 
 
 def get_closes(raw, cutoff_ms):

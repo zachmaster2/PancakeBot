@@ -38,7 +38,7 @@ def _load_data():
                 out[int(rec["epoch"])] = rec["klines_1s"]
         return out
 
-    spot = load_klines("var/cutoff_spot_prices.jsonl")
+    spot = load_klines("var/bnb_spot_prices.jsonl")
     btc = load_klines("var/btc_spot_prices.jsonl")
     _cache.update(rounds=rounds, spot=spot, btc=btc)
     return rounds, spot, btc
@@ -65,7 +65,7 @@ def run(sim_size=20000, verbose=True, initial_bankroll=50.0):
         min_bet_amount_bnb=_MIN_BET_AMOUNT_BNB,
         treasury_fee_fraction=_TREASURY_FEE_FRACTION,
     )
-    pipeline.refresh_spot_klines(spot_klines_by_epoch=spot)
+    pipeline.refresh_bnb_klines(bnb_klines_by_epoch=spot)
     pipeline.refresh_btc_klines(btc_klines_by_epoch=btc)
 
     bankroll = initial_bankroll

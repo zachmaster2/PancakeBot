@@ -78,7 +78,7 @@ def main():
     print(f"Loaded {len(rounds_map)} rounds", flush=True)
 
     for label, path, inst_id in [
-        ("BNB", "var/cutoff_spot_prices.jsonl", "BNB-USDT"),
+        ("BNB", "var/bnb_spot_prices.jsonl", "BNB-USDT"),
         ("BTC", "var/btc_spot_prices.jsonl", "BTC-USDT"),
     ]:
         print(f"\n=== {label} ===", flush=True)

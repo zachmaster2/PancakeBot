@@ -74,7 +74,7 @@ def main():
     rounds = list(store.iter_closed_rounds())
     total = len(rounds)
     btc_kl = load_kl("var/btc_spot_prices.jsonl")
-    bnb_kl = load_kl("var/cutoff_spot_prices.jsonl")
+    bnb_kl = load_kl("var/bnb_spot_prices.jsonl")
     print(f"Total rounds: {total}")
 
     # ==================================================================

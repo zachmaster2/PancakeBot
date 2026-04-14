@@ -50,7 +50,7 @@ def _load_data():
                 out[int(rec["epoch"])] = rec["klines_1s"]
         return out
 
-    spot = load_klines("var/cutoff_spot_prices.jsonl")
+    spot = load_klines("var/bnb_spot_prices.jsonl")
     btc = load_klines("var/btc_spot_prices.jsonl")
     return rounds, spot, btc
 
@@ -59,7 +59,7 @@ def classify_btc_status(
     epoch: int,
     cutoff_ts_ms: int,
     bet_side: str,
-    spot_klines_by_epoch: dict,
+    bnb_klines_by_epoch: dict,
     btc_klines_by_epoch: dict,
 ) -> str:
     """Independently classify a bet as btc_agree, btc_disagree, btc_neutral, or contrarian.
@@ -67,7 +67,7 @@ def classify_btc_status(
     Uses compute_signal_from_klines to get the signal + btc_agrees/btc_disagrees.
     For contrarian bets (main gate has no signal), returns 'contrarian'.
     """
-    bnb_klines = spot_klines_by_epoch.get(epoch)
+    bnb_klines = bnb_klines_by_epoch.get(epoch)
     btc_klines = btc_klines_by_epoch.get(epoch)
 
     if bnb_klines is None or len(bnb_klines) == 0:
@@ -104,7 +104,7 @@ def run_analysis():
         min_bet_amount_bnb=_MIN_BET_AMOUNT_BNB,
         treasury_fee_fraction=_TREASURY_FEE_FRACTION,
     )
-    pipeline.refresh_spot_klines(spot_klines_by_epoch=spot)
+    pipeline.refresh_bnb_klines(bnb_klines_by_epoch=spot)
     pipeline.refresh_btc_klines(btc_klines_by_epoch=btc)
 
     bankroll = 50.0
@@ -131,7 +131,7 @@ def run_analysis():
                 epoch=epoch,
                 cutoff_ts_ms=cutoff_ts_ms,
                 bet_side=decision.bet_side,
-                spot_klines_by_epoch=spot,
+                bnb_klines_by_epoch=spot,
                 btc_klines_by_epoch=btc,
             )
 
@@ -312,7 +312,7 @@ def run_analysis():
         min_bet_amount_bnb=_MIN_BET_AMOUNT_BNB,
         treasury_fee_fraction=_TREASURY_FEE_FRACTION,
     )
-    pipeline_cf.refresh_spot_klines(spot_klines_by_epoch=spot)
+    pipeline_cf.refresh_bnb_klines(bnb_klines_by_epoch=spot)
     pipeline_cf.refresh_btc_klines(btc_klines_by_epoch=btc)
 
     for rnd in sim_rounds:
@@ -331,7 +331,7 @@ def run_analysis():
                 epoch=epoch,
                 cutoff_ts_ms=cutoff_ts_ms,
                 bet_side=decision.bet_side,
-                spot_klines_by_epoch=spot,
+                bnb_klines_by_epoch=spot,
                 btc_klines_by_epoch=btc,
             )
 

@@ -157,7 +157,7 @@ def run_analysis():
                 out[int(rec["epoch"])] = rec["klines_1s"]
         return out
 
-    bnb_kl = load_kl("var/cutoff_spot_prices.jsonl")
+    bnb_kl = load_kl("var/bnb_spot_prices.jsonl")
     btc_kl = load_kl("var/btc_spot_prices.jsonl")
     eth_kl = load_kl(ETH_PATH)
     print(f"ETH klines: {len(eth_kl)}")

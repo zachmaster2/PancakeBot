@@ -76,8 +76,10 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
             msg=(
                 f"closed_rounds={int(summary.stored_closed_round_count)} "
                 f"epochs=[{int(summary.earliest_closed_epoch)}..{int(summary.latest_closed_epoch)}] "
-                f"spot_klines_synced={int(summary.spot_klines_synced)} "
-                f"btc_klines_synced={int(summary.btc_klines_synced)}"
+                f"bnb_synced={int(summary.bnb_klines_synced)} "
+                f"btc_synced={int(summary.btc_klines_synced)} "
+                f"eth_synced={int(summary.eth_klines_synced)} "
+                f"sol_synced={int(summary.sol_klines_synced)}"
             ),
         )
         return

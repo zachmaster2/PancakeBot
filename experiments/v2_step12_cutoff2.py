@@ -49,7 +49,7 @@ def load_data():
 
     # BNB: resync replaced original file, so .jsonl is cutoff=2
     # BTC: check .new first (in-progress), then original (may be old cutoff=4)
-    bnb_path = "var/cutoff_spot_prices.jsonl"
+    bnb_path = "var/bnb_spot_prices.jsonl"
     btc_path = "var/btc_spot_prices.jsonl.new"
     if not Path(btc_path).exists():
         btc_path = "var/btc_spot_prices.jsonl"
