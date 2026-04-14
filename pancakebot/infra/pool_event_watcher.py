@@ -278,45 +278,61 @@ class PoolEventWatcher:
         with self._lock:
             self._block_ts[block_number] = timestamp
 
+    def _rpc_call(self, rpc: str, method: str, params: list) -> dict | None:
+        """Single JSON-RPC call. Returns result or None on error."""
+        import urllib.request as _urllib_req
+        req = json.dumps({
+            "jsonrpc": "2.0", "id": 1,
+            "method": method, "params": params,
+        }).encode()
+        resp = _urllib_req.urlopen(_urllib_req.Request(
+            rpc, data=req,
+            headers={"Content-Type": "application/json"},
+        ), timeout=10)
+        body = json.loads(resp.read())
+        return body.get("result")
+
+    def _rpc_batch(self, rpc: str, calls: list[tuple[str, list]]) -> list[dict | None]:
+        """Batch JSON-RPC call. Returns list of results (None for failures)."""
+        import urllib.request as _urllib_req
+        batch = [
+            {"jsonrpc": "2.0", "id": i, "method": method, "params": params}
+            for i, (method, params) in enumerate(calls)
+        ]
+        req = json.dumps(batch).encode()
+        resp = _urllib_req.urlopen(_urllib_req.Request(
+            rpc, data=req,
+            headers={"Content-Type": "application/json"},
+        ), timeout=30)
+        body = json.loads(resp.read())
+        # Responses may arrive out of order; index by id.
+        by_id = {r["id"]: r.get("result") for r in body} if isinstance(body, list) else {}
+        return [by_id.get(i) for i in range(len(calls))]
+
     def backfill_round(self, round_start_ts: int) -> None:
         """Backfill bets by scanning blocks from round_start_ts to now.
 
-        Uses eth_getBlockByNumber with full transactions (works on ALL
-        free BSC RPCs) instead of eth_getLogs (unreliable on free nodes).
+        Uses batched eth_getBlockByNumber with full transactions (works on
+        ALL free BSC RPCs) instead of eth_getLogs (unreliable on free nodes).
         Filters transactions to the prediction contract and parses
         bet events from transaction receipts.
 
         Called once by the runtime loop after the first epoch handshake.
         Dedup by tx_hash:log_index prevents double-counting with WSS.
         """
-        import urllib.request as _urllib_req
         from pancakebot.core.constants import RPC_URLS
 
         _BSC_BLOCK_TIME = 0.5  # conservative (actual ~0.44s)
-        rpc = RPC_URLS[0]  # use our standard BSC RPC
+        _BATCH_SIZE = 100      # BSC free RPCs reject batches > 100
+        rpc = RPC_URLS[0]
 
         try:
             # Get current block + timestamp
-            bn_req = json.dumps({
-                "jsonrpc": "2.0", "id": 1,
-                "method": "eth_blockNumber", "params": [],
-            }).encode()
-            resp = _urllib_req.urlopen(_urllib_req.Request(
-                rpc, data=bn_req,
-                headers={"Content-Type": "application/json"},
-            ), timeout=10)
-            current_block = int(json.loads(resp.read())["result"], 16)
-
-            ts_req = json.dumps({
-                "jsonrpc": "2.0", "id": 2,
-                "method": "eth_getBlockByNumber",
-                "params": [hex(current_block), False],
-            }).encode()
-            resp = _urllib_req.urlopen(_urllib_req.Request(
-                rpc, data=ts_req,
-                headers={"Content-Type": "application/json"},
-            ), timeout=10)
-            current_ts = int(json.loads(resp.read())["result"]["timestamp"], 16)
+            current_block = int(self._rpc_call(rpc, "eth_blockNumber", []), 16)
+            cur_block_data = self._rpc_call(
+                rpc, "eth_getBlockByNumber", [hex(current_block), False],
+            )
+            current_ts = int(cur_block_data["timestamp"], 16)
 
             # Convert round_start_ts to block number
             seconds_back = max(0, current_ts - round_start_ts)
@@ -327,50 +343,70 @@ class PoolEventWatcher:
             contract_lower = self._contract_addr.lower()
             count = 0
             blocks_with_bets = 0
+            blocks_failed = 0
+            reverted_txs = 0
+            receipt_fails = 0
+            total_blocks = current_block - from_block + 1
 
-            for bn in range(from_block, current_block + 1):
-                req = json.dumps({
-                    "jsonrpc": "2.0", "id": bn,
-                    "method": "eth_getBlockByNumber",
-                    "params": [hex(bn), True],
-                }).encode()
+            info("POOL_WSS", "BKFILL", "SCAN",
+                 msg=f"Scanning {total_blocks} blocks in batches of {_BATCH_SIZE} "
+                     f"({hex(from_block)}..{hex(current_block)})")
+
+            # Fetch blocks in batches
+            all_blocks = range(from_block, current_block + 1)
+            for batch_start in range(0, len(all_blocks), _BATCH_SIZE):
+                batch_bns = list(all_blocks[batch_start:batch_start + _BATCH_SIZE])
+                calls = [
+                    ("eth_getBlockByNumber", [hex(bn), True])
+                    for bn in batch_bns
+                ]
                 try:
-                    resp = _urllib_req.urlopen(_urllib_req.Request(
-                        rpc, data=req,
-                        headers={"Content-Type": "application/json"},
-                    ), timeout=10)
-                    block = json.loads(resp.read()).get("result")
-                    if not block:
-                        continue
+                    results = self._rpc_batch(rpc, calls)
                 except Exception:
+                    blocks_failed += len(batch_bns)
                     continue
 
-                block_ts = int(block["timestamp"], 16)
-                with self._lock:
-                    self._block_ts[bn] = block_ts
+                # Collect tx hashes that need receipt fetches
+                tx_candidates: list[tuple[int, dict]] = []  # (block_num, tx)
 
-                has_bet = False
-                for tx in block.get("transactions", []):
-                    to_addr = (tx.get("to") or "").lower()
-                    if to_addr != contract_lower:
+                for bn, block in zip(batch_bns, results):
+                    if not block:
+                        blocks_failed += 1
                         continue
-                    value_wei = int(tx.get("value", "0x0"), 16)
-                    if value_wei <= 0:
-                        continue  # not a bet (claim or other)
 
-                    # Fetch receipt to get the actual event logs
+                    block_ts = int(block["timestamp"], 16)
+                    with self._lock:
+                        self._block_ts[bn] = block_ts
+
+                    for tx in block.get("transactions", []):
+                        to_addr = (tx.get("to") or "").lower()
+                        if to_addr != contract_lower:
+                            continue
+                        value_wei = int(tx.get("value", "0x0"), 16)
+                        if value_wei <= 0:
+                            continue
+                        tx_candidates.append((bn, tx))
+
+                # Batch-fetch receipts for candidate transactions
+                if tx_candidates:
+                    rcpt_calls = [
+                        ("eth_getTransactionReceipt", [tx["hash"]])
+                        for _, tx in tx_candidates
+                    ]
                     try:
-                        rcpt_req = json.dumps({
-                            "jsonrpc": "2.0", "id": bn + 1000000,
-                            "method": "eth_getTransactionReceipt",
-                            "params": [tx["hash"]],
-                        }).encode()
-                        rcpt_resp = _urllib_req.urlopen(_urllib_req.Request(
-                            rpc, data=rcpt_req,
-                            headers={"Content-Type": "application/json"},
-                        ), timeout=10)
-                        receipt = json.loads(rcpt_resp.read()).get("result")
+                        rcpt_results = self._rpc_batch(rpc, rcpt_calls)
+                    except Exception:
+                        receipt_fails += len(rcpt_calls)
+                        continue
+
+                    bet_blocks: set[int] = set()
+                    for (bn, _tx), receipt in zip(tx_candidates, rcpt_results):
                         if not receipt:
+                            receipt_fails += 1
+                            continue
+                        status = int(receipt.get("status", "0x0"), 16)
+                        if status != 1:
+                            reverted_txs += 1
                             continue
                         for log in receipt.get("logs", []):
                             topics = log.get("topics", [])
@@ -379,17 +415,15 @@ class PoolEventWatcher:
                             if topics[0] in (_BET_BULL_TOPIC, _BET_BEAR_TOPIC):
                                 self._process_bet_event(log)
                                 count += 1
-                                has_bet = True
-                    except Exception:
-                        continue
-
-                if has_bet:
-                    blocks_with_bets += 1
+                                bet_blocks.add(bn)
+                    blocks_with_bets += len(bet_blocks)
 
             info("POOL_WSS", "BKFILL", "OK",
                  msg=f"Backfilled {count} bets from {blocks_with_bets} blocks "
-                     f"({hex(from_block)}..{hex(current_block)}, "
-                     f"{current_block - from_block} scanned)")
+                     f"({total_blocks} scanned, "
+                     f"{blocks_failed} block_fails, "
+                     f"{reverted_txs} reverted, "
+                     f"{receipt_fails} rcpt_fails)")
 
         except Exception as e:
             warn("POOL_WSS", "BKFILL", "FAIL", msg=f"{e}")
