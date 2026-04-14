@@ -54,6 +54,7 @@ class MomentumGateResult:
     skip_reason: str | None
     signal_strength: float = 0.0  # min(|r3|, |r7|, |r15|) for adaptive sizing
     eth_confirmation_strength: float = 0.0  # ETH min(|r|) when confirming BTC direction
+    sol_confirmation_strength: float = 0.0  # SOL min(|r|) when confirming BTC direction
 
 
 class MomentumGate:
@@ -250,6 +251,7 @@ def compute_signal_from_klines(
     btc_klines: list[list] | None,
     cutoff_ms: int,
     eth_klines: list[list] | None = None,
+    sol_klines: list[list] | None = None,
 ) -> MomentumGateResult:
     """Compute signal from raw kline arrays (backtest path).
 
@@ -261,6 +263,8 @@ def compute_signal_from_klines(
         btc_klines = _trim_to_window(btc_klines, cutoff_ms)
     if eth_klines is not None:
         eth_klines = _trim_to_window(eth_klines, cutoff_ms)
+    if sol_klines is not None:
+        sol_klines = _trim_to_window(sol_klines, cutoff_ms)
 
     bnb_reason = _validate_klines_raw(bnb_klines, cutoff_ms, "bnb")
     if bnb_reason is not None:
@@ -276,8 +280,11 @@ def compute_signal_from_klines(
     eth_closes = None
     if eth_klines and len(eth_klines) >= _CANDLE_COUNT:
         eth_closes = [k[4] for k in eth_klines]
+    sol_closes = None
+    if sol_klines and len(sol_klines) >= _CANDLE_COUNT:
+        sol_closes = [k[4] for k in sol_klines]
 
-    return _compute_signal(bnb_closes, btc_closes, eth_closes)
+    return _compute_signal(bnb_closes, btc_closes, eth_closes, sol_closes)
 
 
 def _trim_to_window(klines: list[list], cutoff_ms: int) -> list[list]:
@@ -290,14 +297,15 @@ def _compute_signal(
     bnb_closes: list[float],
     btc_closes: list[float] | None,
     eth_closes: list[float] | None = None,
+    sol_closes: list[float] | None = None,
 ) -> MomentumGateResult:
     """Core signal logic shared by live and backtest paths.
 
     Multi-TF BTC: all lookbacks (3, 7, 15) must agree in direction
     and min(|return|) must exceed _MTF_THRESH.
 
-    ETH confirmation: if ETH multi-TF also fires in the same direction,
-    eth_confirmation_strength is set to min(|eth_r|) for sizing boost.
+    ETH/SOL confirmation: if ETH or SOL multi-TF also fires in the same
+    direction, their confirmation strengths are set for sizing boost.
     """
     if btc_closes is None:
         return MomentumGateResult(
@@ -331,15 +339,22 @@ def _compute_signal(
 
     direction = "Bull" if returns[0] > 0 else "Bear"
 
-    # Check ETH confirmation for sizing boost
+    # Check ETH/SOL confirmation for sizing boost
+    btc_positive = returns[0] > 0
+
     eth_strength = 0.0
     if eth_closes is not None:
         eth_rets = [_get_return(eth_closes, lb) for lb in _MTF_LOOKBACKS]
         if all(r is not None for r in eth_rets):
-            # ETH must agree with BTC direction on all timeframes
-            btc_positive = returns[0] > 0
             if all((r > 0) == btc_positive for r in eth_rets):
                 eth_strength = min(abs(r) for r in eth_rets)
+
+    sol_strength = 0.0
+    if sol_closes is not None:
+        sol_rets = [_get_return(sol_closes, lb) for lb in _MTF_LOOKBACKS]
+        if all(r is not None for r in sol_rets):
+            if all((r > 0) == btc_positive for r in sol_rets):
+                sol_strength = min(abs(r) for r in sol_rets)
 
     return MomentumGateResult(
         signal=direction, tier="multi_tf",
@@ -347,4 +362,5 @@ def _compute_signal(
         skip_reason=None,
         signal_strength=min_abs,
         eth_confirmation_strength=eth_strength,
+        sol_confirmation_strength=sol_strength,
     )
