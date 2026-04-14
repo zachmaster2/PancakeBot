@@ -1,17 +1,20 @@
-"""OKX dual-asset momentum gate.
+"""OKX multi-timeframe BTC momentum gate.
 
 Signal architecture:
 
-  BNB Acceleration
-    Two BNB 1s-return lookback pairs agree on direction and
-    max(|ret|) >= 0.0002.  Pairs tried in order: (7,10), (5,10), (5,7).
+  Multi-Timeframe BTC Agreement
+    BTC 3s, 7s, and 15s returns must ALL agree in direction AND
+    min(|r3|, |r7|, |r15|) >= threshold (default 0.0002).
 
-  BTC is used for confirmation/sizing only (btc_agrees / btc_disagrees),
-  not as a standalone signal trigger.
+    The signal strength (min_abs_return) is exposed for adaptive
+    bet sizing in the pipeline: stronger moves = larger bets.
+
+  BNB klines are still fetched (required by sync/backtest infrastructure)
+  but are NOT used for signal generation.
 
 Uses OKX public 1s candles (no auth required).
 
-Kline window: 40 contiguous 1s candles covering [lockAt-44, lockAt-4).
+Kline window: 31 contiguous 1s candles covering [lockAt-32, lockAt-2).
 The newest candle (index -1) has open_time = cutoff - 1 and its
 close_price is the price at cutoff.  Lookbacks use direct indexing:
 the price N seconds before cutoff is ``closes[-(N+1)]``.
@@ -28,11 +31,9 @@ from pancakebot.core.logging import info, warn
 # Number of 1s candles fetched and used by all modes (live, sync, backtest).
 _CANDLE_COUNT = 31
 
-# Tuned constants — these were optimized together; do not change independently.
-_ACCEL_PAIRS: list[tuple[int, int]] = [(7, 10), (5, 10), (5, 7)]
-_ACCEL_THRESH = 0.0002
-_BTC_LOOKBACK = 30
-_BTC_THRESH = 0.0003
+# Multi-TF BTC lookbacks — all must agree in direction.
+_MTF_LOOKBACKS = (3, 7, 15)
+_MTF_THRESH = 0.0002  # min(|r3|, |r7|, |r15|) must exceed this
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,10 +46,11 @@ class MomentumGateConfig:
 @dataclass(frozen=True, slots=True)
 class MomentumGateResult:
     signal: str | None       # "Bull", "Bear", or None
-    tier: str | None         # "accel" or "any+btc"
-    btc_agrees: bool
-    btc_disagrees: bool
+    tier: str | None         # "multi_tf"
+    btc_agrees: bool         # kept for interface compat (always True for MTF)
+    btc_disagrees: bool      # kept for interface compat (always False for MTF)
     skip_reason: str | None
+    signal_strength: float = 0.0  # min(|r3|, |r7|, |r15|) for adaptive sizing
 
 
 class MomentumGate:
@@ -227,25 +229,17 @@ def _log_no_signal(
     btc_closes: list[float] | None,
 ) -> None:
     """Log diagnostic when signal doesn't fire — shows why."""
-    bnb_price = bnb_closes[-1] if bnb_closes else 0.0
-    uniq = len(set(bnb_closes)) if bnb_closes else 0
-
-    max_ret = 0.0
-    for short, long in _ACCEL_PAIRS:
-        for lb in (short, long):
-            r = _get_return(bnb_closes, lb)
-            if r is not None:
-                max_ret = max(max_ret, abs(r))
-
-    btc_ret = _get_return(btc_closes, _BTC_LOOKBACK) if btc_closes else None
-    btc_str = f"{abs(btc_ret):.6f}" if btc_ret is not None else "N/A"
+    btc_rets = {}
+    if btc_closes:
+        for lb in _MTF_LOOKBACKS:
+            r = _get_return(btc_closes, lb)
+            btc_rets[lb] = f"{r:.7f}" if r is not None else "N/A"
 
     info("GATE", "DIAG", "NO_SIGNAL",
-         bnb=f"${bnb_price:.1f}",
-         max_ret=f"{max_ret:.7f}",
-         thresh=f"{_ACCEL_THRESH}",
-         uniq=uniq,
-         btc30=btc_str)
+         btc_r3=btc_rets.get(3, "N/A"),
+         btc_r7=btc_rets.get(7, "N/A"),
+         btc_r15=btc_rets.get(15, "N/A"),
+         thresh=f"{_MTF_THRESH}")
 
 
 def compute_signal_from_klines(
@@ -289,38 +283,43 @@ def _compute_signal(
 ) -> MomentumGateResult:
     """Core signal logic shared by live and backtest paths.
 
-    Takes pre-extracted close price arrays.  Lookbacks use direct
-    indexing: closes[-(N+1)] is the price N seconds before cutoff.
+    Multi-TF BTC: all lookbacks (3, 7, 15) must agree in direction
+    and min(|return|) must exceed _MTF_THRESH.
     """
-
-    # --- Tier 1: BNB Acceleration ---
-    for short, long in _ACCEL_PAIRS:
-        rs = _get_return(bnb_closes, short)
-        rl = _get_return(bnb_closes, long)
-        if rs and rl and rs != 0 and rl != 0 and (rs > 0) == (rl > 0):
-            if max(abs(rs), abs(rl)) >= _ACCEL_THRESH:
-                d = "Bull" if rs > 0 else "Bear"
-                btc_ag, btc_dis = _check_btc(btc_closes, d)
-                return MomentumGateResult(
-                    signal=d, tier="accel",
-                    btc_agrees=btc_ag, btc_disagrees=btc_dis,
-                    skip_reason=None,
-                )
-
-    return MomentumGateResult(
-        signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-        skip_reason="gate_no_signal",
-    )
-
-
-def _check_btc(
-    btc_closes: list[float] | None, bnb_dir: str,
-) -> tuple[bool, bool]:
-    """Check if BTC 30s return agrees/disagrees with BNB direction."""
     if btc_closes is None:
-        return False, False
-    btc_r = _get_return(btc_closes, _BTC_LOOKBACK)
-    if btc_r is None or abs(btc_r) < _BTC_THRESH:
-        return False, False
-    btc_dir = "Bull" if btc_r > 0 else "Bear"
-    return (btc_dir == bnb_dir, btc_dir != bnb_dir)
+        return MomentumGateResult(
+            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
+            skip_reason="gate_no_btc_klines",
+        )
+
+    returns = []
+    for lb in _MTF_LOOKBACKS:
+        r = _get_return(btc_closes, lb)
+        if r is None:
+            return MomentumGateResult(
+                signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
+                skip_reason="gate_no_signal",
+            )
+        returns.append(r)
+
+    # All must agree in direction
+    if not (all(r > 0 for r in returns) or all(r < 0 for r in returns)):
+        return MomentumGateResult(
+            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
+            skip_reason="gate_no_signal",
+        )
+
+    min_abs = min(abs(r) for r in returns)
+    if min_abs < _MTF_THRESH:
+        return MomentumGateResult(
+            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
+            skip_reason="gate_no_signal",
+        )
+
+    direction = "Bull" if returns[0] > 0 else "Bear"
+    return MomentumGateResult(
+        signal=direction, tier="multi_tf",
+        btc_agrees=True, btc_disagrees=False,
+        skip_reason=None,
+        signal_strength=min_abs,
+    )

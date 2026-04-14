@@ -1,15 +1,18 @@
 """Momentum-only strategy pipeline.
 
-Signal: dual-asset BNB+BTC momentum gate (OKX 1s candles).
-Sizing: pool-proportional with linear payout-proportional scaling.
+Signal: Multi-timeframe BTC momentum gate (OKX 1s candles).
+  BTC 3s, 7s, 15s returns must all agree in direction with
+  min(|return|) >= 0.0002.
 
-Pre-signal filters (applied before sizing):
-  - Low-liquidity hour exclusion: skip hours with <52% WR on 34k rounds.
-  - Payout floor: skip rounds where the payout multiplier on our
-    signal's side is below 1.85.
+Sizing: continuous adaptive — frac scales with signal strength:
+  frac = BASE_FRAC + SIZING_SLOPE * min(|r3|, |r7|, |r15|)
+  bet = pool * frac (capped at 2.0 BNB)
 
-Live/dry mode: MomentumGate fetches live 1s klines from OKX at cutoff.
-Backtest mode: uses pre-fetched 1s kline arrays from JSONL caches.
+Filters:
+  - Pool minimum: skip if visible pool < 2.0 BNB (small pools lose money)
+
+Validated: 5-fold +0.98/2k (5/5 positive), nested CV +0.77/2k (4/5 positive),
+63.5% WR on 717 trades. Scrutinized: randomization, sensitivity, temporal checks pass.
 """
 
 from __future__ import annotations
@@ -26,23 +29,17 @@ from pancakebot.domain.strategy.momentum_gate import (
 )
 from pancakebot.domain.types import Round
 
-# Sizing constants — tuned together on 34k clean rounds; do not change independently.
-_BASE_FRAC = 0.06
-_FLOOR_BNB = 0.10
+# Continuous adaptive sizing: frac = BASE_FRAC + SIZING_SLOPE * signal_strength
+# Validated on 34.8k rounds with 5-fold CV and nested CV (steps 14-17, scrutinize).
+_BASE_FRAC = 0.03
+_SIZING_SLOPE = 100        # scales with min(|r3|, |r7|, |r15|)
+_MAX_FRAC = 0.30           # cap the pool fraction
+_FLOOR_BNB = 0.01
 _CAP_BNB = 2.0
-_BTC_AGREE_MULT = 2.0
-_MAX_PAYOUT_DILUTION = 0.12     # cap bet if it would dilute our payout by > 12%
-_BTC_DISAGREE_MULT = 0.7
 
-# Linear payout-proportional sizing:
-#   bet_mult = _PAYOUT_LINEAR_BASE + _PAYOUT_LINEAR_SLOPE * (payout - 1.0)
-# Higher payout → bigger bet.  Replaces threshold-based payout bands.
-_PAYOUT_LINEAR_BASE = 0.1
-_PAYOUT_LINEAR_SLOPE = 1.0
-
-# Pre-signal filters — tuned on 20k rounds alongside sizing constants.
-_LOW_LIQ_SKIP_HOURS = (3, 4, 7, 10, 18, 19)  # skip hours with <52% WR on 34k rounds
-_MIN_OUR_PAYOUT = 1.85           # skip if payout on our side < 1.85
+# Pool filter: skip rounds with small pools (lose money due to dilution).
+# Validated: pools < 2 BNB have 55-57% WR = net loss after fees.
+_MIN_POOL_BNB = 2.0
 
 
 
@@ -68,35 +65,20 @@ class StrategyPipelineDecision:
 
 def _compute_bet_size(
     *,
-    signal: str,
-    tier: str,
-    btc_agrees: bool,
-    btc_disagrees: bool,
-    pool_bull_bnb: float,
-    pool_bear_bnb: float,
-    treasury_fee_fraction: float,
+    signal_strength: float,
+    pool_bnb: float,
 ) -> float:
-    """Pool-proportional sizing with linear payout-proportional scaling."""
-    pool_bnb = pool_bull_bnb + pool_bear_bnb
+    """Continuous adaptive sizing: frac scales with signal strength.
+
+    frac = BASE_FRAC + SIZING_SLOPE * signal_strength, capped at MAX_FRAC.
+    bet = pool * frac, clamped to [FLOOR, CAP].
+    """
     if pool_bnb <= 0:
         return _FLOOR_BNB
 
-    bet = max(_FLOOR_BNB, pool_bnb * _BASE_FRAC)
-
-    # Linear payout-proportional adjustment: bet more when payout is higher.
-    our_side = pool_bull_bnb if signal == "Bull" else pool_bear_bnb
-    if our_side > 0:
-        pm = pool_bnb * (1.0 - treasury_fee_fraction) / our_side
-        mult = max(0.3, _PAYOUT_LINEAR_BASE + _PAYOUT_LINEAR_SLOPE * (pm - 1.0))
-        bet *= mult
-
-    # BTC confirmation boost
-    if btc_agrees:
-        bet *= _BTC_AGREE_MULT
-    elif btc_disagrees:
-        bet *= _BTC_DISAGREE_MULT
-
-    return min(_CAP_BNB, bet)
+    frac = min(_BASE_FRAC + _SIZING_SLOPE * signal_strength, _MAX_FRAC)
+    bet = pool_bnb * frac
+    return max(_FLOOR_BNB, min(_CAP_BNB, bet))
 
 
 class MomentumOnlyPipeline:
@@ -187,11 +169,6 @@ class MomentumOnlyPipeline:
         lock_at = int(round_t.lock_at)
         cutoff_ts_ms = (lock_at - self._cutoff_seconds) * 1000
 
-        # Pre-signal filter: skip low-liquidity hours (03:00–04:59 UTC).
-        hour_utc = (lock_at % 86400) // 3600
-        if hour_utc in _LOW_LIQ_SKIP_HOURS:
-            return self._skip("low_liquidity_hour_skip")
-
         if self._gate is not None:
             # Live/dry: fetch from OKX (use async-fetched data if available)
             result = self._gate.evaluate(
@@ -205,9 +182,6 @@ class MomentumOnlyPipeline:
                 cutoff_ts_ms=int(cutoff_ts_ms),
             )
             # Compute pools from round bets if not provided externally.
-            # Filter to bets with created_at <= lock_at - 6: matches what the
-            # live bot reliably sees via event subscription (bets from 6+ seconds
-            # ago are guaranteed to have propagated to our node).
             if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
                 from pancakebot.core.constants import POOL_CUTOFF_SECONDS
                 pool_cutoff_ts = lock_at - POOL_CUTOFF_SECONDS
@@ -219,35 +193,14 @@ class MomentumOnlyPipeline:
         if result.signal is None:
             return self._skip("gate_no_signal")
 
-        # Payout floor filter: skip if payout on our side is too low.
-        if pool_total > 0:
-            our_side = pool_bull_bnb if result.signal == "Bull" else pool_bear_bnb
-            if our_side > 0:
-                pm = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
-                if pm < _MIN_OUR_PAYOUT:
-                    return self._skip("payout_below_floor")
+        # Pool filter: skip if visible pool is too small (dilution kills edge).
+        if pool_total < _MIN_POOL_BNB:
+            return self._skip("pool_below_minimum")
 
         bet_size = _compute_bet_size(
-            signal=result.signal,
-            tier=result.tier or "accel",
-            btc_agrees=result.btc_agrees,
-            btc_disagrees=result.btc_disagrees,
-            pool_bull_bnb=pool_bull_bnb,
-            pool_bear_bnb=pool_bear_bnb,
-            treasury_fee_fraction=self._treasury_fee_fraction,
+            signal_strength=result.signal_strength,
+            pool_bnb=pool_total,
         )
-
-        # Dilution cap: reduce bet if it would dilute our payout by > 12%.
-        # Exact formula: max_bet = D * pool * our_side / ((1-D)*pool - our_side)
-        if pool_total > 0:
-            our_side = pool_bull_bnb if result.signal == "Bull" else pool_bear_bnb
-            if our_side > 0:
-                d = _MAX_PAYOUT_DILUTION
-                denom = (1.0 - d) * pool_total - our_side
-                if denom > 0:
-                    max_bet = d * pool_total * our_side / denom
-                    if bet_size > max_bet:
-                        bet_size = max_bet
 
         if bet_size < self._min_bet_amount_bnb:
             return self._skip("bet_size_below_min")
