@@ -11,6 +11,7 @@ pattern.
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -32,9 +33,27 @@ _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 
 _OKX_BASE = "https://www.okx.com"
 _KLINES_PER_ROUND = 31  # Must match momentum_gate._CANDLE_COUNT
-_FETCH_WORKERS = 4      # concurrent OKX fetches per asset (8 total with both assets)
+_FETCH_WORKERS = 4      # concurrent OKX fetches per batch
 _FETCH_RETRIES = 3      # retry failed OKX requests
 _RETRY_DELAY_S = 1.0    # base delay between retries (doubles each attempt)
+
+# Global rate limiter: OKX allows 20 req/2s per endpoint per IP = 10/s.
+# All sync threads share this to avoid 429 errors.
+_OKX_RATE_LIMIT_PER_SEC = 8  # safely under 10/s
+_rate_lock = threading.Lock()
+_rate_last = 0.0
+
+
+def _rate_acquire() -> None:
+    """Block until we can make another OKX request without exceeding rate limit."""
+    global _rate_last
+    min_interval = 1.0 / _OKX_RATE_LIMIT_PER_SEC
+    with _rate_lock:
+        now = time.monotonic()
+        wait = _rate_last + min_interval - now
+        if wait > 0:
+            time.sleep(wait)
+        _rate_last = time.monotonic()
 
 _SPOT_KLINES_PATH = Path("var/cutoff_spot_prices.jsonl")
 _BTC_KLINES_PATH = Path("var/btc_spot_prices.jsonl")
@@ -117,10 +136,9 @@ def sync_runtime_market_data(
     sol_store = KlineStore(str(_SOL_KLINES_PATH))
 
     cutoff_s = int(cfg.cutoff_seconds)
-    # Sync in pairs of 2 to stay under OKX rate limit (20 req/2s per endpoint).
-    # Each _sync_1s_klines uses _FETCH_WORKERS=4 internal threads, so
-    # 2 pairs × 4 workers = 8 concurrent requests (safely under 10/s).
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    # All 4 pairs run in parallel — the shared _rate_acquire() limiter
+    # throttles total OKX requests to 8/s across all threads.
+    with ThreadPoolExecutor(max_workers=4) as pool:
         spot_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="BNB-USDT",
@@ -131,11 +149,6 @@ def sync_runtime_market_data(
             rounds=tail_rounds, inst_id="BTC-USDT",
             store=btc_store, label="BTC", cutoff_seconds=cutoff_s,
         )
-        spot_synced = spot_fut.result()
-        btc_synced = btc_fut.result()
-
-    # Second batch: ETH + SOL (after BNB + BTC finish).
-    with ThreadPoolExecutor(max_workers=2) as pool:
         eth_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="ETH-USDT",
@@ -146,6 +159,8 @@ def sync_runtime_market_data(
             rounds=tail_rounds, inst_id="SOL-USDT",
             store=sol_store, label="SOL", cutoff_seconds=cutoff_s,
         )
+        spot_synced = spot_fut.result()
+        btc_synced = btc_fut.result()
         eth_fut.result()
         sol_fut.result()
 
@@ -527,6 +542,7 @@ def _fetch_1s_klines(*, inst_id: str, anchor_ms: int) -> list[list] | None:
             f"&after={after_ms}"
         )
         for attempt in range(_FETCH_RETRIES):
+            _rate_acquire()
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "PancakeBot/1.0"})
                 with urllib.request.urlopen(req, timeout=10) as resp:
