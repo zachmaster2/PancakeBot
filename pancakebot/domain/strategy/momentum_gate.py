@@ -33,7 +33,7 @@ _CANDLE_COUNT = 31
 
 # Multi-TF BTC lookbacks — all must agree in direction.
 _MTF_LOOKBACKS = (3, 7, 15)
-_MTF_THRESH = 0.0002  # min(|r3|, |r7|, |r15|) must exceed this
+_MTF_THRESH = 0.0001  # min(|r3|, |r7|, |r15|) must exceed this
 
 
 @dataclass(frozen=True, slots=True)

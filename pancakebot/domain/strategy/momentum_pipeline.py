@@ -10,9 +10,10 @@ Sizing: continuous adaptive — frac scales with signal strength:
 
 Filters:
   - Pool minimum: skip if visible pool < 2.0 BNB (small pools lose money)
+  - Payout floor: skip if payout on our side < 1.5 (crowd-agreeing rounds lose)
 
-Validated: 5-fold +1.76/2k (5/5 positive), nested CV 5/5 positive,
-63.5% WR on 717 trades. Scrutinized: randomization, sensitivity, temporal checks pass.
+Validated: 5-fold +2.21/2k (5/5 positive), nested CV +1.59/2k (4/5 positive).
+Scrutinized: randomization, sensitivity, temporal stability checks pass.
 """
 
 from __future__ import annotations
@@ -32,10 +33,12 @@ from pancakebot.domain.types import Round
 # Continuous adaptive sizing with payout boost.
 # Signal strength sizing: frac = BASE_FRAC + SIZING_SLOPE * signal_strength
 # Payout boost: frac *= max(0.5, 1.0 + PAYOUT_SLOPE * (payout - 2.0))
-# Validated: 5-fold +1.76/2k (5/5 positive), nested CV 5/5 positive.
+# Payout floor: skip rounds where payout on our side < MIN_PAYOUT.
+# Validated: 5-fold +2.21/2k (5/5 positive), nested CV +1.59/2k (4/5 positive).
 _BASE_FRAC = 0.03
 _SIZING_SLOPE = 100        # scales with min(|r3|, |r7|, |r15|)
 _PAYOUT_SLOPE = 1.0        # bet more when our side has high payout
+_MIN_PAYOUT = 1.5          # skip if payout on our side < this
 _MAX_FRAC = 0.30           # cap the pool fraction
 _FLOOR_BNB = 0.01
 _CAP_BNB = 2.0
@@ -213,6 +216,12 @@ class MomentumOnlyPipeline:
             return self._skip("pool_below_minimum")
 
         our_side = pool_bull_bnb if result.signal == "Bull" else pool_bear_bnb
+
+        # Payout floor: skip if payout on our side is too low.
+        if our_side > 0 and pool_total > 0:
+            payout = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
+            if payout < _MIN_PAYOUT:
+                return self._skip("payout_below_floor")
         bet_size = _compute_bet_size(
             signal_strength=result.signal_strength,
             pool_bnb=pool_total,
