@@ -175,7 +175,7 @@ def main():
     print(f"Loaded {len(rounds_map)} rounds from closed_rounds.jsonl")
 
     pairs = [
-        ("BNB", "var/cutoff_spot_prices.jsonl"),
+        ("BNB", "var/bnb_spot_prices.jsonl"),
         ("BTC", "var/btc_spot_prices.jsonl"),
         ("ETH", "var/eth_spot_prices.jsonl"),
         ("SOL", "var/sol_spot_prices.jsonl"),

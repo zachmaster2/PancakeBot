@@ -55,8 +55,10 @@ class RunSyncModeTests(unittest.TestCase):
                 stored_closed_round_count=100,
                 earliest_closed_epoch=1,
                 latest_closed_epoch=100,
-                spot_klines_synced=50,
+                bnb_klines_synced=50,
                 btc_klines_synced=50,
+                eth_klines_synced=50,
+                sol_klines_synced=50,
             )
             run_from_config(config_path="config.toml", dry=False, backtest=False, sync=True)
 

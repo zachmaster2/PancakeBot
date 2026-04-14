@@ -34,7 +34,7 @@ def load_data():
             if rec.get("klines_1s") is not None:
                 out[int(rec["epoch"])] = rec["klines_1s"]
         return out
-    return rounds, load_kl("var/cutoff_spot_prices.jsonl"), load_kl("var/btc_spot_prices.jsonl")
+    return rounds, load_kl("var/bnb_spot_prices.jsonl"), load_kl("var/btc_spot_prices.jsonl")
 
 
 def simulate(rounds, spot, btc, *, base_frac=0.06, floor_bnb=0.10, cap_bnb=2.0,

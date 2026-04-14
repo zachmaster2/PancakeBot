@@ -1,7 +1,7 @@
 """Backtest runner — momentum-only offline replay.
 
 Iterates closed rounds in chronological order, runs MomentumOnlyPipeline
-(no live OKX gate; uses cached 1s spot klines instead), and settles each
+(no live OKX gate; uses cached 1s klines instead), and settles each
 bet against the closed-round pool data from closed_rounds.jsonl.
 """
 from __future__ import annotations
@@ -20,8 +20,8 @@ from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline
 from pancakebot.domain.types import Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
-_SPOT_KLINES_PATH = Path("var/cutoff_spot_prices.jsonl")
-_BTC_SPOT_KLINES_PATH = Path("var/btc_spot_prices.jsonl")
+_BNB_KLINES_PATH = Path("var/bnb_spot_prices.jsonl")
+_BTC_KLINES_PATH = Path("var/btc_spot_prices.jsonl")
 _ETH_KLINES_PATH = Path("var/eth_spot_prices.jsonl")
 _SOL_KLINES_PATH = Path("var/sol_spot_prices.jsonl")
 
@@ -57,7 +57,7 @@ def _load_all_rounds(runtime_cfg) -> list[Round]:
     raise InvariantError("backtest_no_round_store_available")
 
 
-def _load_spot_klines_from(path: Path) -> dict[int, list[list]]:
+def _load_klines_from(path: Path) -> dict[int, list[list]]:
     """Load pre-fetched 1s kline arrays from a JSONL file.
 
     Returns {epoch: [[ts_ms, o, h, l, c, vol], ...]} for epochs that
@@ -127,26 +127,26 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
         ),
     )
 
-    # Load pre-fetched 1s spot klines for honest backtest signal.
-    spot_klines = _load_spot_klines_from(_SPOT_KLINES_PATH)
-    if spot_klines:
-        info("BACK", "SETUP", "SPOT_KL", msg=f"Loaded BNB 1s spot klines for {len(spot_klines)} epochs")
+    # Load pre-fetched 1s klines for honest backtest signal.
+    bnb_klines = _load_klines_from(_BNB_KLINES_PATH)
+    if bnb_klines:
+        info("BACK", "SETUP", "BNB_KL", msg=f"Loaded BNB 1s klines for {len(bnb_klines)} epochs")
     else:
-        info("BACK", "SETUP", "SPOT_KL", msg="No BNB spot klines found — backtest will skip all rounds")
+        info("BACK", "SETUP", "BNB_KL", msg="No BNB klines found — backtest will skip all rounds")
 
-    btc_klines = _load_spot_klines_from(_BTC_SPOT_KLINES_PATH)
+    btc_klines = _load_klines_from(_BTC_KLINES_PATH)
     if btc_klines:
-        info("BACK", "SETUP", "BTC_KL", msg=f"Loaded BTC 1s spot klines for {len(btc_klines)} epochs")
+        info("BACK", "SETUP", "BTC_KL", msg=f"Loaded BTC 1s klines for {len(btc_klines)} epochs")
 
-    eth_klines = _load_spot_klines_from(_ETH_KLINES_PATH) if _ETH_KLINES_PATH.exists() else {}
+    eth_klines = _load_klines_from(_ETH_KLINES_PATH) if _ETH_KLINES_PATH.exists() else {}
     if eth_klines:
-        info("BACK", "SETUP", "ETH_KL", msg=f"Loaded ETH 1s spot klines for {len(eth_klines)} epochs")
+        info("BACK", "SETUP", "ETH_KL", msg=f"Loaded ETH 1s klines for {len(eth_klines)} epochs")
 
-    sol_klines = _load_spot_klines_from(_SOL_KLINES_PATH) if _SOL_KLINES_PATH.exists() else {}
+    sol_klines = _load_klines_from(_SOL_KLINES_PATH) if _SOL_KLINES_PATH.exists() else {}
     if sol_klines:
-        info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s spot klines for {len(sol_klines)} epochs")
+        info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s klines for {len(sol_klines)} epochs")
 
-    # Build momentum pipeline (no live gate — backtest uses cached 1s spot klines).
+    # Build momentum pipeline (no live gate — backtest uses cached 1s klines).
     from pancakebot.domain.strategy.momentum_gate import MomentumGateConfig
     gate_config: MomentumGateConfig = runtime_cfg.momentum_gate_config  # type: ignore[assignment]
     pipeline = MomentumOnlyPipeline(
@@ -156,7 +156,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
         min_bet_amount_bnb=runtime_cfg.min_bet_amount_bnb,
         treasury_fee_fraction=runtime_cfg.treasury_fee_fraction,
     )
-    pipeline.refresh_spot_klines(spot_klines_by_epoch=spot_klines)
+    pipeline.refresh_bnb_klines(bnb_klines_by_epoch=bnb_klines)
     pipeline.refresh_btc_klines(btc_klines_by_epoch=btc_klines)
     pipeline.refresh_eth_klines(eth_klines_by_epoch=eth_klines)
     pipeline.refresh_sol_klines(sol_klines_by_epoch=sol_klines)

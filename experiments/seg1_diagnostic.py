@@ -28,7 +28,7 @@ def main():
                 out[int(rec["epoch"])] = rec["klines_1s"]
         return out
 
-    spot = load_kl("var/cutoff_spot_prices.jsonl")
+    spot = load_kl("var/bnb_spot_prices.jsonl")
     btc_kl = load_kl("var/btc_spot_prices.jsonl")
 
     gate_cfg = MomentumGateConfig(enabled=True, symbol="BNB-USDT", btc_symbol="BTC-USDT")
@@ -36,7 +36,7 @@ def main():
         config=gate_cfg, gate=None, cutoff_seconds=4,
         min_bet_amount_bnb=0.001, treasury_fee_fraction=0.03,
     )
-    pipe.refresh_spot_klines(spot_klines_by_epoch=spot)
+    pipe.refresh_bnb_klines(bnb_klines_by_epoch=spot)
     pipe.refresh_btc_klines(btc_klines_by_epoch=btc_kl)
 
     bankroll = 50.0

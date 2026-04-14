@@ -34,7 +34,7 @@ def main():
     print(f"Closed rounds: {len(round_epochs)} epochs, range [{min(round_epochs)}..{max(round_epochs)}]")
 
     for label, current_path, bak_path in [
-        ("BNB spot", "var/cutoff_spot_prices.jsonl", "var/cutoff_spot_prices.jsonl.bak"),
+        ("BNB spot", "var/bnb_spot_prices.jsonl", "var/bnb_spot_prices.jsonl.bak"),
         ("BTC spot", "var/btc_spot_prices.jsonl", "var/btc_spot_prices.jsonl.bak"),
     ]:
         print(f"\n=== {label} ===")

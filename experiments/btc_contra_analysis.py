@@ -27,7 +27,7 @@ def main():
                 out[int(rec["epoch"])] = rec["klines_1s"]
         return out
 
-    spot = load_kl("var/cutoff_spot_prices.jsonl")
+    spot = load_kl("var/bnb_spot_prices.jsonl")
     btc_kl = load_kl("var/btc_spot_prices.jsonl")
 
     LOW_LIQ_HOURS = (3, 4, 7, 10, 18, 19)

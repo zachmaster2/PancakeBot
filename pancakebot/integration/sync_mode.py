@@ -55,7 +55,7 @@ def _rate_acquire() -> None:
             time.sleep(wait)
         _rate_last = time.monotonic()
 
-_SPOT_KLINES_PATH = Path("var/cutoff_spot_prices.jsonl")
+_BNB_KLINES_PATH = Path("var/bnb_spot_prices.jsonl")
 _BTC_KLINES_PATH = Path("var/btc_spot_prices.jsonl")
 _ETH_KLINES_PATH = Path("var/eth_spot_prices.jsonl")
 _SOL_KLINES_PATH = Path("var/sol_spot_prices.jsonl")
@@ -68,8 +68,10 @@ class SyncSummary:
     stored_closed_round_count: int
     earliest_closed_epoch: int
     latest_closed_epoch: int
-    spot_klines_synced: int
+    bnb_klines_synced: int
     btc_klines_synced: int
+    eth_klines_synced: int
+    sol_klines_synced: int
 
 
 def sync_runtime_market_data(
@@ -130,7 +132,7 @@ def sync_runtime_market_data(
     # Phase 2: Sync BNB + BTC 1s klines in parallel (anchored at lockAt).
     tail_rounds = rounds_all[-cache_n:]
 
-    spot_store = KlineStore(str(_SPOT_KLINES_PATH))
+    bnb_store = KlineStore(str(_BNB_KLINES_PATH))
     btc_store = KlineStore(str(_BTC_KLINES_PATH))
     eth_store = KlineStore(str(_ETH_KLINES_PATH))
     sol_store = KlineStore(str(_SOL_KLINES_PATH))
@@ -139,10 +141,10 @@ def sync_runtime_market_data(
     # All 4 pairs run in parallel — the shared _rate_acquire() limiter
     # throttles total OKX requests to 8/s across all threads.
     with ThreadPoolExecutor(max_workers=4) as pool:
-        spot_fut = pool.submit(
+        bnb_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="BNB-USDT",
-            store=spot_store, label="BNB", cutoff_seconds=cutoff_s,
+            store=bnb_store, label="BNB", cutoff_seconds=cutoff_s,
         )
         btc_fut = pool.submit(
             _sync_1s_klines,
@@ -159,16 +161,16 @@ def sync_runtime_market_data(
             rounds=tail_rounds, inst_id="SOL-USDT",
             store=sol_store, label="SOL", cutoff_seconds=cutoff_s,
         )
-        spot_synced = spot_fut.result()
+        bnb_synced = bnb_fut.result()
         btc_synced = btc_fut.result()
-        eth_fut.result()
-        sol_fut.result()
+        eth_synced = eth_fut.result()
+        sol_synced = sol_fut.result()
 
     # Phase 3: Integrity — trim all stores to the exact intersection so
     # every closed round has klines in ALL 4 stores.  Retry transient
     # failures first, then trim any epochs that genuinely have no data.
     all_stores = [
-        ("BNB-USDT", spot_store, "BNB-retry"),
+        ("BNB-USDT", bnb_store, "BNB-retry"),
         ("BTC-USDT", btc_store, "BTC-retry"),
         ("ETH-USDT", eth_store, "ETH-retry"),
         ("SOL-USDT", sol_store, "SOL-retry"),
@@ -206,11 +208,16 @@ def sync_runtime_market_data(
     trimmed_rounds = len(all_round_epochs) - len(valid_epochs)
     if trimmed_rounds > 0:
         _trim_closed_rounds(round_store, valid_epochs)
-    for _, store, _ in all_stores:
+        info("CORE", "SYNC", "TRIM",
+             msg=f"Trimmed closed_rounds: {len(all_round_epochs)} -> {len(valid_epochs)}")
+    for inst_id, store, _ in all_stores:
         store_epochs = store.load_done_epochs()
         trimmed = len(store_epochs) - len(valid_epochs)
         if trimmed > 0:
             _trim_kline_store(store, valid_epochs)
+            label = inst_id.split("-")[0]  # "BNB-USDT" -> "BNB"
+            info("CORE", "SYNC", "TRIM",
+                 msg=f"Trimmed {label} klines: {len(store_epochs)} -> {len(valid_epochs)}")
 
     # Re-read final state after any trimming.
     final_rounds = list(round_store.iter_closed_rounds())
@@ -242,8 +249,10 @@ def sync_runtime_market_data(
         stored_closed_round_count=int(stored_closed_round_count),
         earliest_closed_epoch=int(earliest_closed_epoch),
         latest_closed_epoch=int(latest_closed_epoch),
-        spot_klines_synced=int(spot_synced),
+        bnb_klines_synced=int(bnb_synced),
         btc_klines_synced=int(btc_synced),
+        eth_klines_synced=int(eth_synced),
+        sol_klines_synced=int(sol_synced),
     )
 
 

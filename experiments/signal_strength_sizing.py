@@ -33,7 +33,7 @@ def main():
                 out[int(rec["epoch"])] = rec["klines_1s"]
         return out
 
-    spot = load_kl("var/cutoff_spot_prices.jsonl")
+    spot = load_kl("var/bnb_spot_prices.jsonl")
     btc_kl = load_kl("var/btc_spot_prices.jsonl")
 
     # Collect per-trade signal strength data

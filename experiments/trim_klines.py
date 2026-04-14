@@ -24,7 +24,7 @@ def main():
     rounds = {int(r.epoch): r for r in store.iter_closed_rounds()}
     print(f"Loaded {len(rounds)} rounds")
 
-    for label, path in [("BNB spot", "var/cutoff_spot_prices.jsonl"),
+    for label, path in [("BNB spot", "var/bnb_spot_prices.jsonl"),
                          ("BTC spot", "var/btc_spot_prices.jsonl")]:
         print(f"\n=== {label}: {path} ===")
         records = []
