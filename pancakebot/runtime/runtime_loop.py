@@ -95,8 +95,6 @@ class RuntimeConfig:
         dry_audit_trades_path="var/runtime/dry_audit_trades.csv",
         dry_cycle_audit_path="var/runtime/dry_cycle_audit.csv",
         dry_bankroll_state_path="var/runtime/dry_bankroll_state.json",
-        dry_pipeline_bootstrap_state_path="var/runtime/dry_pipeline_bootstrap_state.pkl.gz",
-        live_pipeline_bootstrap_state_path="var/runtime/live_pipeline_bootstrap_state.pkl.gz",
     )
 
 
@@ -125,7 +123,6 @@ def _dry_runtime_state_files(paths: RuntimeStatePathsConfig) -> list[Path]:
         Path(paths.dry_audit_trades_path),
         Path(paths.dry_cycle_audit_path),
         Path(paths.dry_bankroll_state_path),
-        Path(paths.dry_pipeline_bootstrap_state_path),
     ]
 
 

@@ -41,7 +41,7 @@ _MTF_THRESH = 0.0001
 @dataclass(frozen=True, slots=True)
 class MomentumGateConfig:
     enabled: bool
-    symbol: str              # "BNB-USDT"
+    bnb_symbol: str          # "BNB-USDT"
     btc_symbol: str          # "BTC-USDT"
     eth_symbol: str = "ETH-USDT"
     sol_symbol: str = "SOL-USDT"
@@ -103,7 +103,7 @@ class MomentumGate:
         if not self._cfg.enabled:
             return None
         pool = ThreadPoolExecutor(max_workers=4)
-        bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, _CANDLE_COUNT, cutoff_ts_ms)
+        bnb_fut = pool.submit(self._fetch_klines, self._cfg.bnb_symbol, _CANDLE_COUNT, cutoff_ts_ms)
         btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _CANDLE_COUNT, cutoff_ts_ms)
         eth_fut = pool.submit(self._fetch_klines, self._cfg.eth_symbol, _CANDLE_COUNT, cutoff_ts_ms)
         sol_fut = pool.submit(self._fetch_klines, self._cfg.sol_symbol, _CANDLE_COUNT, cutoff_ts_ms)
@@ -139,7 +139,7 @@ class MomentumGate:
             sol_klines = kline_futures[3].result() if len(kline_futures) > 3 else None
         else:
             with ThreadPoolExecutor(max_workers=4) as pool:
-                bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, _CANDLE_COUNT, cutoff_ts_ms)
+                bnb_fut = pool.submit(self._fetch_klines, self._cfg.bnb_symbol, _CANDLE_COUNT, cutoff_ts_ms)
                 btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _CANDLE_COUNT, cutoff_ts_ms)
                 eth_fut = pool.submit(self._fetch_klines, self._cfg.eth_symbol, _CANDLE_COUNT, cutoff_ts_ms)
                 sol_fut = pool.submit(self._fetch_klines, self._cfg.sol_symbol, _CANDLE_COUNT, cutoff_ts_ms)

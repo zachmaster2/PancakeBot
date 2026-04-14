@@ -62,8 +62,6 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                 dry_audit_trades_path=str(runtime_dir / "dry_audit_trades.csv"),
                 dry_cycle_audit_path=str(runtime_dir / "dry_cycle_audit.csv"),
                 dry_bankroll_state_path=str(runtime_dir / "dry_bankroll_state.json"),
-                dry_pipeline_bootstrap_state_path=str(runtime_dir / "dry_pipeline.pkl.gz"),
-                live_pipeline_bootstrap_state_path=str(runtime_dir / "live_pipeline.pkl.gz"),
             )
 
             with patch("pancakebot.runtime.runtime_loop._DRY_RUNTIME_ARCHIVE_ROOT", archive_root):
@@ -92,8 +90,6 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                 dry_audit_trades_path=str(runtime_dir / "dry_audit_trades.csv"),
                 dry_cycle_audit_path=str(runtime_dir / "dry_cycle_audit.csv"),
                 dry_bankroll_state_path=str(runtime_dir / "dry_bankroll_state.json"),
-                dry_pipeline_bootstrap_state_path=str(runtime_dir / "dry_pipeline.pkl.gz"),
-                live_pipeline_bootstrap_state_path=str(runtime_dir / "live_pipeline.pkl.gz"),
             )
 
             with patch("pancakebot.runtime.runtime_loop._DRY_RUNTIME_ARCHIVE_ROOT", archive_root):
@@ -234,8 +230,6 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_audit_trades_path=str(dry_audit_path),
                     dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                     dry_bankroll_state_path=str(bankroll_state_path),
-                    dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
-                    live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
                 ),
                 contract=_WalletStub(55.0),
                 wallet_address="0xabc",
@@ -259,8 +253,6 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_audit_trades_path=str(root / "dry_audit.csv"),
                     dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                     dry_bankroll_state_path=str(root / "dry_bankroll_state.json"),
-                    dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
-                    live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
                 ),
                 contract=_WalletStub(61.75),
                 wallet_address="0xabc",
@@ -284,8 +276,6 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_audit_trades_path=str(root / "dry_audit.csv"),
                     dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                     dry_bankroll_state_path=str(root / "dry_bankroll_state.json"),
-                    dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
-                    live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
                 ),
                 contract=wallet,
                 wallet_address="0xabc",
@@ -310,8 +300,6 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_audit_trades_path=str(root / "dry_audit.csv"),
                     dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                     dry_bankroll_state_path=str(root / "dry_bankroll_state.json"),
-                    dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
-                    live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
                 ),
                 contract=_WalletStub(0.2333411609),
                 wallet_address="0xabc",
@@ -342,8 +330,6 @@ class RuntimeLoopDryStateTests(unittest.TestCase):
                     dry_audit_trades_path=str(root / "dry_audit.csv"),
                     dry_cycle_audit_path=str(root / "dry_cycle_audit.csv"),
                     dry_bankroll_state_path=str(bankroll_state_path),
-                    dry_pipeline_bootstrap_state_path=str(root / "dry_pipeline.pkl.gz"),
-                    live_pipeline_bootstrap_state_path=str(root / "live_pipeline.pkl.gz"),
                 ),
                 contract=_WalletStub(0.2333411609),
                 wallet_address="0xabc",

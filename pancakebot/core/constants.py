@@ -14,6 +14,11 @@ EXPECTED_CHAIN_ID = 56
 
 PREDICTION_V2_CONTRACT_ADDRESS = "0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA"
 
+# Protocol constants (verified on-chain at startup in live mode).
+# These are NOT user-tunable — they're set by the PancakeSwap contract.
+TREASURY_FEE_FRACTION = 0.03   # 3% of total pool taken as fee
+MIN_BET_AMOUNT_BNB = 0.001     # minimum bet accepted by the contract
+
 # The contract's treasury fee is expressed in basis points (bps).
 TREASURY_FEE_DIVISOR = 10_000
 

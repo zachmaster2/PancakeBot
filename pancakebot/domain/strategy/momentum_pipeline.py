@@ -178,15 +178,6 @@ class MomentumOnlyPipeline:
         """Set last_settled_epoch from the warmup batch. No ML state."""
         self.settle_closed_rounds(rounds=rounds)
 
-    def export_bootstrap_state(self) -> dict:
-        return {
-            "last_settled_epoch": self._last_settled_epoch,
-        }
-
-    def import_bootstrap_state(self, *, state: dict) -> None:
-        raw = state.get("last_settled_epoch")
-        self._last_settled_epoch = None if raw is None else int(raw)
-
     # ------------------------------------------------------------------
     # Core decision
     # ------------------------------------------------------------------
