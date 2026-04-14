@@ -133,6 +133,8 @@ class MomentumOnlyPipeline:
         # Backtest: 1s klines per epoch {epoch: [[ts_ms, o, h, l, c, vol], ...]}
         self._spot_klines_by_epoch: dict[int, list[list]] = {}
         self._btc_klines_by_epoch: dict[int, list[list]] = {}
+        self._eth_klines_by_epoch: dict[int, list[list]] = {}
+        self._sol_klines_by_epoch: dict[int, list[list]] = {}
 
     # ------------------------------------------------------------------
     # Required interface: StrategyPipeline-compatible
@@ -156,6 +158,14 @@ class MomentumOnlyPipeline:
     def refresh_btc_klines(self, *, btc_klines_by_epoch: dict[int, list[list]]) -> None:
         """Load pre-fetched BTC 1s kline arrays keyed by epoch (backtest mode)."""
         self._btc_klines_by_epoch = dict(btc_klines_by_epoch)
+
+    def refresh_eth_klines(self, *, eth_klines_by_epoch: dict[int, list[list]]) -> None:
+        """Load pre-fetched ETH 1s kline arrays keyed by epoch (backtest mode)."""
+        self._eth_klines_by_epoch = dict(eth_klines_by_epoch)
+
+    def refresh_sol_klines(self, *, sol_klines_by_epoch: dict[int, list[list]]) -> None:
+        """Load pre-fetched SOL 1s kline arrays keyed by epoch (backtest mode)."""
+        self._sol_klines_by_epoch = dict(sol_klines_by_epoch)
 
     def settle_closed_rounds(self, *, rounds: list[Round]) -> None:
         """Track the last settled epoch (no ML state to update)."""
@@ -273,7 +283,12 @@ class MomentumOnlyPipeline:
                 skip_reason="gate_no_spot_klines",
             )
         btc_klines = self._btc_klines_by_epoch.get(epoch)
-        return compute_signal_from_klines(bnb_klines, btc_klines, cutoff_ts_ms)
+        eth_klines = self._eth_klines_by_epoch.get(epoch)
+        sol_klines = self._sol_klines_by_epoch.get(epoch)
+        return compute_signal_from_klines(
+            bnb_klines, btc_klines, cutoff_ts_ms,
+            eth_klines=eth_klines, sol_klines=sol_klines,
+        )
 
     @staticmethod
     def _skip(reason: str) -> StrategyPipelineDecision:

@@ -310,15 +310,19 @@ def load_app_config(path: str) -> AppConfig:
     backtest_cfg.validate()
 
     _validate_unknown_keys("momentum_gate", momentum_gate_raw, {
-        "enabled", "symbol", "btc_symbol",
+        "enabled", "symbol", "btc_symbol", "eth_symbol", "sol_symbol",
     })
     mg_enabled = _opt_bool(momentum_gate_raw, "enabled", False)
     mg_symbol = _opt_str(momentum_gate_raw, "symbol", "BNB-USDT")
     mg_btc_symbol = _opt_str(momentum_gate_raw, "btc_symbol", "BTC-USDT")
+    mg_eth_symbol = _opt_str(momentum_gate_raw, "eth_symbol", "ETH-USDT")
+    mg_sol_symbol = _opt_str(momentum_gate_raw, "sol_symbol", "SOL-USDT")
     momentum_gate_cfg = MomentumGateConfig(
         enabled=mg_enabled,
         symbol=mg_symbol,
         btc_symbol=mg_btc_symbol,
+        eth_symbol=mg_eth_symbol,
+        sol_symbol=mg_sol_symbol,
     )
 
     return AppConfig(

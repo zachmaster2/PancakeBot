@@ -28,6 +28,8 @@ bet_receipt_timeout_seconds = 45
 enabled = true
 symbol = "BNB-USDT"
 btc_symbol = "BTC-USDT"
+eth_symbol = "ETH-USDT"
+sol_symbol = "SOL-USDT"
 
 [contract]
 # PancakeSwap Prediction V2 protocol constants.
