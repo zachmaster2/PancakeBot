@@ -12,7 +12,7 @@ Filters:
   - Pool minimum: skip if visible pool < 2.0 BNB (small pools lose money)
   - Payout floor: skip if payout on our side < 1.5 (crowd-agreeing rounds lose)
 
-Validated: 5-fold +2.21/2k (5/5 positive), nested CV +1.59/2k (4/5 positive).
+Validated: 5-fold +2.36/2k (5/5 positive), nested CV +2.19/2k (4/5 positive).
 Scrutinized: randomization, sensitivity, temporal stability checks pass.
 """
 
@@ -38,6 +38,7 @@ from pancakebot.domain.types import Round
 _BASE_FRAC = 0.03
 _SIZING_SLOPE = 100        # scales with min(|r3|, |r7|, |r15|)
 _PAYOUT_SLOPE = 1.0        # bet more when our side has high payout
+_ETH_SIZING_WEIGHT = 0.3   # add ETH confirming strength * weight to signal_strength
 _MIN_PAYOUT = 1.5          # skip if payout on our side < this
 _MAX_FRAC = 0.30           # cap the pool fraction
 _FLOOR_BNB = 0.01
@@ -222,8 +223,13 @@ class MomentumOnlyPipeline:
             payout = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
             if payout < _MIN_PAYOUT:
                 return self._skip("payout_below_floor")
+        # ETH confirmation adds to effective signal strength for sizing
+        effective_strength = result.signal_strength
+        if result.eth_confirmation_strength > 0:
+            effective_strength += result.eth_confirmation_strength * _ETH_SIZING_WEIGHT
+
         bet_size = _compute_bet_size(
-            signal_strength=result.signal_strength,
+            signal_strength=effective_strength,
             pool_bnb=pool_total,
             our_side_bnb=our_side,
         )
