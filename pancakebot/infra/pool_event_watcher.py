@@ -199,11 +199,6 @@ class PoolEventWatcher:
             info("POOL_WSS", "SUB", "OK",
                  msg=f"Subscribed to bet events + newHeads")
 
-            # Backfill: WSS subscription is now live, so backfill covers
-            # everything before connection. Dedup handles any overlap
-            # with events already received via subscription.
-            self._backfill_http()
-
             while not self._stop_event.is_set():
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
@@ -283,23 +278,22 @@ class PoolEventWatcher:
         with self._lock:
             self._block_ts[block_number] = timestamp
 
-    def _backfill_http(self) -> None:
-        """Backfill bets for the current round via HTTP eth_getLogs.
+    def backfill_round(self, round_start_ts: int) -> None:
+        """Backfill bets from round_start_ts to now via HTTP eth_getLogs.
 
-        Free BSC WebSocket nodes don't support eth_getLogs, so we use
-        1rpc.io/bnb via HTTP instead.  Block count is computed from
-        the round duration (INTERVAL_SECONDS / ~3s per BSC block).
+        Called by the runtime loop once it knows the current round's
+        timing (lock_at - INTERVAL_SECONDS). Converts timestamp to
+        block number using the current block rate, then fetches all
+        bet events from that block onward. Dedup prevents double-counting
+        with events already received via WSS subscription.
         """
         import urllib.request as _urllib_req
 
         _BACKFILL_RPC = "https://1rpc.io/bnb"
-        from pancakebot.core.constants import INTERVAL_SECONDS
-        # BSC produces blocks every ~3 seconds
-        # BSC block time is ~0.44s (verified). Use 0.5s as conservative estimate.
-        blocks_per_round = int(INTERVAL_SECONDS / 0.5) + 20  # ~620 blocks for 5 min
+        _BSC_BLOCK_TIME = 0.5  # conservative estimate (actual ~0.44s)
 
         try:
-            # Get current block
+            # Get current block + timestamp to compute target block
             bn_req = json.dumps({
                 "jsonrpc": "2.0", "id": 1,
                 "method": "eth_blockNumber", "params": [],
@@ -309,7 +303,22 @@ class PoolEventWatcher:
                 headers={"Content-Type": "application/json"},
             ), timeout=10)
             current_block = int(json.loads(resp.read())["result"], 16)
-            from_block = hex(max(0, current_block - blocks_per_round))
+
+            ts_req = json.dumps({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "eth_getBlockByNumber",
+                "params": [hex(current_block), False],
+            }).encode()
+            resp = _urllib_req.urlopen(_urllib_req.Request(
+                _BACKFILL_RPC, data=ts_req,
+                headers={"Content-Type": "application/json"},
+            ), timeout=10)
+            current_ts = int(json.loads(resp.read())["result"]["timestamp"], 16)
+
+            # Convert round_start_ts to block number
+            seconds_back = max(0, current_ts - round_start_ts)
+            blocks_back = int(seconds_back / _BSC_BLOCK_TIME) + 20  # margin
+            from_block = hex(max(0, current_block - blocks_back))
 
             # Fetch bet events
             logs_req = json.dumps({
