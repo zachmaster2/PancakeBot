@@ -165,22 +165,25 @@ def sync_runtime_market_data(
         sol_fut.result()
 
     # Phase 3: Integrity — trim all stores to the exact intersection so
-    # every closed round has klines in BOTH stores.  Retry transient
+    # every closed round has klines in ALL 4 stores.  Retry transient
     # failures first, then trim any epochs that genuinely have no data.
+    all_stores = [
+        ("BNB-USDT", spot_store, "BNB-retry"),
+        ("BTC-USDT", btc_store, "BTC-retry"),
+        ("ETH-USDT", eth_store, "ETH-retry"),
+        ("SOL-USDT", sol_store, "SOL-retry"),
+    ]
     _MAX_RETRY_PASSES = 3
 
     for retry_pass in range(_MAX_RETRY_PASSES):
-        spot_epochs = spot_store.load_done_epochs()
-        btc_epochs = btc_store.load_done_epochs()
-        covered_epochs = spot_epochs & btc_epochs
-
+        covered_epochs = set.intersection(*(s.load_done_epochs() for _, s, _ in all_stores))
         all_epochs = {int(r.epoch) for r in tail_rounds}
         uncovered = all_epochs - covered_epochs
         if not uncovered:
             break
 
         info(
-            "CORE", "SYNC", "INTEGRITY",
+            "CORE", "SYNC", "INTEG",
             msg=(
                 f"Retry pass {retry_pass + 1}/{_MAX_RETRY_PASSES}: "
                 f"{len(uncovered)} rounds still missing klines "
@@ -188,54 +191,44 @@ def sync_runtime_market_data(
             ),
         )
         uncovered_rounds = [r for r in tail_rounds if int(r.epoch) in uncovered]
-        _sync_1s_klines(
-            rounds=uncovered_rounds, inst_id="BNB-USDT",
-            store=spot_store, label="BNB-retry", cutoff_seconds=cutoff_s,
-        )
-        _sync_1s_klines(
-            rounds=uncovered_rounds, inst_id="BTC-USDT",
-            store=btc_store, label="BTC-retry", cutoff_seconds=cutoff_s,
-        )
+        for inst_id, store, label in all_stores:
+            _sync_1s_klines(
+                rounds=uncovered_rounds, inst_id=inst_id,
+                store=store, label=label, cutoff_seconds=cutoff_s,
+            )
 
-    # After retries, trim stores to the exact three-way intersection:
-    # every round must have klines in BOTH stores, and every kline must
-    # belong to an existing round.  Never trim data just because it's
-    # older than the simulation window — only trim records that genuinely
-    # fail integrity (missing counterpart in another store).
-    spot_epochs = spot_store.load_done_epochs()
-    btc_epochs = btc_store.load_done_epochs()
+    # After retries, trim stores to the exact 5-way intersection:
+    # every round must have klines in ALL stores.
     all_round_epochs = {int(r.epoch) for r in rounds_all}
-    valid_epochs = all_round_epochs & spot_epochs & btc_epochs
+    all_kline_epoch_sets = [s.load_done_epochs() for _, s, _ in all_stores]
+    valid_epochs = all_round_epochs & set.intersection(*all_kline_epoch_sets)
 
     trimmed_rounds = len(all_round_epochs) - len(valid_epochs)
-    trimmed_spot = len(spot_epochs) - len(valid_epochs)
-    trimmed_btc = len(btc_epochs) - len(valid_epochs)
-
     if trimmed_rounds > 0:
         _trim_closed_rounds(round_store, valid_epochs)
-    if trimmed_spot > 0:
-        _trim_kline_store(spot_store, valid_epochs)
-    if trimmed_btc > 0:
-        _trim_kline_store(btc_store, valid_epochs)
+    for _, store, _ in all_stores:
+        store_epochs = store.load_done_epochs()
+        trimmed = len(store_epochs) - len(valid_epochs)
+        if trimmed > 0:
+            _trim_kline_store(store, valid_epochs)
 
     # Re-read final state after any trimming.
     final_rounds = list(round_store.iter_closed_rounds())
-    final_spot = spot_store.load_done_epochs()
-    final_btc = btc_store.load_done_epochs()
     final_round_epochs = {int(r.epoch) for r in final_rounds}
-
-    if final_round_epochs != final_spot or final_round_epochs != final_btc:
-        raise InvariantError(
-            f"sync_integrity_mismatch: rounds={len(final_round_epochs)} "
-            f"spot={len(final_spot)} btc={len(final_btc)}"
-        )
+    for inst_id, store, _ in all_stores:
+        store_epochs = store.load_done_epochs()
+        if final_round_epochs != store_epochs:
+            raise InvariantError(
+                f"sync_integrity_mismatch: rounds={len(final_round_epochs)} "
+                f"{inst_id}={len(store_epochs)}"
+            )
 
     info(
-        "CORE", "SYNC", "INTEGRITY",
+        "CORE", "SYNC", "INTEG",
         msg=(
             f"Stores aligned: {len(final_round_epochs)} epochs "
             f"[{min(final_round_epochs)}..{max(final_round_epochs)}] "
-            f"(trimmed {trimmed_rounds} rounds, {trimmed_spot} spot, {trimmed_btc} btc)"
+            f"(trimmed {trimmed_rounds} rounds)"
         ),
     )
 
