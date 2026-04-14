@@ -165,12 +165,19 @@ class MomentumGate:
 
         result = _compute_signal(bnb_closes, btc_closes, eth_closes, sol_closes)
 
-        # Diagnostic: log why signal did/didn't fire so dry-run progress is visible
+        # Diagnostic: log signal details so dry-run progress is visible
         if result.signal is not None:
-            info("GATE", "SIGNAL", "FIRE", tier=result.tier, side=result.signal,
-                 btc_ag=result.btc_agrees)
+            info("GATE", "SIGNAL", "FIRE",
+                 side=result.signal,
+                 strength=f"{result.signal_strength:.6f}",
+                 eth_confirm=f"{result.eth_confirmation_strength:.6f}",
+                 sol_confirm=f"{result.sol_confirmation_strength:.6f}",
+                 bnb_ok=bnb_klines is not None,
+                 btc_ok=btc_closes is not None,
+                 eth_ok=eth_closes is not None,
+                 sol_ok=sol_closes is not None)
         else:
-            _log_no_signal(bnb_closes, btc_closes)
+            _log_no_signal(bnb_closes, btc_closes, eth_closes, sol_closes)
 
         return result
 
@@ -243,6 +250,8 @@ def _get_return(closes: list[float], lookback: int) -> float | None:
 def _log_no_signal(
     bnb_closes: list[float],
     btc_closes: list[float] | None,
+    eth_closes: list[float] | None = None,
+    sol_closes: list[float] | None = None,
 ) -> None:
     """Log diagnostic when signal doesn't fire — shows why."""
     btc_rets = {}
@@ -255,7 +264,11 @@ def _log_no_signal(
          btc_r3=btc_rets.get(3, "N/A"),
          btc_r7=btc_rets.get(7, "N/A"),
          btc_r15=btc_rets.get(15, "N/A"),
-         thresh=f"{_MTF_THRESH}")
+         thresh=f"{_MTF_THRESH}",
+         bnb_ok=bnb_closes is not None and len(bnb_closes) > 0,
+         btc_ok=btc_closes is not None,
+         eth_ok=eth_closes is not None,
+         sol_ok=sol_closes is not None)
 
 
 def compute_signal_from_klines(
