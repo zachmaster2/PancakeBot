@@ -57,6 +57,7 @@ class PoolEventWatcher:
         self._lock = threading.Lock()
         self._pools: dict[int, _EpochPool] = {}  # epoch -> pool
         self._block_ts: dict[int, int] = {}       # block_number -> timestamp
+        self._seen_tx: set[str] = set()            # dedup by tx hash + log index
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._connected = False
@@ -200,6 +201,10 @@ class PoolEventWatcher:
             info("POOL_WSS", "SUB", "OK",
                  msg=f"Subscribed to bet events + newHeads")
 
+            # Re-run backfill to cover gap between initial backfill and
+            # WSS subscription start. Dedup prevents double-counting.
+            self._backfill_http()
+
             while not self._stop_event.is_set():
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
@@ -247,7 +252,17 @@ class PoolEventWatcher:
         if amount_wei <= 0:
             return
 
+        # Dedup: use tx hash + log index to avoid double-counting
+        tx_hash = log.get("transactionHash", "")
+        log_idx = log.get("logIndex", "")
+        dedup_key = f"{tx_hash}:{log_idx}"
+
         with self._lock:
+            if dedup_key and dedup_key in self._seen_tx:
+                return
+            if dedup_key:
+                self._seen_tx.add(dedup_key)
+
             # Look up block timestamp if available
             block_ts = self._block_ts.get(block_number, 0)
 
