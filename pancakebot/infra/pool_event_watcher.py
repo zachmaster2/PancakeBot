@@ -200,68 +200,9 @@ class PoolEventWatcher:
 
             # Backfill: fetch recent bet events via eth_getLogs to catch
             # bets placed before we subscribed.  Covers the current open
-            # round (~5 min = ~100 BSC blocks at 3s each).
-            try:
-                # Get current block number
-                bn_req = json.dumps({
-                    "jsonrpc": "2.0", "id": 10,
-                    "method": "eth_blockNumber", "params": [],
-                })
-                await ws.send(bn_req)
-                bn_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-                if "result" in bn_resp:
-                    current_block = int(bn_resp["result"], 16)
-                    from_block = hex(max(0, current_block - 120))  # ~6 min of blocks
-
-                    backfill_req = json.dumps({
-                        "jsonrpc": "2.0", "id": 11,
-                        "method": "eth_getLogs",
-                        "params": [{
-                            "address": self._contract_addr,
-                            "topics": [[_BET_BULL_TOPIC, _BET_BEAR_TOPIC]],
-                            "fromBlock": from_block,
-                            "toBlock": "latest",
-                        }],
-                    })
-                    await ws.send(backfill_req)
-                    backfill_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-                    if "result" in backfill_resp and isinstance(backfill_resp["result"], list):
-                        # Collect unique block numbers to fetch timestamps
-                        blocks_needed = set()
-                        for log in backfill_resp["result"]:
-                            try:
-                                bn = int(log.get("blockNumber", "0x0"), 16)
-                                if bn > 0:
-                                    blocks_needed.add(bn)
-                            except ValueError:
-                                pass
-
-                        # Fetch block timestamps for backfilled events
-                        for bn in blocks_needed:
-                            try:
-                                ts_req = json.dumps({
-                                    "jsonrpc": "2.0", "id": 12,
-                                    "method": "eth_getBlockByNumber",
-                                    "params": [hex(bn), False],
-                                })
-                                await ws.send(ts_req)
-                                ts_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-                                if "result" in ts_resp and ts_resp["result"]:
-                                    block_ts = int(ts_resp["result"]["timestamp"], 16)
-                                    with self._lock:
-                                        self._block_ts[bn] = block_ts
-                            except Exception:
-                                pass
-
-                        count = 0
-                        for log in backfill_resp["result"]:
-                            self._process_bet_event(log)
-                            count += 1
-                        if count > 0:
-                            info("POOL_WSS", "BACKFILL", "OK",
-                                 msg=f"Backfilled {count} bet events from {len(blocks_needed)} blocks")
-            except Exception as e:
-                warn("POOL_WSS", "BACKFILL", "FAIL", msg=f"Backfill failed: {e}")
+            # round.  Uses _ws_rpc() to handle interleaved subscription
+            # events while waiting for RPC responses.
+            await self._backfill(ws, logs_sub_id, heads_resp["result"])
 
             while not self._stop_event.is_set():
                 try:
@@ -331,3 +272,86 @@ class PoolEventWatcher:
 
         with self._lock:
             self._block_ts[block_number] = timestamp
+
+    async def _ws_rpc(self, ws, req_id: int, method: str, params: list,
+                      logs_sub_id: str, heads_sub_id: str) -> dict | None:
+        """Send an RPC request and return its response, processing any
+        interleaved subscription events while waiting."""
+        req = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        await ws.send(req)
+        for _ in range(50):  # max 50 messages before giving up
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            msg = json.loads(raw)
+            if "id" in msg and msg["id"] == req_id:
+                return msg  # our RPC response
+            # Subscription event — process it and keep waiting
+            if "params" in msg:
+                sub_id = msg["params"].get("subscription")
+                result = msg["params"].get("result", {})
+                if sub_id == logs_sub_id:
+                    self._process_bet_event(result)
+                elif sub_id == heads_sub_id:
+                    self._process_new_head(result)
+        return None
+
+    async def _backfill(self, ws, logs_sub_id: str, heads_sub_id: str) -> None:
+        """Backfill bets for the current round via eth_getLogs."""
+        try:
+            # Get current block number
+            bn_resp = await self._ws_rpc(ws, 10, "eth_blockNumber", [],
+                                          logs_sub_id, heads_sub_id)
+            if not bn_resp or "result" not in bn_resp:
+                warn("POOL_WSS", "BACKFILL", "FAIL", msg="Could not get block number")
+                return
+
+            current_block = int(bn_resp["result"], 16)
+            # ~10 minutes of BSC blocks (covers 2 full rounds)
+            from_block = hex(max(0, current_block - 200))
+
+            logs_resp = await self._ws_rpc(
+                ws, 11, "eth_getLogs",
+                [{"address": self._contract_addr,
+                  "topics": [[_BET_BULL_TOPIC, _BET_BEAR_TOPIC]],
+                  "fromBlock": from_block, "toBlock": "latest"}],
+                logs_sub_id, heads_sub_id)
+
+            if not logs_resp or "result" not in logs_resp:
+                warn("POOL_WSS", "BACKFILL", "FAIL", msg="eth_getLogs returned no result")
+                return
+
+            logs = logs_resp["result"]
+            if not isinstance(logs, list):
+                return
+
+            # Collect unique block numbers for timestamp resolution
+            blocks_needed = set()
+            for log in logs:
+                try:
+                    bn = int(log.get("blockNumber", "0x0"), 16)
+                    if bn > 0:
+                        blocks_needed.add(bn)
+                except ValueError:
+                    pass
+
+            # Fetch block timestamps (needed for pool cutoff filtering)
+            for i, bn in enumerate(sorted(blocks_needed)):
+                ts_resp = await self._ws_rpc(
+                    ws, 100 + i, "eth_getBlockByNumber", [hex(bn), False],
+                    logs_sub_id, heads_sub_id)
+                if ts_resp and "result" in ts_resp and ts_resp["result"]:
+                    block_ts = int(ts_resp["result"]["timestamp"], 16)
+                    with self._lock:
+                        self._block_ts[bn] = block_ts
+
+            # Process all backfilled bet events
+            count = 0
+            for log in logs:
+                self._process_bet_event(log)
+                count += 1
+
+            info("POOL_WSS", "BACKFILL", "OK",
+                 msg=f"Backfilled {count} bet events from {len(blocks_needed)} blocks "
+                     f"(block range {from_block}..{hex(current_block)})")
+
+        except Exception as e:
+            warn("POOL_WSS", "BACKFILL", "FAIL", msg=f"Backfill error: {e}")
