@@ -38,6 +38,8 @@ _RETRY_DELAY_S = 1.0    # base delay between retries (doubles each attempt)
 
 _SPOT_KLINES_PATH = Path("var/cutoff_spot_prices.jsonl")
 _BTC_KLINES_PATH = Path("var/btc_spot_prices.jsonl")
+_ETH_KLINES_PATH = Path("var/eth_spot_prices.jsonl")
+_SOL_KLINES_PATH = Path("var/sol_spot_prices.jsonl")
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,9 +113,11 @@ def sync_runtime_market_data(
 
     spot_store = KlineStore(str(_SPOT_KLINES_PATH))
     btc_store = KlineStore(str(_BTC_KLINES_PATH))
+    eth_store = KlineStore(str(_ETH_KLINES_PATH))
+    sol_store = KlineStore(str(_SOL_KLINES_PATH))
 
     cutoff_s = int(cfg.cutoff_seconds)
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         spot_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="BNB-USDT",
@@ -124,8 +128,20 @@ def sync_runtime_market_data(
             rounds=tail_rounds, inst_id="BTC-USDT",
             store=btc_store, label="BTC", cutoff_seconds=cutoff_s,
         )
+        eth_fut = pool.submit(
+            _sync_1s_klines,
+            rounds=tail_rounds, inst_id="ETH-USDT",
+            store=eth_store, label="ETH", cutoff_seconds=cutoff_s,
+        )
+        sol_fut = pool.submit(
+            _sync_1s_klines,
+            rounds=tail_rounds, inst_id="SOL-USDT",
+            store=sol_store, label="SOL", cutoff_seconds=cutoff_s,
+        )
         spot_synced = spot_fut.result()
         btc_synced = btc_fut.result()
+        eth_fut.result()  # best-effort, don't block on ETH/SOL
+        sol_fut.result()
 
     # Phase 3: Integrity — trim all stores to the exact intersection so
     # every closed round has klines in BOTH stores.  Retry transient

@@ -43,6 +43,8 @@ class MomentumGateConfig:
     enabled: bool
     symbol: str              # "BNB-USDT"
     btc_symbol: str          # "BTC-USDT"
+    eth_symbol: str = "ETH-USDT"
+    sol_symbol: str = "SOL-USDT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +60,12 @@ class MomentumGateResult:
 
 
 class MomentumGate:
-    """Stateless dual-asset momentum gate: fetches BNB + BTC 1s klines."""
+    """Multi-asset momentum gate: fetches BNB + BTC + ETH + SOL 1s klines."""
 
     def __init__(self, *, config: MomentumGateConfig, okx_client: OkxClient) -> None:
         self._cfg = config
         self._client = okx_client
-        # Cached after each evaluate() so the pipeline can use BTC/BNB data
+        # Cached after each evaluate() so the pipeline can use data
         # for auxiliary signals and regime-adaptive sizing without re-fetching.
         self.last_btc_closes: list[float] | None = None
         self.last_bnb_closes: list[float] | None = None
@@ -86,13 +88,13 @@ class MomentumGate:
     # By the time evaluate() is called the data is already waiting.
     # ------------------------------------------------------------------
 
-    def fetch_klines_async(self, *, cutoff_ts_ms: int) -> tuple[Future, Future] | None:
-        """Kick off BNB + BTC kline fetches in parallel background threads.
+    def fetch_klines_async(self, *, cutoff_ts_ms: int) -> tuple | None:
+        """Kick off BNB + BTC + ETH + SOL kline fetches in parallel.
 
         Call this immediately after waking from sleep, *before* the
         RPC calls (epoch handshake, lock_ts, round_data).  Returns a
-        pair of Futures that evaluate() will collect, or None when the
-        gate is disabled.
+        4-tuple of Futures that evaluate() will collect, or None when
+        the gate is disabled.
 
         *cutoff_ts_ms* is passed to OKX as the ``after`` parameter so
         only completed candles (open_time < cutoff) are returned —
@@ -100,17 +102,19 @@ class MomentumGate:
         """
         if not self._cfg.enabled:
             return None
-        pool = ThreadPoolExecutor(max_workers=2)
+        pool = ThreadPoolExecutor(max_workers=4)
         bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, _CANDLE_COUNT, cutoff_ts_ms)
         btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _CANDLE_COUNT, cutoff_ts_ms)
+        eth_fut = pool.submit(self._fetch_klines, self._cfg.eth_symbol, _CANDLE_COUNT, cutoff_ts_ms)
+        sol_fut = pool.submit(self._fetch_klines, self._cfg.sol_symbol, _CANDLE_COUNT, cutoff_ts_ms)
         pool.shutdown(wait=False)   # let threads finish on their own
-        return bnb_fut, btc_fut
+        return bnb_fut, btc_fut, eth_fut, sol_fut
 
     def evaluate(
         self,
         *,
         cutoff_ts_ms: int,
-        kline_futures: tuple[Future, Future] | None = None,
+        kline_futures: tuple | None = None,
     ) -> MomentumGateResult:
         """Compute signal from current OKX data.
 
@@ -131,12 +135,18 @@ class MomentumGate:
         if kline_futures is not None:
             bnb_klines = kline_futures[0].result()
             btc_klines = kline_futures[1].result()
+            eth_klines = kline_futures[2].result() if len(kline_futures) > 2 else None
+            sol_klines = kline_futures[3].result() if len(kline_futures) > 3 else None
         else:
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=4) as pool:
                 bnb_fut = pool.submit(self._fetch_klines, self._cfg.symbol, _CANDLE_COUNT, cutoff_ts_ms)
                 btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _CANDLE_COUNT, cutoff_ts_ms)
+                eth_fut = pool.submit(self._fetch_klines, self._cfg.eth_symbol, _CANDLE_COUNT, cutoff_ts_ms)
+                sol_fut = pool.submit(self._fetch_klines, self._cfg.sol_symbol, _CANDLE_COUNT, cutoff_ts_ms)
                 bnb_klines = bnb_fut.result()
                 btc_klines = btc_fut.result()
+                eth_klines = eth_fut.result()
+                sol_klines = sol_fut.result()
 
         # Validate: we expect exactly _CANDLE_COUNT contiguous 1s candles
         # ending at cutoff - 1.  Reject if the response is incomplete.
@@ -146,12 +156,14 @@ class MomentumGate:
 
         bnb_closes = [k["close_price"] for k in bnb_klines]
         btc_closes = [k["close_price"] for k in btc_klines] if btc_klines and len(btc_klines) >= _CANDLE_COUNT else None
+        eth_closes = [k["close_price"] for k in eth_klines] if eth_klines and len(eth_klines) >= _CANDLE_COUNT else None
+        sol_closes = [k["close_price"] for k in sol_klines] if sol_klines and len(sol_klines) >= _CANDLE_COUNT else None
 
         # Cache closes for pipeline auxiliary signals and regime-adaptive sizing.
         self.last_bnb_closes = bnb_closes
         self.last_btc_closes = btc_closes
 
-        result = _compute_signal(bnb_closes, btc_closes)
+        result = _compute_signal(bnb_closes, btc_closes, eth_closes, sol_closes)
 
         # Diagnostic: log why signal did/didn't fire so dry-run progress is visible
         if result.signal is not None:

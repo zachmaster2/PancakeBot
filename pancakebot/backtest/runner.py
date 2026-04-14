@@ -22,6 +22,8 @@ from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
 _SPOT_KLINES_PATH = Path("var/cutoff_spot_prices.jsonl")
 _BTC_SPOT_KLINES_PATH = Path("var/btc_spot_prices.jsonl")
+_ETH_KLINES_PATH = Path("var/eth_spot_prices.jsonl")
+_SOL_KLINES_PATH = Path("var/sol_spot_prices.jsonl")
 
 
 @dataclass(slots=True)
@@ -136,6 +138,14 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     if btc_klines:
         info("BACK", "SETUP", "BTC_KL", msg=f"Loaded BTC 1s spot klines for {len(btc_klines)} epochs")
 
+    eth_klines = _load_spot_klines_from(_ETH_KLINES_PATH) if _ETH_KLINES_PATH.exists() else {}
+    if eth_klines:
+        info("BACK", "SETUP", "ETH_KL", msg=f"Loaded ETH 1s spot klines for {len(eth_klines)} epochs")
+
+    sol_klines = _load_spot_klines_from(_SOL_KLINES_PATH) if _SOL_KLINES_PATH.exists() else {}
+    if sol_klines:
+        info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s spot klines for {len(sol_klines)} epochs")
+
     # Build momentum pipeline (no live gate — backtest uses cached 1s spot klines).
     from pancakebot.domain.strategy.momentum_gate import MomentumGateConfig
     gate_config: MomentumGateConfig = runtime_cfg.momentum_gate_config  # type: ignore[assignment]
@@ -148,7 +158,9 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     )
     pipeline.refresh_spot_klines(spot_klines_by_epoch=spot_klines)
     pipeline.refresh_btc_klines(btc_klines_by_epoch=btc_klines)
-    info("BACK", "SETUP", "PIPELINE", msg="MomentumOnlyPipeline ready (backtest/dual-asset mode)")
+    pipeline.refresh_eth_klines(eth_klines_by_epoch=eth_klines)
+    pipeline.refresh_sol_klines(sol_klines_by_epoch=sol_klines)
+    info("BACK", "SETUP", "PIPELINE", msg="MomentumOnlyPipeline ready (backtest/4-asset mode)")
 
     # Output files.
     out_dir.mkdir(parents=True, exist_ok=True)
