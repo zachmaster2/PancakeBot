@@ -80,8 +80,6 @@ class PoolEventWatcher:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
-        # Backfill via HTTP first (independent of WebSocket)
-        self._backfill_http()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="pool-event-watcher",
@@ -201,8 +199,9 @@ class PoolEventWatcher:
             info("POOL_WSS", "SUB", "OK",
                  msg=f"Subscribed to bet events + newHeads")
 
-            # Re-run backfill to cover gap between initial backfill and
-            # WSS subscription start. Dedup prevents double-counting.
+            # Backfill: WSS subscription is now live, so backfill covers
+            # everything before connection. Dedup handles any overlap
+            # with events already received via subscription.
             self._backfill_http()
 
             while not self._stop_event.is_set():
