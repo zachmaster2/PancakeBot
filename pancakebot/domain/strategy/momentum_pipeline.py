@@ -39,6 +39,7 @@ _BASE_FRAC = 0.03
 _SIZING_SLOPE = 100        # scales with min(|r3|, |r7|, |r15|)
 _PAYOUT_SLOPE = 1.0        # bet more when our side has high payout
 _ETH_SIZING_WEIGHT = 0.3   # add ETH confirming strength * weight to signal_strength
+_SOL_SIZING_WEIGHT = 0.3   # add SOL confirming strength * weight to signal_strength
 _MIN_PAYOUT = 1.5          # skip if payout on our side < this
 _MAX_FRAC = 0.30           # cap the pool fraction
 _FLOOR_BNB = 0.01
@@ -236,10 +237,12 @@ class MomentumOnlyPipeline:
             payout = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
             if payout < _MIN_PAYOUT:
                 return self._skip("payout_below_floor")
-        # ETH confirmation adds to effective signal strength for sizing
+        # ETH/SOL confirmation adds to effective signal strength for sizing
         effective_strength = result.signal_strength
         if result.eth_confirmation_strength > 0:
             effective_strength += result.eth_confirmation_strength * _ETH_SIZING_WEIGHT
+        if result.sol_confirmation_strength > 0:
+            effective_strength += result.sol_confirmation_strength * _SOL_SIZING_WEIGHT
 
         bet_size = _compute_bet_size(
             signal_strength=effective_strength,
