@@ -301,7 +301,7 @@ class PoolEventWatcher:
             bn_resp = await self._ws_rpc(ws, 10, "eth_blockNumber", [],
                                           logs_sub_id, heads_sub_id)
             if not bn_resp or "result" not in bn_resp:
-                warn("POOL_WSS", "BACKFILL", "FAIL", msg="Could not get block number")
+                warn("POOL_WSS", "BKFILL", "FAIL", msg="Could not get block number")
                 return
 
             current_block = int(bn_resp["result"], 16)
@@ -316,7 +316,7 @@ class PoolEventWatcher:
                 logs_sub_id, heads_sub_id)
 
             if not logs_resp or "result" not in logs_resp:
-                warn("POOL_WSS", "BACKFILL", "FAIL", msg="eth_getLogs returned no result")
+                warn("POOL_WSS", "BKFILL", "FAIL", msg="eth_getLogs returned no result")
                 return
 
             logs = logs_resp["result"]
@@ -349,9 +349,9 @@ class PoolEventWatcher:
                 self._process_bet_event(log)
                 count += 1
 
-            info("POOL_WSS", "BACKFILL", "OK",
+            info("POOL_WSS", "BKFILL", "OK",
                  msg=f"Backfilled {count} bet events from {len(blocks_needed)} blocks "
                      f"(block range {from_block}..{hex(current_block)})")
 
         except Exception as e:
-            warn("POOL_WSS", "BACKFILL", "FAIL", msg=f"Backfill error: {e}")
+            warn("POOL_WSS", "BKFILL", "FAIL", msg=f"Backfill error: {e}")
