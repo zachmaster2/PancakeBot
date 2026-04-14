@@ -33,7 +33,7 @@ from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline
 from pancakebot.runtime.claim_manager import claim_scan_cursor
 from pancakebot.runtime.settlement import settle_from_round_data
 from pancakebot.runtime.sleep import sleep_seconds
-from pancakebot.core.constants import BUFFER_SECONDS, INTERVAL_SECONDS
+from pancakebot.core.constants import BUFFER_SECONDS, INTERVAL_SECONDS, POOL_CUTOFF_SECONDS
 from pancakebot.core.errors import InvariantError, TransientRpcError
 from pancakebot.core.logging import info, warn
 from pancakebot.core.time import now_ts
@@ -1204,41 +1204,28 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         if current_epoch2 is None:
             # Transient RPC failure — full re-handshake as fallback
-            locked_round, open_round, current_epoch, open_rd2 = _epoch_handshake(cfg, closed)
+            locked_round, open_round, current_epoch, _ = _epoch_handshake(cfg, closed)
             locked_epoch = locked_round.epoch
             lock_ts_t = int(open_round.lock_at)
-            pool_bull_bnb = open_rd2.bull_amount_wei / BNB_WEI
-            pool_bear_bnb = open_rd2.bear_amount_wei / BNB_WEI
         else:
-            # Common path: epoch unchanged — reuse open_round and lock_ts
-            # from Step 1/4, fetch only fresh pool amounts (1 RPC).
+            # Common path: epoch unchanged — reuse open_round and lock_ts.
             open_round = _open_round
-            open_rd2 = cfg.contract.round_data(current_epoch)
-            pool_bull_bnb = open_rd2.bull_amount_wei / BNB_WEI
-            pool_bear_bnb = open_rd2.bear_amount_wei / BNB_WEI
 
-        # Step 7b: Use event-based pool data if available (more accurate
-        # than single-point RPC read which may lag 1-2 blocks behind).
-        # The event watcher accumulates confirmed BetBull/BetBear events
-        # in real time, so its pool state reflects the latest processed block.
+        # Step 7b: Pool data from event subscription (no round_data RPC).
+        # Filter to bets with block_timestamp <= lock_at - 6 for consistency
+        # with backtest (bets from 6+ seconds ago are guaranteed propagated).
+        pool_bull_bnb = 0.0
+        pool_bear_bnb = 0.0
         if cfg.pool_watcher is not None and cfg.pool_watcher.connected:
-            evt_bull, evt_bear = cfg.pool_watcher.get_pool(epoch=current_epoch)
-            if evt_bull > 0 or evt_bear > 0:
-                rpc_total = pool_bull_bnb + pool_bear_bnb
-                evt_total = evt_bull + evt_bear
-                # Use event pools if they show >= RPC pools (more up-to-date).
-                # If event pools are smaller (missed events on reconnect),
-                # fall back to RPC as a safety net.
-                if evt_total >= rpc_total * 0.95:
-                    pool_bull_bnb = evt_bull
-                    pool_bear_bnb = evt_bear
-                    info("POOL", "WSS", "USE",
-                         epoch=current_epoch,
-                         evt=f"{evt_total:.4f}", rpc=f"{rpc_total:.4f}")
-                else:
-                    info("POOL", "WSS", "RPC",
-                         epoch=current_epoch,
-                         evt=f"{evt_total:.4f}", rpc=f"{rpc_total:.4f}")
+            pool_ts_cutoff = lock_ts_t - POOL_CUTOFF_SECONDS
+            pool_bull_bnb, pool_bear_bnb = cfg.pool_watcher.get_pool(
+                epoch=current_epoch, max_ts=pool_ts_cutoff,
+            )
+            pool_total = pool_bull_bnb + pool_bear_bnb
+            if pool_total > 0:
+                info("POOL", "WSS", "USE",
+                     epoch=current_epoch, total=f"{pool_total:.4f}",
+                     cutoff=f"lock-6s")
             # Clean up old epochs
             if locked_epoch > 2:
                 cfg.pool_watcher.clear_old_epochs(keep_after=locked_epoch - 2)

@@ -18,7 +18,7 @@ live_pipeline_bootstrap_state_path = "var/runtime/live_pipeline_bootstrap_state.
 abi_json_path = "abi/prediction_v2_abi.json"
 
 [runtime]
-cutoff_seconds = 4
+cutoff_seconds = 2
 latency_log_path = "var/live_latency.jsonl"
 dry_initial_bankroll_bnb = 50.0
 wait_for_bet_receipt = true
