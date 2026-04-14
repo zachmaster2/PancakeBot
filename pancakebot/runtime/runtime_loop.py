@@ -1135,6 +1135,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if lock_ts_t <= 0:
             raise InvariantError("lock_ts_t_invalid")
 
+        # Step 4b: Backfill pool data for the current round (one-time per epoch).
+        # Must run before the long sleep so pool data is ready at decision time.
+        if cfg.pool_watcher is not None:
+            round_start_ts = lock_ts_t - INTERVAL_SECONDS
+            cfg.pool_watcher.backfill_round(round_start_ts)
+
         # Step 5: cutoff_ts(t) = lock_ts(t) - cutoff_seconds.
         cutoff_ts_t = lock_ts_t - cfg.cutoff_seconds
 
