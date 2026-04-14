@@ -295,7 +295,8 @@ class PoolEventWatcher:
         _BACKFILL_RPC = "https://1rpc.io/bnb"
         from pancakebot.core.constants import INTERVAL_SECONDS
         # BSC produces blocks every ~3 seconds
-        blocks_per_round = INTERVAL_SECONDS // 3 + 10  # +10 margin
+        # BSC block time is ~0.44s (verified). Use 0.5s as conservative estimate.
+        blocks_per_round = int(INTERVAL_SECONDS / 0.5) + 20  # ~620 blocks for 5 min
 
         try:
             # Get current block
