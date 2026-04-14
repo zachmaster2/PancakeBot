@@ -48,6 +48,13 @@ _CAP_BNB = 2.0
 # Validated: pools < 2 BNB have 55-57% WR = net loss after fees.
 _MIN_POOL_BNB = 2.0
 
+# Pool-adaptive threshold: stricter signal on small pools (lower WR),
+# relaxed on large pools (higher WR, less dilution).
+# Nested CV: +2.31/2k (4/5), consistent param selection across folds.
+_SMALL_POOL_THRESH = 0.0002  # pool < _POOL_THRESH_BOUNDARY
+_LARGE_POOL_THRESH = 0.0001  # pool >= _POOL_THRESH_BOUNDARY
+_POOL_THRESH_BOUNDARY = 3.0
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +222,12 @@ class MomentumOnlyPipeline:
         # Pool filter: skip if visible pool is too small (dilution kills edge).
         if pool_total < _MIN_POOL_BNB:
             return self._skip("pool_below_minimum")
+
+        # Pool-adaptive threshold: require stronger signal on smaller pools.
+        min_thresh = _LARGE_POOL_THRESH if pool_total >= _POOL_THRESH_BOUNDARY \
+            else _SMALL_POOL_THRESH
+        if result.signal_strength < min_thresh:
+            return self._skip("signal_below_pool_thresh")
 
         our_side = pool_bull_bnb if result.signal == "Bull" else pool_bear_bnb
 
