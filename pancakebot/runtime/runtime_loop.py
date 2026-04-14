@@ -140,6 +140,9 @@ def _unique_archive_dir(root: Path, *, ts: int, reason: str) -> Path:
         suffix += 1
 
 
+_MIN_ROUNDS_TO_ARCHIVE = 10  # don't archive runs shorter than this
+
+
 def _archive_dry_runtime_state(
     paths: RuntimeStatePathsConfig,
     *,
@@ -149,6 +152,18 @@ def _archive_dry_runtime_state(
     existing = [path.resolve() for path in _dry_runtime_state_files(paths) if path.exists()]
     if not existing:
         return None
+
+    # Skip archiving short runs — just delete the files.
+    cycle_csv = Path(paths.dry_cycle_audit_path)
+    if cycle_csv.exists():
+        n_lines = sum(1 for _ in cycle_csv.open()) - 1  # subtract header
+        if n_lines < _MIN_ROUNDS_TO_ARCHIVE:
+            for f in existing:
+                f.unlink(missing_ok=True)
+            if n_lines > 0:
+                info("RUN", "DRY", "CLEAN",
+                     msg=f"Deleted previous dry state ({n_lines} rounds, below {_MIN_ROUNDS_TO_ARCHIVE} threshold)")
+            return None
     archive_root = _DRY_RUNTIME_ARCHIVE_ROOT.resolve()
     archive_root.mkdir(parents=True, exist_ok=True)
     ts_now = int(now_ts())
