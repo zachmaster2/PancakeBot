@@ -21,7 +21,6 @@ class RunSyncModeTests(unittest.TestCase):
     def test_run_from_config_sync_dispatches_without_private_key(self) -> None:
         fake_cfg = SimpleNamespace(
             closed_rounds_path="var/closed_rounds.jsonl",
-            market_data_db_path="var/market_data.sqlite",
             abi_json_path="abi/predictionv2.json",
             cutoff_seconds=12,
             latency_log_path="var/latency.log",
@@ -35,8 +34,6 @@ class RunSyncModeTests(unittest.TestCase):
                 dry_audit_trades_path="var/runtime/dry_audit_trades.csv",
                 dry_cycle_audit_path="var/runtime/dry_cycle_audit.csv",
                 dry_bankroll_state_path="var/runtime/dry_bankroll_state.json",
-                dry_pipeline_bootstrap_state_path="var/runtime/dry_pipeline.pkl.gz",
-                live_pipeline_bootstrap_state_path="var/runtime/live_pipeline.pkl.gz",
             ),
             momentum_gate=MagicMock(),
             backtest=MagicMock(),

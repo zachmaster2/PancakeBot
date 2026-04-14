@@ -8,9 +8,11 @@ from pancakebot.config.load_config import load_app_config
 from pancakebot.core.constants import (
     BNB_WEI,
     EXPECTED_CHAIN_ID,
+    MIN_BET_AMOUNT_BNB,
     PREDICTION_V2_GRAPH_ENDPOINT,
     RPC_TIMEOUT_SECONDS,
     RPC_URLS,
+    TREASURY_FEE_FRACTION,
 )
 from pancakebot.infra.okx_client import OkxClient
 from pancakebot.domain.strategy.momentum_gate import MomentumGate
@@ -53,8 +55,8 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
             momentum_gate=None,
             dry=dry,
             runtime_state_paths=cfg.runtime_state_paths,
-            min_bet_amount_bnb=float(cfg.min_bet_amount_bnb),
-            treasury_fee_fraction=float(cfg.treasury_fee_fraction),
+            min_bet_amount_bnb=MIN_BET_AMOUNT_BNB,
+            treasury_fee_fraction=TREASURY_FEE_FRACTION,
         )
         run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var"))
         return

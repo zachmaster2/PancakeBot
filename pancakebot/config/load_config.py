@@ -155,24 +155,16 @@ def load_app_config(path: str) -> AppConfig:
 
     allowed_path_keys = {
         "closed_rounds_path",
-        "market_data_db_path",
         "claim_scan_cursor_path",
         "dry_bets_path",
         "dry_settled_epochs_path",
         "dry_audit_trades_path",
         "dry_cycle_audit_path",
         "dry_bankroll_state_path",
-        "dry_pipeline_bootstrap_state_path",
-        "live_pipeline_bootstrap_state_path",
     }
     _validate_unknown_keys("paths", paths, allowed_path_keys)
 
     closed_rounds_path = _req_str(paths, "closed_rounds_path")
-    market_data_db_path = _opt_str(
-        paths,
-        "market_data_db_path",
-        "../PancakeBot_var_exp/market_data_v1.sqlite",
-    )
     claim_scan_cursor_path = _opt_str(
         paths,
         "claim_scan_cursor_path",
@@ -203,16 +195,6 @@ def load_app_config(path: str) -> AppConfig:
         "dry_bankroll_state_path",
         "var/runtime/dry_bankroll_state.json",
     )
-    dry_pipeline_bootstrap_state_path = _opt_str(
-        paths,
-        "dry_pipeline_bootstrap_state_path",
-        "var/runtime/dry_pipeline_bootstrap_state.pkl.gz",
-    )
-    live_pipeline_bootstrap_state_path = _opt_str(
-        paths,
-        "live_pipeline_bootstrap_state_path",
-        "var/runtime/live_pipeline_bootstrap_state.pkl.gz",
-    )
     _validate_distinct_paths(
         "runtime_state",
         {
@@ -222,8 +204,6 @@ def load_app_config(path: str) -> AppConfig:
             "dry_audit_trades_path": str(dry_audit_trades_path),
             "dry_cycle_audit_path": str(dry_cycle_audit_path),
             "dry_bankroll_state_path": str(dry_bankroll_state_path),
-            "dry_pipeline_bootstrap_state_path": str(dry_pipeline_bootstrap_state_path),
-            "live_pipeline_bootstrap_state_path": str(live_pipeline_bootstrap_state_path),
         },
     )
 
@@ -255,15 +235,11 @@ def load_app_config(path: str) -> AppConfig:
     if bet_receipt_timeout_seconds <= 0:
         raise InvariantError("bet_receipt_timeout_seconds_must_be_positive")
 
-    _validate_unknown_keys("contract", contract_raw, {
-        "min_bet_amount_bnb", "treasury_fee_fraction",
-    })
-    min_bet_amount_bnb = _opt_float(contract_raw, "min_bet_amount_bnb", 0.001)
-    if float(min_bet_amount_bnb) <= 0.0:
-        raise InvariantError("contract_min_bet_amount_bnb_must_be_positive")
-    treasury_fee_fraction = _opt_float(contract_raw, "treasury_fee_fraction", 0.03)
-    if not (0.0 <= float(treasury_fee_fraction) < 1.0):
-        raise InvariantError("contract_treasury_fee_fraction_out_of_range")
+    # [contract] section is no longer used — protocol constants are in
+    # pancakebot.core.constants (TREASURY_FEE_FRACTION, MIN_BET_AMOUNT_BNB).
+    # Accept but ignore the section for backward compatibility.
+    if contract_raw:
+        pass  # silently ignore legacy [contract] section
 
     allowed_bt_keys = {
         "simulation_size",
@@ -310,16 +286,16 @@ def load_app_config(path: str) -> AppConfig:
     backtest_cfg.validate()
 
     _validate_unknown_keys("momentum_gate", momentum_gate_raw, {
-        "enabled", "symbol", "btc_symbol", "eth_symbol", "sol_symbol",
+        "enabled", "bnb_symbol", "btc_symbol", "eth_symbol", "sol_symbol",
     })
     mg_enabled = _opt_bool(momentum_gate_raw, "enabled", False)
-    mg_symbol = _opt_str(momentum_gate_raw, "symbol", "BNB-USDT")
+    mg_bnb_symbol = _opt_str(momentum_gate_raw, "bnb_symbol", "BNB-USDT")
     mg_btc_symbol = _opt_str(momentum_gate_raw, "btc_symbol", "BTC-USDT")
     mg_eth_symbol = _opt_str(momentum_gate_raw, "eth_symbol", "ETH-USDT")
     mg_sol_symbol = _opt_str(momentum_gate_raw, "sol_symbol", "SOL-USDT")
     momentum_gate_cfg = MomentumGateConfig(
         enabled=mg_enabled,
-        symbol=mg_symbol,
+        bnb_symbol=mg_bnb_symbol,
         btc_symbol=mg_btc_symbol,
         eth_symbol=mg_eth_symbol,
         sol_symbol=mg_sol_symbol,
@@ -327,7 +303,6 @@ def load_app_config(path: str) -> AppConfig:
 
     return AppConfig(
         closed_rounds_path=closed_rounds_path,
-        market_data_db_path=market_data_db_path,
         abi_json_path=abi_json_path,
         cutoff_seconds=cutoff_seconds,
         latency_log_path=latency_log_path,
@@ -341,11 +316,7 @@ def load_app_config(path: str) -> AppConfig:
             dry_audit_trades_path=dry_audit_trades_path,
             dry_cycle_audit_path=dry_cycle_audit_path,
             dry_bankroll_state_path=dry_bankroll_state_path,
-            dry_pipeline_bootstrap_state_path=dry_pipeline_bootstrap_state_path,
-            live_pipeline_bootstrap_state_path=live_pipeline_bootstrap_state_path,
         ),
         momentum_gate=momentum_gate_cfg,
-        min_bet_amount_bnb=min_bet_amount_bnb,
-        treasury_fee_fraction=treasury_fee_fraction,
         backtest=backtest_cfg,
     )

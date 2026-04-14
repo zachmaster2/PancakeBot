@@ -16,8 +16,6 @@ class RuntimeStatePathsConfig:
     dry_audit_trades_path: str
     dry_cycle_audit_path: str
     dry_bankroll_state_path: str
-    dry_pipeline_bootstrap_state_path: str
-    live_pipeline_bootstrap_state_path: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +24,6 @@ class AppConfig:
 
     # Paths
     closed_rounds_path: str
-    market_data_db_path: str
     abi_json_path: str
 
     # Runtime
@@ -41,10 +38,6 @@ class AppConfig:
 
     # OKX momentum gate (live/dry only; ignored by backtest).
     momentum_gate: MomentumGateConfig
-
-    # Protocol constants (sourced from chain on first live run; kept in config for backtest).
-    min_bet_amount_bnb: float
-    treasury_fee_fraction: float
 
     # Backtest options. Live and dry ignore these.
     backtest: BacktestConfig
