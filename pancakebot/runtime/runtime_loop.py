@@ -102,6 +102,7 @@ class RuntimeConfig:
 class _ClosedState:
     strategy_pipeline: MomentumOnlyPipeline | None = None
     claim_scan_initialized: bool = False
+    pool_backfill_done: bool = False
     simulated_bankroll_bnb: float | None = None
     dry_bets_by_epoch: dict[int, dict[str, object]] | None = None
     dry_settled_epochs: set[int] | None = None
@@ -1135,11 +1136,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if lock_ts_t <= 0:
             raise InvariantError("lock_ts_t_invalid")
 
-        # Step 4b: Backfill pool data for the current round (one-time per epoch).
-        # Must run before the long sleep so pool data is ready at decision time.
-        if cfg.pool_watcher is not None:
+        # Step 4b: Backfill pool data on first iteration only.
+        # After this, WSS subscription catches all bets in real time.
+        if cfg.pool_watcher is not None and not closed.pool_backfill_done:
             round_start_ts = lock_ts_t - INTERVAL_SECONDS
             cfg.pool_watcher.backfill_round(round_start_ts)
+            closed.pool_backfill_done = True
 
         # Step 5: cutoff_ts(t) = lock_ts(t) - cutoff_seconds.
         cutoff_ts_t = lock_ts_t - cfg.cutoff_seconds
