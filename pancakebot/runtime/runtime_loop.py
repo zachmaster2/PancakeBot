@@ -1586,7 +1586,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
 
 def _sleep_until_ts(target_ts: float, *, reason: str, epoch: int | None = None) -> None:
     remaining = target_ts - time.time()
-    if remaining <= 0:
+    if remaining <= 0.5:
         return
 
     msg = f"Sleeping {int(remaining)}s ({reason})"
