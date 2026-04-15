@@ -448,15 +448,15 @@
         <!-- ---- External Sources (left) ---- -->
         <rect x="20" y="30" width="180" height="60" rx="10" fill="#0e3a3e" stroke="#22d3ee" stroke-width="1.5"/>
         <text x="110" y="55" text-anchor="middle" fill="#22d3ee" font-size="11" font-weight="600">OKX Public API</text>
-        <text x="110" y="73" text-anchor="middle" fill="#7dd3fc" font-size="9.5">1-second candles (BNB, BTC)</text>
+        <text x="110" y="73" text-anchor="middle" fill="#7dd3fc" font-size="9.5">1s candles (BTC, ETH, SOL)</text>
 
         <rect x="20" y="120" width="180" height="60" rx="10" fill="#1e1a3a" stroke="#a78bfa" stroke-width="1.5"/>
         <text x="110" y="145" text-anchor="middle" fill="#a78bfa" font-size="11" font-weight="600">The Graph API</text>
         <text x="110" y="163" text-anchor="middle" fill="#c4b5fd" font-size="9.5">Closed round history</text>
 
         <rect x="20" y="210" width="180" height="60" rx="10" fill="#1a2e1a" stroke="#4ade80" stroke-width="1.5"/>
-        <text x="110" y="235" text-anchor="middle" fill="#4ade80" font-size="11" font-weight="600">BSC RPC Nodes</text>
-        <text x="110" y="253" text-anchor="middle" fill="#86efac" font-size="9.5">On-chain round state &amp; bets</text>
+        <text x="110" y="235" text-anchor="middle" fill="#4ade80" font-size="11" font-weight="600">BSC RPC + WSS</text>
+        <text x="110" y="253" text-anchor="middle" fill="#86efac" font-size="9.5">Round state, bets, pool events</text>
 
         <!-- ---- Arrows from sources ---- -->
         <line x1="200" y1="60" x2="280" y2="110" stroke="#22d3ee" stroke-width="1.2" marker-end="url(#arrow)"/>
@@ -480,12 +480,12 @@
         <text x="645" y="85" text-anchor="middle" fill="#f6c549" font-size="9" font-weight="600" letter-spacing="1.5">SIGNAL ENGINE</text>
 
         <rect x="560" y="100" width="170" height="44" rx="6" fill="#0e3a3e" stroke="#22d3ee" stroke-width="1"/>
-        <text x="645" y="118" text-anchor="middle" fill="#22d3ee" font-size="10" font-weight="500">Tier 1: BNB Acceleration</text>
-        <text x="645" y="134" text-anchor="middle" fill="#7dd3fc" font-size="8.5">Lookback pairs agree + threshold</text>
+        <text x="645" y="118" text-anchor="middle" fill="#22d3ee" font-size="10" font-weight="500">Primary: BTC Multi-TF</text>
+        <text x="645" y="134" text-anchor="middle" fill="#7dd3fc" font-size="8.5">3s, 7s, 15s returns all agree</text>
 
         <rect x="560" y="152" width="170" height="44" rx="6" fill="#1e1a3a" stroke="#a78bfa" stroke-width="1"/>
-        <text x="645" y="170" text-anchor="middle" fill="#a78bfa" font-size="10" font-weight="500">Tier 2: BTC Confirmation</text>
-        <text x="645" y="186" text-anchor="middle" fill="#c4b5fd" font-size="8.5">BNB move + BTC 30s agrees</text>
+        <text x="645" y="170" text-anchor="middle" fill="#a78bfa" font-size="10" font-weight="500">Regime-2: ETH+SOL</text>
+        <text x="645" y="186" text-anchor="middle" fill="#c4b5fd" font-size="8.5">Both agree when BTC is silent</text>
 
         <rect x="580" y="205" width="130" height="24" rx="5" fill="#161824" stroke="#4ade80" stroke-width="1"/>
         <text x="645" y="221" text-anchor="middle" fill="#4ade80" font-size="9.5">Bull / Bear / Skip</text>
@@ -545,45 +545,45 @@
   <div class="signal-section">
     <div class="tier-row">
       <div class="tier-card tier1">
-        <div class="tier-badge">Tier 1 — Primary</div>
-        <h3>BNB Acceleration</h3>
-        <p>Detects short-term price momentum in BNB using pairs of lookback windows on 1-second candles from OKX.</p>
+        <div class="tier-badge">Primary</div>
+        <h3>BTC Multi-Timeframe Agreement</h3>
+        <p>Detects short-term BTC momentum using three lookback windows on 1-second candles from OKX.</p>
         <ul class="condition-list">
-          <li>Try lookback pairs: <code>(7s, 10s)</code> then <code>(5s, 10s)</code> then <code>(5s, 7s)</code></li>
-          <li>Both returns must agree in direction (both positive or both negative)</li>
-          <li>At least one return must exceed the threshold: <code>|return| &ge; 0.02%</code></li>
-          <li>First pair to pass fires the signal — Bull or Bear</li>
+          <li>BTC 3s, 7s, and 15s returns must <strong>all agree</strong> in direction</li>
+          <li>Minimum strength: <code>min(|r3|, |r7|, |r15|) &ge; threshold</code></li>
+          <li>Pool-adaptive threshold: <code>0.0002</code> for small pools, <code>0.0001</code> for large</li>
+          <li>ETH/SOL confirmation boosts sizing when they agree with BTC direction</li>
         </ul>
       </div>
       <div class="tier-card tier2">
-        <div class="tier-badge">Tier 2 — Fallback</div>
-        <h3>BTC Confirmation</h3>
-        <p>If Tier 1 doesn't fire, checks whether BNB and BTC are moving together as a confirmation signal.</p>
+        <div class="tier-badge">Regime-2</div>
+        <h3>ETH + SOL Agreement</h3>
+        <p>When BTC is silent (no multi-TF agreement), checks whether ETH and SOL independently agree on direction.</p>
         <ul class="condition-list">
-          <li>BNB must have any nonzero 7-second return</li>
-          <li>BTC 30-second return must be in the same direction</li>
-          <li>BTC return must be significant: <code>|return| &ge; 0.03%</code></li>
-          <li>Both must agree (BNB up + BTC up = Bull)</li>
+          <li>Both ETH and SOL multi-TF(3,7,15) must fire in the same direction</li>
+          <li>Minimum strength: <code>min(eth_str, sol_str) &ge; 0.00015</code></li>
+          <li>Smaller sizing than primary: <code>base_frac=0.02, cap=0.5 BNB</code></li>
+          <li>Fires on ~37% more rounds, filling flat BTC periods</li>
         </ul>
       </div>
     </div>
     <div class="sizing-card">
       <h3>Position Sizing</h3>
       <p style="font-size: 0.85rem; color: #94a3b8;">
-        Bet size is proportional to the round's pool, with adjustments for payout odds and BTC agreement.
+        Continuous adaptive sizing based on signal strength, cross-pair confirmation, and payout odds (Kelly reasoning).
       </p>
       <div class="sizing-grid">
         <div class="sizing-item">
-          <div class="sz-label">Base Size</div>
-          <div class="sz-value">6% of pool</div>
+          <div class="sz-label">Base Frac</div>
+          <div class="sz-value">4% of pool</div>
         </div>
         <div class="sizing-item">
           <div class="sz-label">Floor / Cap</div>
-          <div class="sz-value">0.05 — 0.35 BNB</div>
+          <div class="sz-value">0.01 — 2.0 BNB</div>
         </div>
         <div class="sizing-item">
-          <div class="sz-label">BTC Boost</div>
-          <div class="sz-value">1.25x if agrees</div>
+          <div class="sz-label">ETH/SOL Boost</div>
+          <div class="sz-value">+0.3x each</div>
         </div>
       </div>
     </div>
@@ -598,26 +598,27 @@
         <div class="ls-desc">Query the BSC smart contract for the current epoch number and round timing (when it locks, when it closes).</div>
       </div>
       <div class="loop-step">
-        <div class="ls-title">Sleep Until Cutoff</div>
-        <div class="ls-desc">Calculate the decision deadline: <strong>4 seconds before lock</strong>. Sleep until then (usually ~4.5 minutes).</div>
-        <div class="ls-time">~269 seconds of idle waiting</div>
+        <div class="ls-title">Phase A: Sleep + Housekeeping</div>
+        <div class="ls-desc">Sleep until <strong>6 seconds before lock</strong>. Then perform epoch recheck (BSC RPC), warm 3 OKX TLS connections in parallel, and read pool data from WSS subscription.</div>
+        <div class="ls-time">lock_at &minus; 6s &rarr; all housekeeping outside critical path</div>
       </div>
       <div class="loop-step data">
-        <div class="ls-title">Prefetch Market Data</div>
-        <div class="ls-desc">Immediately on wake: kick off two parallel background threads to fetch BNB and BTC 1-second candles from OKX. This runs while the next RPC calls happen.</div>
+        <div class="ls-title">Phase B: Sleep Until Fetch</div>
+        <div class="ls-desc">Sleep until <strong>1.75 seconds before lock</strong> (cutoff + 250ms OKX publish delay). This gives OKX time to finalize the candle at the cutoff moment.</div>
+        <div class="ls-time">lock_at &minus; 1.75s &rarr; critical path begins</div>
       </div>
       <div class="loop-step data">
-        <div class="ls-title">Epoch Recheck + Pool Fetch</div>
-        <div class="ls-desc">Quick RPC call to confirm the epoch hasn't shifted. Fetch current bull/bear pool amounts to inform sizing.</div>
+        <div class="ls-title">Fetch Klines</div>
+        <div class="ls-desc">Fetch BTC, ETH, SOL 1-second candles from OKX in parallel on pre-warmed connections. Typical latency: ~285ms.</div>
       </div>
       <div class="loop-step signal">
-        <div class="ls-title">Compute Signal</div>
-        <div class="ls-desc">Run the momentum gate: Tier 1 acceleration check, then Tier 2 BTC confirmation if needed. Result: Bull, Bear, or Skip.</div>
+        <div class="ls-title">Compute Signal + Size</div>
+        <div class="ls-desc">Run BTC multi-TF gate (primary) or ETH+SOL regime-2 (fallback). Apply pool-adaptive threshold, payout filter, and continuous adaptive sizing.</div>
       </div>
       <div class="loop-step action">
         <div class="ls-title">Timing Guard + Execute</div>
-        <div class="ls-desc">Final safety check: if less than 3 seconds remain before lock, abort (BSC blocks take ~3s). Otherwise, sign and broadcast the bet transaction.</div>
-        <div class="ls-time">Total decision window: ~1 second</div>
+        <div class="ls-desc">If less than 1 second remains before lock, abort. Otherwise, sign and broadcast the bet transaction to BSC.</div>
+        <div class="ls-time">Safety margin: 1 second (BSC block time ~0.44s)</div>
       </div>
       <div class="loop-step settle">
         <div class="ls-title">Wait + Settle</div>
