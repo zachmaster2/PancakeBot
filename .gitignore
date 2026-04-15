@@ -26,10 +26,3 @@ var/
 # OS noise
 Thumbs.db
 Desktop.ini
-
-# Local agent capability checks
-codex_write_test.txt
-
-# Local copied crash logs
-dry_mode_error.txt
-proposed_plan.txt
