@@ -395,6 +395,40 @@ class Web3PredictionContract:
             )
         )
 
+    def claimable_refundable_batch(
+        self, *, epochs: list[int], wallet_address: str,
+    ) -> dict[int, tuple[bool, bool]]:
+        """Batch-check claimable and refundable for multiple epochs.
+
+        Returns {epoch: (claimable, refundable)} for each epoch.
+        Both checks are packed into a single RPC batch (2 calls per epoch).
+        """
+        if not epochs:
+            return {}
+        checksum = Web3.to_checksum_address(str(wallet_address))
+        encoded: list[str] = []
+        for e in epochs:
+            encoded.append(
+                self._contract.functions.claimable(int(e), checksum)._encode_transaction_data()
+            )
+            encoded.append(
+                self._contract.functions.refundable(int(e), checksum)._encode_transaction_data()
+            )
+        # Batch in chunks of 100 calls.
+        all_results: list[bytes | None] = []
+        for chunk_start in range(0, len(encoded), 100):
+            chunk = encoded[chunk_start:chunk_start + 100]
+            all_results.extend(self._batch_eth_calls(chunk))
+
+        out: dict[int, tuple[bool, bool]] = {}
+        for i, e in enumerate(epochs):
+            c_raw = all_results[i * 2]
+            r_raw = all_results[i * 2 + 1]
+            c = bool(self._w3.codec.decode(["bool"], c_raw)[0]) if c_raw else False
+            r = bool(self._w3.codec.decode(["bool"], r_raw)[0]) if r_raw else False
+            out[int(e)] = (c, r)
+        return out
+
     # ---- Write calls ----
 
     def _submit_tx_with_timing(
