@@ -137,27 +137,28 @@ def claim_scan_cursor(
     # Batch-fetch close_ts for all epochs at once.
     close_ts_map = contract.close_ts_batch(all_epochs) if all_epochs else {}
 
-    scanned = 0
+    # Filter to scannable epochs (before live edge and buffer).
+    scannable: list[int] = []
     for epoch in all_epochs:
         e = int(epoch)
-
         if e == locked_epoch or e == current_epoch:
             break
-
         cts = close_ts_map.get(e)
         if cts is not None and now_ts - cts < buffer_seconds:
             break
+        scannable.append(e)
+    scanned = len(scannable)
 
-        scanned += 1
-
-        if dry:
-            continue
-
-        claimable = contract.claimable(epoch=e, wallet_address=wallet_address)
-        refundable = contract.refundable(epoch=e, wallet_address=wallet_address)
-        if claimable or refundable:
-            pending_claims.append((e, cursor + scanned - 1))
-            _flush_pending(force_all=False)
+    # Batch-check claimable + refundable for all scannable epochs.
+    if not dry and scannable:
+        cr_map = contract.claimable_refundable_batch(
+            epochs=scannable, wallet_address=wallet_address,
+        )
+        for i, e in enumerate(scannable):
+            c, r = cr_map.get(e, (False, False))
+            if c or r:
+                pending_claims.append((e, cursor + i))
+                _flush_pending(force_all=False)
 
     scanned_total = scanned
     cursor += scanned
