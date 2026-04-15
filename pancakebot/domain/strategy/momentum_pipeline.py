@@ -66,6 +66,14 @@ _REGIME2_MIN_STRENGTH = 0.00015  # min(eth_strength, sol_strength) threshold
 _REGIME2_BASE_FRAC = 0.02       # smaller base (regime-2 WR is lower)
 _REGIME2_CAP_BNB = 0.5          # cap regime-2 bets at 0.5 BNB
 
+# Strong-signal bypass: allow bets on pools below _MIN_POOL_BNB if the
+# BTC signal is very strong. Pools must still exceed this floor.
+# 5-fold: +2.85/2k (5/5), 113 extra bets at 58.4% WR.
+_STRONG_BYPASS_STRENGTH = 0.0004  # BTC min(|r3|,|r7|,|r15|) threshold
+_STRONG_BYPASS_POOL_FLOOR = 1.0   # minimum pool even for strong signals
+_STRONG_BYPASS_BASE_FRAC = 0.03   # conservative sizing on small pools
+_STRONG_BYPASS_CAP_BNB = 0.3      # small cap to limit dilution
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,8 +272,15 @@ class MomentumOnlyPipeline:
             return self._skip("gate_no_signal")
 
         # Pool filter: skip if visible pool is too small (dilution kills edge).
+        # Exception: very strong primary signals can bypass on pools >= floor.
+        is_strong_bypass = False
         if pool_total < _MIN_POOL_BNB:
-            return self._skip("pool_below_minimum")
+            if (not is_regime2
+                    and result.signal_strength >= _STRONG_BYPASS_STRENGTH
+                    and pool_total >= _STRONG_BYPASS_POOL_FLOOR):
+                is_strong_bypass = True
+            else:
+                return self._skip("pool_below_minimum")
 
         our_side = pool_bull_bnb if signal_dir == "Bull" else pool_bear_bnb
 
@@ -282,6 +297,14 @@ class MomentumOnlyPipeline:
                 our_side_bnb=our_side,
                 base_frac=_REGIME2_BASE_FRAC,
                 cap_bnb=_REGIME2_CAP_BNB,
+            )
+        elif is_strong_bypass:
+            bet_size = _compute_bet_size(
+                signal_strength=effective_strength,
+                pool_bnb=pool_total,
+                our_side_bnb=our_side,
+                base_frac=_STRONG_BYPASS_BASE_FRAC,
+                cap_bnb=_STRONG_BYPASS_CAP_BNB,
             )
         else:
             bet_size = _compute_bet_size(
