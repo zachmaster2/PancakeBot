@@ -59,10 +59,12 @@ _POOL_THRESH_BOUNDARY = 3.0
 
 # Regime-2: ETH+SOL multi-TF agreement when BTC is silent.
 # Fills flat periods where primary BTC signal doesn't fire.
-# 5-fold: +2.72/2k (5/5), 37% more bets, fold_std improves.
-# Regime-2 bets have 58.6% WR independently.
+# 5-fold: +2.83/2k (5/5) with separate sizing, 37% more bets.
+# Regime-2 bets have 58.6% WR — lower than primary, so bet smaller.
 _REGIME2_ENABLED = True
 _REGIME2_MIN_STRENGTH = 0.00015  # min(eth_strength, sol_strength) threshold
+_REGIME2_BASE_FRAC = 0.02       # smaller base (regime-2 WR is lower)
+_REGIME2_CAP_BNB = 0.5          # cap regime-2 bets at 0.5 BNB
 
 
 
@@ -91,20 +93,22 @@ def _compute_bet_size(
     signal_strength: float,
     pool_bnb: float,
     our_side_bnb: float,
+    base_frac: float = _BASE_FRAC,
+    cap_bnb: float = _CAP_BNB,
 ) -> float:
     """Continuous adaptive sizing with payout-proportional boost.
 
-    1. Signal-strength sizing: frac = BASE_FRAC + SIZING_SLOPE * signal_strength
+    1. Signal-strength sizing: frac = base_frac + SIZING_SLOPE * signal_strength
     2. Payout boost: when our side has high payout (fewer bettors on our side),
        multiply frac by up to 2x. This is Kelly reasoning — bet more when
        the odds are favorable.
 
-    Validated: +1.76/2k (5/5 positive folds), 63.5% WR.
+    Regime-2 bets use smaller base_frac and cap (lower WR → bet less).
     """
     if pool_bnb <= 0:
         return _FLOOR_BNB
 
-    frac = min(_BASE_FRAC + _SIZING_SLOPE * signal_strength, _MAX_FRAC)
+    frac = min(base_frac + _SIZING_SLOPE * signal_strength, _MAX_FRAC)
 
     # Payout-proportional boost: bet more when our side has high payout.
     if our_side_bnb > 0:
@@ -113,7 +117,7 @@ def _compute_bet_size(
         frac = min(frac * payout_mult, _MAX_FRAC)
 
     bet = pool_bnb * frac
-    return max(_FLOOR_BNB, min(_CAP_BNB, bet))
+    return max(_FLOOR_BNB, min(cap_bnb, bet))
 
 
 class MomentumOnlyPipeline:
@@ -227,6 +231,7 @@ class MomentumOnlyPipeline:
         # Determine signal source: primary (BTC) or regime-2 (ETH+SOL)
         signal_dir = None
         effective_strength = 0.0
+        is_regime2 = False
 
         if result.signal is not None:
             # Primary: BTC multi-TF fires
@@ -253,6 +258,7 @@ class MomentumOnlyPipeline:
                         result.eth_signal_strength * _ETH_SIZING_WEIGHT
                         + result.sol_signal_strength * _SOL_SIZING_WEIGHT
                     )
+                    is_regime2 = True
 
         if signal_dir is None:
             return self._skip("gate_no_signal")
@@ -269,11 +275,20 @@ class MomentumOnlyPipeline:
             if payout < _MIN_PAYOUT:
                 return self._skip("payout_below_floor")
 
-        bet_size = _compute_bet_size(
-            signal_strength=effective_strength,
-            pool_bnb=pool_total,
-            our_side_bnb=our_side,
-        )
+        if is_regime2:
+            bet_size = _compute_bet_size(
+                signal_strength=effective_strength,
+                pool_bnb=pool_total,
+                our_side_bnb=our_side,
+                base_frac=_REGIME2_BASE_FRAC,
+                cap_bnb=_REGIME2_CAP_BNB,
+            )
+        else:
+            bet_size = _compute_bet_size(
+                signal_strength=effective_strength,
+                pool_bnb=pool_total,
+                our_side_bnb=our_side,
+            )
 
         if bet_size < self._min_bet_amount_bnb:
             return self._skip("bet_size_below_min")
