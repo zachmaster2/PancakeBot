@@ -98,7 +98,7 @@ class PoolEventWatcher:
     def get_pool(self, epoch: int, *, max_ts: int = 0) -> tuple[float, float]:
         """Return (bull_bnb, bear_bnb) from confirmed events for a given epoch.
 
-        If max_ts > 0, only include bets with block_timestamp <= max_ts.
+        If max_ts > 0, only include bets with block_timestamp < max_ts.
         This allows filtering to e.g. lock_at - 6 for consistent pool data.
         """
         bull_wei = 0
@@ -120,7 +120,7 @@ class PoolEventWatcher:
                 if max_ts > 0:
                     if bet.block_ts == 0:
                         continue  # unknown timestamp, skip to be safe
-                    if bet.block_ts > max_ts:
+                    if bet.block_ts >= max_ts:
                         continue
 
                 if bet.side == "Bull":

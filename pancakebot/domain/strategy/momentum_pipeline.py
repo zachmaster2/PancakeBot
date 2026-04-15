@@ -380,15 +380,16 @@ class MomentumOnlyPipeline:
 
 
 def _pools_from_bets(round_t: Round, cutoff_ts: int) -> tuple[float, float]:
-    """Compute bull/bear pool BNB from bets placed at or before cutoff_ts.
+    """Compute bull/bear pool BNB from bets placed strictly before cutoff_ts.
 
-    Uses cutoff_ts (lock_at - cutoff_seconds) to match what the live bot
-    sees via RPC at decision time.  Bets placed after cutoff are excluded.
+    Uses cutoff_ts (lock_at - POOL_CUTOFF_SECONDS) to match what the live
+    bot sees.  Strict < avoids boundary ambiguity between The Graph's
+    createdAt and BSC block timestamps.
     """
     bull_wei = 0
     bear_wei = 0
     for bet in round_t.bets:
-        if int(bet.created_at) > cutoff_ts:
+        if int(bet.created_at) >= cutoff_ts:
             continue
         if bet.position == "Bull":
             bull_wei += int(bet.amount_wei)
