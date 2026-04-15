@@ -18,7 +18,7 @@ from pancakebot.errors import InvariantError
 from pancakebot.log import info
 from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline
 from pancakebot.types import Round
-from pancakebot.runtime.settlement import settle_bet_against_closed_round
+from pancakebot.settlement import settle_bet_against_closed_round
 
 _BNB_KLINES_PATH = Path("var/bnb_spot_prices.jsonl")
 _BTC_KLINES_PATH = Path("var/btc_spot_prices.jsonl")

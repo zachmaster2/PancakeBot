@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from pancakebot.integration.app import run_from_config
+from pancakebot.app import run_from_config
 from pancakebot.log import info
 
 
