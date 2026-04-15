@@ -161,6 +161,8 @@ def load_app_config(path: str) -> AppConfig:
         "dry_audit_trades_path",
         "dry_cycle_audit_path",
         "dry_bankroll_state_path",
+        "dry_archive_root",
+        "dry_fresh_start",
     }
     _validate_unknown_keys("paths", paths, allowed_path_keys)
 
@@ -195,6 +197,12 @@ def load_app_config(path: str) -> AppConfig:
         "dry_bankroll_state_path",
         "var/runtime/dry_bankroll_state.json",
     )
+    dry_archive_root = _opt_str(
+        paths,
+        "dry_archive_root",
+        "../PancakeBot_var_exp",
+    )
+    dry_fresh_start = bool(paths.get("dry_fresh_start", True))
     _validate_distinct_paths(
         "runtime_state",
         {
@@ -316,6 +324,8 @@ def load_app_config(path: str) -> AppConfig:
             dry_audit_trades_path=dry_audit_trades_path,
             dry_cycle_audit_path=dry_cycle_audit_path,
             dry_bankroll_state_path=dry_bankroll_state_path,
+            dry_archive_root=dry_archive_root,
+            dry_fresh_start=dry_fresh_start,
         ),
         momentum_gate=momentum_gate_cfg,
         backtest=backtest_cfg,

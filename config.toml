@@ -10,6 +10,8 @@ dry_settled_epochs_path = "var/runtime/dry_settled_epochs.txt"
 dry_audit_trades_path = "var/runtime/dry_audit_trades.csv"
 dry_cycle_audit_path = "var/runtime/dry_cycle_audit.csv"
 dry_bankroll_state_path = "var/runtime/dry_bankroll_state.json"
+dry_archive_root = "../PancakeBot_var_exp"
+dry_fresh_start = true
 
 [graph]
 abi_json_path = "abi/prediction_v2_abi.json"
