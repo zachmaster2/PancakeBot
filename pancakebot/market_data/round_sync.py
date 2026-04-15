@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from pancakebot.infra.graph_client import GraphClient
-from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
+from pancakebot.market_data.graph_client import GraphClient
+from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.errors import InvariantError
 from pancakebot.log import info
 

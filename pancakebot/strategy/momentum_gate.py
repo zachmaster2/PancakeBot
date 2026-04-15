@@ -25,7 +25,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
-from pancakebot.infra.okx_client import OkxClient
+from pancakebot.market_data.okx_client import OkxClient
 from pancakebot.log import warn
 
 # Number of 1s candles fetched and used by all modes (live, sync, backtest).

@@ -14,7 +14,7 @@ from pancakebot.constants import (
     PREDICTION_V2_CONTRACT_ADDRESS,
     TREASURY_FEE_DIVISOR,
 )
-from pancakebot.infra.onchain.web3_contract_config import Web3ContractConfig
+from pancakebot.chain.contract_config import Web3ContractConfig
 from pancakebot.errors import InvariantError, TransientRpcError
 
 _T = TypeVar("_T")
