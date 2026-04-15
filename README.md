@@ -1,112 +1,77 @@
 # PancakeBot
 
-Spec-driven, invariant-heavy runtime for PancakeSwap Prediction v2.
+Automated trading bot for PancakeSwap Prediction V2 on BNB Smart Chain.
 
-## Quick start
+## Strategy
 
-Current shared baseline:
+**Signal:** BTC multi-timeframe momentum agreement. BTC 3s, 7s, and 15s
+returns must all agree in direction with `min(|return|) >= threshold`.
 
-- `1 gwei` accounting gas
-- router: `selector_max_score`
-- selector/router warmup: `10000`
-- active dislocation candidates:
-  - `disloc_stageB_bullonly_recent8pct_v1`
-- flow candidate:
-  - `flow_lgbm_recent_t12k_r1k_regime40_v1`
-  - `enabled = false` in the current contained runtime profile
-  - retained for re-qualification research, not active in dry/live by default
-  - `train_size = 12000`
-  - `retrain_interval = 1000`
-  - `ev_threshold = 0.0025`
-  - `min_total_pool_c = 1.0`
-  - `selector_score_penalty_bnb = 0.0`
-  - `roll_window = 40`
-  - `roll_winrate_min = 0.48`
-  - `cooldown_trades = 40`
+- Pool-adaptive threshold: 0.0002 for pools < 3 BNB, 0.0001 for pools >= 3 BNB
+- Signal fires ~3% of rounds (bear-biased: 90% of PnL from Bear signals)
 
-   1. #### Create a `.env` file at the repo root:
+**Regime-2:** When BTC is silent, ETH + SOL multi-TF(3,7,15) agreement fires
+as a secondary signal with smaller sizing.
 
-      - `THE_GRAPH_API_KEY` - API key for The Graph gateway (Bearer token)
-      - `BSC_WALLET_PRIVATE_KEY` - Wallet private key hex (with or without `0x`)
+**Sizing:** Continuous adaptive based on signal strength, ETH/SOL confirmation,
+and payout odds.
 
-   2. #### Review `config.toml` key settings:
-
-      - `[strategy.router]`
-      - active dislocation candidates under `[strategy.dislocation]`
-      - `[runtime]` cutoff and receipt settings
-      - `[paths]` runtime-state outputs for dry/live smoke runs
-      - `[backtest] simulation_size` (backtest only)
-
-   3. #### Run:
-
-      | mode      | command                    | description                                           |
-      |-----------|----------------------------|-------------------------------------------------------|
-      | Backtest  | `.\.venv\Scripts\python.exe run.py --backtest` | simulates dry/live deterministically without sleeping |
-      | Dry       | `.\.venv\Scripts\python.exe run.py --dry`      | simulates bets/claims without broadcasting            |
-      | Live      | `.\.venv\Scripts\python.exe run.py`            | places real on-chain bets                             |
-      | Sync only | `.\.venv\Scripts\python.exe run.py --sync-only` | updates closed rounds and kline coverage, then exits  |
-
-      - Outputs (`var/`):
-         - Backtest:
-            - `backtest_trades.csv`
-            - `backtest_summary.json`
-         - Dry/Live:
-            - rolling closed-round store
-            - runtime artifacts/logs
-            - `runtime/claim_scan_cursor.txt`
-            - `runtime/dry_bets.jsonl`
-            - `runtime/dry_settled_epochs.txt`
-            - `runtime/dry_audit_trades.csv` for persistent dry bet/settlement audit
-            - `runtime/dry_cycle_audit.csv` for per-cycle dry decision audit
-            - `runtime/dry_bankroll_state.json`
-
-At dry startup, any existing `var/runtime` dry-state files are first archived to
-`../PancakeBot_var_exp/dry_run_archive_*_startup_fresh_reset/`, then the new
-run starts fresh. On dry shutdown, the current state is also snapshotted to
-`../PancakeBot_var_exp/dry_run_archive_*_shutdown_snapshot/`.
-
-`runtime/dry_cycle_audit.csv` is reset at dry startup so each run has a clean
-decision log. It now records both:
-- `observed_*` pool fields: the raw open-round snapshot seen by dry mode
-- `cutoff_used_*` pool fields: the cutoff-filtered pool actually used by the
-  strategy logic
-
-`runtime/dry_audit_trades.csv` remains the per-run dry bet/settlement ledger.
-
-## Dry smoke
-
-Use the shared `config.toml` baseline directly:
-
-```powershell
-.\.venv\Scripts\python.exe run.py --config config.toml --dry
+```
+effective_strength = btc_min_abs + eth_confirm * 0.3 + sol_confirm * 0.3
+frac = min(0.04 + 100 * effective_strength, 0.30)
+frac = frac * max(0.5, 1.0 + 1.0 * (payout - 2.0))
+bet = max(0.01, min(2.0, pool * frac))
 ```
 
-Recommended preflight before a long dry run:
+**Filters:** Pool minimum (1.5 BNB), payout floor (1.5x), strong-signal
+bypass for small pools (BTC strength > 0.0004, pool >= 1.0 BNB).
 
-```powershell
-.\.venv\Scripts\python.exe -m inspection.run_runtime_preflight --check-env
+## Architecture
 
-.\.venv\Scripts\python.exe -m inspection.run_backtest_scenario --name smoke_promoted_runtime_profile --sim-size 200 --reset-mode continuous
-```
+See [docs/architecture.html](docs/architecture.html) for the visual diagram.
 
-If you only need the latest on-disk market inputs for research or inspection,
-without starting the dry/live loop, use:
+**Two-phase runtime loop (per round):**
 
-```powershell
-.\.venv\Scripts\python.exe run.py --sync-only
-```
+| Phase | Timing | Actions |
+|-------|--------|---------|
+| A: Housekeeping | lock_at - 6s | Epoch check (BSC RPC), TLS warmup (3 parallel connections to OKX), pool data (BSC WSS) |
+| Sleep | 3-4s | Wait for cutoff moment + OKX publish delay |
+| B: Critical path | lock_at - 1.75s | Fetch BTC/ETH/SOL 1s klines (~285ms), compute signal, sizing, timing guard (lock_at - 1s), submit bet |
 
-Experimental controller dry tests should not edit `config.toml` directly.
-Use the runbook in [WINDOW_CONTROLLER_DRY_TEST_RUNBOOK.md](/C:/Users/zking/Documents/GitHub/PancakeBot/docs/WINDOW_CONTROLLER_DRY_TEST_RUNBOOK.md) together with:
+**Data sources:**
 
-```powershell
-.\.venv\Scripts\python.exe -m inspection.write_window_controller_runtime_config ...
-```
+| Source | Data | Used for |
+|--------|------|----------|
+| OKX public REST API | BTC, ETH, SOL 1s candles | Signal computation |
+| BSC RPC (publicnode) | Epoch state, round data | Timing, bet submission |
+| BSC WSS (publicnode) | Real-time BetBull/BetBear events | Pool tracking |
+| The Graph API | Historical closed rounds | Sync mode (backtest data) |
 
-Current best experimental controller dry-test candidate:
-- baseline: `disloc_stageB_bullonly_recent8pct_v1`
-- alternate: `disloc_cons_20260227_x80`
-- mode: `trailing_best_vs_baseline`
-- `window_rounds = 216`
-- `lookback_windows = 3`
-- `margin_per_500 = 1.0`
+## Setup
+
+1. Create a `.env` file at the repo root:
+
+   - `THE_GRAPH_API_KEY` - API key for The Graph gateway
+   - `BSC_WALLET_PRIVATE_KEY` - Wallet private key hex (with or without `0x`)
+
+2. Review `config.toml` settings.
+
+3. Run:
+
+   | Mode | Command | Description |
+   |------|---------|-------------|
+   | Sync | `python run.py --sync` | Fetch closed rounds + klines from OKX, then exit |
+   | Backtest | `python run.py --backtest` | Replay signal on historical data |
+   | Dry | `python run.py --dry` | Paper trading with real-time data |
+   | Live | `python run.py` | Real on-chain bets |
+
+## Outputs
+
+- `var/backtest_trades.csv`, `var/backtest_summary.json` - Backtest results
+- `var/runtime/dry_bankroll_state.json` - Dry mode bankroll
+- `var/runtime/dry_cycle_audit.csv` - Per-round decision log
+- `var/runtime/dry_audit_trades.csv` - Dry bet/settlement ledger
+- `var/{bnb,btc,eth,sol}_spot_prices.jsonl` - Synced 1s kline data
+- `var/closed_rounds.jsonl` - Historical round data
+
+Dry state is archived to `../PancakeBot_var_exp/` on startup and shutdown.
