@@ -7,7 +7,7 @@ import tomllib
 
 from pancakebot.backtest.config import BacktestConfig
 from pancakebot.config.app_config import AppConfig, RuntimeStatePathsConfig
-from pancakebot.domain.strategy.momentum_gate import MomentumGateConfig
+from pancakebot.strategy.momentum_gate import MomentumGateConfig
 from pancakebot.errors import InvariantError
 
 

@@ -4,7 +4,7 @@ import json
 import os
 from typing import Iterator, Sequence
 
-from pancakebot.domain.types import Round
+from pancakebot.types import Round
 from pancakebot.errors import InvariantError
 
 
@@ -179,4 +179,4 @@ class ClosedRoundsStore:
 
         os.replace(replace_path, self._path)
 
-    # JSON codecs live on Round/Bet in pancakebot.domain.types.
+    # JSON codecs live on Round/Bet in pancakebot.types.

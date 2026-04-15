@@ -26,10 +26,10 @@ from pancakebot.constants import (
     GAS_COST_BET_BNB,
 )
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
-from pancakebot.domain.types import Round
+from pancakebot.types import Round
 from pancakebot.infra.onchain.web3_prediction_contract import RoundData, Web3PredictionContract
-from pancakebot.domain.strategy.momentum_gate import MomentumGate
-from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline, StrategyPipelineDecision
+from pancakebot.strategy.momentum_gate import MomentumGate
+from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline, StrategyPipelineDecision
 from pancakebot.runtime.claim_manager import claim_scan_cursor
 from pancakebot.runtime.settlement import settle_from_round_data
 from time import sleep as sleep_seconds
@@ -1487,7 +1487,7 @@ def _log_deferred_gate_signal(decision: StrategyPipelineDecision) -> None:
 
 def _build_momentum_pipeline(*, cfg: RuntimeConfig) -> MomentumOnlyPipeline:
     """Build momentum-only strategy pipeline."""
-    from pancakebot.domain.strategy.momentum_gate import MomentumGateConfig
+    from pancakebot.strategy.momentum_gate import MomentumGateConfig
     gate_config: MomentumGateConfig = cfg.momentum_gate_config  # type: ignore[assignment]
     return MomentumOnlyPipeline(
         config=gate_config,
