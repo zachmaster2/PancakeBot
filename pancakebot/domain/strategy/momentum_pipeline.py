@@ -329,13 +329,13 @@ class MomentumOnlyPipeline:
         cutoff_ts_ms: int,
     ) -> MomentumGateResult:
         """Run signal logic on cached klines (backtest path)."""
-        bnb_klines = self._bnb_klines_by_epoch.get(epoch)
-        if bnb_klines is None or len(bnb_klines) == 0:
+        btc_klines = self._btc_klines_by_epoch.get(epoch)
+        if btc_klines is None or len(btc_klines) == 0:
             return MomentumGateResult(
                 signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-                skip_reason="gate_no_bnb_klines",
+                skip_reason="gate_no_btc_klines",
             )
-        btc_klines = self._btc_klines_by_epoch.get(epoch)
+        bnb_klines = self._bnb_klines_by_epoch.get(epoch, [])
         eth_klines = self._eth_klines_by_epoch.get(epoch)
         sol_klines = self._sol_klines_by_epoch.get(epoch)
         return compute_signal_from_klines(

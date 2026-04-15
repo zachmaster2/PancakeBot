@@ -26,7 +26,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 from pancakebot.infra.okx_client import OkxClient
-from pancakebot.core.logging import info, warn
+from pancakebot.core.logging import warn
 
 # Number of 1s candles fetched and used by all modes (live, sync, backtest).
 _CANDLE_COUNT = 31
@@ -73,11 +73,17 @@ class MomentumGate:
         # Cached after each evaluate() so the pipeline can use data
         # for auxiliary signals and regime-adaptive sizing without re-fetching.
         self.last_btc_closes: list[float] | None = None
-        self.last_bnb_closes: list[float] | None = None
+        # Per-pair fetch timing (ms) — set each evaluate(), logged by caller
+        # AFTER timing guard so file I/O doesn't delay bet submission.
+        self.last_fetch_timing: dict[str, int] | None = None
 
     @property
     def enabled(self) -> bool:
         return self._cfg.enabled
+
+    def warmup_session(self) -> None:
+        """Re-warm the OKX TLS connection before fetching klines."""
+        self._client.warmup()
 
     # ------------------------------------------------------------------
     # Async fetch / evaluate split
@@ -94,12 +100,16 @@ class MomentumGate:
     # ------------------------------------------------------------------
 
     def fetch_klines_async(self, *, cutoff_ts_ms: int) -> tuple | None:
-        """Kick off BNB + BTC + ETH + SOL kline fetches in parallel.
+        """Kick off BTC + ETH + SOL kline fetches in parallel.
 
         Call this immediately after waking from sleep, *before* the
         RPC calls (epoch handshake, lock_ts, round_data).  Returns a
-        4-tuple of Futures that evaluate() will collect, or None when
+        3-tuple of Futures that evaluate() will collect, or None when
         the gate is disabled.
+
+        BNB klines are NOT fetched here — they aren't used for signal
+        computation (only for sync/backtest data collection).  Skipping
+        BNB saves one OKX HTTP request in the critical bet path.
 
         *cutoff_ts_ms* is passed to OKX as the ``after`` parameter so
         only completed candles (open_time < cutoff) are returned —
@@ -107,13 +117,12 @@ class MomentumGate:
         """
         if not self._cfg.enabled:
             return None
-        pool = ThreadPoolExecutor(max_workers=4)
-        bnb_fut = pool.submit(self._fetch_klines, self._cfg.bnb_symbol, _CANDLE_COUNT, cutoff_ts_ms)
+        pool = ThreadPoolExecutor(max_workers=3)
         btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _CANDLE_COUNT, cutoff_ts_ms)
         eth_fut = pool.submit(self._fetch_klines, self._cfg.eth_symbol, _CANDLE_COUNT, cutoff_ts_ms)
         sol_fut = pool.submit(self._fetch_klines, self._cfg.sol_symbol, _CANDLE_COUNT, cutoff_ts_ms)
         pool.shutdown(wait=False)   # let threads finish on their own
-        return bnb_fut, btc_fut, eth_fut, sol_fut
+        return btc_fut, eth_fut, sol_fut
 
     def evaluate(
         self,
@@ -136,53 +145,48 @@ class MomentumGate:
                 skip_reason=None,
             )
 
-        # Collect klines — from async fetch or inline fallback
+        # Collect klines — BTC/ETH/SOL only (BNB not needed for signal).
+        import time as _time
         if kline_futures is not None:
-            bnb_klines = kline_futures[0].result()
-            btc_klines = kline_futures[1].result()
-            eth_klines = kline_futures[2].result() if len(kline_futures) > 2 else None
-            sol_klines = kline_futures[3].result() if len(kline_futures) > 3 else None
+            _t0 = _time.monotonic()
+            btc_klines = kline_futures[0].result()
+            _t_btc = _time.monotonic()
+            eth_klines = kline_futures[1].result() if len(kline_futures) > 1 else None
+            _t_eth = _time.monotonic()
+            sol_klines = kline_futures[2].result() if len(kline_futures) > 2 else None
+            _t_sol = _time.monotonic()
+            # Store timing for caller to log AFTER timing guard (no file I/O here)
+            self.last_fetch_timing = {
+                "btc_ms": int((_t_btc - _t0) * 1000),
+                "eth_ms": int((_t_eth - _t_btc) * 1000),
+                "sol_ms": int((_t_sol - _t_eth) * 1000),
+                "total_ms": int((_t_sol - _t0) * 1000),
+            }
         else:
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                bnb_fut = pool.submit(self._fetch_klines, self._cfg.bnb_symbol, _CANDLE_COUNT, cutoff_ts_ms)
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _CANDLE_COUNT, cutoff_ts_ms)
                 eth_fut = pool.submit(self._fetch_klines, self._cfg.eth_symbol, _CANDLE_COUNT, cutoff_ts_ms)
                 sol_fut = pool.submit(self._fetch_klines, self._cfg.sol_symbol, _CANDLE_COUNT, cutoff_ts_ms)
-                bnb_klines = bnb_fut.result()
                 btc_klines = btc_fut.result()
                 eth_klines = eth_fut.result()
                 sol_klines = sol_fut.result()
 
-        # Validate: we expect exactly _CANDLE_COUNT contiguous 1s candles
-        # ending at cutoff - 1.  Reject if the response is incomplete.
-        bnb_reason = _validate_klines(bnb_klines, cutoff_ts_ms, "bnb")
-        if bnb_reason is not None:
-            return self._skip(bnb_reason)
+        # Validate BTC klines (the signal source).  We require exactly
+        # _CANDLE_COUNT contiguous 1s candles ending at cutoff - 1.
+        btc_reason = _validate_klines(btc_klines, cutoff_ts_ms, "btc")
+        if btc_reason is not None:
+            return self._skip(btc_reason)
 
-        bnb_closes = [k["close_price"] for k in bnb_klines]
-        btc_closes = [k["close_price"] for k in btc_klines] if btc_klines and len(btc_klines) >= _CANDLE_COUNT else None
+        btc_closes = [k["close_price"] for k in btc_klines]
         eth_closes = [k["close_price"] for k in eth_klines] if eth_klines and len(eth_klines) >= _CANDLE_COUNT else None
         sol_closes = [k["close_price"] for k in sol_klines] if sol_klines and len(sol_klines) >= _CANDLE_COUNT else None
 
-        # Cache closes for pipeline auxiliary signals and regime-adaptive sizing.
-        self.last_bnb_closes = bnb_closes
         self.last_btc_closes = btc_closes
 
-        result = _compute_signal(bnb_closes, btc_closes, eth_closes, sol_closes)
+        result = _compute_signal(btc_closes, eth_closes, sol_closes)
 
-        # Diagnostic: log signal details so dry-run progress is visible
-        if result.signal is not None:
-            info("GATE", "SIGNAL", "FIRE",
-                 side=result.signal,
-                 strength=f"{result.signal_strength:.6f}",
-                 eth_confirm=f"{result.eth_confirmation_strength:.6f}",
-                 sol_confirm=f"{result.sol_confirmation_strength:.6f}",
-                 bnb_ok=bnb_klines is not None,
-                 btc_ok=btc_closes is not None,
-                 eth_ok=eth_closes is not None,
-                 sol_ok=sol_closes is not None)
-        else:
-            _log_no_signal(bnb_closes, btc_closes, eth_closes, sol_closes)
+        # NOTE: No logging here — caller logs AFTER timing guard so
+        # file I/O doesn't delay bet submission in the critical path.
 
         return result
 
@@ -252,30 +256,6 @@ def _get_return(closes: list[float], lookback: int) -> float | None:
     return (now / ago) - 1.0
 
 
-def _log_no_signal(
-    bnb_closes: list[float],
-    btc_closes: list[float] | None,
-    eth_closes: list[float] | None = None,
-    sol_closes: list[float] | None = None,
-) -> None:
-    """Log diagnostic when signal doesn't fire — shows why."""
-    btc_rets = {}
-    if btc_closes:
-        for lb in _MTF_LOOKBACKS:
-            r = _get_return(btc_closes, lb)
-            btc_rets[lb] = f"{r:.7f}" if r is not None else "N/A"
-
-    info("GATE", "DIAG", "NO_SIGNAL",
-         btc_r3=btc_rets.get(3, "N/A"),
-         btc_r7=btc_rets.get(7, "N/A"),
-         btc_r15=btc_rets.get(15, "N/A"),
-         thresh=f"{_MTF_THRESH}",
-         bnb_ok=bnb_closes is not None and len(bnb_closes) > 0,
-         btc_ok=btc_closes is not None,
-         eth_ok=eth_closes is not None,
-         sol_ok=sol_closes is not None)
-
-
 def compute_signal_from_klines(
     bnb_klines: list[list],
     btc_klines: list[list] | None,
@@ -286,9 +266,9 @@ def compute_signal_from_klines(
     """Compute signal from raw kline arrays (backtest path).
 
     Trims klines to the same window the live path fetches, validates
-    the result, then computes the signal using direct indexing.
+    BTC (the signal source), then computes the signal.  BNB klines are
+    accepted for interface compat but are not used for signal logic.
     """
-    bnb_klines = _trim_to_window(bnb_klines, cutoff_ms)
     if btc_klines is not None:
         btc_klines = _trim_to_window(btc_klines, cutoff_ms)
     if eth_klines is not None:
@@ -296,17 +276,15 @@ def compute_signal_from_klines(
     if sol_klines is not None:
         sol_klines = _trim_to_window(sol_klines, cutoff_ms)
 
-    bnb_reason = _validate_klines_raw(bnb_klines, cutoff_ms, "bnb")
-    if bnb_reason is not None:
+    # Validate BTC klines (same gate as live path).
+    btc_reason = _validate_klines_raw(btc_klines, cutoff_ms, "btc")
+    if btc_reason is not None:
         return MomentumGateResult(
             signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-            skip_reason=bnb_reason,
+            skip_reason=btc_reason,
         )
 
-    bnb_closes = [k[4] for k in bnb_klines]
-    btc_closes = None
-    if btc_klines and len(btc_klines) >= _CANDLE_COUNT:
-        btc_closes = [k[4] for k in btc_klines]
+    btc_closes = [k[4] for k in btc_klines]
     eth_closes = None
     if eth_klines and len(eth_klines) >= _CANDLE_COUNT:
         eth_closes = [k[4] for k in eth_klines]
@@ -314,7 +292,7 @@ def compute_signal_from_klines(
     if sol_klines and len(sol_klines) >= _CANDLE_COUNT:
         sol_closes = [k[4] for k in sol_klines]
 
-    return _compute_signal(bnb_closes, btc_closes, eth_closes, sol_closes)
+    return _compute_signal(btc_closes, eth_closes, sol_closes)
 
 
 def _trim_to_window(klines: list[list], cutoff_ms: int) -> list[list]:
@@ -340,7 +318,6 @@ def _compute_pair_multi_tf(
 
 
 def _compute_signal(
-    bnb_closes: list[float],
     btc_closes: list[float] | None,
     eth_closes: list[float] | None = None,
     sol_closes: list[float] | None = None,

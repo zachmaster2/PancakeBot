@@ -21,6 +21,40 @@ class OkxClient:
 
     def __init__(self, *, timeout_seconds: float) -> None:
         self._timeout_seconds = timeout_seconds
+        self._session = requests.Session()
+
+    def warmup(self, connections: int = 3) -> None:
+        """Fill the connection pool so parallel fetches hit warm connections."""
+        from concurrent.futures import ThreadPoolExecutor
+        url = f"{_OKX_BASE_URL}/api/v5/public/time"
+        with ThreadPoolExecutor(max_workers=connections) as pool:
+            futs = [pool.submit(self._session.get, url, timeout=self._timeout_seconds)
+                    for _ in range(connections)]
+            for f in futs:
+                f.result()
+
+    def fetch_raw(
+        self,
+        *,
+        endpoint: str,
+        params: dict[str, str],
+    ) -> dict | None:
+        """Low-level GET returning parsed JSON body, or None on failure.
+
+        Reuses the session's keep-alive connection.  Intended for sync
+        mode and any caller that needs the raw OKX response.
+        """
+        url = f"{_OKX_BASE_URL}/api/v5/market/{endpoint}"
+        try:
+            r = self._session.get(url, params=params, timeout=self._timeout_seconds)
+        except requests.RequestException:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            return r.json()
+        except ValueError:
+            return None
 
     def fetch_1s_klines(
         self,
@@ -54,7 +88,7 @@ class OkxClient:
             params["after"] = str(after_ms)
 
         try:
-            r = requests.get(url, params=params, timeout=self._timeout_seconds)
+            r = self._session.get(url, params=params, timeout=self._timeout_seconds)
         except requests.RequestException as e:
             raise InvariantError(f"okx_client_1s_request_failed: {e}") from e
 

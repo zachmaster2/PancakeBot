@@ -29,7 +29,7 @@ from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
 from pancakebot.domain.types import Round
 from pancakebot.infra.onchain.web3_prediction_contract import RoundData, Web3PredictionContract
 from pancakebot.domain.strategy.momentum_gate import MomentumGate
-from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline
+from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline, StrategyPipelineDecision
 from pancakebot.runtime.claim_manager import claim_scan_cursor
 from pancakebot.runtime.settlement import settle_from_round_data
 from pancakebot.runtime.sleep import sleep_seconds
@@ -41,6 +41,8 @@ from pancakebot.core.money import bankroll_suffix, format_bankroll, usd_suffix
 from pancakebot.infra.pool_event_watcher import PoolEventWatcher
 
 _LOCK_SAFETY_MARGIN_SECONDS = 1  # abort bet if wall-clock is within this many seconds of lock_at
+_PREFETCH_OFFSET_SECONDS = 4    # wake this many seconds before cutoff for housekeeping
+_OKX_PUBLISH_DELAY_SECONDS = 0.25  # delay after cutoff to let OKX publish the candle
 
 # Extra cushion added to the claim-check wake time to avoid alignment retries near Graph/RPC boundaries.
 _CLAIM_CHECK_PADDING_SECONDS = 5
@@ -1170,29 +1172,17 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
 
-        # Step 6: Sleep until cutoff_ts(t).
-        _sleep_until_ts(cutoff_ts_t, reason="wait_for_cutoff", epoch=current_epoch)
+        # ── Phase A: Housekeeping (before cutoff) ─────────────────────
+        # Wake early to do epoch check + TLS warmup while we're still
+        # waiting for the cutoff moment.  These run OUTSIDE the critical
+        # timing window so they don't eat into our bet-submission budget.
+        wake_ts = cutoff_ts_t - _PREFETCH_OFFSET_SECONDS
+        _sleep_until_ts(wake_ts, reason="wait_for_prefetch", epoch=current_epoch)
 
-        # Step 6a: Kick off OKX kline fetch after a short delay — gives
-        # OKX time to publish the latest 1s candle before we ask for it.
-        # The ~250 ms delay is absorbed by the RPC work in Steps 6b–7
-        # (~150–450 ms), so the futures are still ready by evaluate().
-        okx_kline_futures = None
-        if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, '_gate'):
-            gate = closed.strategy_pipeline._gate
-            if gate is not None:
-                time.sleep(0.25)
-                okx_kline_futures = gate.fetch_klines_async(cutoff_ts_ms=int(cutoff_ts_t * 1000))
-
-        # Step 6b: Quick epoch check — just verify current_epoch hasn't
-        # shifted during the ~267 s sleep.  A full handshake (3 RPC calls,
-        # ~450 ms) is only needed on the rare occasion the epoch actually
-        # changed; a single current_epoch() call (~150 ms) suffices for
-        # the common case.
+        # Epoch quick-check: verify current_epoch hasn't shifted during sleep.
         try:
             current_epoch2 = int(cfg.contract.current_epoch())
         except TransientRpcError:
-            # On transient failure, fall back to a full handshake.
             current_epoch2 = None
 
         if current_epoch2 is not None and current_epoch2 != current_epoch:
@@ -1223,17 +1213,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             continue
 
         if current_epoch2 is None:
-            # Transient RPC failure — full re-handshake as fallback
             locked_round, open_round, current_epoch, _ = _epoch_handshake(cfg, closed)
             locked_epoch = locked_round.epoch
             lock_ts_t = int(open_round.lock_at)
         else:
-            # Common path: epoch unchanged — reuse open_round and lock_ts.
             open_round = _open_round
 
-        # Step 7b: Pool data from event subscription (no round_data RPC).
-        # Filter to bets with block_timestamp <= lock_at - 6 for consistency
-        # with backtest (bets from 6+ seconds ago are guaranteed propagated).
+        # TLS warmup: re-establish OKX keep-alive connection (dies after
+        # ~60 s idle between 5-minute rounds).  Subsequent kline fetches
+        # hit the warm connection (~50 ms instead of ~2 s).
+        gate = None
+        if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, '_gate'):
+            gate = closed.strategy_pipeline._gate
+            if gate is not None:
+                gate.warmup_session()
+
+        # Pool data from WSS subscription (no RPC needed, ~0 ms).
         pool_bull_bnb = 0.0
         pool_bear_bnb = 0.0
         if cfg.pool_watcher is not None and cfg.pool_watcher.connected:
@@ -1246,9 +1241,18 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 info("POOL", "WSS", "USE",
                      epoch=current_epoch, total=f"{pool_total:.4f}",
                      cutoff=f"lock-6s")
-            # Clean up old epochs
             if locked_epoch > 2:
                 cfg.pool_watcher.clear_old_epochs(keep_after=locked_epoch - 2)
+
+        # ── Phase B: Critical path (after cutoff) ─────────────────────
+        # Sleep until cutoff + delay, then fetch → decide → bet.
+        fetch_ts = cutoff_ts_t + _OKX_PUBLISH_DELAY_SECONDS
+        _sleep_until_ts(fetch_ts, reason="wait_for_okx_publish", epoch=current_epoch)
+
+        # Kick off kline fetches on warm connection.
+        okx_kline_futures = None
+        if gate is not None:
+            okx_kline_futures = gate.fetch_klines_async(cutoff_ts_ms=int(cutoff_ts_t * 1000))
 
         # Step 8: Decide.
         t_features_start_ms = _mono_ms()
@@ -1299,6 +1303,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 pool_bear_bnb=pool_bear_bnb,
             )
             info("RUN", "ACT", "SKIP", msg=f"Skip epoch {current_epoch}: {reason}")
+            # SKIP path: no time pressure, safe to log timing here.
+            if gate is not None and gate.last_fetch_timing is not None:
+                info("GATE", "FETCH", "TIMING", **gate.last_fetch_timing)
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
@@ -1461,9 +1468,24 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 pool_bear_bnb=pool_bear_bnb,
             )
 
+        # Step 14b: Deferred GATE logging — emit AFTER bet so file I/O
+        # doesn't delay bet submission in the critical path.
+        if gate is not None and gate.last_fetch_timing is not None:
+            info("GATE", "FETCH", "TIMING", **gate.last_fetch_timing)
+        # Log signal details for dry-run visibility.
+        _log_deferred_gate_signal(decision)
+
         # Step 15: Sleep until claim + claim scan.
         _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
         return
+
+
+def _log_deferred_gate_signal(decision: StrategyPipelineDecision) -> None:
+    """Log GATE signal details after bet submission (deferred from evaluate)."""
+    if decision.action == "BET":
+        info("GATE", "SIGNAL", "FIRE",
+             side=decision.bet_side,
+             strength=f"{decision.bet_size_bnb:.4f}")
 
 
 def _build_momentum_pipeline(*, cfg: RuntimeConfig) -> MomentumOnlyPipeline:
@@ -1566,7 +1588,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     _dry_settle_available_bets(cfg, closed)
 
 
-def _sleep_until_ts(target_ts: int, *, reason: str, epoch: int | None = None) -> None:
+def _sleep_until_ts(target_ts: float, *, reason: str, epoch: int | None = None) -> None:
     remaining = target_ts - time.time()
     if remaining <= 0:
         return

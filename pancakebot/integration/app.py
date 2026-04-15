@@ -66,10 +66,13 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
         graph_api_key = require_env("THE_GRAPH_API_KEY")
         graph = GraphClient(endpoint=PREDICTION_V2_GRAPH_ENDPOINT, api_key=graph_api_key)
         round_store = ClosedRoundsStore(cfg.closed_rounds_path)
+        okx_client = OkxClient(timeout_seconds=10.0)
+        okx_client.warmup()
         summary = sync_runtime_market_data(
             cfg=cfg,
             graph=graph,
             round_store=round_store,
+            okx_client=okx_client,
         )
         info(
             "CORE",
@@ -113,6 +116,7 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
     momentum_gate = None
     if cfg.momentum_gate.enabled:
         okx_client = OkxClient(timeout_seconds=10.0)
+        okx_client.warmup()
         momentum_gate = MomentumGate(config=cfg.momentum_gate, okx_client=okx_client)
 
     # Pool event watcher: subscribes to confirmed BetBull/BetBear events
