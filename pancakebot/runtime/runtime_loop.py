@@ -1564,24 +1564,24 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     claim_ts = close_ts + BUFFER_SECONDS + _CLAIM_CHECK_PADDING_SECONDS
     _sleep_until_ts(claim_ts, reason="wait_for_claim", epoch=claim_epoch)
 
-    # Refresh epochs after sleeping so the prior locked round can become closed.
-    locked_round2, _open_round2, current_epoch2, _open_rd2 = _epoch_handshake(cfg, closed)
-
-    claim_scan_cursor(
-        contract=cfg.contract,
-        wallet_address=cfg.wallet_address,
-        dry=cfg.dry,
-        cursor_path=cfg.runtime_state_paths.claim_scan_cursor_path,
-        locked_epoch=locked_round2.epoch,
-        current_epoch=current_epoch2,
-        now_ts=int(now_ts()),
-        buffer_seconds=BUFFER_SECONDS,
-        get_close_ts=cfg.contract.close_ts,
-        page_size=100,
-        gas_limit=GAS_LIMIT_CLAIM,
-        claim_batch_size=_CLAIM_BATCH_SIZE,
-        min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
-    )
+    if not cfg.dry:
+        # Live: refresh epochs and run claim scan to collect winnings.
+        locked_round2, _open_round2, current_epoch2, _open_rd2 = _epoch_handshake(cfg, closed)
+        claim_scan_cursor(
+            contract=cfg.contract,
+            wallet_address=cfg.wallet_address,
+            dry=False,
+            cursor_path=cfg.runtime_state_paths.claim_scan_cursor_path,
+            locked_epoch=locked_round2.epoch,
+            current_epoch=current_epoch2,
+            now_ts=int(now_ts()),
+            buffer_seconds=BUFFER_SECONDS,
+            get_close_ts=cfg.contract.close_ts,
+            page_size=100,
+            gas_limit=GAS_LIMIT_CLAIM,
+            claim_batch_size=_CLAIM_BATCH_SIZE,
+            min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
+        )
 
     _dry_settle_available_bets(cfg, closed)
 
