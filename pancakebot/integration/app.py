@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from pancakebot.backtest.runner import run_backtest
-from pancakebot.config.env import load_env, require_env
-from pancakebot.config.load_config import load_app_config
+from pancakebot.config import load_env, require_env
+from pancakebot.config import load_app_config
 from pancakebot.constants import (
     BNB_WEI,
     EXPECTED_CHAIN_ID,

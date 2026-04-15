@@ -1,15 +1,131 @@
+"""Configuration: dataclasses, TOML loading, and env helpers.
+
+Merges the former config/app_config.py, config/load_config.py,
+config/env.py, and backtest/config.py into a single module.
+"""
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import tomllib
+from dotenv import load_dotenv
 
-from pancakebot.backtest.config import BacktestConfig
-from pancakebot.config.app_config import AppConfig, RuntimeStatePathsConfig
-from pancakebot.strategy.momentum_gate import MomentumGateConfig
 from pancakebot.errors import InvariantError
+from pancakebot.strategy.momentum_gate import MomentumGateConfig
 
+
+# ── Environment helpers ──────────────────────────────────────────────
+
+def load_env() -> None:
+    """Load .env into process environment."""
+    load_dotenv()
+
+
+def require_env(name: str) -> str:
+    v = os.getenv(name)
+    if v is None or not str(v).strip():
+        raise InvariantError(f"missing_env_var: {name}")
+    return str(v).strip()
+
+
+# ── Backtest config ──────────────────────────────────────────────────
+
+_BACKTEST_RESET_MODES = ("continuous", "chunk_reset")
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestConfig:
+    """Backtest configuration."""
+
+    simulation_size: int
+    initial_bankroll_bnb: float
+    reset_mode: str = "continuous"
+    reset_every_rounds: int = 0
+    tail_offset_rounds: int = 0
+    epoch_start: int | None = None
+    epoch_end: int | None = None
+
+    def validate(self) -> None:
+        if not isinstance(self.simulation_size, int):
+            raise InvariantError("backtest_simulation_size_not_int")
+        if self.simulation_size <= 0:
+            raise InvariantError("backtest_simulation_size_must_be_positive")
+
+        if not isinstance(self.initial_bankroll_bnb, (int, float)):
+            raise InvariantError("backtest_initial_bankroll_bnb_not_number")
+        if self.initial_bankroll_bnb <= 0.0:
+            raise InvariantError("backtest_initial_bankroll_bnb_must_be_positive")
+
+        if not isinstance(self.reset_mode, str):
+            raise InvariantError("backtest_reset_mode_not_str")
+        mode = self.reset_mode.strip()
+        if mode not in _BACKTEST_RESET_MODES:
+            raise InvariantError("backtest_reset_mode_invalid")
+
+        if not isinstance(self.reset_every_rounds, int):
+            raise InvariantError("backtest_reset_every_rounds_not_int")
+        if self.reset_every_rounds < 0:
+            raise InvariantError("backtest_reset_every_rounds_negative")
+        if mode == "chunk_reset" and self.reset_every_rounds <= 0:
+            raise InvariantError("backtest_chunk_reset_every_rounds_must_be_positive")
+
+        if not isinstance(self.tail_offset_rounds, int):
+            raise InvariantError("backtest_tail_offset_rounds_not_int")
+        if self.tail_offset_rounds < 0:
+            raise InvariantError("backtest_tail_offset_rounds_negative")
+
+        if self.epoch_start is not None and self.epoch_end is not None:
+            if self.epoch_start > self.epoch_end:
+                raise InvariantError("backtest_epoch_start_after_epoch_end")
+
+
+# ── Runtime state paths config ───────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class RuntimeStatePathsConfig:
+    """Filesystem paths for mutable runtime state shared by live and dry modes."""
+
+    claim_scan_cursor_path: str
+    dry_bets_path: str
+    dry_settled_epochs_path: str
+    dry_audit_trades_path: str
+    dry_cycle_audit_path: str
+    dry_bankroll_state_path: str
+    dry_archive_root: str
+    dry_fresh_start: bool
+
+
+# ── App config ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class AppConfig:
+    """User-facing configuration loaded from config.toml."""
+
+    # Paths
+    closed_rounds_path: str
+    abi_json_path: str
+
+    # Runtime
+    cutoff_seconds: int
+    latency_log_path: str
+    dry_initial_bankroll_bnb: float | None
+    wait_for_bet_receipt: bool
+    bet_receipt_timeout_seconds: int
+
+    # Runtime state paths
+    runtime_state_paths: RuntimeStatePathsConfig
+
+    # OKX momentum gate (live/dry only; ignored by backtest).
+    momentum_gate: MomentumGateConfig
+
+    # Backtest options. Live and dry ignore these.
+    backtest: BacktestConfig
+
+
+# ── TOML parsing helpers ─────────────────────────────────────────────
 
 def _req(obj: dict[str, Any], key: str) -> Any:
     if key not in obj:
@@ -53,22 +169,6 @@ def _opt_int(obj: dict[str, Any], key: str, default: int) -> int:
     return i
 
 
-def _req_float(obj: dict[str, Any], key: str) -> float:
-    v = _req(obj, key)
-    if not isinstance(v, (int, float)):
-        raise InvariantError(f"config_key_not_number: {key}")
-    return float(v)
-
-
-def _opt_float(obj: dict[str, Any], key: str, default: float) -> float:
-    if key not in obj:
-        return float(default)
-    v = obj[key]
-    if not isinstance(v, (int, float)):
-        raise InvariantError(f"config_key_not_number: {key}")
-    return float(v)
-
-
 def _opt_float_or_none(obj: dict[str, Any], key: str) -> float | None:
     if key not in obj:
         return None
@@ -84,13 +184,6 @@ def _opt_bool(obj: dict[str, Any], key: str, default: bool) -> bool:
     if key not in obj:
         return default
     v = obj[key]
-    if not isinstance(v, bool):
-        raise InvariantError(f"config_key_not_bool: {key}")
-    return v
-
-
-def _req_bool(obj: dict[str, Any], key: str) -> bool:
-    v = _req(obj, key)
     if not isinstance(v, bool):
         raise InvariantError(f"config_key_not_bool: {key}")
     return v
@@ -113,6 +206,8 @@ def _validate_distinct_paths(section_name: str, paths: dict[str, str]) -> None:
             )
         seen[normalized] = str(key)
 
+
+# ── Main loader ──────────────────────────────────────────────────────
 
 def load_app_config(path: str) -> AppConfig:
     p = Path(path)
@@ -167,41 +262,13 @@ def load_app_config(path: str) -> AppConfig:
     _validate_unknown_keys("paths", paths, allowed_path_keys)
 
     closed_rounds_path = _req_str(paths, "closed_rounds_path")
-    claim_scan_cursor_path = _opt_str(
-        paths,
-        "claim_scan_cursor_path",
-        "var/runtime/claim_scan_cursor.txt",
-    )
-    dry_bets_path = _opt_str(
-        paths,
-        "dry_bets_path",
-        "var/runtime/dry_bets.jsonl",
-    )
-    dry_settled_epochs_path = _opt_str(
-        paths,
-        "dry_settled_epochs_path",
-        "var/runtime/dry_settled_epochs.txt",
-    )
-    dry_audit_trades_path = _opt_str(
-        paths,
-        "dry_audit_trades_path",
-        "var/runtime/dry_audit_trades.csv",
-    )
-    dry_cycle_audit_path = _opt_str(
-        paths,
-        "dry_cycle_audit_path",
-        "var/runtime/dry_cycle_audit.csv",
-    )
-    dry_bankroll_state_path = _opt_str(
-        paths,
-        "dry_bankroll_state_path",
-        "var/runtime/dry_bankroll_state.json",
-    )
-    dry_archive_root = _opt_str(
-        paths,
-        "dry_archive_root",
-        "../PancakeBot_var_exp",
-    )
+    claim_scan_cursor_path = _opt_str(paths, "claim_scan_cursor_path", "var/runtime/claim_scan_cursor.txt")
+    dry_bets_path = _opt_str(paths, "dry_bets_path", "var/runtime/dry_bets.jsonl")
+    dry_settled_epochs_path = _opt_str(paths, "dry_settled_epochs_path", "var/runtime/dry_settled_epochs.txt")
+    dry_audit_trades_path = _opt_str(paths, "dry_audit_trades_path", "var/runtime/dry_audit_trades.csv")
+    dry_cycle_audit_path = _opt_str(paths, "dry_cycle_audit_path", "var/runtime/dry_cycle_audit.csv")
+    dry_bankroll_state_path = _opt_str(paths, "dry_bankroll_state_path", "var/runtime/dry_bankroll_state.json")
+    dry_archive_root = _opt_str(paths, "dry_archive_root", "../PancakeBot_var_exp")
     dry_fresh_start = bool(paths.get("dry_fresh_start", True))
     _validate_distinct_paths(
         "runtime_state",
@@ -243,20 +310,12 @@ def load_app_config(path: str) -> AppConfig:
     if bet_receipt_timeout_seconds <= 0:
         raise InvariantError("bet_receipt_timeout_seconds_must_be_positive")
 
-    # [contract] section is no longer used — protocol constants are in
-    # pancakebot.constants (TREASURY_FEE_FRACTION, MIN_BET_AMOUNT_BNB).
-    # Accept but ignore the section for backward compatibility.
     if contract_raw:
         pass  # silently ignore legacy [contract] section
 
     allowed_bt_keys = {
-        "simulation_size",
-        "initial_bankroll_bnb",
-        "reset_mode",
-        "reset_every_rounds",
-        "tail_offset_rounds",
-        "epoch_start",
-        "epoch_end",
+        "simulation_size", "initial_bankroll_bnb", "reset_mode",
+        "reset_every_rounds", "tail_offset_rounds", "epoch_start", "epoch_end",
     }
     _validate_unknown_keys("backtest", backtest, allowed_bt_keys)
 
@@ -269,8 +328,8 @@ def load_app_config(path: str) -> AppConfig:
     initial_bankroll_bnb_v = backtest.get("initial_bankroll_bnb", 0.5)
     if not isinstance(initial_bankroll_bnb_v, (int, float)):
         raise InvariantError("backtest_initial_bankroll_bnb_not_number")
-    initial_bankroll_bnb = float(initial_bankroll_bnb_v)
-    if initial_bankroll_bnb <= 0.0:
+    bt_bankroll = float(initial_bankroll_bnb_v)
+    if bt_bankroll <= 0.0:
         raise InvariantError("backtest_initial_bankroll_bnb_must_be_positive")
 
     reset_mode = _opt_str(backtest, "reset_mode", "continuous")
@@ -284,7 +343,7 @@ def load_app_config(path: str) -> AppConfig:
 
     backtest_cfg = BacktestConfig(
         simulation_size=simulation_size_v,
-        initial_bankroll_bnb=initial_bankroll_bnb,
+        initial_bankroll_bnb=bt_bankroll,
         reset_mode=str(reset_mode),
         reset_every_rounds=int(reset_every_rounds),
         tail_offset_rounds=int(tail_offset_rounds),

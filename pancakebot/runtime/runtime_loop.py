@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from pancakebot.config.app_config import RuntimeStatePathsConfig
+from pancakebot.config import RuntimeStatePathsConfig
 from pancakebot.constants import (
     BNB_WEI,
     GAS_LIMIT_BET,
