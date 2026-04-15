@@ -18,6 +18,7 @@ class Web3ContractConfig:
     rpc_url: str
     abi_json_path: str
     private_key: str
+    rpc_urls: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.rpc_url:

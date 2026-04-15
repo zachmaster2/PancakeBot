@@ -96,32 +96,47 @@ class Web3PredictionContract:
 
     def __init__(self, cfg: Web3ContractConfig):
         self._cfg = cfg
+        self._rpc_urls = list(cfg.rpc_urls) if cfg.rpc_urls else [cfg.rpc_url]
+        self._rpc_index = 0
 
-        w3 = Web3(Web3.HTTPProvider(cfg.rpc_url))
-        chain_id = int(w3.eth.chain_id)
-        if chain_id != int(EXPECTED_CHAIN_ID):
-            raise InvariantError(f'unexpected_chain_id: got={chain_id} expected={EXPECTED_CHAIN_ID}')
-
+        # Create a web3 instance + contract per RPC URL so each keeps
+        # its own persistent session (warm TLS connection).
         pk = cfg.private_key.strip()
         if pk.startswith('0x'):
             pk = pk[2:]
         if len(pk) != 64:
             raise InvariantError('private_key_must_be_32_bytes')
 
-        self._w3 = w3
-        self._account = w3.eth.account.from_key(pk)
-
         abi = _load_abi_list(cfg.abi_json_path)
-        self._contract = w3.eth.contract(
-            address=Web3.to_checksum_address(PREDICTION_V2_CONTRACT_ADDRESS),
-            abi=abi,
-        )
+        contract_addr = Web3.to_checksum_address(PREDICTION_V2_CONTRACT_ADDRESS)
+
+        self._providers: list[tuple[Web3, Any]] = []
+        for url in self._rpc_urls:
+            w3 = Web3(Web3.HTTPProvider(url))
+            c = w3.eth.contract(address=contract_addr, abi=abi)
+            self._providers.append((w3, c))
+
+        # Verify chain ID on the primary URL.
+        w3_primary = self._providers[0][0]
+        chain_id = int(w3_primary.eth.chain_id)
+        if chain_id != int(EXPECTED_CHAIN_ID):
+            raise InvariantError(f'unexpected_chain_id: got={chain_id} expected={EXPECTED_CHAIN_ID}')
+
+        self._w3 = w3_primary
+        self._contract = self._providers[0][1]
+        self._account = w3_primary.eth.account.from_key(pk)
+
+    def _rotate_rpc(self) -> None:
+        """Round-robin to next RPC URL, switching to its warm session."""
+        self._rpc_index = (self._rpc_index + 1) % len(self._providers)
+        self._w3, self._contract = self._providers[self._rpc_index]
 
     @property
     def wallet_address(self) -> str:
         return str(self._account.address)
 
     def _rpc_call(self, *, op: str, fn: Callable[[], _T]) -> _T:
+        self._rotate_rpc()
         try:
             return fn()
         except (InvariantError, TransientRpcError):
@@ -147,7 +162,8 @@ class Web3PredictionContract:
             for i, data in enumerate(encoded_calls)
         ]
         import urllib.request
-        rpc_url = self._cfg.rpc_url
+        self._rotate_rpc()
+        rpc_url = self._rpc_urls[self._rpc_index]
         req = urllib.request.Request(
             rpc_url,
             data=json.dumps(batch).encode(),
