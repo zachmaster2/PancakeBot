@@ -25,5 +25,4 @@ class Web3ContractConfig:
             raise InvariantError('rpc_url_required')
         if not self.abi_json_path:
             raise InvariantError('abi_json_path_required')
-        if not self.private_key:
-            raise InvariantError('private_key_required')
+        # private_key is optional — empty string means read-only mode (dry).

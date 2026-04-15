@@ -34,10 +34,10 @@ from pancakebot.chain.pool_watcher import PoolEventWatcher
 
 
 
-def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) -> None:
+def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool, live: bool = False) -> None:
     cfg = load_app_config(config_path)
 
-    selected_modes = int(dry) + int(backtest) + int(sync)
+    selected_modes = int(dry) + int(backtest) + int(sync) + int(live)
     if selected_modes > 1:
         raise InvariantError("run_modes_mutually_exclusive")
 
@@ -90,8 +90,9 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
         )
         return
 
+    # Dry or live mode — both need RPC, live also needs private key.
     load_env()
-    private_key = require_env("BSC_WALLET_PRIVATE_KEY")
+    private_key = require_env("BSC_WALLET_PRIVATE_KEY") if live else ""
     rpc_url = choose_rpc_url(
         RPC_URLS,
         expected_chain_id=int(EXPECTED_CHAIN_ID),
