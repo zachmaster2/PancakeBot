@@ -99,6 +99,7 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool) 
 
     contract_cfg = Web3ContractConfig(
         rpc_url=rpc_url,
+        rpc_urls=tuple(RPC_URLS),
         abi_json_path=cfg.abi_json_path,
         private_key=private_key,
     )
