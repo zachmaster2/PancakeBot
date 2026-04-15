@@ -13,8 +13,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-import urllib.request
-import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +29,6 @@ from pancakebot.runtime.sleep import sleep_seconds
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 
-_OKX_BASE = "https://www.okx.com"
 _KLINES_PER_ROUND = 31  # Must match momentum_gate._CANDLE_COUNT
 _FETCH_WORKERS = 4      # concurrent OKX fetches per batch
 _FETCH_RETRIES = 3      # retry failed OKX requests
@@ -79,6 +76,7 @@ def sync_runtime_market_data(
     cfg: AppConfig,
     graph: GraphClient,
     round_store: ClosedRoundsStore,
+    okx_client: object,
 ) -> SyncSummary:
     warmup_rounds = int(required_runtime_sync_cache_n())
     cache_n = max(int(warmup_rounds), int(cfg.backtest.simulation_size))
@@ -145,21 +143,25 @@ def sync_runtime_market_data(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="BNB-USDT",
             store=bnb_store, label="BNB", cutoff_seconds=cutoff_s,
+            okx_client=okx_client,
         )
         btc_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="BTC-USDT",
             store=btc_store, label="BTC", cutoff_seconds=cutoff_s,
+            okx_client=okx_client,
         )
         eth_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="ETH-USDT",
             store=eth_store, label="ETH", cutoff_seconds=cutoff_s,
+            okx_client=okx_client,
         )
         sol_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="SOL-USDT",
             store=sol_store, label="SOL", cutoff_seconds=cutoff_s,
+            okx_client=okx_client,
         )
         bnb_synced = bnb_fut.result()
         btc_synced = btc_fut.result()
@@ -197,6 +199,7 @@ def sync_runtime_market_data(
             _sync_1s_klines(
                 rounds=uncovered_rounds, inst_id=inst_id,
                 store=store, label=label, cutoff_seconds=cutoff_s,
+                okx_client=okx_client,
             )
 
     # After retries, trim stores to the exact 5-way intersection:
@@ -295,6 +298,7 @@ def _sync_1s_klines(
     store: KlineStore,
     label: str,
     cutoff_seconds: int = 2,
+    okx_client: object,
 ) -> int:
     """Fetch 1s OKX klines for rounds not yet in the store. Returns count synced.
 
@@ -348,7 +352,7 @@ def _sync_1s_klines(
         synced, errors = _fetch_and_append(
             rounds_asc=append_rounds, inst_id=inst_id, store=store, label=label,
             latest_on_disk=latest_on_disk, done_count=len(done_epochs),
-            cutoff_seconds=cutoff_seconds,
+            cutoff_seconds=cutoff_seconds, okx_client=okx_client,
         )
         total_synced += synced
         total_errors += errors
@@ -359,7 +363,7 @@ def _sync_1s_klines(
         synced, errors = _fetch_to_staging(
             rounds_asc=prepend_rounds, inst_id=inst_id,
             staging_path=staging_path, label=label,
-            cutoff_seconds=cutoff_seconds,
+            cutoff_seconds=cutoff_seconds, okx_client=okx_client,
         )
         total_errors += errors
         if synced > 0:
@@ -377,6 +381,7 @@ def _sync_1s_klines(
 def _fetch_and_append(
     *, rounds_asc: list, inst_id: str, store: KlineStore, label: str,
     latest_on_disk: int | None, done_count: int, cutoff_seconds: int = 2,
+    okx_client: object,
 ) -> tuple[int, int]:
     """Fetch epochs in ordered batches and append each to store immediately."""
     synced = 0
@@ -388,7 +393,7 @@ def _fetch_and_append(
         if batch_start > 0:
             time.sleep(1.0)
 
-        results, batch_errors = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds)
+        results, batch_errors = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds, okx_client=okx_client)
         errors += batch_errors
         if not results:
             continue
@@ -417,7 +422,7 @@ def _fetch_and_append(
 
 def _fetch_to_staging(
     *, rounds_asc: list, inst_id: str, staging_path: str, label: str,
-    cutoff_seconds: int = 2,
+    cutoff_seconds: int = 2, okx_client: object,
 ) -> tuple[int, int]:
     """Fetch older epochs into a staging file (resumable append-only)."""
     import os as _os
@@ -447,7 +452,7 @@ def _fetch_to_staging(
             if batch_start > 0:
                 time.sleep(1.0)
 
-            results, batch_errors = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds)
+            results, batch_errors = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds, okx_client=okx_client)
             errors += batch_errors
 
             for rec in results:
@@ -492,12 +497,12 @@ def _prepend_staging_to_store(*, store: KlineStore, staging_path: str, label: st
          msg=f"  prepended {len(staging_records)} older epochs into store")
 
 
-def _fetch_batch(batch: list, inst_id: str, cutoff_seconds: int = 2) -> tuple[list[dict], int]:
+def _fetch_batch(batch: list, inst_id: str, okx_client: object, cutoff_seconds: int = 2) -> tuple[list[dict], int]:
     """Fetch a batch of rounds in parallel. Returns (results, error_count)."""
     results: list[dict] = []
     errors = 0
     with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one_kline, rnd, inst_id, cutoff_seconds): rnd for rnd in batch}
+        futures = {pool.submit(_fetch_one_kline, rnd, inst_id, okx_client, cutoff_seconds): rnd for rnd in batch}
         for fut in as_completed(futures):
             try:
                 rec = fut.result()
@@ -511,52 +516,41 @@ def _fetch_batch(batch: list, inst_id: str, cutoff_seconds: int = 2) -> tuple[li
     return results, errors
 
 
-def _fetch_one_kline(rnd, inst_id: str, cutoff_seconds: int = 2) -> dict | None:
+def _fetch_one_kline(rnd, inst_id: str, okx_client: object, cutoff_seconds: int = 2) -> dict | None:
     """Fetch 1s klines for a single round. Returns record dict or None."""
     epoch = int(rnd.epoch)
     lock_at = rnd.lock_at
     if lock_at is None:
         return None
     cutoff_ms = int(lock_at) * 1000 - cutoff_seconds * 1000
-    klines = _fetch_1s_klines(inst_id=inst_id, anchor_ms=cutoff_ms)
+    klines = _fetch_1s_klines(inst_id=inst_id, anchor_ms=cutoff_ms, okx_client=okx_client)
     if klines is None:
         return None
     return {"epoch": epoch, "lock_at": int(lock_at), "klines_1s": klines}
 
 
-def _fetch_1s_klines(*, inst_id: str, anchor_ms: int) -> list[list] | None:
+def _fetch_1s_klines(*, inst_id: str, anchor_ms: int, okx_client: object) -> list[list] | None:
     """Fetch 1s klines ending just before anchor_ms from OKX.
 
-    Returns the *_KLINES_PER_ROUND* completed candles with open_time
-    < anchor_ms, matching exactly what the live path fetches via the
-    OKX ``after`` parameter.  Tries history-candles first, falls back
-    to the live candles endpoint.  Each endpoint is retried up to
-    _FETCH_RETRIES times with exponential backoff.
+    Uses the shared OkxClient session (keep-alive) for fast fetches.
+    Tries history-candles first, falls back to the live candles endpoint.
+    Each endpoint is retried up to _FETCH_RETRIES times.
 
     Returns list of [ts_ms, open, high, low, close, volume] sorted
     oldest-first, or None on failure.
     """
-    after_ms = anchor_ms
+    params = {
+        "instId": inst_id,
+        "bar": "1s",
+        "limit": str(_KLINES_PER_ROUND),
+        "after": str(anchor_ms),
+    }
     for endpoint in ("history-candles", "candles"):
-        url = (
-            f"{_OKX_BASE}/api/v5/market/{endpoint}"
-            f"?instId={inst_id}&bar=1s&limit={_KLINES_PER_ROUND}"
-            f"&after={after_ms}"
-        )
         for attempt in range(_FETCH_RETRIES):
             _rate_acquire()
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": "PancakeBot/1.0"})
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    body = json.loads(resp.read())
-            except urllib.error.HTTPError as he:
-                if he.code == 429:
-                    # Rate limited — back off aggressively (5s, 10s, 20s)
-                    time.sleep(5.0 * (2 ** attempt))
-                    continue
-                time.sleep(_RETRY_DELAY_S * (2 ** attempt))
-                continue
-            except (urllib.error.URLError, TimeoutError, OSError):
+            body = okx_client.fetch_raw(endpoint=endpoint, params=params)
+
+            if body is None:
                 time.sleep(_RETRY_DELAY_S * (2 ** attempt))
                 continue
 
