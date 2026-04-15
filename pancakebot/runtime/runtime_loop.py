@@ -32,7 +32,7 @@ from pancakebot.domain.strategy.momentum_gate import MomentumGate
 from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline, StrategyPipelineDecision
 from pancakebot.runtime.claim_manager import claim_scan_cursor
 from pancakebot.runtime.settlement import settle_from_round_data
-from pancakebot.runtime.sleep import sleep_seconds
+from time import sleep as sleep_seconds
 from pancakebot.core.constants import BUFFER_SECONDS, INTERVAL_SECONDS, POOL_CUTOFF_SECONDS
 from pancakebot.core.errors import InvariantError, TransientRpcError
 from pancakebot.core.logging import info, warn
