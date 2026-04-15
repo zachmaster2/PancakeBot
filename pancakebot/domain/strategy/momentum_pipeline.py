@@ -35,7 +35,7 @@ from pancakebot.domain.types import Round
 # Payout boost: frac *= max(0.5, 1.0 + PAYOUT_SLOPE * (payout - 2.0))
 # Payout floor: skip rounds where payout on our side < MIN_PAYOUT.
 # Validated: 5-fold +2.21/2k (5/5 positive), nested CV +1.59/2k (4/5 positive).
-_BASE_FRAC = 0.03
+_BASE_FRAC = 0.04
 _SIZING_SLOPE = 100        # scales with min(|r3|, |r7|, |r15|)
 _PAYOUT_SLOPE = 1.0        # bet more when our side has high payout
 _ETH_SIZING_WEIGHT = 0.3   # add ETH confirming strength * weight to signal_strength
@@ -46,8 +46,9 @@ _FLOOR_BNB = 0.01
 _CAP_BNB = 2.0
 
 # Pool filter: skip rounds with small pools (lose money due to dilution).
-# Validated: pools < 2 BNB have 55-57% WR = net loss after fees.
-_MIN_POOL_BNB = 2.0
+# Sweep showed pools >= 1.5 BNB are profitable with adaptive threshold.
+# 5-fold: +2.75/2k (5/5), 48% more bets than pool>=2.0.
+_MIN_POOL_BNB = 1.5
 
 # Pool-adaptive threshold: stricter signal on small pools (lower WR),
 # relaxed on large pools (higher WR, less dilution).
