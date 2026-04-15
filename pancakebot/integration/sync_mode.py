@@ -25,7 +25,7 @@ from pancakebot.infra.closed_rounds_sync import sync_closed_rounds
 from pancakebot.infra.graph_client import GraphClient
 from pancakebot.infra.kline_store import KlineStore
 from pancakebot.runtime.runtime_loop import required_runtime_sync_cache_n
-from pancakebot.runtime.sleep import sleep_seconds
+from time import sleep as sleep_seconds
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 
