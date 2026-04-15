@@ -418,12 +418,16 @@ class PoolEventWatcher:
                                 bet_blocks.add(bn)
                     blocks_with_bets += len(bet_blocks)
 
-            info("POOL_WSS", "BKFILL", "OK",
-                 msg=f"Backfilled {count} bets from {blocks_with_bets} blocks "
-                     f"({total_blocks} scanned, "
-                     f"{blocks_failed} block_fails, "
-                     f"{reverted_txs} reverted, "
-                     f"{receipt_fails} rcpt_fails)")
+            log_fn = info if count > 0 or blocks_failed == 0 else warn
+            log_fn("POOL_WSS", "BKFILL", "OK",
+                   msg=f"Backfilled {count} bets from {blocks_with_bets} blocks "
+                       f"({total_blocks} scanned, "
+                       f"{blocks_failed} block_fails, "
+                       f"{reverted_txs} reverted, "
+                       f"{receipt_fails} rcpt_fails)")
+            if count == 0 and total_blocks > 200:
+                warn("POOL_WSS", "BKFILL", "EMPTY",
+                     msg=f"0 bets in {total_blocks} blocks — may indicate a filtering issue")
 
         except Exception as e:
             warn("POOL_WSS", "BKFILL", "FAIL", msg=f"{e}")
