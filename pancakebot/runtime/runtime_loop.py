@@ -129,6 +129,14 @@ def _dry_runtime_state_files(paths: RuntimeStatePathsConfig) -> list[Path]:
     ]
 
 
+def _relative_archive_path(archive_dir: Path) -> str:
+    """Return archive path relative to CWD for concise logging."""
+    try:
+        return str(Path("..") / archive_dir.relative_to(Path.cwd().parent))
+    except ValueError:
+        return str(archive_dir)
+
+
 def _unique_archive_dir(root: Path, *, ts: int, reason: str) -> Path:
     stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(ts))
     base = root / f"dry_run_archive_{stamp}_{reason}"
@@ -1067,7 +1075,7 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
                 "RUN",
                 "DRY",
                 "ARCHIVE",
-                msg=f"Archived previous dry runtime state to {archived}",
+                msg=f"Archived previous dry runtime state to {_relative_archive_path(archived)}",
             )
         bankroll_state = _resolve_initial_dry_bankroll_state(cfg)
         closed.simulated_bankroll_bnb = bankroll_state.simulated_bankroll_bnb
