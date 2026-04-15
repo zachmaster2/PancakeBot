@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-from pancakebot.config.app_config import AppConfig
+from pancakebot.config import AppConfig
 from pancakebot.errors import InvariantError, TransientGraphError
 from pancakebot.log import info
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore

@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pancakebot.backtest.config import BacktestConfig
+from pancakebot.config import BacktestConfig
 from pancakebot.constants import GAS_COST_BET_BNB
 from pancakebot.errors import InvariantError
 from pancakebot.log import info
