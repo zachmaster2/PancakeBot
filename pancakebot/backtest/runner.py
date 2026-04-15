@@ -300,4 +300,64 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
     )
-    info("BACK", "RESULT", "FILES", msg=f"trades={trades_path} summary={summary_path}")
+    # Generate equity curve plot.
+    equity_path = out_dir / "equity_curves.png"
+    _plot_equity_curve(trades_path, equity_path, initial_bankroll_bnb, total_rounds)
+    info("BACK", "RESULT", "FILES", msg=f"trades={trades_path} summary={summary_path} equity={equity_path}")
+
+
+def _plot_equity_curve(
+    trades_path: Path,
+    out_path: Path,
+    initial_bankroll: float,
+    total_rounds: int,
+) -> None:
+    """Generate equity curve PNG from backtest trades CSV."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    bankrolls = []
+    with open(trades_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            bankrolls.append(float(row["bankroll_bnb"]))
+
+    pnl = [b - initial_bankroll for b in bankrolls]
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), gridspec_kw={"height_ratios": [3, 1]})
+
+    # Top: cumulative PnL
+    axes[0].plot(range(len(pnl)), pnl, color="#E91E63", linewidth=1.5)
+    axes[0].set_ylabel("Cumulative PnL (BNB)")
+    axes[0].set_title(f"Backtest Equity Curve ({total_rounds} rounds)")
+    axes[0].axhline(y=0, color="black", linewidth=0.5, linestyle="--")
+    axes[0].grid(True, alpha=0.3)
+
+    # 5-fold boundaries
+    fold_size = total_rounds // 5
+    for i in range(1, 5):
+        axes[0].axvline(x=i * fold_size, color="gray", linewidth=0.5, linestyle=":")
+        axes[0].text(i * fold_size, axes[0].get_ylim()[1] * 0.95,
+                     f"F{i+1}", fontsize=8, color="gray", ha="center")
+
+    # Bottom: rolling PnL rate
+    window = 500
+    if len(bankrolls) > window:
+        rolling = []
+        for i in range(window, len(bankrolls)):
+            rate = (bankrolls[i] - bankrolls[i - window]) / window * 2000
+            rolling.append(rate)
+        axes[1].plot(range(window, len(bankrolls)), rolling,
+                     color="#E91E63", linewidth=1.0, alpha=0.8)
+
+    axes[1].set_ylabel("Rolling PnL/2k (500-round window)")
+    axes[1].set_xlabel("Round index")
+    axes[1].axhline(y=0, color="red", linewidth=0.5, linestyle="--")
+    axes[1].grid(True, alpha=0.3)
+    for i in range(1, 5):
+        axes[1].axvline(x=i * fold_size, color="gray", linewidth=0.5, linestyle=":")
+
+    plt.tight_layout()
+    plt.savefig(str(out_path), dpi=150)
+    plt.close(fig)
