@@ -129,54 +129,38 @@ def claim_scan_cursor(
             claimed_total += len(chunk)
         pending_claims = pending_claims[n:]
 
-    while True:
-        epochs = list(
-            contract.get_user_rounds(
-                wallet_address=wallet_address,
-                cursor=cursor,
-                size=size,
-            )
-        )
-        if not epochs:
+    # Fetch all epoch IDs in one batched RPC call (instead of N pages).
+    all_epochs = contract.get_user_rounds_all_batched(
+        wallet_address=wallet_address, cursor=cursor, total=total, page_size=size,
+    )
+
+    # Batch-fetch close_ts for all epochs at once.
+    close_ts_map = contract.close_ts_batch(all_epochs) if all_epochs else {}
+
+    scanned = 0
+    for epoch in all_epochs:
+        e = int(epoch)
+
+        if e == locked_epoch or e == current_epoch:
             break
 
-        scanned = 0
-        stop = False
-
-        for epoch in epochs:
-            e = int(epoch)
-
-            # Stop at the live edge.
-            if e == locked_epoch or e == current_epoch:
-                stop = True
-                break
-
-            close_ts = get_close_ts(e)
-            if close_ts is not None:
-                if now_ts - close_ts < buffer_seconds:
-                    stop = True
-                    break
-
-            scanned += 1
-
-            # In dry mode we never submit on-chain claims.
-            if dry:
-                continue
-
-            claimable = contract.claimable(epoch=e, wallet_address=wallet_address)
-            refundable = contract.refundable(epoch=e, wallet_address=wallet_address)
-            if claimable or refundable:
-                pending_claims.append((e, cursor + scanned - 1))
-                _flush_pending(force_all=False)
-
-        scanned_total += scanned
-        cursor += scanned
-
-        if stop:
+        cts = close_ts_map.get(e)
+        if cts is not None and now_ts - cts < buffer_seconds:
             break
 
-        if cursor >= total:
-            break
+        scanned += 1
+
+        if dry:
+            continue
+
+        claimable = contract.claimable(epoch=e, wallet_address=wallet_address)
+        refundable = contract.refundable(epoch=e, wallet_address=wallet_address)
+        if claimable or refundable:
+            pending_claims.append((e, cursor + scanned - 1))
+            _flush_pending(force_all=False)
+
+    scanned_total = scanned
+    cursor += scanned
 
     if (not dry) and pending_claims:
         should_force_flush = False

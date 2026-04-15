@@ -129,6 +129,52 @@ class Web3PredictionContract:
         except Exception as e:
             raise TransientRpcError(f"{str(op)}_failed: {e}") from e
 
+    def _batch_eth_calls(self, encoded_calls: list[str]) -> list[bytes | None]:
+        """Send multiple eth_call requests in one JSON-RPC batch.
+
+        Each entry in *encoded_calls* is a hex-encoded calldata string
+        (from ``_encode_transaction_data()``) for the prediction contract.
+        Returns raw response bytes (or None for failed calls) in order.
+        """
+        contract_addr = str(self._contract.address)
+        batch = [
+            {
+                "jsonrpc": "2.0",
+                "id": i,
+                "method": "eth_call",
+                "params": [{"to": contract_addr, "data": data}, "latest"],
+            }
+            for i, data in enumerate(encoded_calls)
+        ]
+        import urllib.request
+        rpc_url = self._cfg.rpc_url
+        req = urllib.request.Request(
+            rpc_url,
+            data=json.dumps(batch).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=30)
+            body = json.loads(resp.read())
+        except Exception as e:
+            raise TransientRpcError(f"batch_eth_call_failed: {e}") from e
+
+        if not isinstance(body, list):
+            raise TransientRpcError(f"batch_eth_call_bad_response: {type(body)}")
+
+        by_id: dict[int, str | None] = {}
+        for item in body:
+            by_id[item.get("id")] = item.get("result")
+
+        out: list[bytes | None] = []
+        for i in range(len(encoded_calls)):
+            raw_hex = by_id.get(i)
+            if raw_hex is None or not isinstance(raw_hex, str):
+                out.append(None)
+            else:
+                out.append(bytes.fromhex(raw_hex[2:] if raw_hex.startswith("0x") else raw_hex))
+        return out
+
     def wallet_balance_bnb(self, wallet_address: str) -> float:
         """Return native BNB balance for a wallet address (as BNB float)."""
         checksum_address = Web3.to_checksum_address(str(wallet_address))
@@ -281,6 +327,55 @@ class Web3PredictionContract:
         )
         epochs = values[0]
         return [int(x) for x in epochs]
+
+    def get_user_rounds_all_batched(
+        self, *, wallet_address: str, cursor: int, total: int, page_size: int = 100,
+    ) -> list[int]:
+        """Fetch all user round epochs from cursor to total in one RPC batch."""
+        checksum = Web3.to_checksum_address(str(wallet_address))
+        encoded: list[str] = []
+        for offset in range(cursor, total, page_size):
+            size = min(page_size, total - offset)
+            encoded.append(
+                self._contract.functions.getUserRounds(checksum, offset, size)._encode_transaction_data()
+            )
+        if not encoded:
+            return []
+
+        results = self._batch_eth_calls(encoded)
+        all_epochs: list[int] = []
+        for raw in results:
+            if raw is None:
+                continue
+            # Decode using the contract's ABI: returns (uint256[], uint256)
+            decoded = self._w3.codec.decode(["uint256[]", "uint256"], raw)
+            all_epochs.extend(int(x) for x in decoded[0])
+        return all_epochs
+
+    def close_ts_batch(self, epochs: list[int]) -> dict[int, int | None]:
+        """Fetch close_ts for multiple epochs in one RPC batch."""
+        if not epochs:
+            return {}
+        encoded = [
+            self._contract.functions.rounds(int(e))._encode_transaction_data()
+            for e in epochs
+        ]
+        # Batch in chunks of 100 (BSC free RPC limit).
+        out: dict[int, int | None] = {}
+        for chunk_start in range(0, len(encoded), 100):
+            chunk_encoded = encoded[chunk_start:chunk_start + 100]
+            chunk_epochs = epochs[chunk_start:chunk_start + 100]
+            results = self._batch_eth_calls(chunk_encoded)
+            # rounds() returns a large tuple; close_ts is at index 3.
+            # ABI: (uint256,uint256,uint256,uint256,int256,int256,uint256,uint256,uint256,uint256,bool)
+            round_types = ["uint256","uint256","uint256","uint256","int256","int256","uint256","uint256","uint256","uint256","bool"]
+            for e, raw in zip(chunk_epochs, results):
+                if raw is None:
+                    out[int(e)] = None
+                else:
+                    decoded = self._w3.codec.decode(round_types, raw)
+                    out[int(e)] = int(decoded[3])
+        return out
 
     def claimable(self, *, epoch: int, wallet_address: str) -> bool:
         checksum_address = Web3.to_checksum_address(str(wallet_address))
