@@ -105,7 +105,7 @@ def main():
     print(f"  {len(data)} rounds loaded")
 
     configs = {
-        "Current (pool>=1.5, b=.04)": dict(
+        "BTC only (pool>=1.5, b=.04)": dict(
             min_pool=1.5, thresh_mode="adaptive", uniform_thresh=0.0001,
             small_thresh=0.0002, large_thresh=0.0001, thresh_boundary=3.0,
             min_payout=1.5, base_frac=0.04, slope=100, cap_bnb=2.0,
@@ -115,28 +115,34 @@ def main():
             small_thresh=0.0002, large_thresh=0.0001, thresh_boundary=3.0,
             min_payout=1.5, base_frac=0.03, slope=100, cap_bnb=2.0,
         ),
-        "More bets (pool>=1.5, pay>=1.3, b=.04)": dict(
-            min_pool=1.5, thresh_mode="adaptive", uniform_thresh=0.0001,
-            small_thresh=0.0002, large_thresh=0.0001, thresh_boundary=3.0,
-            min_payout=1.3, base_frac=0.04, slope=100, cap_bnb=2.0,
-        ),
-        "Most linear (pool>=1.25, pay>=1.3, s=75)": dict(
-            min_pool=1.25, thresh_mode="adaptive", uniform_thresh=0.0001,
-            small_thresh=0.0002, large_thresh=0.0001, thresh_boundary=3.0,
-            min_payout=1.3, base_frac=0.04, slope=75, cap_bnb=2.0,
-        ),
     }
+
+    # Load production backtest with regime-2 from trades CSV
+    import csv
+    regime2_curve = []
+    trades_path = Path("var/backtest_trades.csv")
+    if trades_path.exists():
+        with open(trades_path) as f:
+            reader = csv.DictReader(f)
+            for i, row in enumerate(reader):
+                regime2_curve.append((i + 1, float(row["bankroll_bnb"]) - 50.0))
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={"height_ratios": [3, 1]})
 
-    colors = ["#2196F3", "#9E9E9E", "#4CAF50", "#FF9800"]
-    for (label, cfg), color in zip(configs.items(), colors):
+    colors = ["#E91E63", "#2196F3", "#9E9E9E"]
+    # Plot regime-2 curve first (from production backtest)
+    if regime2_curve:
+        xs = [c[0] for c in regime2_curve]
+        ys = [c[1] for c in regime2_curve]
+        axes[0].plot(xs, ys, label="Current: BTC + ETH/SOL regime-2", color=colors[0], linewidth=2.0, alpha=0.9)
+
+    for (label, cfg), color in zip(configs.items(), colors[1:]):
         print(f"  Simulating: {label}...", flush=True)
         curve = simulate(data, **cfg)
         xs = [c[0] for c in curve]
         ys = [c[1] - 50.0 for c in curve]  # PnL relative to start
-        lw = 2.0 if "Current" in label else 1.2
-        axes[0].plot(xs, ys, label=label, color=color, linewidth=lw, alpha=0.9 if "Current" in label else 0.7)
+        lw = 1.5 if "BTC only" in label else 1.0
+        axes[0].plot(xs, ys, label=label, color=color, linewidth=lw, alpha=0.7)
 
     axes[0].set_ylabel("Cumulative PnL (BNB)")
     axes[0].set_title("Equity Curves: Strategy Variants Over 35k Rounds")
@@ -152,7 +158,17 @@ def main():
 
     # Bottom panel: rolling 500-round PnL rate
     window = 500
-    for (label, cfg), color in zip(configs.items(), colors):
+    if regime2_curve:
+        ys_r2 = [c[1] + 50.0 for c in regime2_curve]  # absolute bankroll
+        rolling = []
+        for i in range(window, len(ys_r2)):
+            rate = (ys_r2[i] - ys_r2[i - window]) / window * 2000
+            rolling.append((i, rate))
+        if rolling:
+            axes[1].plot([r[0] for r in rolling], [r[1] for r in rolling],
+                        label="Current: BTC + ETH/SOL regime-2", color=colors[0], linewidth=1.5, alpha=0.8)
+
+    for (label, cfg), color in zip(configs.items(), colors[1:]):
         curve = simulate(data, **cfg)
         ys = [c[1] for c in curve]
         rolling = []
@@ -160,9 +176,9 @@ def main():
             rate = (ys[i] - ys[i - window]) / window * 2000
             rolling.append((i, rate))
         if rolling:
-            lw = 1.5 if "Current" in label else 0.8
+            lw = 1.2 if "BTC only" in label else 0.8
             axes[1].plot([r[0] for r in rolling], [r[1] for r in rolling],
-                        label=label, color=color, linewidth=lw, alpha=0.8 if "Current" in label else 0.5)
+                        label=label, color=color, linewidth=lw, alpha=0.6)
 
     axes[1].set_ylabel("Rolling PnL/2k (500-round window)")
     axes[1].set_xlabel("Round index")
