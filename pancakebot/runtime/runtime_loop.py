@@ -281,7 +281,7 @@ def run_live_loop(cfg: RuntimeConfig) -> None:
                     "RUN",
                     "DRY",
                     "ARCHIVE",
-                    msg=f"Saved shutdown dry-state snapshot to {archived}",
+                    msg=f"Saved shutdown dry-state snapshot to {Path(cfg.runtime_state_paths.dry_archive_root) / archived.name}",
                 )
 
 
