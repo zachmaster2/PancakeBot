@@ -104,8 +104,6 @@ class Web3PredictionContract:
         pk = cfg.private_key.strip()
         if pk.startswith('0x'):
             pk = pk[2:]
-        if len(pk) != 64:
-            raise InvariantError('private_key_must_be_32_bytes')
 
         abi = _load_abi_list(cfg.abi_json_path)
         contract_addr = Web3.to_checksum_address(PREDICTION_V2_CONTRACT_ADDRESS)
@@ -124,7 +122,8 @@ class Web3PredictionContract:
 
         self._w3 = w3_primary
         self._contract = self._providers[0][1]
-        self._account = w3_primary.eth.account.from_key(pk)
+        # Account is optional — only needed for live mode (signing transactions).
+        self._account = w3_primary.eth.account.from_key(pk) if len(pk) == 64 else None
 
     def _rotate_rpc(self) -> None:
         """Round-robin to next RPC URL, switching to its warm session."""
@@ -133,6 +132,8 @@ class Web3PredictionContract:
 
     @property
     def wallet_address(self) -> str:
+        if self._account is None:
+            return ""
         return str(self._account.address)
 
     def _rpc_call(self, *, op: str, fn: Callable[[], _T]) -> _T:
