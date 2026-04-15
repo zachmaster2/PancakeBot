@@ -57,6 +57,11 @@ class MomentumGateResult:
     signal_strength: float = 0.0  # min(|r3|, |r7|, |r15|) for adaptive sizing
     eth_confirmation_strength: float = 0.0  # ETH min(|r|) when confirming BTC direction
     sol_confirmation_strength: float = 0.0  # SOL min(|r|) when confirming BTC direction
+    # Independent ETH/SOL multi-TF (for regime-2: fires when BTC is silent)
+    eth_signal: str | None = None        # ETH's own multi-TF direction
+    eth_signal_strength: float = 0.0     # ETH min(|r|) when its own multi-TF fires
+    sol_signal: str | None = None        # SOL's own multi-TF direction
+    sol_signal_strength: float = 0.0     # SOL min(|r|) when its own multi-TF fires
 
 
 class MomentumGate:
@@ -318,6 +323,22 @@ def _trim_to_window(klines: list[list], cutoff_ms: int) -> list[list]:
     return before[-_CANDLE_COUNT:] if len(before) > _CANDLE_COUNT else before
 
 
+def _compute_pair_multi_tf(
+    closes: list[float] | None,
+) -> tuple[str | None, float]:
+    """Compute multi-TF(3,7,15) for a single pair. Returns (direction, min_abs)."""
+    if closes is None:
+        return None, 0.0
+    rets = [_get_return(closes, lb) for lb in _MTF_LOOKBACKS]
+    if any(r is None for r in rets):
+        return None, 0.0
+    if all(r > 0 for r in rets):
+        return "Bull", min(abs(r) for r in rets)
+    if all(r < 0 for r in rets):
+        return "Bear", min(abs(r) for r in rets)
+    return None, 0.0
+
+
 def _compute_signal(
     bnb_closes: list[float],
     btc_closes: list[float] | None,
@@ -332,60 +353,56 @@ def _compute_signal(
     ETH/SOL confirmation: if ETH or SOL multi-TF also fires in the same
     direction, their confirmation strengths are set for sizing boost.
     """
-    if btc_closes is None:
+    # Always compute independent ETH/SOL multi-TF (used by regime-2).
+    eth_sig, eth_sig_str = _compute_pair_multi_tf(eth_closes)
+    sol_sig, sol_sig_str = _compute_pair_multi_tf(sol_closes)
+
+    def _no_btc_result(skip_reason: str) -> MomentumGateResult:
         return MomentumGateResult(
             signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-            skip_reason="gate_no_btc_klines",
+            skip_reason=skip_reason,
+            eth_signal=eth_sig, eth_signal_strength=eth_sig_str,
+            sol_signal=sol_sig, sol_signal_strength=sol_sig_str,
         )
+
+    if btc_closes is None:
+        return _no_btc_result("gate_no_btc_klines")
 
     returns = []
     for lb in _MTF_LOOKBACKS:
         r = _get_return(btc_closes, lb)
         if r is None:
-            return MomentumGateResult(
-                signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-                skip_reason="gate_no_signal",
-            )
+            return _no_btc_result("gate_no_signal")
         returns.append(r)
 
     # All must agree in direction
     if not (all(r > 0 for r in returns) or all(r < 0 for r in returns)):
-        return MomentumGateResult(
-            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-            skip_reason="gate_no_signal",
-        )
+        return _no_btc_result("gate_no_signal")
 
     min_abs = min(abs(r) for r in returns)
     if min_abs < _MTF_THRESH:
-        return MomentumGateResult(
-            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-            skip_reason="gate_no_signal",
-        )
+        return _no_btc_result("gate_no_signal")
 
     direction = "Bull" if returns[0] > 0 else "Bear"
 
-    # Check ETH/SOL confirmation for sizing boost
+    # Check ETH/SOL confirmation for sizing boost (reuse pre-computed signals)
     btc_positive = returns[0] > 0
 
-    eth_strength = 0.0
-    if eth_closes is not None:
-        eth_rets = [_get_return(eth_closes, lb) for lb in _MTF_LOOKBACKS]
-        if all(r is not None for r in eth_rets):
-            if all((r > 0) == btc_positive for r in eth_rets):
-                eth_strength = min(abs(r) for r in eth_rets)
+    eth_confirm = 0.0
+    if eth_sig is not None and (eth_sig == "Bull") == btc_positive:
+        eth_confirm = eth_sig_str
 
-    sol_strength = 0.0
-    if sol_closes is not None:
-        sol_rets = [_get_return(sol_closes, lb) for lb in _MTF_LOOKBACKS]
-        if all(r is not None for r in sol_rets):
-            if all((r > 0) == btc_positive for r in sol_rets):
-                sol_strength = min(abs(r) for r in sol_rets)
+    sol_confirm = 0.0
+    if sol_sig is not None and (sol_sig == "Bull") == btc_positive:
+        sol_confirm = sol_sig_str
 
     return MomentumGateResult(
         signal=direction, tier="multi_tf",
         btc_agrees=True, btc_disagrees=False,
         skip_reason=None,
         signal_strength=min_abs,
-        eth_confirmation_strength=eth_strength,
-        sol_confirmation_strength=sol_strength,
+        eth_confirmation_strength=eth_confirm,
+        sol_confirmation_strength=sol_confirm,
+        eth_signal=eth_sig, eth_signal_strength=eth_sig_str,
+        sol_signal=sol_sig, sol_signal_strength=sol_sig_str,
     )
