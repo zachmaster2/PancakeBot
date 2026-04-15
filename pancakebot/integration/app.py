@@ -15,7 +15,7 @@ from pancakebot.constants import (
     TREASURY_FEE_FRACTION,
 )
 from pancakebot.infra.okx_client import OkxClient
-from pancakebot.domain.strategy.momentum_gate import MomentumGate
+from pancakebot.strategy.momentum_gate import MomentumGate
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
 from pancakebot.infra.graph_client import GraphClient
 from pancakebot.infra.rpc_pool import choose_rpc_url

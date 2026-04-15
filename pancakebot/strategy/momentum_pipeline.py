@@ -22,13 +22,13 @@ from dataclasses import dataclass
 
 from pancakebot.constants import BNB_WEI
 from pancakebot.errors import InvariantError
-from pancakebot.domain.strategy.momentum_gate import (
+from pancakebot.strategy.momentum_gate import (
     MomentumGate,
     MomentumGateConfig,
     MomentumGateResult,
     compute_signal_from_klines,
 )
-from pancakebot.domain.types import Round
+from pancakebot.types import Round
 
 # Continuous adaptive sizing with payout boost.
 # Signal strength sizing: frac = BASE_FRAC + SIZING_SLOPE * signal_strength

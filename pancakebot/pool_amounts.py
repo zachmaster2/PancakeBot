@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from pancakebot.domain.types import Bet
+from pancakebot.types import Bet
 from pancakebot.errors import InvariantError
 
 

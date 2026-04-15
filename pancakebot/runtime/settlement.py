@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pancakebot.constants import BNB_WEI, GAS_COST_CLAIM_BNB
-from pancakebot.domain.types import Round
-from pancakebot.domain.pool_amounts import compute_pool_amounts_wei, compute_pool_amounts_wei_at_or_before
+from pancakebot.types import Round
+from pancakebot.pool_amounts import compute_pool_amounts_wei, compute_pool_amounts_wei_at_or_before
 from pancakebot.errors import InvariantError
 
 

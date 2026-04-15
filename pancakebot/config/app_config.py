@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pancakebot.backtest.config import BacktestConfig
-from pancakebot.domain.strategy.momentum_gate import MomentumGateConfig
+from pancakebot.strategy.momentum_gate import MomentumGateConfig
 
 
 @dataclass(frozen=True, slots=True)

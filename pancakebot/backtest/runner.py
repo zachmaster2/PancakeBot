@@ -16,8 +16,8 @@ from pancakebot.backtest.config import BacktestConfig
 from pancakebot.constants import GAS_COST_BET_BNB
 from pancakebot.errors import InvariantError
 from pancakebot.log import info
-from pancakebot.domain.strategy.momentum_pipeline import MomentumOnlyPipeline
-from pancakebot.domain.types import Round
+from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline
+from pancakebot.types import Round
 from pancakebot.runtime.settlement import settle_bet_against_closed_round
 
 _BNB_KLINES_PATH = Path("var/bnb_spot_prices.jsonl")
@@ -147,7 +147,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
         info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s klines for {len(sol_klines)} epochs")
 
     # Build momentum pipeline (no live gate — backtest uses cached 1s klines).
-    from pancakebot.domain.strategy.momentum_gate import MomentumGateConfig
+    from pancakebot.strategy.momentum_gate import MomentumGateConfig
     gate_config: MomentumGateConfig = runtime_cfg.momentum_gate_config  # type: ignore[assignment]
     pipeline = MomentumOnlyPipeline(
         config=gate_config,
