@@ -274,7 +274,7 @@ def run_live_loop(cfg: RuntimeConfig) -> None:
             archived = _archive_dry_runtime_state(
                 cfg.runtime_state_paths,
                 reason="shutdown_snapshot",
-                move_files=False,
+                move_files=True,
             )
             if archived is not None:
                 info(
