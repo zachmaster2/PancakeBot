@@ -1236,7 +1236,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             )
             pool_total = pool_bull_bnb + pool_bear_bnb
             if pool_total > 0:
-                info("POOL_WSS", "POOL", "USE",
+                info("POOL_WSS", "ROUND", "DATA",
                      epoch=current_epoch, pool_bnb=f"{pool_total:.4f}")
             if locked_epoch > 2:
                 cfg.pool_watcher.clear_old_epochs(keep_after=locked_epoch - 2)
