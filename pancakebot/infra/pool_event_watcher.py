@@ -347,6 +347,9 @@ class PoolEventWatcher:
             reverted_txs = 0
             receipt_fails = 0
             total_blocks = current_block - from_block + 1
+            total_txs = 0
+            contract_txs = 0
+            contract_txs_with_value = 0
 
             info("POOL_WSS", "BKFILL", "SCAN",
                  msg=f"Scanning {total_blocks} blocks in batches of {_BATCH_SIZE} "
@@ -378,13 +381,17 @@ class PoolEventWatcher:
                     with self._lock:
                         self._block_ts[bn] = block_ts
 
-                    for tx in block.get("transactions", []):
+                    txs = block.get("transactions", [])
+                    total_txs += len(txs)
+                    for tx in txs:
                         to_addr = (tx.get("to") or "").lower()
                         if to_addr != contract_lower:
                             continue
+                        contract_txs += 1
                         value_wei = int(tx.get("value", "0x0"), 16)
                         if value_wei <= 0:
                             continue
+                        contract_txs_with_value += 1
                         tx_candidates.append((bn, tx))
 
                 # Batch-fetch receipts for candidate transactions
@@ -418,16 +425,13 @@ class PoolEventWatcher:
                                 bet_blocks.add(bn)
                     blocks_with_bets += len(bet_blocks)
 
-            log_fn = info if count > 0 or blocks_failed == 0 else warn
-            log_fn("POOL_WSS", "BKFILL", "OK",
-                   msg=f"Backfilled {count} bets from {blocks_with_bets} blocks "
-                       f"({total_blocks} scanned, "
-                       f"{blocks_failed} block_fails, "
-                       f"{reverted_txs} reverted, "
-                       f"{receipt_fails} rcpt_fails)")
-            if count == 0 and total_blocks > 200:
-                warn("POOL_WSS", "BKFILL", "EMPTY",
-                     msg=f"0 bets in {total_blocks} blocks — may indicate a filtering issue")
+            info("POOL_WSS", "BKFILL", "OK",
+                 msg=f"Backfilled {count} bets from {blocks_with_bets} blocks "
+                     f"({total_blocks} blks, {total_txs} txs, "
+                     f"{contract_txs} to_contract, {contract_txs_with_value} with_value, "
+                     f"{blocks_failed} blk_fail, "
+                     f"{reverted_txs} reverted, "
+                     f"{receipt_fails} rcpt_fail)")
 
         except Exception as e:
             warn("POOL_WSS", "BKFILL", "FAIL", msg=f"{e}")
