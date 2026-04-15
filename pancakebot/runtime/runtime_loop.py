@@ -25,9 +25,9 @@ from pancakebot.constants import (
     GAS_LIMIT_CLAIM,
     GAS_COST_BET_BNB,
 )
-from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
+from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.types import Round
-from pancakebot.infra.onchain.web3_prediction_contract import RoundData, Web3PredictionContract
+from pancakebot.chain.prediction_contract import RoundData, Web3PredictionContract
 from pancakebot.strategy.momentum_gate import MomentumGate
 from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline, StrategyPipelineDecision
 from pancakebot.runtime.claim_manager import claim_scan_cursor
@@ -38,7 +38,7 @@ from pancakebot.errors import InvariantError, TransientRpcError
 from pancakebot.log import info, warn
 from pancakebot.time import now_ts
 from pancakebot.money import bankroll_suffix, format_bankroll, usd_suffix
-from pancakebot.infra.pool_event_watcher import PoolEventWatcher
+from pancakebot.chain.pool_watcher import PoolEventWatcher
 
 _LOCK_SAFETY_MARGIN_SECONDS = 1  # abort bet if wall-clock is within this many seconds of lock_at
 _PREFETCH_OFFSET_SECONDS = 4    # wake this many seconds before cutoff for housekeeping

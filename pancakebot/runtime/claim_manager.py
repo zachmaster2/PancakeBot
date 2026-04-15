@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionContract
+from pancakebot.chain.prediction_contract import Web3PredictionContract
 from pancakebot.errors import InvariantError
 from pancakebot.log import info
 
