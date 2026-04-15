@@ -16,6 +16,8 @@ class RuntimeStatePathsConfig:
     dry_audit_trades_path: str
     dry_cycle_audit_path: str
     dry_bankroll_state_path: str
+    dry_archive_root: str
+    dry_fresh_start: bool
 
 
 @dataclass(frozen=True, slots=True)

@@ -52,7 +52,6 @@ _BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 _ONE_MINUTE_MS = 60_000
-_DRY_RUNTIME_ARCHIVE_ROOT = Path(__file__).resolve().parents[2].parent / "PancakeBot_var_exp"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +96,8 @@ class RuntimeConfig:
         dry_audit_trades_path="var/runtime/dry_audit_trades.csv",
         dry_cycle_audit_path="var/runtime/dry_cycle_audit.csv",
         dry_bankroll_state_path="var/runtime/dry_bankroll_state.json",
+        dry_archive_root="../PancakeBot_var_exp",
+        dry_fresh_start=True,
     )
 
 
@@ -129,12 +130,6 @@ def _dry_runtime_state_files(paths: RuntimeStatePathsConfig) -> list[Path]:
     ]
 
 
-def _relative_archive_path(archive_dir: Path) -> str:
-    """Return archive path relative to CWD for concise logging."""
-    try:
-        return str(Path("..") / archive_dir.relative_to(Path.cwd().parent))
-    except ValueError:
-        return str(archive_dir)
 
 
 def _unique_archive_dir(root: Path, *, ts: int, reason: str) -> Path:
@@ -150,7 +145,7 @@ def _unique_archive_dir(root: Path, *, ts: int, reason: str) -> Path:
         suffix += 1
 
 
-_MIN_ROUNDS_TO_ARCHIVE = 5  # don't archive runs shorter than this
+_MIN_ROUNDS_TO_ARCHIVE = 1  # don't archive runs shorter than this
 
 
 def _archive_dry_runtime_state(
@@ -175,7 +170,7 @@ def _archive_dry_runtime_state(
             info("RUN", "DRY", "CLEAN",
                  msg=f"Deleted previous dry state ({n_lines} rounds, below {_MIN_ROUNDS_TO_ARCHIVE} threshold)")
         return None
-    archive_root = _DRY_RUNTIME_ARCHIVE_ROOT.resolve()
+    archive_root = Path(paths.dry_archive_root).resolve()
     archive_root.mkdir(parents=True, exist_ok=True)
     ts_now = int(now_ts())
     archive_dir = _unique_archive_dir(archive_root, ts=ts_now, reason=reason)
@@ -1065,25 +1060,24 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     closed = _ClosedState(strategy_pipeline=strategy_pipeline)
 
     if cfg.dry:
-        archived = _archive_dry_runtime_state(
-            cfg.runtime_state_paths,
-            reason="startup_fresh_reset",
-            move_files=True,
-        )
-        if archived is not None:
-            info(
-                "RUN",
-                "DRY",
-                "ARCHIVE",
-                msg=f"Archived previous dry runtime state to {_relative_archive_path(archived)}",
+        fresh = cfg.runtime_state_paths.dry_fresh_start
+        if fresh:
+            archived = _archive_dry_runtime_state(
+                cfg.runtime_state_paths,
+                reason="startup_fresh_reset",
+                move_files=True,
             )
+            if archived is not None:
+                archive_log = Path(cfg.runtime_state_paths.dry_archive_root) / archived.name
+                info("RUN", "DRY", "ARCHIVE",
+                     msg=f"Archived previous dry runtime state to {archive_log}")
         bankroll_state = _resolve_initial_dry_bankroll_state(cfg)
         closed.simulated_bankroll_bnb = bankroll_state.simulated_bankroll_bnb
         closed.dry_bets_by_epoch = _load_dry_bets(cfg.runtime_state_paths.dry_bets_path)
         _ensure_dry_audit_csv(cfg.runtime_state_paths.dry_audit_trades_path)
         _ensure_dry_cycle_audit_csv(
             cfg.runtime_state_paths.dry_cycle_audit_path,
-            reset=True,
+            reset=fresh,
         )
         settled_epochs = _load_dry_settled_epochs(cfg.runtime_state_paths.dry_settled_epochs_path)
         settled_epochs.update(
