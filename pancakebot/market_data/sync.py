@@ -24,7 +24,7 @@ from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.market_data.round_sync import sync_closed_rounds
 from pancakebot.market_data.graph_client import GraphClient
 from pancakebot.market_data.kline_store import KlineStore
-from pancakebot.runtime.runtime_loop import required_runtime_sync_cache_n
+from pancakebot.runtime.config import required_runtime_sync_cache_n
 from time import sleep as sleep_seconds
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
