@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import requests
 
-from pancakebot.core.errors import InvariantError, TransientRpcError
+from pancakebot.errors import InvariantError, TransientRpcError
 
 
 def _eth_chain_id(rpc_url: str, *, timeout_seconds: int) -> int:

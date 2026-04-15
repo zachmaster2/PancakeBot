@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Callable
 
 from pancakebot.infra.onchain.web3_prediction_contract import Web3PredictionContract
-from pancakebot.core.errors import InvariantError
-from pancakebot.core.logging import info
+from pancakebot.errors import InvariantError
+from pancakebot.log import info
 
 _PAGE_SIZE_DEFAULT = 100
 

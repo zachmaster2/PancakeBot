@@ -4,7 +4,7 @@ import os
 
 from dotenv import load_dotenv
 
-from pancakebot.core.errors import InvariantError
+from pancakebot.errors import InvariantError
 
 
 def load_env() -> None:

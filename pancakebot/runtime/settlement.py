@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pancakebot.core.constants import BNB_WEI, GAS_COST_CLAIM_BNB
+from pancakebot.constants import BNB_WEI, GAS_COST_CLAIM_BNB
 from pancakebot.domain.types import Round
 from pancakebot.domain.pool_amounts import compute_pool_amounts_wei, compute_pool_amounts_wei_at_or_before
-from pancakebot.core.errors import InvariantError
+from pancakebot.errors import InvariantError
 
 
 def settle_from_round_data(

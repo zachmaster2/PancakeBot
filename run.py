@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 
 from pancakebot.integration.app import run_from_config
-from pancakebot.core.logging import info
+from pancakebot.log import info
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

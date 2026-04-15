@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pancakebot.config.app_config import AppConfig
-from pancakebot.core.errors import InvariantError, TransientGraphError
-from pancakebot.core.logging import info
+from pancakebot.errors import InvariantError, TransientGraphError
+from pancakebot.log import info
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
 from pancakebot.infra.closed_rounds_sync import sync_closed_rounds
 from pancakebot.infra.graph_client import GraphClient

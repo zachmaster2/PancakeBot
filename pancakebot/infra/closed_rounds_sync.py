@@ -5,8 +5,8 @@ from pathlib import Path
 
 from pancakebot.infra.graph_client import GraphClient
 from pancakebot.infra.closed_rounds_store import ClosedRoundsStore
-from pancakebot.core.errors import InvariantError
-from pancakebot.core.logging import info
+from pancakebot.errors import InvariantError
+from pancakebot.log import info
 
 
 def sync_closed_rounds(*, graph: GraphClient, store: ClosedRoundsStore, cache_n: int) -> None:

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from pancakebot.domain.types import Bet
-from pancakebot.core.errors import InvariantError
+from pancakebot.errors import InvariantError
 
 
 @dataclass(frozen=True, slots=True)

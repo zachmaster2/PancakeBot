@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pancakebot.core.errors import InvariantError
+from pancakebot.errors import InvariantError
 
 _BACKTEST_RESET_MODES = ("continuous", "chunk_reset")
 
