@@ -160,7 +160,6 @@ class MomentumGate:
                 "btc_ms": int((_t_btc - _t0) * 1000),
                 "eth_ms": int((_t_eth - _t_btc) * 1000),
                 "sol_ms": int((_t_sol - _t_eth) * 1000),
-                "total_ms": int((_t_sol - _t0) * 1000),
             }
         else:
             with ThreadPoolExecutor(max_workers=3) as pool:
