@@ -22,7 +22,8 @@ from pancakebot.chain.rpc_pool import choose_rpc_url
 from pancakebot.chain.contract_config import Web3ContractConfig
 from pancakebot.chain.prediction_contract import Web3PredictionContract
 from pancakebot.runtime.contract_constants_cache import ContractConstants, save_contract_constants
-from pancakebot.runtime.runtime_loop import RuntimeConfig, run_live_loop
+from pancakebot.runtime.config import RuntimeConfig
+from pancakebot.runtime.engine import run_live_loop
 from pancakebot.market_data.sync import sync_runtime_market_data
 from pancakebot.errors import InvariantError
 from pancakebot.log import info
