@@ -1086,12 +1086,7 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
             "RUN",
             "DRY",
             "STATE",
-            msg=(
-                f"Loaded dry bankroll {bankroll_state.simulated_bankroll_bnb:.6f} BNB "
-                f"source={bankroll_state.source} "
-                f"path={cfg.runtime_state_paths.dry_bankroll_state_path} "
-                f"cycle_audit_path={cfg.runtime_state_paths.dry_cycle_audit_path}"
-            ),
+            msg=f"Loaded dry bankroll {bankroll_state.simulated_bankroll_bnb:.6f} BNB source={bankroll_state.source}",
         )
 
     return closed
