@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from pancakebot.core.errors import InvariantError
+from pancakebot.errors import InvariantError
 
 
 _DEFAULT_PATH = Path("var/contract_constants.json")

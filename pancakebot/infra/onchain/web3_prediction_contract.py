@@ -8,14 +8,14 @@ from typing import Any, Callable, Literal, Sequence, TypeVar
 from web3 import Web3
 from web3.exceptions import TimeExhausted
 
-from pancakebot.core.constants import (
+from pancakebot.constants import (
     BNB_WEI,
     EXPECTED_CHAIN_ID,
     PREDICTION_V2_CONTRACT_ADDRESS,
     TREASURY_FEE_DIVISOR,
 )
 from pancakebot.infra.onchain.web3_contract_config import Web3ContractConfig
-from pancakebot.core.errors import InvariantError, TransientRpcError
+from pancakebot.errors import InvariantError, TransientRpcError
 
 _T = TypeVar("_T")
 

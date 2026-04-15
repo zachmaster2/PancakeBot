@@ -7,8 +7,8 @@ from typing import Any, Literal
 import requests
 
 from pancakebot.domain.types import Bet, Round
-from pancakebot.core.errors import InvariantError, TransientGraphError
-from pancakebot.core.logging import warn
+from pancakebot.errors import InvariantError, TransientGraphError
+from pancakebot.log import warn
 
 RoundState = Literal["open", "locked", "closed"]
 
@@ -367,7 +367,7 @@ class GraphClient:
         return bets
 
     def _parse_round(self, r: dict[str, Any], *, state: RoundState, bets: list[Bet]) -> Round:
-        from pancakebot.core.constants import INTERVAL_SECONDS
+        from pancakebot.constants import INTERVAL_SECONDS
 
         epoch = self._parse_int(r.get("epoch"), "round.epoch")
         start_at = self._parse_int(r.get("startAt"), "round.startAt")

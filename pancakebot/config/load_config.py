@@ -8,7 +8,7 @@ import tomllib
 from pancakebot.backtest.config import BacktestConfig
 from pancakebot.config.app_config import AppConfig, RuntimeStatePathsConfig
 from pancakebot.domain.strategy.momentum_gate import MomentumGateConfig
-from pancakebot.core.errors import InvariantError
+from pancakebot.errors import InvariantError
 
 
 def _req(obj: dict[str, Any], key: str) -> Any:
@@ -244,7 +244,7 @@ def load_app_config(path: str) -> AppConfig:
         raise InvariantError("bet_receipt_timeout_seconds_must_be_positive")
 
     # [contract] section is no longer used — protocol constants are in
-    # pancakebot.core.constants (TREASURY_FEE_FRACTION, MIN_BET_AMOUNT_BNB).
+    # pancakebot.constants (TREASURY_FEE_FRACTION, MIN_BET_AMOUNT_BNB).
     # Accept but ignore the section for backward compatibility.
     if contract_raw:
         pass  # silently ignore legacy [contract] section

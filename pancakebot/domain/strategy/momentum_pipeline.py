@@ -20,8 +20,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pancakebot.core.constants import BNB_WEI
-from pancakebot.core.errors import InvariantError
+from pancakebot.constants import BNB_WEI
+from pancakebot.errors import InvariantError
 from pancakebot.domain.strategy.momentum_gate import (
     MomentumGate,
     MomentumGateConfig,
@@ -231,7 +231,7 @@ class MomentumOnlyPipeline:
             )
             # Compute pools from round bets if not provided externally.
             if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
-                from pancakebot.core.constants import POOL_CUTOFF_SECONDS
+                from pancakebot.constants import POOL_CUTOFF_SECONDS
                 pool_cutoff_ts = lock_at - POOL_CUTOFF_SECONDS
                 pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, pool_cutoff_ts)
         pool_total = pool_bull_bnb + pool_bear_bnb

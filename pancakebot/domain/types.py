@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
 
-from pancakebot.core.constants import INTERVAL_SECONDS
-from pancakebot.core.errors import InvariantError
+from pancakebot.constants import INTERVAL_SECONDS
+from pancakebot.errors import InvariantError
 
 
 @dataclass(frozen=True, slots=True)

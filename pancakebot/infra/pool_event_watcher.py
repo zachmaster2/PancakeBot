@@ -18,8 +18,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from pancakebot.core.constants import BNB_WEI, PREDICTION_V2_CONTRACT_ADDRESS
-from pancakebot.core.logging import info, warn
+from pancakebot.constants import BNB_WEI, PREDICTION_V2_CONTRACT_ADDRESS
+from pancakebot.log import info, warn
 
 # Public BSC WebSocket endpoint (no signup, no API key).
 BSC_PUBLIC_WSS = "wss://bsc.publicnode.com"
@@ -320,7 +320,7 @@ class PoolEventWatcher:
         Called once by the runtime loop after the first epoch handshake.
         Dedup by tx_hash:log_index prevents double-counting with WSS.
         """
-        from pancakebot.core.constants import RPC_URLS
+        from pancakebot.constants import RPC_URLS
 
         _BSC_BLOCK_TIME = 0.5  # conservative (actual ~0.44s)
         _BATCH_SIZE = 100      # BSC free RPCs reject batches > 100
