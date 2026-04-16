@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 from pancakebot.constants import (
     BNB_WEI,
@@ -19,7 +18,6 @@ from pancakebot.runtime.config import RuntimeConfig
 from pancakebot import paths
 from pancakebot.runtime.dry import (
     _ClosedState,
-    _archive_dry_runtime_state,
     _append_jsonl,
     _dry_record_bet,
     _dry_settle_available_bets,
@@ -65,62 +63,48 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         raise InvariantError("wallet_address_required_for_live")
     if cfg.min_bet_amount_bnb <= 0.0:
         raise InvariantError("runtime_min_bet_amount_nonpositive")
-    try:
-        closed_state = _init_closed_state(cfg)
+    closed_state = _init_closed_state(cfg)
 
-        bnbusd_price = _fetch_current_bnb_price_usd(cfg)
-        if cfg.dry:
-            if closed_state.simulated_bankroll_bnb is None:
-                raise InvariantError("dry_bankroll_uninitialized")
-            bankroll_bnb = closed_state.simulated_bankroll_bnb
-        else:
-            bankroll_bnb = _fetch_wallet_balance_bnb_with_retries(
-                cfg=cfg,
-                reason="live_wallet_bootstrap",
-            )
-        info(
-            "CORE",
-            "RUN",
-            "BANKROLL",
-            msg=f"Starting bankroll: {format_bankroll(bankroll_bnb=bankroll_bnb, bnbusd_price=bnbusd_price)}",
+    bnbusd_price = _fetch_current_bnb_price_usd(cfg)
+    if cfg.dry:
+        if closed_state.simulated_bankroll_bnb is None:
+            raise InvariantError("dry_bankroll_uninitialized")
+        bankroll_bnb = closed_state.simulated_bankroll_bnb
+    else:
+        bankroll_bnb = _fetch_wallet_balance_bnb_with_retries(
+            cfg=cfg,
+            reason="live_wallet_bootstrap",
         )
+    info(
+        "CORE",
+        "RUN",
+        "BANKROLL",
+        msg=f"Starting bankroll: {format_bankroll(bankroll_bnb=bankroll_bnb, bnbusd_price=bnbusd_price)}",
+    )
 
-        while True:
-            try:
-                _run_one_iteration(cfg, closed_state)
-            except TransientRpcError as e:
-                info(
-                    "CORE",
-                    "RUN",
-                    "RETRY",
-                    msg=(
-                        "Caught TransientRpcError during runtime loop: "
-                        f"retrying after delay err={str(e)}"
-                    ),
-                )
-                info(
-                    "CORE",
-                    "LOOP",
-                    "SLEEP",
-                    msg=(
-                        f"duration={_TRANSIENT_NETWORK_DELAY_SECONDS}s "
-                        "reason=delay_after_transient_network_error"
-                    ),
-                )
-                sleep_seconds(_TRANSIENT_NETWORK_DELAY_SECONDS)
-    finally:
-        if cfg.dry:
-            archived = _archive_dry_runtime_state(
-                reason="shutdown_snapshot",
-                move_files=True,
+    while True:
+        try:
+            _run_one_iteration(cfg, closed_state)
+        except TransientRpcError as e:
+            info(
+                "CORE",
+                "RUN",
+                "RETRY",
+                msg=(
+                    "Caught TransientRpcError during runtime loop: "
+                    f"retrying after delay err={str(e)}"
+                ),
             )
-            if archived is not None:
-                info(
-                    "RUN",
-                    "DRY",
-                    "ARCHIVE",
-                    msg=f"Saved shutdown dry-state snapshot to {Path(paths.DRY_ARCHIVE_ROOT) / archived.name}",
-                )
+            info(
+                "CORE",
+                "LOOP",
+                "SLEEP",
+                msg=(
+                    f"duration={_TRANSIENT_NETWORK_DELAY_SECONDS}s "
+                    "reason=delay_after_transient_network_error"
+                ),
+            )
+            sleep_seconds(_TRANSIENT_NETWORK_DELAY_SECONDS)
 
 
 def _mono_ms() -> float:
