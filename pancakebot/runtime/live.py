@@ -4,7 +4,6 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from pancakebot.chain.prediction_contract import Web3PredictionContract
 from pancakebot.util import InvariantError
@@ -48,7 +47,6 @@ def claim_scan_cursor(
     current_epoch: int,
     now_ts: int,
     buffer_seconds: int,
-    get_close_ts: Callable[[int], int | None],
     page_size: int = _PAGE_SIZE_DEFAULT,
     gas_limit: int = 300_000,
     claim_batch_size: int = 10,

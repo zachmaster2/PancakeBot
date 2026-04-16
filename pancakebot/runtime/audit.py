@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import csv
+import time
 from pathlib import Path
 
 from pancakebot.constants import BNB_WEI
 from pancakebot.util import InvariantError
-from pancakebot.util import now_ts
 from pancakebot.types import Round
 
 
@@ -256,7 +256,7 @@ def record_cycle_audit(
     append_cycle_audit_row(
         cycle_audit_path,
         {
-            "cycle_ts": int(now_ts()),
+            "cycle_ts": int(time.time()),
             "current_epoch": current_epoch,
             "locked_epoch": locked_epoch,
             "lock_ts": lock_ts,

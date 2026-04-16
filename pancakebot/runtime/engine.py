@@ -29,7 +29,6 @@ from pancakebot.runtime.dry import (
 )
 from pancakebot.runtime.live import claim_scan_cursor
 from pancakebot.strategy.momentum_pipeline import StrategyPipelineDecision
-from pancakebot.util import now_ts
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
@@ -131,7 +130,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
     # take an action using a coherent epoch snapshot.
     while True:
         # Step 1: Epoch alignment handshake (shift-aware) with retries.
-        locked_round, _open_round, current_epoch, _open_rd = _epoch_handshake(cfg, closed)
+        locked_round, _open_round, current_epoch, _open_rd = _epoch_handshake(cfg)
         locked_epoch = locked_round.epoch
 
         if locked_round.lock_price is None:
@@ -150,9 +149,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
                     locked_epoch=locked_epoch,
                     current_epoch=current_epoch,
-                    now_ts=int(now_ts()),
+                    now_ts=int(time.time()),
                     buffer_seconds=cfg.buffer_seconds,
-                    get_close_ts=cfg.contract.close_ts,
                     page_size=100,
                     gas_limit=GAS_LIMIT_CLAIM,
                     claim_batch_size=_CLAIM_BATCH_SIZE,
@@ -195,7 +193,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # we must wake for claim first (no approximation).
         prev_locked_epoch = locked_round.epoch - 1
         claim_ts = locked_round.lock_at + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
-        if now_ts() < claim_ts < cutoff_ts_t:
+        if time.time() < claim_ts < cutoff_ts_t:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
 
@@ -240,7 +238,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             continue
 
         if current_epoch2 is None:
-            locked_round, open_round, current_epoch, _ = _epoch_handshake(cfg, closed)
+            locked_round, open_round, current_epoch, _ = _epoch_handshake(cfg)
             locked_epoch = locked_round.epoch
             lock_ts_t = int(open_round.lock_at)
         else:
@@ -294,8 +292,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             raise InvariantError("strategy_pipeline_missing")
         decision = closed.strategy_pipeline.decide_open_round(
             round_t=open_round,
-            bankroll_bnb=bankroll_bnb,
-            allow_oracle_mode=False,
             pool_bull_bnb=pool_bull_bnb,
             pool_bear_bnb=pool_bear_bnb,
             okx_kline_futures=okx_kline_futures,
@@ -475,7 +471,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 ),
             )
             _dry_record_bet(
-                cfg,
                 closed,
                 epoch=current_epoch,
                 side=decision.bet_side,
@@ -524,7 +519,7 @@ def _log_deferred_gate_signal(decision: StrategyPipelineDecision) -> None:
              strength=f"{decision.bet_size_bnb:.4f}")
 
 
-def _epoch_handshake(cfg: RuntimeConfig, closed: _ClosedState) -> tuple[Round, Round, int, object]:
+def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
     """RPC-only epoch alignment.
 
     Returns (locked_round_stub, open_round_stub, current_epoch, open_rd)
@@ -590,7 +585,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     _sleep_until_ts(claim_ts, reason="wait_for_claim", epoch=claim_epoch)
 
     # Epoch handshake to refresh round state (both modes).
-    locked_round2, _open_round2, current_epoch2, _open_rd2 = _epoch_handshake(cfg, closed)
+    locked_round2, _open_round2, current_epoch2, _open_rd2 = _epoch_handshake(cfg)
 
     # Live only: claim scan to collect winnings.
     if not cfg.dry:
@@ -601,9 +596,8 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
             cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
             locked_epoch=locked_round2.epoch,
             current_epoch=current_epoch2,
-            now_ts=int(now_ts()),
+            now_ts=int(time.time()),
             buffer_seconds=cfg.buffer_seconds,
-            get_close_ts=cfg.contract.close_ts,
             page_size=100,
             gas_limit=GAS_LIMIT_CLAIM,
             claim_batch_size=_CLAIM_BATCH_SIZE,
