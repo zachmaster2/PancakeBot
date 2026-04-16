@@ -58,8 +58,10 @@ def _fetch_current_bnb_price_usd(cfg: RuntimeConfig) -> float:
 
 
 def run_live_loop(cfg: RuntimeConfig) -> None:
-    if not cfg.wallet_address:
-        raise InvariantError("wallet_address_required")
+    # Wallet address is only required for live mode (signing transactions).
+    # Dry mode reads from chain via public RPC, no signing needed.
+    if not cfg.dry and not cfg.wallet_address:
+        raise InvariantError("wallet_address_required_for_live")
     if cfg.min_bet_amount_bnb <= 0.0:
         raise InvariantError("runtime_min_bet_amount_nonpositive")
     try:
@@ -138,23 +140,24 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if bnbusd_price <= 0.0:
             raise InvariantError("locked_round_lock_price_nonpositive")
 
-        # Step 2: Initial claim scan (one-time) after the first successful alignment.
+        # Step 2: Initial claim scan (one-time, live only) after first alignment.
         if not closed.claim_scan_initialized:
-            claim_scan_cursor(
-                contract=cfg.contract,
-                wallet_address=cfg.wallet_address,
-                dry=cfg.dry,
-                cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
-                locked_epoch=locked_epoch,
-                current_epoch=current_epoch,
-                now_ts=int(now_ts()),
-                buffer_seconds=cfg.buffer_seconds,
-                get_close_ts=cfg.contract.close_ts,
-                page_size=100,
-                gas_limit=GAS_LIMIT_CLAIM,
-                claim_batch_size=_CLAIM_BATCH_SIZE,
-                min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
-            )
+            if not cfg.dry:
+                claim_scan_cursor(
+                    contract=cfg.contract,
+                    wallet_address=cfg.wallet_address,
+                    dry=False,
+                    cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
+                    locked_epoch=locked_epoch,
+                    current_epoch=current_epoch,
+                    now_ts=int(now_ts()),
+                    buffer_seconds=cfg.buffer_seconds,
+                    get_close_ts=cfg.contract.close_ts,
+                    page_size=100,
+                    gas_limit=GAS_LIMIT_CLAIM,
+                    claim_batch_size=_CLAIM_BATCH_SIZE,
+                    min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
+                )
 
             _dry_settle_available_bets(cfg, closed)
             closed.claim_scan_initialized = True
