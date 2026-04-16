@@ -1,3 +1,4 @@
+"""Entrypoint dispatcher for backtest, sync, dry, and live run modes."""
 from __future__ import annotations
 
 from pathlib import Path

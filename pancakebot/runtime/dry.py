@@ -1,4 +1,4 @@
-"""Dry-run state management: bankroll, bets, settlement, archiving."""
+"""Dry-mode state: simulated bankroll, pending bets, settlement, archiving of prior runs."""
 
 from __future__ import annotations
 

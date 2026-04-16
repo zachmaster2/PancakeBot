@@ -1,8 +1,4 @@
-"""Configuration: dataclasses, TOML loading, and env helpers.
-
-Simplified config -- most settings are hardcoded as project constants.
-Only user-tunable knobs live in config.toml.
-"""
+"""Load AppConfig and BacktestConfig from a TOML file and read required env vars."""
 from __future__ import annotations
 
 import os

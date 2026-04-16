@@ -1,3 +1,4 @@
+"""Web3ContractConfig dataclass holding RPC URL(s), ABI path, and optional private key."""
 from __future__ import annotations
 
 from dataclasses import dataclass

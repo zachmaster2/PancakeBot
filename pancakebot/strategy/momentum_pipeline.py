@@ -1,20 +1,8 @@
-"""Momentum-only strategy pipeline.
+"""MomentumOnlyPipeline: BTC primary signal plus ETH+SOL regime-2 with adaptive sizing.
 
-Signal sources (via MomentumGate on OKX 1s candles):
-  - Primary: BTC multi-TF (3s, 7s, 15s) all agree, pool-adaptive
-    threshold on min(|r3|, |r7|, |r15|).
-  - Regime-2: ETH + SOL multi-TF both agree when BTC is silent;
-    smaller sizing because WR is lower than primary.
-  - Strong-signal bypass: relaxes the pool minimum when the BTC
-    signal is very strong.
-
-Sizing: continuous adaptive — frac scales with signal strength:
-  frac = BASE_FRAC + SIZING_SLOPE * signal_strength
-  bet = pool * frac * payout_boost (capped per regime)
-
-Filters:
-  - Pool minimum (with strong-signal bypass).
-  - Payout floor: skip rounds where payout on our side is too low.
+Drives bet/skip decisions from MomentumGate output (live/dry) or cached klines
+(backtest), applies pool-adaptive thresholds, a strong-signal pool bypass, a
+payout floor, and continuous sizing scaled by signal strength.
 """
 
 from __future__ import annotations

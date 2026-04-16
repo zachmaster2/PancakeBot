@@ -1,3 +1,4 @@
+"""Epoch-ascending JSONL store for closed rounds with append and prepend operations."""
 from __future__ import annotations
 
 import json

@@ -1,3 +1,7 @@
+"""Compute win/loss/refund settlement for a bet against on-chain round data or a closed Round.
+
+Includes the bet's self-impact on the winning-side denominator and subtracts claim gas.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass

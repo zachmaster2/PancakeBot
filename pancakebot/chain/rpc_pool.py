@@ -1,3 +1,4 @@
+"""Pick the first RPC URL that responds with the expected chain id."""
 from __future__ import annotations
 
 import requests

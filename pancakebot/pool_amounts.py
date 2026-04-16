@@ -1,3 +1,4 @@
+"""Aggregate bet amounts into total/bull/bear wei pools, optionally filtered by timestamp."""
 from __future__ import annotations
 
 from dataclasses import dataclass

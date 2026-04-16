@@ -1,8 +1,7 @@
-"""Backtest runner — momentum-only offline replay.
+"""Replay closed rounds through MomentumOnlyPipeline using cached 1s klines.
 
-Iterates closed rounds in chronological order, runs MomentumOnlyPipeline
-(no live OKX gate; uses cached 1s klines instead), and settles each
-bet against the closed-round pool data from closed_rounds.jsonl.
+Settles each bet against historical pool data, writes per-trade CSV,
+summary JSON, and an equity curve PNG.
 """
 from __future__ import annotations
 

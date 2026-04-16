@@ -1,3 +1,4 @@
+"""Sync at least cache_n usable closed rounds into the ClosedRoundsStore via fixed-epoch-window scans."""
 from __future__ import annotations
 
 import math

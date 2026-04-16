@@ -1,12 +1,4 @@
-"""JSONL store for 1s kline data, keyed by epoch (epoch-ascending).
-
-Format:
-  - One JSON object per line: {"epoch": int, "lock_at": int, "klines_1s": [...]}
-  - No error records — only successfully fetched data is persisted.
-
-Store invariant:
-  - epochs are strictly increasing on disk.
-"""
+"""Epoch-ascending JSONL store for per-round 1s kline arrays."""
 from __future__ import annotations
 
 import json

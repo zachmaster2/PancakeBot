@@ -1,3 +1,4 @@
+"""Integer-seconds wall-clock timestamp helper."""
 import time
 
 

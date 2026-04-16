@@ -1,3 +1,4 @@
+"""Web3 wrapper for PancakeSwap Prediction V2: round reads, claim/bet writes, batched RPC calls."""
 from __future__ import annotations
 
 import json

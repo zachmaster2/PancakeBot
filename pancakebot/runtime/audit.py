@@ -1,8 +1,4 @@
-"""Audit CSV management: shared by both dry and live modes.
-
-Extracted from dry.py -- the "dry" prefix is dropped since these functions
-serve both runtime modes.
-"""
+"""Trade and cycle audit CSV writers plus pool snapshot and settled-epoch recovery helpers."""
 
 from __future__ import annotations
 

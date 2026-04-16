@@ -1,7 +1,4 @@
-"""Hardcoded filesystem paths for all runtime state.
-
-No configuration needed -- these are project conventions, not user settings.
-"""
+"""Filesystem paths for ABI, closed rounds, spot price klines, and dry/live/backtest outputs."""
 
 # -- Shared --
 ABI_JSON_PATH = "abi/prediction_v2_abi.json"

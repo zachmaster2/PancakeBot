@@ -1,3 +1,4 @@
+"""CLI entrypoint: parses --sync/--backtest/--dry/--live flags and invokes run_from_config."""
 from __future__ import annotations
 
 import argparse

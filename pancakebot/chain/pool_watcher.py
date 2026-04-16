@@ -1,14 +1,8 @@
-"""WebSocket event watcher for PancakeSwap Prediction V2 pool tracking.
+"""WebSocket watcher that accumulates PancakeSwap Prediction V2 bet pools.
 
-Subscribes to:
-  1. BetBull/BetBear log events — accumulates pool amounts per epoch
-  2. newHeads — tracks block_number → timestamp mapping for time filtering
-
-At decision time, the pipeline queries pools filtered to a specific
-timestamp (e.g., lock_at - 6) for consistency with backtest.
-
-Thread-safe: the background listener writes to lock-protected dicts,
-and get_pool reads from them.
+Subscribes to BetBull/BetBear logs and newHeads over a public BSC WSS
+endpoint, maintains per-epoch pool amounts with block-timestamp-aware
+filtering, and supports RPC backfill for missed bets at startup.
 """
 from __future__ import annotations
 

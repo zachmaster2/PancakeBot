@@ -1,8 +1,4 @@
-"""Contract constants: fetch from chain, cache to disk.
-
-Synced by --sync mode. Read from disk by backtest/dry/live.
-Replaces hardcoded values in constants.py for chain-sourced parameters.
-"""
+"""Load and save on-chain contract constants (min bet, treasury fee, interval, buffer) to disk."""
 from __future__ import annotations
 
 import json

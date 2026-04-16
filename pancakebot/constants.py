@@ -1,10 +1,4 @@
-"""Project-wide constants (locked).
-
-These values are intentionally *not* configurable to keep runtime configuration minimal.
-If you change any of these, also update README.md and specs/ (if present).
-
-Canonical v1.0 frozen constants are sourced from spec_work/local/full_spec_v4.txt.
-"""
+"""Chain, RPC, Graph, and gas constants for BNB Chain and PancakeSwap Prediction V2."""
 
 from __future__ import annotations
 

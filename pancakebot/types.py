@@ -1,3 +1,4 @@
+"""Bet and Round dataclasses with JSON codecs for subgraph/RPC ingestion."""
 from __future__ import annotations
 
 from dataclasses import dataclass
