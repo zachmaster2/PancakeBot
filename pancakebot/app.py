@@ -22,7 +22,7 @@ from pancakebot.chain.contract_config import Web3ContractConfig
 from pancakebot.chain.prediction_contract import Web3PredictionContract
 from pancakebot.market_data.contract_constants import ContractConstants, save_contract_constants
 from pancakebot.runtime.config import RuntimeConfig
-from pancakebot.runtime.engine import run_live_loop
+from pancakebot.runtime import engine
 from pancakebot.market_data.sync import sync_runtime_market_data
 from pancakebot.util import InvariantError
 from pancakebot.log import info
@@ -168,6 +168,6 @@ def run_from_config(
     )
 
     try:
-        run_live_loop(runtime_cfg)
+        engine.run_realtime_loop(runtime_cfg)
     finally:
         pool_watcher.stop()
