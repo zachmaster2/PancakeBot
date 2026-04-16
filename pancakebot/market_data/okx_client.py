@@ -1,8 +1,4 @@
-"""Minimal OKX public REST client for 1s klines.
-
-OKX is accessible from US IPs for unauthenticated market data.
-No API key required.
-"""
+"""OKX public REST client for fetching 1s spot candles (unauthenticated)."""
 
 from __future__ import annotations
 

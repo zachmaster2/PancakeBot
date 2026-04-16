@@ -1,3 +1,4 @@
+"""Filesystem helper to create a file's parent directory if it does not exist."""
 from pathlib import Path
 
 

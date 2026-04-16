@@ -1,3 +1,4 @@
+"""Cursor-based claim scan: walks user rounds, batches claimable/refundable epochs, and submits claim txs."""
 from __future__ import annotations
 
 import time

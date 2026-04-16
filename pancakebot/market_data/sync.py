@@ -1,12 +1,8 @@
-"""Sync runtime market data: closed rounds + 1s spot klines for backtest.
+"""Fetch closed rounds from The Graph and BNB/BTC/ETH/SOL 1s klines from OKX.
 
-Fetches closed rounds from The Graph, then fetches BNB + BTC + ETH + SOL
-1s klines from OKX for any rounds not already present in the kline stores.
-
-Kline fetching uses parallel workers within each asset and runs all four
-assets concurrently.  Records are collected, sorted by epoch, and
-appended in strict ascending order — matching the closed rounds store
-pattern.
+Runs the four kline fetches in parallel under a shared rate limiter,
+trims the round store and kline stores to their common epoch intersection,
+and returns a SyncSummary of counts.
 """
 from __future__ import annotations
 

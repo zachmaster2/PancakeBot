@@ -1,4 +1,4 @@
-"""Runtime configuration dataclass and constants."""
+"""RuntimeConfig dataclass binding the round store, contract, gate, pool watcher, and runtime knobs."""
 
 from __future__ import annotations
 

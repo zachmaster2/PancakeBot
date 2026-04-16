@@ -1,3 +1,4 @@
+"""BNB-to-USD conversion and human-readable bankroll/amount formatting helpers."""
 from __future__ import annotations
 
 

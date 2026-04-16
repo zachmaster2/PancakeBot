@@ -1,11 +1,4 @@
-"""Live runtime loop: epoch alignment, decision, bet submission, claim cycle.
-
-Hard rules (project-level):
-  - Do not catch-and-continue exceptions (developer errors must crash).
-  - Pure RPC + OKX: no Graph API, no closed-rounds cache in live/dry mode.
-
-This module orchestrates on-chain RPC and OKX momentum-gate strategy execution.
-"""
+"""Live/dry runtime loop: epoch handshake, cutoff-aligned decision, bet submission, and claim scan."""
 
 from __future__ import annotations
 

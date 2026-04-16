@@ -1,3 +1,4 @@
+"""The Graph client for PancakeSwap Prediction V2: fetches open, locked, and closed rounds with bets."""
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,3 +1,6 @@
+"""Exception types for invariant violations and transient RPC/Graph failures."""
+
+
 class InvariantError(Exception):
     pass
 

@@ -1,3 +1,4 @@
+"""Fixed-width structured logger with info/warn/error levels and typed field formatting."""
 from __future__ import annotations
 
 import datetime
