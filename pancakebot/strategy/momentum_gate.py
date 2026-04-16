@@ -129,6 +129,9 @@ class MomentumGate:
 
         # Collect klines -- BTC/ETH/SOL only (BNB not needed for signal).
         import time as _time
+        btc_klines: list[dict] | None = None
+        eth_klines: list[dict] | None = None
+        sol_klines: list[dict] | None = None
         if kline_futures is not None:
             _t0 = _time.monotonic()
             btc_klines = kline_futures[0].result()
@@ -155,8 +158,8 @@ class MomentumGate:
         # Validate BTC klines (the signal source).  We require exactly
         # _CANDLE_COUNT contiguous 1s candles ending at cutoff - 1.
         btc_reason = _validate_klines(btc_klines, cutoff_ts_ms, "btc")
-        if btc_reason is not None:
-            return self._skip(btc_reason)
+        if btc_reason is not None or btc_klines is None:
+            return self._skip(btc_reason or "gate_no_btc_klines")
 
         btc_closes = [k["close_price"] for k in btc_klines]
         eth_closes = [k["close_price"] for k in eth_klines] if eth_klines and len(eth_klines) >= _CANDLE_COUNT else None
@@ -286,9 +289,10 @@ def _compute_pair_multi_tf(
     """Compute multi-TF(3,7,15) for a single pair. Returns (direction, min_abs)."""
     if closes is None:
         return None, 0.0
-    rets = [_get_return(closes, lb) for lb in _MTF_LOOKBACKS]
-    if any(r is None for r in rets):
+    rets_opt = [_get_return(closes, lb) for lb in _MTF_LOOKBACKS]
+    if any(r is None for r in rets_opt):
         return None, 0.0
+    rets: list[float] = [r for r in rets_opt if r is not None]
     if all(r > 0 for r in rets):
         return "Bull", min(abs(r) for r in rets)
     if all(r < 0 for r in rets):

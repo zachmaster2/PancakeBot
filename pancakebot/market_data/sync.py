@@ -21,6 +21,7 @@ from pancakebot.log import info
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.market_data.round_sync import sync_closed_rounds
 from pancakebot.market_data.graph_client import GraphClient
+from pancakebot.market_data.okx_client import OkxClient
 from pancakebot.market_data.kline_store import KlineStore
 from time import sleep as sleep_seconds
 
@@ -72,7 +73,7 @@ def sync_runtime_market_data(
     cfg: AppConfig,
     graph: GraphClient,
     round_store: ClosedRoundsStore,
-    okx_client: object,
+    okx_client: OkxClient,
 ) -> SyncSummary:
     cache_n = int(cfg.backtest.simulation_size)
 
@@ -290,7 +291,7 @@ def _sync_1s_klines(
     store: KlineStore,
     label: str,
     cutoff_seconds: int = 2,
-    okx_client: object,
+    okx_client: OkxClient,
 ) -> int:
     """Fetch 1s OKX klines for rounds not yet in the store. Returns count synced.
 
@@ -373,7 +374,7 @@ def _sync_1s_klines(
 def _fetch_and_append(
     *, rounds_asc: list, inst_id: str, store: KlineStore, label: str,
     latest_on_disk: int | None, done_count: int, cutoff_seconds: int = 2,
-    okx_client: object,
+    okx_client: OkxClient,
 ) -> tuple[int, int]:
     """Fetch epochs in ordered batches and append each to store immediately."""
     synced = 0
@@ -414,7 +415,7 @@ def _fetch_and_append(
 
 def _fetch_to_staging(
     *, rounds_asc: list, inst_id: str, staging_path: str, label: str,
-    cutoff_seconds: int = 2, okx_client: object,
+    cutoff_seconds: int = 2, okx_client: OkxClient,
 ) -> tuple[int, int]:
     """Fetch older epochs into a staging file (resumable append-only)."""
     # Load what's already in the staging file from a prior interrupted run.
@@ -485,7 +486,7 @@ def _prepend_staging_to_store(*, store: KlineStore, staging_path: str, label: st
          msg=f"  prepended {len(staging_records)} older epochs into store")
 
 
-def _fetch_batch(batch: list, inst_id: str, okx_client: object, cutoff_seconds: int = 2) -> tuple[list[dict], int]:
+def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient, cutoff_seconds: int = 2) -> tuple[list[dict], int]:
     """Fetch a batch of rounds in parallel. Returns (results, error_count)."""
     results: list[dict] = []
     errors = 0
@@ -494,7 +495,7 @@ def _fetch_batch(batch: list, inst_id: str, okx_client: object, cutoff_seconds: 
         for fut in as_completed(futures):
             try:
                 rec = fut.result()
-            except Exception:
+            except Exception:  # noqa: BLE001 -- count any fetch failure as error
                 errors += 1
                 continue
             if rec is None:
@@ -504,7 +505,7 @@ def _fetch_batch(batch: list, inst_id: str, okx_client: object, cutoff_seconds: 
     return results, errors
 
 
-def _fetch_one_kline(rnd, inst_id: str, okx_client: object, cutoff_seconds: int = 2) -> dict | None:
+def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient, cutoff_seconds: int = 2) -> dict | None:
     """Fetch 1s klines for a single round. Returns record dict or None."""
     epoch = int(rnd.epoch)
     lock_at = rnd.lock_at
@@ -517,7 +518,7 @@ def _fetch_one_kline(rnd, inst_id: str, okx_client: object, cutoff_seconds: int 
     return {"epoch": epoch, "lock_at": int(lock_at), "klines_1s": klines}
 
 
-def _fetch_1s_klines(*, inst_id: str, anchor_ms: int, okx_client: object) -> list[list] | None:
+def _fetch_1s_klines(*, inst_id: str, anchor_ms: int, okx_client: OkxClient) -> list[list] | None:
     """Fetch 1s klines ending just before anchor_ms from OKX.
 
     Uses the shared OkxClient session (keep-alive) for fast fetches.

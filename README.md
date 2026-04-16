@@ -4,12 +4,12 @@ Automated trading bot for PancakeSwap Prediction V2 on BNB Smart Chain.
 
 ## Modes
 
-| Mode | Command | Env vars | Description |
-|------|---------|----------|-------------|
-| Sync | `python run.py --sync` | `THE_GRAPH_API_KEY` | Fetch rounds + klines + contract constants |
-| Backtest | `python run.py --backtest` | (none) | Replay historical data, compute PnL |
-| Dry | `python run.py --dry` | (none) | Real-time paper trading |
-| Live | `python run.py --live` | `BSC_WALLET_PRIVATE_KEY` | Real on-chain bets |
+| Mode     | Command                    | Env vars                   | Description                                   |
+|----------|----------------------------|----------------------------|-----------------------------------------------|
+| Sync     | `python run.py --sync`     | `THE_GRAPH_API_KEY`        | Fetch rounds + klines + contract constants    |
+| Backtest | `python run.py --backtest` | (none)                     | Replay historical data, compute PnL           |
+| Dry      | `python run.py --dry`      | (none)                     | Real-time paper trading                       |
+| Live     | `python run.py --live`     | `BSC_WALLET_PRIVATE_KEY`   | Real on-chain bets                            |
 
 Running with no flags prints help. Modes are mutually exclusive.
 

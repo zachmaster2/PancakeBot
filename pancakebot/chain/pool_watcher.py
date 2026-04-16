@@ -202,7 +202,7 @@ class PoolEventWatcher:
                     try:
                         pong = await ws.ping()
                         await asyncio.wait_for(pong, timeout=5)
-                    except Exception:
+                    except Exception:  # noqa: BLE001 -- any ping failure triggers reconnect
                         break
                     continue
 
@@ -273,7 +273,8 @@ class PoolEventWatcher:
         with self._lock:
             self._block_ts[block_number] = timestamp
 
-    def _rpc_call(self, rpc: str, method: str, params: list) -> dict | None:
+    @staticmethod
+    def _rpc_call(rpc: str, method: str, params: list) -> dict | None:
         """Single JSON-RPC call. Returns result or None on error."""
         req = json.dumps({
             "jsonrpc": "2.0", "id": 1,
@@ -286,7 +287,8 @@ class PoolEventWatcher:
         body = json.loads(resp.read())
         return body.get("result")
 
-    def _rpc_batch(self, rpc: str, calls: list[tuple[str, list]]) -> list[dict | None]:
+    @staticmethod
+    def _rpc_batch(rpc: str, calls: list[tuple[str, list]]) -> list[dict | None]:
         """Batch JSON-RPC call. Returns list of results (None for failures)."""
         batch = [
             {"jsonrpc": "2.0", "id": i, "method": method, "params": params}
@@ -356,7 +358,7 @@ class PoolEventWatcher:
                 ]
                 try:
                     results = self._rpc_batch(rpc, calls)
-                except Exception:
+                except Exception:  # noqa: BLE001 -- batch RPC failure, count as blocks failed
                     blocks_failed += len(batch_bns)
                     continue
 
@@ -393,7 +395,7 @@ class PoolEventWatcher:
                     ]
                     try:
                         rcpt_results = self._rpc_batch(rpc, rcpt_calls)
-                    except Exception:
+                    except Exception:  # noqa: BLE001 -- batch receipt fetch failure
                         receipt_fails += len(rcpt_calls)
                         continue
 

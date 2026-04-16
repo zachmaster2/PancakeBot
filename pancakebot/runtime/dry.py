@@ -8,7 +8,7 @@ import os
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pancakebot import paths as _paths
@@ -38,8 +38,8 @@ class _ClosedState:
     claim_scan_initialized: bool = False
     pool_backfill_done: bool = False
     simulated_bankroll_bnb: float | None = None
-    dry_bets_by_epoch: dict[int, dict[str, object]] | None = None
-    dry_settled_epochs: set[int] | None = None
+    dry_bets_by_epoch: dict[int, dict[str, object]] = field(default_factory=dict)
+    dry_settled_epochs: set[int] = field(default_factory=set)
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,8 +513,8 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         # Fetch round data from contract; skip if not yet finalized.
         try:
             rd = cfg.contract.round_data(e)
-        except Exception:
-            continue  # transient RPC failure -- will retry next iteration
+        except Exception:  # noqa: BLE001 -- transient RPC failure, retry next iteration
+            continue
 
         if not rd.oracle_called and rd.close_ts > time.time():
             continue  # round not yet closed on-chain
@@ -638,7 +638,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
 
 
 def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
-    """Initialise live/dry runtime state. No disk sync -- pure RPC + OKX."""
+    """Initialize live/dry runtime state. No disk sync -- pure RPC + OKX."""
     info("CORE", "RUN", "SETUP", msg="Core setup: strategy=momentum_gate mode=rpc_only")
 
     strategy_pipeline = _build_momentum_pipeline(cfg=cfg)

@@ -82,7 +82,6 @@ def claim_scan_cursor(
     if size <= 0:
         raise InvariantError("claim_page_size_nonpositive")
 
-    scanned_total = 0
     claimed_total = 0
     pending_claims: list[tuple[int, int]] = []
 
@@ -102,9 +101,9 @@ def claim_scan_cursor(
             n = (len(pending_claims) // claim_batch_size) * claim_batch_size
         if n <= 0:
             return
-        to_claim = [epoch for epoch, _ in pending_claims[:n]]
-        for i in range(0, len(to_claim), claim_batch_size):
-            chunk = to_claim[i : i + claim_batch_size]
+        to_claim = [ep for ep, _ in pending_claims[:n]]
+        for idx in range(0, len(to_claim), claim_batch_size):
+            chunk = to_claim[idx : idx + claim_batch_size]
             chunk_gas_limit = gas_limit * len(chunk)
             t0 = time.perf_counter()
             gas_price_wei = contract.suggest_gas_price_wei()
@@ -163,7 +162,6 @@ def claim_scan_cursor(
     cursor += scanned
 
     if (not dry) and pending_claims:
-        should_force_flush = False
         if floor_bnb is not None:
             wallet_bnb = float(contract.wallet_balance_bnb(wallet_address))
             should_force_flush = wallet_bnb < floor_bnb
