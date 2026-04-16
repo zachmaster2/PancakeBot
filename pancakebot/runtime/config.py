@@ -31,9 +31,11 @@ class RuntimeConfig:
     # Prefetch offset: how many seconds before cutoff to wake for housekeeping
     prefetch_offset_seconds: int
 
-    # Protocol constants (cached at startup)
+    # Protocol constants (from chain via contract_constants.json)
     min_bet_amount_bnb: float
     treasury_fee_fraction: float
+    interval_seconds: int
+    buffer_seconds: int
 
     # Dry-mode initial bankroll
     dry_initial_bankroll_bnb: float | None

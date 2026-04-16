@@ -17,8 +17,6 @@ from pancakebot.constants import (
     GAS_LIMIT_BET,
     GAS_LIMIT_CLAIM,
     GAS_COST_BET_BNB,
-    BUFFER_SECONDS,
-    INTERVAL_SECONDS,
     POOL_CUTOFF_SECONDS,
 )
 from pancakebot.errors import InvariantError, TransientRpcError
@@ -158,7 +156,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 locked_epoch=locked_epoch,
                 current_epoch=current_epoch,
                 now_ts=int(now_ts()),
-                buffer_seconds=BUFFER_SECONDS,
+                buffer_seconds=cfg.buffer_seconds,
                 get_close_ts=cfg.contract.close_ts,
                 page_size=100,
                 gas_limit=GAS_LIMIT_CLAIM,
@@ -190,7 +188,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Step 4b: Backfill pool data on first iteration only.
         # After this, WSS subscription catches all bets in real time.
         if cfg.pool_watcher is not None and not closed.pool_backfill_done:
-            round_start_ts = lock_ts_t - INTERVAL_SECONDS
+            round_start_ts = lock_ts_t - cfg.interval_seconds
             cfg.pool_watcher.backfill_round(round_start_ts)
             closed.pool_backfill_done = True
 
@@ -201,7 +199,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # just-closed locked epoch may become claimable before the next cutoff. In that case,
         # we must wake for claim first (no approximation).
         prev_locked_epoch = locked_round.epoch - 1
-        claim_ts = locked_round.lock_at + BUFFER_SECONDS + _CLAIM_CHECK_PADDING_SECONDS
+        claim_ts = locked_round.lock_at + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
         if now_ts() < claim_ts < cutoff_ts_t:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
@@ -583,7 +581,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     if close_ts <= 0:
         raise InvariantError("close_ts_invalid")
 
-    claim_ts = close_ts + BUFFER_SECONDS + _CLAIM_CHECK_PADDING_SECONDS
+    claim_ts = close_ts + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
     _sleep_until_ts(claim_ts, reason="wait_for_claim", epoch=claim_epoch)
 
     # Epoch handshake to refresh round state (both modes).
@@ -599,7 +597,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
             locked_epoch=locked_round2.epoch,
             current_epoch=current_epoch2,
             now_ts=int(now_ts()),
-            buffer_seconds=BUFFER_SECONDS,
+            buffer_seconds=cfg.buffer_seconds,
             get_close_ts=cfg.contract.close_ts,
             page_size=100,
             gas_limit=GAS_LIMIT_CLAIM,

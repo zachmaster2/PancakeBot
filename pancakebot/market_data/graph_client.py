@@ -367,7 +367,8 @@ class GraphClient:
         return bets
 
     def _parse_round(self, r: dict[str, Any], *, state: RoundState, bets: list[Bet]) -> Round:
-        from pancakebot.constants import INTERVAL_SECONDS
+        from pancakebot.market_data.contract_constants import load_contract_constants
+        INTERVAL_SECONDS = load_contract_constants().interval_seconds
 
         epoch = self._parse_int(r.get("epoch"), "round.epoch")
         start_at = self._parse_int(r.get("startAt"), "round.startAt")
