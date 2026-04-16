@@ -45,10 +45,11 @@ def compute_pool_amounts_wei(*, bets: Iterable[Bet]) -> PoolAmountsWei:
     return PoolAmountsWei(total_wei=total, bull_wei=bull, bear_wei=bear)
 
 
-def compute_pool_amounts_wei_at_or_before(*, bets: Iterable[Bet], cutoff_ts: int) -> PoolAmountsWei:
-    """Compute pool amounts using only cutoff-eligible bets.
+def compute_pool_amounts_wei_before(*, bets: Iterable[Bet], cutoff_ts: int) -> PoolAmountsWei:
+    """Compute pool amounts using only bets strictly before cutoff_ts.
 
-    Spec: a bet is cutoff-eligible iff created_at <= cutoff_ts (inclusive).
+    Strict < avoids boundary ambiguity between The Graph's createdAt
+    and BSC block timestamps.
     """
-    eligible = (b for b in bets if b.created_at <= cutoff_ts)
+    eligible = (b for b in bets if b.created_at < cutoff_ts)
     return compute_pool_amounts_wei(bets=eligible)
