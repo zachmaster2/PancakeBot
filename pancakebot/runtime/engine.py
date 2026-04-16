@@ -367,9 +367,19 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             return
 
         # Step 12: Submit bet.
-        amount_wei = int(round(decision.bet_size_bnb * BNB_WEI))
-        if amount_wei <= 0:
+        computed_amount_wei = int(round(decision.bet_size_bnb * BNB_WEI))
+        if computed_amount_wei <= 0:
             raise InvariantError("bet_amount_wei_nonpositive")
+
+        # Live safety: if min_bet_only is set, clamp the submitted amount to
+        # the contract minimum.  All strategy logic runs normally; only the
+        # on-chain bet size is reduced.  Audit logs record both sizes.
+        amount_wei = computed_amount_wei
+        if not cfg.dry and cfg.live_min_bet_only:
+            min_wei = int(round(cfg.min_bet_amount_bnb * BNB_WEI))
+            amount_wei = min_wei
+            info("RUN", "ACT", "CLAMP",
+                 msg=f"min_bet_only: clamping {computed_amount_wei / BNB_WEI:.4f} -> {amount_wei / BNB_WEI:.4f} BNB")
 
         tx_submit = None
         if not cfg.dry:
