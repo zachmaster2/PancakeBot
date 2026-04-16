@@ -205,8 +205,12 @@ def load_app_config(path: str) -> AppConfig:
 
     epoch_start_raw = backtest_sec.get("epoch_start")
     epoch_end_raw = backtest_sec.get("epoch_end")
-    epoch_start = None if epoch_start_raw is None else int(epoch_start_raw)
-    epoch_end = None if epoch_end_raw is None else int(epoch_end_raw)
+    epoch_start: int | None = None
+    epoch_end: int | None = None
+    if epoch_start_raw is not None:
+        epoch_start = int(epoch_start_raw)
+    if epoch_end_raw is not None:
+        epoch_end = int(epoch_end_raw)
 
     backtest_cfg = BacktestConfig(
         simulation_size=simulation_size,

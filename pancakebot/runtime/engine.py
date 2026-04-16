@@ -47,12 +47,14 @@ _ONE_MINUTE_MS = 60_000
 
 def _fetch_current_bnb_price_usd(cfg: RuntimeConfig) -> float:
     """Fetch approximate BNB/USD price from contract (best-effort; 0.0 on failure)."""
+    # USD display fallback; any RPC/parse failure falls back to 0
+    # noinspection PyBroadException
     try:
         epoch = int(cfg.contract.current_epoch())
         rd = cfg.contract.round_data(epoch - 1)
         price = float(rd.lock_price_usd)
         return price if price > 0.0 else 0.0
-    except Exception:  # noqa: BLE001 -- USD display fallback; any RPC/parse failure falls back to 0
+    except Exception:
         return 0.0
 
 
@@ -255,6 +257,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # hit the warm connection (~50 ms instead of ~2 s).
         gate = None
         if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, "_gate"):
+            # noinspection PyProtectedMember
             gate = closed.strategy_pipeline._gate
             if gate is not None:
                 gate.warmup_session()
@@ -369,6 +372,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             return
 
         # Step 12: Submit bet.
+        if decision.bet_side is None:
+            raise InvariantError("decision_bet_side_missing")
+        bet_side: str = decision.bet_side
         computed_amount_wei = int(round(decision.bet_size_bnb * BNB_WEI))
         if computed_amount_wei <= 0:
             raise InvariantError("bet_amount_wei_nonpositive")
@@ -386,7 +392,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         tx_submit = None
         if not cfg.dry:
             gas_price_wei = cfg.contract.suggest_gas_price_wei()
-            if decision.bet_side == "Bull":
+            if bet_side == "Bull":
                 tx_submit = cfg.contract.bet_bull_timed(
                     epoch=current_epoch,
                     amount_wei=amount_wei,
@@ -395,7 +401,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     wait_receipt=True,
                     receipt_timeout_seconds=5,
                 )
-            elif decision.bet_side == "Bear":
+            elif bet_side == "Bear":
                 tx_submit = cfg.contract.bet_bear_timed(
                     epoch=current_epoch,
                     amount_wei=amount_wei,
@@ -405,7 +411,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     receipt_timeout_seconds=5,
                 )
             else:
-                raise InvariantError(f"unexpected_bet_side: {decision.bet_side}")
+                raise InvariantError(f"unexpected_bet_side: {bet_side}")
 
         # Step 13: Log bet with USD (BNB + USD suffixes).
         amount_bnb = amount_wei / BNB_WEI
@@ -419,7 +425,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 msg=(
                     f"Betting {amount_bnb:.4f} BNB"
                     + usd_suffix(amount_bnb=amount_bnb, bnbusd_price=bnbusd_price)
-                    + f" on {decision.bet_side} for epoch {current_epoch}"
+                    + f" on {bet_side} for epoch {current_epoch}"
                     + bankroll_suffix(bankroll_bnb=bankroll_after_live, bnbusd_price=bnbusd_price)
                 ),
             )
@@ -472,14 +478,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 msg=(
                     f"Betting {amount_bnb:.4f} BNB"
                     + usd_suffix(amount_bnb=amount_bnb, bnbusd_price=bnbusd_price)
-                    + f" on {decision.bet_side} for epoch {current_epoch}"
+                    + f" on {bet_side} for epoch {current_epoch}"
                     + bankroll_suffix(bankroll_bnb=bankroll_after_bet, bnbusd_price=bnbusd_price)
                 ),
             )
             _dry_record_bet(
                 closed,
                 epoch=current_epoch,
-                side=decision.bet_side,
+                side=bet_side,
                 amount_bnb=amount_bnb,
                 p_final=pred_p_final,
                 expected_profit_bnb=decision.expected_profit_bnb,

@@ -228,10 +228,14 @@ def _load_dry_bankroll_state(path: str) -> _DryBankrollState | None:
         raise InvariantError(f"dry_bankroll_state_source_invalid: path={path}")
     epoch: int | None = None
     if epoch_raw is not None:
+        if not isinstance(epoch_raw, (int, str)):
+            raise InvariantError(f"dry_bankroll_state_epoch_invalid: path={path}")
         try:
             epoch = int(epoch_raw)
-        except Exception as e:
+        except (ValueError, TypeError) as e:
             raise InvariantError(f"dry_bankroll_state_epoch_invalid: path={path}") from e
+    if not isinstance(bankroll_raw, (int, float)):
+        raise InvariantError(f"dry_bankroll_state_bankroll_invalid: path={path}")
     bankroll_bnb = float(bankroll_raw)
     if bankroll_bnb < 0.0:
         raise InvariantError(f"dry_bankroll_state_bankroll_negative: path={path}")
@@ -292,6 +296,8 @@ def _recover_dry_bankroll_state_from_logs(
         if not isinstance(placed_ts_raw, int):
             continue
         if not isinstance(bankroll_raw, (int, float)):
+            continue
+        if epoch_raw is not None and not isinstance(epoch_raw, (int, str)):
             continue
         epoch = None if epoch_raw is None else int(epoch_raw)
         state = _DryBankrollState(
@@ -511,9 +517,11 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             continue
 
         # Fetch round data from contract; skip if not yet finalized.
+        # Transient RPC failure -- will retry next iteration.
+        # noinspection PyBroadException
         try:
             rd = cfg.contract.round_data(e)
-        except Exception:  # noqa: BLE001 -- transient RPC failure, retry next iteration
+        except Exception:
             continue
 
         if not rd.oracle_called and rd.close_ts > time.time():

@@ -193,7 +193,7 @@ class MomentumOnlyPipeline:
         round_t: Round,
         pool_bull_bnb: float = 0.0,
         pool_bear_bnb: float = 0.0,
-        okx_kline_futures: object | None = None,
+        okx_kline_futures: tuple | None = None,
     ) -> StrategyPipelineDecision:
         """Return BET or SKIP from BTC primary / ETH+SOL regime-2 signals."""
 

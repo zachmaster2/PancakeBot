@@ -21,8 +21,8 @@ class RuntimeConfig:
     # Momentum gate (OKX 1s live client; None in backtest mode)
     momentum_gate: MomentumGate | None
 
-    # On-chain / identity (None in backtest mode, present in dry/live)
-    contract: Web3PredictionContract | None
+    # On-chain / identity (backtest passes a stub; dry/live use real contract)
+    contract: Web3PredictionContract
     wallet_address: str
 
     # Feature cutoff

@@ -412,9 +412,12 @@ class GraphClient:
         # closed usable
         if failed is not False:
             raise InvariantError("closed_round_failed_not_false")
-        for k in ("lockPrice", "closePrice", "position"):
-            if r.get(k) is None:
-                raise InvariantError(f"closed_round_missing_{k}")
+        if lock_price is None:
+            raise InvariantError("closed_round_missing_lockPrice")
+        if close_price is None:
+            raise InvariantError("closed_round_missing_closePrice")
+        if position is None:
+            raise InvariantError("closed_round_missing_position")
 
         pos = str(position)
         if pos not in ("Bull", "Bear", "House"):

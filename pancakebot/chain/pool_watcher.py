@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from pancakebot.constants import BNB_WEI, PREDICTION_V2_CONTRACT_ADDRESS, RPC_URLS
 from pancakebot.log import info, warn
+from pancakebot.util import InvariantError
 
 # Public BSC WebSocket endpoint (no signup, no API key).
 BSC_PUBLIC_WSS = "wss://bsc.publicnode.com"
@@ -198,11 +199,13 @@ class PoolEventWatcher:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
                 except asyncio.TimeoutError:
-                    # Send a ping to keep connection alive
+                    # Send a ping to keep connection alive.
+                    # Any ping failure triggers reconnect.
+                    # noinspection PyBroadException
                     try:
                         pong = await ws.ping()
                         await asyncio.wait_for(pong, timeout=5)
-                    except Exception:  # noqa: BLE001 -- any ping failure triggers reconnect
+                    except Exception:
                         break
                     continue
 
@@ -321,10 +324,15 @@ class PoolEventWatcher:
 
         try:
             # Get current block + timestamp
-            current_block = int(self._rpc_call(rpc, "eth_blockNumber", []), 16)
+            block_num_hex = self._rpc_call(rpc, "eth_blockNumber", [])
+            if block_num_hex is None:
+                raise InvariantError("backfill_block_number_failed")
+            current_block = int(block_num_hex, 16)
             cur_block_data = self._rpc_call(
                 rpc, "eth_getBlockByNumber", [hex(current_block), False],
             )
+            if cur_block_data is None:
+                raise InvariantError("backfill_current_block_fetch_failed")
             current_ts = int(cur_block_data["timestamp"], 16)
 
             # Convert round_start_ts to block number
@@ -356,9 +364,11 @@ class PoolEventWatcher:
                     ("eth_getBlockByNumber", [hex(bn), True])
                     for bn in batch_bns
                 ]
+                # Batch RPC failure: count all blocks as failed.
+                # noinspection PyBroadException
                 try:
                     results = self._rpc_batch(rpc, calls)
-                except Exception:  # noqa: BLE001 -- batch RPC failure, count as blocks failed
+                except Exception:
                     blocks_failed += len(batch_bns)
                     continue
 
@@ -393,9 +403,11 @@ class PoolEventWatcher:
                         ("eth_getTransactionReceipt", [tx["hash"]])
                         for _, tx in tx_candidates
                     ]
+                    # Batch receipt fetch failure: count all as failed.
+                    # noinspection PyBroadException
                     try:
                         rcpt_results = self._rpc_batch(rpc, rcpt_calls)
-                    except Exception:  # noqa: BLE001 -- batch receipt fetch failure
+                    except Exception:
                         receipt_fails += len(rcpt_calls)
                         continue
 

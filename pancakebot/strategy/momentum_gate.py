@@ -260,10 +260,10 @@ def compute_signal_from_klines(
 
     # Validate BTC klines (same gate as live path).
     btc_reason = _validate_klines_raw(btc_klines, cutoff_ms, "btc")
-    if btc_reason is not None:
+    if btc_reason is not None or btc_klines is None:
         return MomentumGateResult(
             signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-            skip_reason=btc_reason,
+            skip_reason=btc_reason or "gate_no_btc_klines",
         )
 
     btc_closes = [k[4] for k in btc_klines]

@@ -260,11 +260,11 @@ def _trim_closed_rounds(store: ClosedRoundsStore, valid_epochs: set[int]) -> Non
     kept = [r for r in all_rounds if int(r.epoch) in valid_epochs]
     kept.sort(key=lambda r: int(r.epoch))
 
-    tmp = store._path + ".tmp"
+    tmp = store.path_jsonl + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         for r in kept:
             f.write(json.dumps(r.to_json(), separators=(",", ":")) + "\n")
-    _os.replace(tmp, store._path)
+    _os.replace(tmp, store.path_jsonl)
 
     info("CORE", "SYNC", "TRIM",
          msg=f"Trimmed closed rounds: {len(all_rounds)} -> {len(kept)}")
@@ -493,9 +493,11 @@ def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient, cutoff_second
     with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
         futures = {pool.submit(_fetch_one_kline, rnd, inst_id, okx_client, cutoff_seconds): rnd for rnd in batch}
         for fut in as_completed(futures):
+            # noinspection PyBroadException
             try:
                 rec = fut.result()
-            except Exception:  # noqa: BLE001 -- count any fetch failure as error
+            except Exception:
+                # Any fetch failure counts as an error.
                 errors += 1
                 continue
             if rec is None:
