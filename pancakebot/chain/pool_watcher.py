@@ -256,6 +256,12 @@ class PoolEventWatcher:
 
             # Round-robin within available endpoints: pick smallest index >= ep_idx,
             # or wrap to the first available.
+            skipped = [ep_states[i].url for i in range(n) if ep_states[i].circuit_open_until > now]
+            if skipped:
+                remaining = min(ep_states[i].circuit_open_until - now
+                                for i in range(n) if ep_states[i].circuit_open_until > now)
+                info("POOL_WSS", "CB", "SKIP",
+                     msg=f"Skipping circuit-open: {skipped} (soonest re-open in {remaining:.0f}s)")
             chosen = None
             for i in available_indices:
                 if i >= ep_idx:
@@ -365,24 +371,29 @@ class PoolEventWatcher:
             self._last_connected_at = now
             self._last_event_at = now
             state.session_connected_at = now
+            session_events = 0
             info("POOL_WSS", "SUB", "OK",
                  msg=f"Subscribed on {state.url}")
 
+            disconnect_reason = "stop"
             while not self._stop_event.is_set() and not self._force_reconnect.is_set():
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
                 except asyncio.TimeoutError:
                     # No message for 10s — send ping to confirm liveness.
                     if self._force_reconnect.is_set():
+                        disconnect_reason = "force_reconnect"
                         break
                     try:
                         pong = await ws.ping()
                         await asyncio.wait_for(pong, timeout=5)
                     except Exception:
+                        disconnect_reason = "ping_timeout"
                         break
                     continue
 
                 self._last_event_at = time.time()
+                session_events += 1
 
                 msg = json.loads(raw)
                 params = msg.get("params", {})
@@ -396,7 +407,15 @@ class PoolEventWatcher:
                 elif sub_id == heads_sub_id:
                     self._process_new_head(result)
 
-        # Exiting cleanly — mark disconnected if we weren't already.
+            if self._force_reconnect.is_set() and disconnect_reason == "stop":
+                disconnect_reason = "force_reconnect"
+
+        # Log session summary before marking disconnected.
+        duration = time.time() - state.session_connected_at if state.session_connected_at > 0 else 0
+        if duration > 0:
+            warn("POOL_WSS", "WS", "CLOSED",
+                 msg=f"Session ended on {state.url}: reason={disconnect_reason} "
+                     f"duration={duration:.0f}s events={session_events}")
         self._connected = False
 
     # ------------------------------------------------------------------
