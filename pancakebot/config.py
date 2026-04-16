@@ -28,18 +28,12 @@ def require_env(name: str) -> str:
 
 # -- Backtest config ----------------------------------------------------------
 
-_BACKTEST_RESET_MODES = ("continuous", "chunk_reset")
-
-
 @dataclass(frozen=True, slots=True)
 class BacktestConfig:
     """Backtest configuration."""
 
     simulation_size: int
     initial_bankroll_bnb: float
-    reset_mode: str = "continuous"
-    reset_every_rounds: int = 0
-    tail_offset_rounds: int = 0
     epoch_start: int | None = None
     epoch_end: int | None = None
 
@@ -53,24 +47,6 @@ class BacktestConfig:
             raise InvariantError("backtest_initial_bankroll_bnb_not_number")
         if self.initial_bankroll_bnb <= 0.0:
             raise InvariantError("backtest_initial_bankroll_bnb_must_be_positive")
-
-        if not isinstance(self.reset_mode, str):
-            raise InvariantError("backtest_reset_mode_not_str")
-        mode = self.reset_mode.strip()
-        if mode not in _BACKTEST_RESET_MODES:
-            raise InvariantError("backtest_reset_mode_invalid")
-
-        if not isinstance(self.reset_every_rounds, int):
-            raise InvariantError("backtest_reset_every_rounds_not_int")
-        if self.reset_every_rounds < 0:
-            raise InvariantError("backtest_reset_every_rounds_negative")
-        if mode == "chunk_reset" and self.reset_every_rounds <= 0:
-            raise InvariantError("backtest_chunk_reset_every_rounds_must_be_positive")
-
-        if not isinstance(self.tail_offset_rounds, int):
-            raise InvariantError("backtest_tail_offset_rounds_not_int")
-        if self.tail_offset_rounds < 0:
-            raise InvariantError("backtest_tail_offset_rounds_negative")
 
         if self.epoch_start is not None and self.epoch_end is not None:
             if self.epoch_start > self.epoch_end:
@@ -142,15 +118,6 @@ def _opt_bool(obj: dict[str, Any], key: str, default: bool) -> bool:
     return v
 
 
-def _opt_str(obj: dict[str, Any], key: str, default: str) -> str:
-    if key not in obj:
-        return str(default)
-    v = obj[key]
-    if not isinstance(v, str) or not v.strip():
-        raise InvariantError(f"config_key_not_nonempty_str: {key}")
-    return v.strip()
-
-
 # -- Main loader --------------------------------------------------------------
 
 def load_app_config(path: str) -> AppConfig:
@@ -205,19 +172,12 @@ def load_app_config(path: str) -> AppConfig:
     if bt_bankroll <= 0.0:
         raise InvariantError("backtest_initial_bankroll_bnb_must_be_positive")
 
-    reset_mode = _opt_str(backtest_sec, "reset_mode", "continuous")
-    reset_every_rounds = _opt_int(backtest_sec, "reset_every_rounds", 0)
-    tail_offset_rounds = _opt_int(backtest_sec, "tail_offset_rounds", 0)
-
     epoch_start = _opt_int_or_none(backtest_sec, "epoch_start")
     epoch_end = _opt_int_or_none(backtest_sec, "epoch_end")
 
     backtest_cfg = BacktestConfig(
         simulation_size=simulation_size,
         initial_bankroll_bnb=bt_bankroll,
-        reset_mode=str(reset_mode),
-        reset_every_rounds=int(reset_every_rounds),
-        tail_offset_rounds=int(tail_offset_rounds),
         epoch_start=epoch_start,
         epoch_end=epoch_end,
     )

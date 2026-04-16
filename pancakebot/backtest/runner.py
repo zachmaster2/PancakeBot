@@ -80,7 +80,6 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     backtest_cfg.validate()
 
     simulation_size = backtest_cfg.simulation_size
-    tail_offset_rounds = backtest_cfg.tail_offset_rounds
     initial_bankroll_bnb = backtest_cfg.initial_bankroll_bnb
 
     info("BACK", "SETUP", "START", msg="Loading closed rounds and klines")
@@ -90,7 +89,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     if not all_rounds:
         raise InvariantError("backtest_no_closed_rounds")
 
-    # Select simulation window: epoch range takes priority over tail window.
+    # Select simulation window: epoch range takes priority over most-recent-N.
     epoch_start = backtest_cfg.epoch_start
     epoch_end = backtest_cfg.epoch_end
     if epoch_start is not None or epoch_end is not None:
@@ -104,10 +103,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
                 f"backtest_no_rounds_in_epoch_range: start={epoch_start} end={epoch_end}"
             )
     else:
-        effective_end = len(all_rounds) - tail_offset_rounds
-        if effective_end <= 0:
-            raise InvariantError("backtest_tail_offset_exceeds_rounds")
-        sim_rounds = all_rounds[max(0, effective_end - simulation_size): effective_end]
+        sim_rounds = all_rounds[-simulation_size:]
         if len(sim_rounds) < simulation_size:
             raise InvariantError(
                 f"backtest_insufficient_rounds: need={simulation_size} have={len(sim_rounds)}"
