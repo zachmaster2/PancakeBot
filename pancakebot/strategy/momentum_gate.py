@@ -27,7 +27,7 @@ the price N seconds before cutoff is ``closes[-(N+1)]``.
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from pancakebot.market_data.okx_client import OkxClient

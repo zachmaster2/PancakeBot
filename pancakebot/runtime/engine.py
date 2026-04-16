@@ -33,10 +33,9 @@ from pancakebot.runtime.dry import (
     _fetch_wallet_balance_bnb_with_retries,
     _init_closed_state,
     _record_dry_cycle_audit,
-    _save_dry_bankroll_state,
 )
 from pancakebot.runtime.live import claim_scan_cursor
-from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline, StrategyPipelineDecision
+from pancakebot.strategy.momentum_pipeline import StrategyPipelineDecision
 from pancakebot.time import now_ts
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
@@ -255,7 +254,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # ~60 s idle between 5-minute rounds).  Subsequent kline fetches
         # hit the warm connection (~50 ms instead of ~2 s).
         gate = None
-        if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, '_gate'):
+        if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, "_gate"):
             gate = closed.strategy_pipeline._gate
             if gate is not None:
                 gate.warmup_session()

@@ -76,7 +76,6 @@ _STRONG_BYPASS_BASE_FRAC = 0.03   # conservative sizing on small pools
 _STRONG_BYPASS_CAP_BNB = 0.3      # small cap to limit dilution
 
 
-
 @dataclass(frozen=True, slots=True)
 class StrategyPipelineDecision:
     """Normalized open-round strategy pipeline decision (momentum-only variant)."""
