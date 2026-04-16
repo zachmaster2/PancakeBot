@@ -21,7 +21,7 @@ from pancakebot.market_data.graph_client import GraphClient
 from pancakebot.chain.rpc_pool import choose_rpc_url
 from pancakebot.chain.contract_config import Web3ContractConfig
 from pancakebot.chain.prediction_contract import Web3PredictionContract
-from pancakebot.runtime.contract_constants_cache import ContractConstants, save_contract_constants
+from pancakebot.market_data.contract_constants import ContractConstants, save_contract_constants
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot.runtime.engine import run_live_loop
 from pancakebot.market_data.sync import sync_runtime_market_data
@@ -109,10 +109,14 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool, 
 
     treasury_fee_fraction = contract.treasury_fee_rate()
     min_bet_amount_bnb = float(contract.min_bet_amount()) / float(BNB_WEI)
+    interval_seconds = contract.interval_seconds()
+    buffer_seconds = contract.buffer_seconds()
     save_contract_constants(
         constants=ContractConstants(
             min_bet_amount_bnb=min_bet_amount_bnb,
             treasury_fee_fraction=treasury_fee_fraction,
+            interval_seconds=interval_seconds,
+            buffer_seconds=buffer_seconds,
         )
     )
 
