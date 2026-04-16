@@ -57,7 +57,7 @@ def _fetch_current_bnb_price_usd(cfg: RuntimeConfig) -> float:
         return 0.0
 
 
-def run_live_loop(cfg: RuntimeConfig) -> None:
+def run_realtime_loop(cfg: RuntimeConfig) -> None:
     # Wallet address is only required for live mode (signing transactions).
     # Dry mode reads from chain via public RPC, no signing needed.
     if not cfg.dry and not cfg.wallet_address:
