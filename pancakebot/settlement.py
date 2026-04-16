@@ -112,7 +112,7 @@ def settle_bet_against_closed_round(
 
     winner_u = round_closed.position.upper()
 
-    # Use ALL bets in the round (no timestamp filter) — matches on-chain
+    # Use ALL bets in the round (no timestamp filter) -- matches on-chain
     # settlement which uses the final pool totals regardless of bet timing.
     pools_wei = compute_pool_amounts_wei(bets=round_closed.bets)
     bull_pool_bnb = pools_wei.bull_wei / BNB_WEI

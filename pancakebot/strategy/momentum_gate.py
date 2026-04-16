@@ -16,7 +16,7 @@ from pancakebot.log import warn
 # Number of 1s candles fetched and used by all modes (live, sync, backtest).
 _CANDLE_COUNT = 31
 
-# Multi-TF BTC lookbacks — all must agree in direction.
+# Multi-TF BTC lookbacks -- all must agree in direction.
 _MTF_LOOKBACKS = (3, 7, 15)
 # Signal fires at this threshold; the pipeline may apply a stricter
 # threshold for small pools (pool-adaptive logic in momentum_pipeline.py).
@@ -58,7 +58,7 @@ class MomentumGate:
         # Cached after each evaluate() so the pipeline can use data
         # for auxiliary signals and regime-adaptive sizing without re-fetching.
         self.last_btc_closes: list[float] | None = None
-        # Per-pair fetch timing (ms) — set each evaluate(), logged by caller
+        # Per-pair fetch timing (ms) -- set each evaluate(), logged by caller
         # AFTER timing guard so file I/O doesn't delay bet submission.
         self.last_fetch_timing: dict[str, int] | None = None
 
@@ -76,7 +76,7 @@ class MomentumGate:
     # The two-phase timing architecture separates housekeeping (Phase A)
     # from the critical bet path (Phase B).  Phase A handles epoch check
     # and TLS warmup; Phase B fetches klines and decides.  The runtime
-    # loop calls fetch_klines_async() at the start of Phase B — the OKX
+    # loop calls fetch_klines_async() at the start of Phase B -- the OKX
     # requests run in background threads while the RPC work proceeds.
     # By the time evaluate() is called the data is already waiting.
     # ------------------------------------------------------------------
@@ -89,12 +89,12 @@ class MomentumGate:
         3-tuple of Futures that evaluate() will collect, or None when
         the gate is disabled.
 
-        BNB klines are NOT fetched here — they aren't used for signal
+        BNB klines are NOT fetched here -- they aren't used for signal
         computation (only for sync/backtest data collection).  Skipping
         BNB saves one OKX HTTP request in the critical bet path.
 
         *cutoff_ts_ms* is passed to OKX as the ``after`` parameter so
-        only completed candles (open_time < cutoff) are returned —
+        only completed candles (open_time < cutoff) are returned --
         the in-progress bar is never fetched.
         """
         if not self._cfg.enabled:
@@ -127,7 +127,7 @@ class MomentumGate:
                 skip_reason=None,
             )
 
-        # Collect klines — BTC/ETH/SOL only (BNB not needed for signal).
+        # Collect klines -- BTC/ETH/SOL only (BNB not needed for signal).
         import time as _time
         if kline_futures is not None:
             _t0 = _time.monotonic()
@@ -166,7 +166,7 @@ class MomentumGate:
 
         result = _compute_signal(btc_closes, eth_closes, sol_closes)
 
-        # NOTE: No logging here — caller logs AFTER timing guard so
+        # NOTE: No logging here -- caller logs AFTER timing guard so
         # file I/O doesn't delay bet submission in the critical path.
 
         return result

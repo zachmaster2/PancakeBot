@@ -516,7 +516,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         try:
             rd = cfg.contract.round_data(e)
         except Exception:
-            continue  # transient RPC failure — will retry next iteration
+            continue  # transient RPC failure -- will retry next iteration
 
         if not rd.oracle_called and rd.close_ts > now_ts():
             continue  # round not yet closed on-chain

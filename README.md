@@ -15,7 +15,7 @@ Running with no flags prints help. Modes are mutually exclusive.
 
 ## Strategy
 
-**Signal:** BTC multi-timeframe momentum — 3s, 7s, and 15s returns must all agree in direction with `min(|return|) >= threshold` (pool-adaptive: 0.0002 small / 0.0001 large).
+**Signal:** BTC multi-timeframe momentum -- 3s, 7s, and 15s returns must all agree in direction with `min(|return|) >= threshold` (pool-adaptive: 0.0002 small / 0.0001 large).
 
 **Regime-2:** When BTC is silent, ETH + SOL multi-TF agreement fires as a secondary signal with smaller sizing.
 

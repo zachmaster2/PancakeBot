@@ -132,7 +132,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     if bnb_klines:
         info("BACK", "SETUP", "BNB_KL", msg=f"Loaded BNB 1s klines for {len(bnb_klines)} epochs")
     else:
-        info("BACK", "SETUP", "BNB_KL", msg="No BNB klines found — backtest will skip all rounds")
+        info("BACK", "SETUP", "BNB_KL", msg="No BNB klines found -- backtest will skip all rounds")
 
     btc_klines = _load_klines_from(_BTC_KLINES_PATH)
     if btc_klines:
@@ -146,7 +146,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     if sol_klines:
         info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s klines for {len(sol_klines)} epochs")
 
-    # Build momentum pipeline (no live gate — backtest uses cached 1s klines).
+    # Build momentum pipeline (no live gate -- backtest uses cached 1s klines).
     from pancakebot.strategy.momentum_gate import MomentumGateConfig
     gate_config: MomentumGateConfig = runtime_cfg.momentum_gate_config  # type: ignore[assignment]
     pipeline = MomentumOnlyPipeline(

@@ -134,7 +134,7 @@ def sync_runtime_market_data(
     sol_store = KlineStore(str(_SOL_KLINES_PATH))
 
     cutoff_s = int(cfg.kline_cutoff_seconds)
-    # All 4 pairs run in parallel — the shared _rate_acquire() limiter
+    # All 4 pairs run in parallel -- the shared _rate_acquire() limiter
     # throttles total OKX requests to 8/s across all threads.
     with ThreadPoolExecutor(max_workers=4) as pool:
         bnb_fut = pool.submit(
@@ -166,7 +166,7 @@ def sync_runtime_market_data(
         eth_synced = eth_fut.result()
         sol_synced = sol_fut.result()
 
-    # Phase 3: Integrity — trim all stores to the exact intersection so
+    # Phase 3: Integrity -- trim all stores to the exact intersection so
     # every closed round has klines in ALL 4 stores.  Retry transient
     # failures first, then trim any epochs that genuinely have no data.
     all_stores = [
@@ -298,10 +298,10 @@ def _sync_1s_klines(
 ) -> int:
     """Fetch 1s OKX klines for rounds not yet in the store. Returns count synced.
 
-    Split into two passes to avoid O(n²) merge-rewrites:
-      1. **Append pass** — epochs AFTER the store's latest: fetched in small
+    Split into two passes to avoid O(n2) merge-rewrites:
+      1. **Append pass** -- epochs AFTER the store's latest: fetched in small
          ordered batches, each appended and flushed immediately (resumable).
-      2. **Prepend pass** — epochs BEFORE the store's earliest: fetched in
+      2. **Prepend pass** -- epochs BEFORE the store's earliest: fetched in
          batches into a staging file, then prepended atomically at the end.
 
     Both passes survive interruption: the append pass writes incrementally,
@@ -328,7 +328,7 @@ def _sync_1s_klines(
         prepend_rounds = [r for r in remaining if int(r.epoch) < earliest_on_disk]
         append_rounds = [r for r in remaining if int(r.epoch) > latest_on_disk]
     else:
-        # Fresh store — everything goes into append.
+        # Fresh store -- everything goes into append.
         prepend_rounds = []
         append_rounds = remaining
 
@@ -368,7 +368,7 @@ def _sync_1s_klines(
 
     if total_errors > 0:
         info("SYNC", "1S_KL", label,
-             msg=f"WARNING: {total_errors} epochs failed — re-run sync to retry them")
+             msg=f"WARNING: {total_errors} epochs failed -- re-run sync to retry them")
 
     info("SYNC", "1S_KL", label, msg=f"Done: {total_synced} synced, {total_errors} failed")
     return total_synced
