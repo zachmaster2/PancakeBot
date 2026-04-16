@@ -132,7 +132,7 @@ class ClosedRoundsStore:
           - `rounds_asc` must be strictly increasing and start strictly after `prev_epoch`.
 
         Returns:
-          - the latest epoch after the append.
+          - the latest epoch after appending.
         """
         if not rounds_asc:
             return prev_epoch

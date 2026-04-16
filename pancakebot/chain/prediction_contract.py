@@ -124,22 +124,23 @@ class Web3PredictionContract:
         self._w3 = w3_primary
         self._contract = self._providers[0][1]
         # Account is optional -- only needed for live mode (signing transactions).
-        self._account = w3_primary.eth.account.from_key(pk) if len(pk) == 64 else None
+        self._account: Any = w3_primary.eth.account.from_key(pk) if len(pk) == 64 else None
 
     def _rotate_rpc(self) -> None:
         """Round-robin to next RPC URL, switching to its warm session."""
         self._rpc_index = (self._rpc_index + 1) % len(self._providers)
         self._w3, self._contract = self._providers[self._rpc_index]
 
-    def _require_account(self):
+    def _require_account(self) -> Any:
         """Return self._account or raise if unset (live-only operations)."""
-        if self._account is None:
+        account = self._account
+        if account is None:
             raise InvariantError("account_required_for_signing")
-        return self._account
+        return account
 
     @property
     def wallet_address(self) -> str:
-        account = self._account
+        account: Any = self._account
         if account is None:
             return ""
         return str(account.address)
@@ -445,11 +446,12 @@ class Web3PredictionContract:
             return {}
         checksum = Web3.to_checksum_address(str(wallet_address))
         encoded: list[str] = []
-        # noinspection PyProtectedMember
         for e in epochs:
+            # noinspection PyProtectedMember
             encoded.append(
                 self._contract.functions.claimable(int(e), checksum)._encode_transaction_data()
             )
+            # noinspection PyProtectedMember
             encoded.append(
                 self._contract.functions.refundable(int(e), checksum)._encode_transaction_data()
             )
