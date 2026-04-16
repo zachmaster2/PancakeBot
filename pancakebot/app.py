@@ -137,7 +137,6 @@ def run_from_config(
         )
     )
 
-    momentum_gate = None
     okx_client = OkxClient(timeout_seconds=10.0)
     okx_client.warmup()
     momentum_gate = MomentumGate(config=momentum_gate_cfg, okx_client=okx_client)

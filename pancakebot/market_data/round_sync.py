@@ -34,6 +34,8 @@ def sync_closed_rounds(*, graph: GraphClient, store: ClosedRoundsStore, cache_n:
     # If the store already exists, then append all rounds newer than our latest (to ensure continuity).
     if store.exists():
         latest_on_disk = store.load_latest_epoch()
+        if latest_on_disk is None:
+            raise InvariantError("sync_latest_epoch_missing_on_existing_store")
         start_epoch = latest_on_disk + 1
         fetch_type = "newer"
 
@@ -47,7 +49,10 @@ def sync_closed_rounds(*, graph: GraphClient, store: ClosedRoundsStore, cache_n:
     if stored_n <= 0:
         raise InvariantError("sync_store_empty")
 
-    older_end = store.load_earliest_epoch() - 1
+    earliest_on_disk = store.load_earliest_epoch()
+    if earliest_on_disk is None:
+        raise InvariantError("sync_earliest_epoch_missing")
+    older_end = earliest_on_disk - 1
     if older_end <= 0:
         raise InvariantError("sync_insufficient_closed_rounds")
 
@@ -102,7 +107,10 @@ def _ensure_min_count_by_scanning_older(*, graph: GraphClient, store: ClosedRoun
     """
     page_size = 1000
     stored_n = store.count_rounds()
-    scan_end = store.load_earliest_epoch() - 1
+    earliest = store.load_earliest_epoch()
+    if earliest is None:
+        raise InvariantError("sync_earliest_epoch_missing_for_older_scan")
+    scan_end = earliest - 1
 
     while stored_n < needed_n:
         if scan_end <= 0:
@@ -126,6 +134,8 @@ def _ensure_min_count_by_scanning_older(*, graph: GraphClient, store: ClosedRoun
 
         if rounds:
             earliest_on_disk = store.load_earliest_epoch()
+            if earliest_on_disk is None:
+                raise InvariantError("sync_earliest_epoch_missing_mid_scan")
 
             prev: int | None = None
             for idx, r in enumerate(rounds):

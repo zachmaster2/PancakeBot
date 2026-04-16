@@ -284,8 +284,8 @@ def record_cycle_audit(
             "bet_size_bnb": bet_size_bnb,
             "p_bull": p_bull,
             "selected_side_probability": selected_side_probability(
-                p_bull=None if p_bull == "" else p_bull,
-                bet_side=None if bet_side == "" else bet_side,
+                p_bull=p_bull if isinstance(p_bull, float) else None,
+                bet_side=bet_side if isinstance(bet_side, str) and bet_side else None,
             ),
             "expected_profit_bnb": expected_profit_bnb,
             "selector_score_bnb": selector_score_bnb,

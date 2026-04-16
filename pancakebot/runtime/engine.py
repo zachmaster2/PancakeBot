@@ -52,7 +52,7 @@ def _fetch_current_bnb_price_usd(cfg: RuntimeConfig) -> float:
         rd = cfg.contract.round_data(epoch - 1)
         price = float(rd.lock_price_usd)
         return price if price > 0.0 else 0.0
-    except Exception:
+    except Exception:  # noqa: BLE001 -- USD display fallback; any RPC/parse failure falls back to 0
         return 0.0
 
 
@@ -174,6 +174,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             closed.strategy_pipeline.settle_closed_rounds(rounds=[_settled_stub])
 
         # Step 4: lock_ts from the handshake (immutable on-chain value).
+        if _open_round.lock_at is None:
+            raise InvariantError("open_round_lock_at_missing")
         lock_ts_t = int(_open_round.lock_at)
         if lock_ts_t <= 0:
             raise InvariantError("lock_ts_t_invalid")
@@ -192,6 +194,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # just-closed locked epoch may become claimable before the next cutoff. In that case,
         # we must wake for claim first (no approximation).
         prev_locked_epoch = locked_round.epoch - 1
+        if locked_round.lock_at is None:
+            raise InvariantError("locked_round_lock_at_missing")
         claim_ts = locked_round.lock_at + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
         if time.time() < claim_ts < cutoff_ts_t:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
@@ -240,6 +244,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if current_epoch2 is None:
             locked_round, open_round, current_epoch, _ = _epoch_handshake(cfg)
             locked_epoch = locked_round.epoch
+            if open_round.lock_at is None:
+                raise InvariantError("open_round_lock_at_missing")
             lock_ts_t = int(open_round.lock_at)
         else:
             open_round = _open_round

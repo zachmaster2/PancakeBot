@@ -156,9 +156,6 @@ class MomentumOnlyPipeline:
     def router_mode(self) -> str:
         return "momentum_gate"
 
-    def selector_ready(self) -> bool:
-        return True
-
     def refresh_bnb_klines(self, *, bnb_klines_by_epoch: dict[int, list[list]]) -> None:
         """Load pre-fetched BNB 1s kline arrays keyed by epoch (backtest mode)."""
         self._bnb_klines_by_epoch = dict(bnb_klines_by_epoch)
@@ -200,6 +197,8 @@ class MomentumOnlyPipeline:
     ) -> StrategyPipelineDecision:
         """Return BET or SKIP from BTC primary / ETH+SOL regime-2 signals."""
 
+        if round_t.lock_at is None:
+            raise InvariantError("round_lock_at_missing")
         lock_at = int(round_t.lock_at)
         cutoff_ts_ms = (lock_at - self._cutoff_seconds) * 1000
 

@@ -131,6 +131,12 @@ class Web3PredictionContract:
         self._rpc_index = (self._rpc_index + 1) % len(self._providers)
         self._w3, self._contract = self._providers[self._rpc_index]
 
+    def _require_account(self):
+        """Return self._account or raise if unset (live-only operations)."""
+        if self._account is None:
+            raise InvariantError("account_required_for_signing")
+        return self._account
+
     @property
     def wallet_address(self) -> str:
         if self._account is None:
@@ -467,7 +473,7 @@ class Web3PredictionContract:
         wait_receipt: bool,
         receipt_timeout_seconds: int,
     ) -> TxSubmitResult:
-        signed = self._account.sign_transaction(tx)
+        signed = self._require_account().sign_transaction(tx)
         t_tx_signed = float(time.perf_counter() * 1000.0)
         try:
             txh = self._w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -537,9 +543,9 @@ class Web3PredictionContract:
             op="build_bet_tx",
             fn=lambda: fn.build_transaction(
                 {
-                    "from": self._account.address,
+                    "from": self._require_account().address,
                     "value": int(amount_wei),
-                    "nonce": Web3.to_int(self._w3.eth.get_transaction_count(self._account.address)),
+                    "nonce": Web3.to_int(self._w3.eth.get_transaction_count(self._require_account().address)),
                     "gas": int(gas_limit),
                     "gasPrice": int(gas_price_wei),
                 }
@@ -618,12 +624,12 @@ class Web3PredictionContract:
         fn = self._contract.functions.claim([int(e) for e in epochs])
         tx = fn.build_transaction(
             {
-                "from": self._account.address,
-                "nonce": Web3.to_int(self._w3.eth.get_transaction_count(self._account.address)),
+                "from": self._require_account().address,
+                "nonce": Web3.to_int(self._w3.eth.get_transaction_count(self._require_account().address)),
                 "gas": int(gas_limit),
                 "gasPrice": int(gas_price_wei),
             }
         )
-        signed = self._account.sign_transaction(tx)
+        signed = self._require_account().sign_transaction(tx)
         txh = self._w3.eth.send_raw_transaction(signed.raw_transaction)
         return str(txh.hex())
