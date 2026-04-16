@@ -6,7 +6,7 @@ import os
 from typing import Iterator, Sequence
 
 from pancakebot.types import Round
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 
 
 class ClosedRoundsStore:

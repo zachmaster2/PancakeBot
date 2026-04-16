@@ -5,7 +5,7 @@ import json
 import os
 from typing import Iterator
 
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 
 
 class KlineStore:

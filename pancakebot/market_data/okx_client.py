@@ -6,7 +6,7 @@ import json
 
 import requests
 
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 
 
 _OKX_BASE_URL = "https://www.okx.com"

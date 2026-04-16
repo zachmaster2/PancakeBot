@@ -8,7 +8,7 @@ from typing import Any, Literal
 import requests
 
 from pancakebot.types import Bet, Round
-from pancakebot.errors import InvariantError, TransientGraphError
+from pancakebot.util import InvariantError, TransientGraphError
 from pancakebot.log import warn
 
 RoundState = Literal["open", "locked", "closed"]

@@ -7,7 +7,7 @@ import numbers
 import sys
 from typing import Any
 
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 
 # Logging goals:
 # - Fixed-width columns for readability.

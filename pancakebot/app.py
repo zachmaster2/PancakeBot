@@ -24,7 +24,7 @@ from pancakebot.market_data.contract_constants import ContractConstants, save_co
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot.runtime.engine import run_live_loop
 from pancakebot.market_data.sync import sync_runtime_market_data
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 from pancakebot.log import info
 from pancakebot.chain.pool_watcher import PoolEventWatcher
 from pancakebot import paths

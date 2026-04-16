@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
 
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 
 
 @dataclass(frozen=True, slots=True)
