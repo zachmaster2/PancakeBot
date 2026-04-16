@@ -50,7 +50,7 @@ class Round:
     used because it reflects when executeRound() was mined (~6s later),
     not the contract's planned lock time.
 
-    close_at is not stored — the claim manager uses RPC close_ts directly.
+    close_at is not stored — the claim scan cursor uses RPC close_ts directly.
     """
 
     epoch: int

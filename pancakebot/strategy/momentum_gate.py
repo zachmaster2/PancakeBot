@@ -1,20 +1,25 @@
-"""OKX multi-timeframe BTC momentum gate.
+"""OKX multi-timeframe momentum gate for BTC, with ETH/SOL support.
 
 Signal architecture:
 
-  Multi-Timeframe BTC Agreement
+  Primary: Multi-Timeframe BTC Agreement
     BTC 3s, 7s, and 15s returns must ALL agree in direction AND
-    min(|r3|, |r7|, |r15|) >= threshold (default 0.0002).
+    min(|r3|, |r7|, |r15|) >= threshold (default 0.0001).
 
     The signal strength (min_abs_return) is exposed for adaptive
     bet sizing in the pipeline: stronger moves = larger bets.
 
-  BNB klines are still fetched (required by sync/backtest infrastructure)
-  but are NOT used for signal generation.
+  Regime-2 (handled by pipeline): ETH + SOL multi-TF agreement
+    Used when BTC is silent; this module computes independent ETH/SOL
+    multi-TF signals and exposes them via MomentumGateResult so the
+    pipeline can combine them.
+
+  BNB klines are still fetched by --sync (required for the backtest
+  data store) but are NOT used for signal generation.
 
 Uses OKX public 1s candles (no auth required).
 
-Kline window: 31 contiguous 1s candles covering [lockAt-32, lockAt-2).
+Kline window: 31 contiguous 1s candles ending at cutoff - 1.
 The newest candle (index -1) has open_time = cutoff - 1 and its
 close_price is the price at cutoff.  Lookbacks use direct indexing:
 the price N seconds before cutoff is ``closes[-(N+1)]``.
