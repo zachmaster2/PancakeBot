@@ -14,19 +14,12 @@ EXPECTED_CHAIN_ID = 56
 
 PREDICTION_V2_CONTRACT_ADDRESS = "0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA"
 
-# Protocol constants (verified on-chain at startup in live mode).
-# These are NOT user-tunable — they're set by the PancakeSwap contract.
-TREASURY_FEE_FRACTION = 0.03   # 3% of total pool taken as fee
-MIN_BET_AMOUNT_BNB = 0.001     # minimum bet accepted by the contract
-
 # The contract's treasury fee is expressed in basis points (bps).
 TREASURY_FEE_DIVISOR = 10_000
 
-# PancakeSwap Prediction V2 protocol timing constants (on-chain values).
-# intervalSeconds: time between round start and lock (also lock to close).
-# bufferSeconds: grace period after close before round expires.
-INTERVAL_SECONDS = 300
-BUFFER_SECONDS = 30
+# Protocol constants (treasury_fee, min_bet, interval_seconds, buffer_seconds)
+# are synced from chain by --sync and cached in var/contract_constants.json.
+# See pancakebot/market_data/contract_constants.py.
 
 # Pool cutoff: only use bets with created_at <= lock_at - POOL_CUTOFF_SECONDS.
 # Bets placed this many seconds before lock are guaranteed to have propagated

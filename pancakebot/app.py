@@ -8,12 +8,11 @@ from pancakebot.config import load_app_config
 from pancakebot.constants import (
     BNB_WEI,
     EXPECTED_CHAIN_ID,
-    MIN_BET_AMOUNT_BNB,
     PREDICTION_V2_GRAPH_ENDPOINT,
     RPC_TIMEOUT_SECONDS,
     RPC_URLS,
-    TREASURY_FEE_FRACTION,
 )
+from pancakebot.market_data.contract_constants import load_contract_constants
 from pancakebot.market_data.okx_client import OkxClient
 from pancakebot.strategy.momentum_gate import MomentumGate, MomentumGateConfig
 from pancakebot.market_data.round_store import ClosedRoundsStore
@@ -57,6 +56,7 @@ def run_from_config(
     )
 
     if backtest:
+        cc = load_contract_constants()
         round_store = ClosedRoundsStore(paths.CLOSED_ROUNDS_PATH)
         runtime_cfg = RuntimeConfig(
             round_store=round_store,
@@ -71,8 +71,10 @@ def run_from_config(
             live_min_bet_only=False,
             dry_fresh_start=False,
             dry_no_archive=False,
-            min_bet_amount_bnb=MIN_BET_AMOUNT_BNB,
-            treasury_fee_fraction=TREASURY_FEE_FRACTION,
+            min_bet_amount_bnb=cc.min_bet_amount_bnb,
+            treasury_fee_fraction=cc.treasury_fee_fraction,
+            interval_seconds=cc.interval_seconds,
+            buffer_seconds=cc.buffer_seconds,
         )
         run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var/backtest"))
         return
@@ -159,6 +161,8 @@ def run_from_config(
         dry_no_archive=no_archive,
         min_bet_amount_bnb=float(min_bet_amount_bnb),
         treasury_fee_fraction=treasury_fee_fraction,
+        interval_seconds=interval_seconds,
+        buffer_seconds=buffer_seconds,
         momentum_gate=momentum_gate,
         pool_watcher=pool_watcher,
     )

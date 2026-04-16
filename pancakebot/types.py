@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
 
-from pancakebot.constants import INTERVAL_SECONDS
 from pancakebot.errors import InvariantError
 
 
@@ -46,7 +45,7 @@ class Bet:
 class Round:
     """A round object normalized from The Graph or RPC.
 
-    lock_at is always computed as start_at + INTERVAL_SECONDS (300s),
+    lock_at is always computed as start_at + interval_seconds (from chain),
     matching the on-chain lockTimestamp.  The Graph's lockAt field is NOT
     used because it reflects when executeRound() was mined (~6s later),
     not the contract's planned lock time.
@@ -64,7 +63,7 @@ class Round:
     bets: Sequence[Bet]
 
     @staticmethod
-    def from_json(obj: dict[str, Any]) -> "Round":
+    def from_json(obj: dict[str, Any], *, interval_seconds: int = 300) -> "Round":
         bets_raw = obj.get("bets") or []
         if not isinstance(bets_raw, list):
             raise InvariantError("round_bets_not_list")
@@ -73,7 +72,7 @@ class Round:
         return Round(
             epoch=int(obj["epoch"]),
             start_at=start_at,
-            lock_at=start_at + INTERVAL_SECONDS,
+            lock_at=start_at + interval_seconds,
             lock_price=None if obj.get("lockPrice") is None else float(obj["lockPrice"]),
             close_price=None if obj.get("closePrice") is None else float(obj["closePrice"]),
             position=obj.get("position"),
