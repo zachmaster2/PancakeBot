@@ -257,9 +257,15 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             pool_total = pool_bull_bnb + pool_bear_bnb
             if pool_total > 0:
                 info("POOL_WSS", "ROUND", "DATA",
-                     epoch=current_epoch, pool_bnb=f"{pool_total:.4f}")
+                     epoch=current_epoch, pool_bnb=f"{pool_total:.4f}",
+                     endpoint=cfg.pool_watcher.current_endpoint)
             if locked_epoch > 2:
                 cfg.pool_watcher.clear_old_epochs(keep_after=locked_epoch - 2)
+        elif cfg.pool_watcher is not None:
+            info("POOL_WSS", "ROUND", "DISC",
+                 epoch=current_epoch,
+                 endpoint=cfg.pool_watcher.current_endpoint,
+                 last_ok=f"{cfg.pool_watcher.last_connected_at:.0f}")
 
         # -- Phase B: Critical path (after cutoff) --
         # Sleep until cutoff + delay, then fetch -> decide -> bet.
