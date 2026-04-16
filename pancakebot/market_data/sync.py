@@ -1,9 +1,9 @@
 """Sync runtime market data: closed rounds + 1s spot klines for backtest.
 
-Fetches closed rounds from The Graph, then fetches BNB + BTC 1s klines
-from OKX for any rounds not already present in the kline stores.
+Fetches closed rounds from The Graph, then fetches BNB + BTC + ETH + SOL
+1s klines from OKX for any rounds not already present in the kline stores.
 
-Kline fetching uses parallel workers within each asset and runs both
+Kline fetching uses parallel workers within each asset and runs all four
 assets concurrently.  Records are collected, sorted by epoch, and
 appended in strict ascending order — matching the closed rounds store
 pattern.
@@ -128,7 +128,7 @@ def sync_runtime_market_data(
         ),
     )
 
-    # Phase 2: Sync BNB + BTC 1s klines in parallel (anchored at lockAt).
+    # Phase 2: Sync BNB + BTC + ETH + SOL 1s klines in parallel (anchored at lockAt).
     tail_rounds = rounds_all[-cache_n:]
 
     bnb_store = KlineStore(str(_BNB_KLINES_PATH))
@@ -203,8 +203,8 @@ def sync_runtime_market_data(
                 okx_client=okx_client,
             )
 
-    # After retries, trim stores to the exact 5-way intersection:
-    # every round must have klines in ALL stores.
+    # After retries, trim stores to the exact intersection across all 4 kline
+    # stores: every closed round must have klines in ALL stores.
     all_round_epochs = {int(r.epoch) for r in rounds_all}
     all_kline_epoch_sets = [s.load_done_epochs() for _, s, _ in all_stores]
     valid_epochs = all_round_epochs & set.intersection(*all_kline_epoch_sets)

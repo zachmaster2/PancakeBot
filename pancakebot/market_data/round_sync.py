@@ -12,8 +12,8 @@ from pancakebot.log import info
 def sync_closed_rounds(*, graph: GraphClient, store: ClosedRoundsStore, cache_n: int) -> None:
     """Ensure the closed rounds JSONL store contains a bounded window of usable closed rounds.
 
-    The store is the long-term persistence layer. The in-memory rolling cache is trimmed separately.
-    This sync is responsible for ensuring we have at least `cache_n` usable closed rounds on disk.
+    The store is the on-disk persistence layer consumed by backtests.
+    This sync ensures we have at least `cache_n` usable closed rounds on disk.
     """
     if cache_n <= 0:
         raise InvariantError("cache_n_nonpositive")

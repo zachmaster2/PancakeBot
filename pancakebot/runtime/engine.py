@@ -44,7 +44,7 @@ from time import sleep as sleep_seconds
 _LOCK_SAFETY_MARGIN_SECONDS = 1  # abort bet if wall-clock is within this many seconds of lock_at
 _OKX_PUBLISH_DELAY_SECONDS = 0.25  # delay after cutoff to let OKX publish the candle
 
-# Extra cushion added to the claim-check wake time to avoid alignment retries near Graph/RPC boundaries.
+# Extra cushion added to the claim-check wake time to avoid alignment retries near RPC boundaries.
 _CLAIM_CHECK_PADDING_SECONDS = 5
 
 _CLAIM_BATCH_SIZE = 10

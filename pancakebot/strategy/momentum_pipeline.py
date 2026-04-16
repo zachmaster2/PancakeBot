@@ -1,19 +1,20 @@
 """Momentum-only strategy pipeline.
 
-Signal: Multi-timeframe BTC momentum gate (OKX 1s candles).
-  BTC 3s, 7s, 15s returns must all agree in direction with
-  min(|return|) >= 0.0002.
+Signal sources (via MomentumGate on OKX 1s candles):
+  - Primary: BTC multi-TF (3s, 7s, 15s) all agree, pool-adaptive
+    threshold on min(|r3|, |r7|, |r15|).
+  - Regime-2: ETH + SOL multi-TF both agree when BTC is silent;
+    smaller sizing because WR is lower than primary.
+  - Strong-signal bypass: relaxes the pool minimum when the BTC
+    signal is very strong.
 
 Sizing: continuous adaptive — frac scales with signal strength:
-  frac = BASE_FRAC + SIZING_SLOPE * min(|r3|, |r7|, |r15|)
-  bet = pool * frac (capped at 2.0 BNB)
+  frac = BASE_FRAC + SIZING_SLOPE * signal_strength
+  bet = pool * frac * payout_boost (capped per regime)
 
 Filters:
-  - Pool minimum: skip if visible pool < 2.0 BNB (small pools lose money)
-  - Payout floor: skip if payout on our side < 1.5 (crowd-agreeing rounds lose)
-
-Validated: 5-fold +2.36/2k (5/5 positive), nested CV +2.19/2k (4/5 positive).
-Scrutinized: randomization, sensitivity, temporal stability checks pass.
+  - Pool minimum (with strong-signal bypass).
+  - Payout floor: skip rounds where payout on our side is too low.
 """
 
 from __future__ import annotations
@@ -212,7 +213,7 @@ class MomentumOnlyPipeline:
         pool_bear_bnb: float = 0.0,
         okx_kline_futures: object | None = None,
     ) -> StrategyPipelineDecision:
-        """Return BET or SKIP based on dual-asset momentum signal."""
+        """Return BET or SKIP from BTC primary / ETH+SOL regime-2 signals."""
 
         lock_at = int(round_t.lock_at)
         cutoff_ts_ms = (lock_at - self._cutoff_seconds) * 1000
