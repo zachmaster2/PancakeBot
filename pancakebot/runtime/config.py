@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pancakebot.config import RuntimeStatePathsConfig
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.chain.prediction_contract import Web3PredictionContract
 from pancakebot.strategy.momentum_gate import MomentumGate
@@ -16,8 +15,8 @@ class RuntimeConfig:
     # Closed rounds store (JSONL; used by backtest only; None in live/dry)
     round_store: ClosedRoundsStore | None
 
-    # Momentum strategy config (always present)
-    momentum_gate_config: object  # MomentumGateConfig
+    # Momentum strategy config (always present; MomentumGateConfig)
+    momentum_gate_config: object
 
     # Momentum gate (OKX 1s live client; None in backtest mode)
     momentum_gate: MomentumGate | None
@@ -29,33 +28,30 @@ class RuntimeConfig:
     # Feature cutoff
     cutoff_seconds: int
 
+    # Prefetch offset: how many seconds before cutoff to wake for housekeeping
+    prefetch_offset_seconds: int
+
     # Protocol constants (cached at startup)
     min_bet_amount_bnb: float
     treasury_fee_fraction: float
 
-    # Runtime latency telemetry.
-    latency_log_path: str
+    # Dry-mode initial bankroll
     dry_initial_bankroll_bnb: float | None
-    wait_for_bet_receipt: bool
-    bet_receipt_timeout_seconds: int
 
     # Execution
     dry: bool
 
+    # Live: clamp all bet sizes to contract minimum for safe testing
+    live_min_bet_only: bool
+
+    # Fresh start: archive existing dry state before starting
+    dry_fresh_start: bool
+
+    # No-archive: delete (don't archive) existing dry state on --fresh
+    dry_no_archive: bool
+
     # Pool event watcher: accumulates BetBull/BetBear events for accurate pools
     pool_watcher: PoolEventWatcher | None = None
-
-    # Mutable runtime state paths used by live/dry loops.
-    runtime_state_paths: RuntimeStatePathsConfig = RuntimeStatePathsConfig(
-        claim_scan_cursor_path="var/runtime/claim_scan_cursor.txt",
-        dry_bets_path="var/runtime/dry_bets.jsonl",
-        dry_settled_epochs_path="var/runtime/dry_settled_epochs.txt",
-        dry_audit_trades_path="var/runtime/dry_audit_trades.csv",
-        dry_cycle_audit_path="var/runtime/dry_cycle_audit.csv",
-        dry_bankroll_state_path="var/runtime/dry_bankroll_state.json",
-        dry_archive_root="../PancakeBot_var_exp",
-        dry_fresh_start=True,
-    )
 
 
 _MOMENTUM_CACHE_N = 10  # retained for sync_mode compatibility

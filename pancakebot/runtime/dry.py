@@ -1,4 +1,4 @@
-"""Dry-run state management: bankroll, bets, settlement, audit CSV, archiving."""
+"""Dry-run state management: bankroll, bets, settlement, archiving."""
 
 from __future__ import annotations
 
@@ -11,11 +11,21 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from pancakebot.config import RuntimeStatePathsConfig
+from pancakebot import paths as _paths
 from pancakebot.constants import BNB_WEI
 from pancakebot.errors import InvariantError, TransientRpcError
 from pancakebot.log import info
 from pancakebot.money import bankroll_suffix, usd_suffix
+from pancakebot.runtime.audit import (
+    append_audit_row as _append_dry_audit_row,
+    append_cycle_audit_row as _append_dry_cycle_audit_row,
+    ensure_audit_csv as _ensure_dry_audit_csv,
+    ensure_cycle_audit_csv as _ensure_dry_cycle_audit_csv,
+    load_settled_epochs_from_audit as _load_dry_settled_epochs_from_audit,
+    record_cycle_audit,
+    round_pool_snapshot as _round_pool_snapshot,
+    selected_side_probability as _selected_side_probability,
+)
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot.settlement import settle_from_round_data
 from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline
@@ -45,14 +55,13 @@ class _DryBankrollState:
     epoch: int | None = None
 
 
-def _dry_runtime_state_files(paths: RuntimeStatePathsConfig) -> list[Path]:
+def _dry_runtime_state_files() -> list[Path]:
     return [
-        Path(paths.claim_scan_cursor_path),
-        Path(paths.dry_bets_path),
-        Path(paths.dry_settled_epochs_path),
-        Path(paths.dry_audit_trades_path),
-        Path(paths.dry_cycle_audit_path),
-        Path(paths.dry_bankroll_state_path),
+        Path(_paths.DRY_PENDING_BETS_PATH),
+        Path(_paths.DRY_SETTLED_EPOCHS_PATH),
+        Path(_paths.DRY_TRADES_PATH),
+        Path(_paths.DRY_CYCLE_AUDIT_PATH),
+        Path(_paths.DRY_BANKROLL_STATE_PATH),
     ]
 
 
@@ -73,17 +82,16 @@ _MIN_ROUNDS_TO_ARCHIVE = 1  # don't archive runs shorter than this
 
 
 def _archive_dry_runtime_state(
-    paths: RuntimeStatePathsConfig,
     *,
     reason: str,
     move_files: bool,
 ) -> Path | None:
-    existing = [path.resolve() for path in _dry_runtime_state_files(paths) if path.exists()]
+    existing = [path.resolve() for path in _dry_runtime_state_files() if path.exists()]
     if not existing:
         return None
 
-    # Skip archiving short runs — just delete the files.
-    cycle_csv = Path(paths.dry_cycle_audit_path)
+    # Skip archiving short runs -- just delete the files.
+    cycle_csv = Path(_paths.DRY_CYCLE_AUDIT_PATH)
     n_lines = 0
     if cycle_csv.exists():
         n_lines = sum(1 for _ in cycle_csv.open()) - 1  # subtract header
@@ -94,7 +102,7 @@ def _archive_dry_runtime_state(
             info("RUN", "DRY", "CLEAN",
                  msg=f"Deleted previous dry state ({n_lines} rounds, below {_MIN_ROUNDS_TO_ARCHIVE} threshold)")
         return None
-    archive_root = Path(paths.dry_archive_root).resolve()
+    archive_root = Path(_paths.DRY_ARCHIVE_ROOT).resolve()
     archive_root.mkdir(parents=True, exist_ok=True)
     ts_now = int(now_ts())
     archive_dir = _unique_archive_dir(archive_root, ts=ts_now, reason=reason)
@@ -200,27 +208,6 @@ def _load_dry_settled_epochs(path: str) -> set[int]:
             out.add(int(line))
         except ValueError as e:
             raise InvariantError(f"dry_settled_epoch_invalid: path={path} line={lineno}") from e
-    return out
-
-
-def _load_dry_settled_epochs_from_audit(path: str) -> set[int]:
-    p = Path(path)
-    if not p.exists():
-        return set()
-    out: set[int] = set()
-    with p.open("r", newline="", encoding="utf-8") as f:
-        for lineno, row in enumerate(csv.DictReader(f), start=2):
-            settled_ts_raw = str(row.get("settled_ts", "")).strip()
-            if settled_ts_raw == "":
-                continue
-            epoch_raw = str(row.get("epoch", "")).strip()
-            if epoch_raw == "":
-                raise InvariantError(f"dry_audit_epoch_missing: path={path} line={lineno}")
-            try:
-                int(settled_ts_raw)
-                out.add(int(epoch_raw))
-            except ValueError as e:
-                raise InvariantError(f"dry_audit_row_invalid: path={path} line={lineno}") from e
     return out
 
 
@@ -351,10 +338,10 @@ def _recover_dry_bankroll_state_from_logs(
 
 
 def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState:
-    persisted = _load_dry_bankroll_state(cfg.runtime_state_paths.dry_bankroll_state_path)
+    persisted = _load_dry_bankroll_state(_paths.DRY_BANKROLL_STATE_PATH)
     recovered = _recover_dry_bankroll_state_from_logs(
-        dry_bets_path=cfg.runtime_state_paths.dry_bets_path,
-        dry_audit_trades_path=cfg.runtime_state_paths.dry_audit_trades_path,
+        dry_bets_path=_paths.DRY_PENDING_BETS_PATH,
+        dry_audit_trades_path=_paths.DRY_TRADES_PATH,
     )
     configured_init = cfg.dry_initial_bankroll_bnb
     can_override_persisted_seed = (
@@ -372,7 +359,7 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
         return persisted
     if recovered is not None:
         return _save_dry_bankroll_state(
-            cfg.runtime_state_paths.dry_bankroll_state_path,
+            _paths.DRY_BANKROLL_STATE_PATH,
             bankroll_bnb=recovered.simulated_bankroll_bnb,
             source="recovered",
             epoch=recovered.epoch,
@@ -380,7 +367,7 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
         )
     if configured_init is not None:
         return _save_dry_bankroll_state(
-            cfg.runtime_state_paths.dry_bankroll_state_path,
+            _paths.DRY_BANKROLL_STATE_PATH,
             bankroll_bnb=configured_init,
             source="configured_init",
             epoch=None,
@@ -391,7 +378,7 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
         reason="dry_wallet_bootstrap",
     )
     return _save_dry_bankroll_state(
-        cfg.runtime_state_paths.dry_bankroll_state_path,
+        _paths.DRY_BANKROLL_STATE_PATH,
         bankroll_bnb=wallet_bnb,
         source="wallet_init",
         epoch=None,
@@ -464,157 +451,14 @@ def _dry_record_bet(
         "bankroll_after_bet_bnb": bankroll_after_bet_bnb,
     }
     closed.dry_bets_by_epoch[epoch] = rec
-    _append_jsonl(cfg.runtime_state_paths.dry_bets_path, rec)
+    _append_jsonl(_paths.DRY_PENDING_BETS_PATH, rec)
     _save_dry_bankroll_state(
-        cfg.runtime_state_paths.dry_bankroll_state_path,
+        _paths.DRY_BANKROLL_STATE_PATH,
         bankroll_bnb=bankroll_after_bet_bnb,
         source="bet",
         epoch=epoch,
         updated_ts=placed_ts,
     )
-
-
-def _ensure_dry_audit_csv(path: str) -> list[str]:
-    header_cols = [
-        "epoch",
-        "placed_ts",
-        "bet_side",
-        "bet_bnb",
-        "pred_win_probability",
-        "p_final",
-        "expected_profit_bnb",
-        "cutoff_bull_bnb",
-        "cutoff_bear_bnb",
-        "final_bull_bnb",
-        "final_bear_bnb",
-        "settled_ts",
-        "outcome",
-        "pnl_bnb",
-        "bankroll_before_bet_bnb",
-        "bankroll_after_bet_bnb",
-        "bankroll_before_settle_bnb",
-        "bankroll_after_settle_bnb",
-    ]
-    p = Path(path)
-    if not p.exists():
-        _ensure_parent_dir(path)
-        with open(path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(header_cols)
-    return header_cols
-
-
-def _append_dry_audit_row(path: str, row: dict[str, object]) -> None:
-    cols = _ensure_dry_audit_csv(path)
-    # Append row in stable column order.
-    with open(path, "a", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([row.get(c, "") for c in cols])
-
-
-def _ensure_dry_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
-    header_cols = [
-        "cycle_ts",
-        "current_epoch",
-        "locked_epoch",
-        "lock_ts",
-        "cutoff_ts",
-        "locked_price_bnbusd",
-        "bankroll_before_action_bnb",
-        "bankroll_after_action_bnb",
-        "observed_total_pool_bnb",
-        "observed_bull_pool_bnb",
-        "observed_bear_pool_bnb",
-        "observed_total_bets",
-        "observed_bull_bets",
-        "observed_bear_bets",
-        "cutoff_used_total_pool_bnb",
-        "cutoff_used_bull_pool_bnb",
-        "cutoff_used_bear_pool_bnb",
-        "cutoff_used_total_bets",
-        "cutoff_used_bull_bets",
-        "cutoff_used_bear_bets",
-        "router_mode",
-        "pipeline_last_settled_epoch",
-        "action",
-        "decision_stage",
-        "bet_side",
-        "bet_size_bnb",
-        "p_bull",
-        "selected_side_probability",
-        "expected_profit_bnb",
-        "selector_score_bnb",
-        "decision_latency_ms",
-        "skip_reason",
-    ]
-    p = Path(path)
-    if reset or not p.exists():
-        _ensure_parent_dir(path)
-        with open(path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(header_cols)
-    return header_cols
-
-
-def _append_dry_cycle_audit_row(path: str, row: dict[str, object]) -> None:
-    cols = _ensure_dry_cycle_audit_csv(path)
-    with open(path, "a", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([row.get(c, "") for c in cols])
-
-
-def _round_pool_snapshot(
-    round_t: Round | None,
-    *,
-    prefix: str,
-    cutoff_ts: int | None = None,
-) -> dict[str, object]:
-    if round_t is None:
-        return {
-            f"{prefix}_total_pool_bnb": "",
-            f"{prefix}_bull_pool_bnb": "",
-            f"{prefix}_bear_pool_bnb": "",
-            f"{prefix}_total_bets": "",
-            f"{prefix}_bull_bets": "",
-            f"{prefix}_bear_bets": "",
-        }
-
-    bull_wei = 0
-    bear_wei = 0
-    bull_bets = 0
-    bear_bets = 0
-    for bet in round_t.bets:
-        if cutoff_ts is not None and bet.created_at > cutoff_ts:
-            continue
-        if bet.position == "Bull":
-            bull_wei += bet.amount_wei
-            bull_bets += 1
-        elif bet.position == "Bear":
-            bear_wei += bet.amount_wei
-            bear_bets += 1
-        else:
-            raise InvariantError(f"unexpected_round_bet_side: {bet.position}")
-
-    bull_bnb = bull_wei / BNB_WEI
-    bear_bnb = bear_wei / BNB_WEI
-    return {
-        f"{prefix}_total_pool_bnb": bull_bnb + bear_bnb,
-        f"{prefix}_bull_pool_bnb": bull_bnb,
-        f"{prefix}_bear_pool_bnb": bear_bnb,
-        f"{prefix}_total_bets": bull_bets + bear_bets,
-        f"{prefix}_bull_bets": bull_bets,
-        f"{prefix}_bear_bets": bear_bets,
-    }
-
-
-def _selected_side_probability(*, p_bull: float | None, bet_side: str | None) -> float | str:
-    if p_bull is None or bet_side is None:
-        return ""
-    if bet_side == "Bull":
-        return p_bull
-    if bet_side == "Bear":
-        return 1.0 - p_bull
-    return ""
 
 
 def _record_dry_cycle_audit(
@@ -639,114 +483,24 @@ def _record_dry_cycle_audit(
 ) -> None:
     if not cfg.dry:
         return
-
-    # Use RPC-fetched pool values when available (live/dry mode);
-    # fall back to round_t.bets snapshot (backtest / no RPC data).
-    if pool_bull_bnb > 0.0 or pool_bear_bnb > 0.0:
-        pool_total = pool_bull_bnb + pool_bear_bnb
-        observed_pool = {
-            "observed_total_pool_bnb": pool_total,
-            "observed_bull_pool_bnb": pool_bull_bnb,
-            "observed_bear_pool_bnb": pool_bear_bnb,
-            "observed_total_bets": "",
-            "observed_bull_bets": "",
-            "observed_bear_bets": "",
-        }
-        cutoff_used_pool = {
-            "cutoff_used_total_pool_bnb": pool_total,
-            "cutoff_used_bull_pool_bnb": pool_bull_bnb,
-            "cutoff_used_bear_pool_bnb": pool_bear_bnb,
-            "cutoff_used_total_bets": "",
-            "cutoff_used_bull_bets": "",
-            "cutoff_used_bear_bets": "",
-        }
-    else:
-        observed_pool = _round_pool_snapshot(open_round, prefix="observed")
-        cutoff_used_pool = _round_pool_snapshot(
-            open_round,
-            prefix="cutoff_used",
-            cutoff_ts=cutoff_ts,
-        )
-    router_mode: str | object = ""
-    pipeline_last_settled_epoch: int | str = ""
-    if closed.strategy_pipeline is not None:
-        router_mode = closed.strategy_pipeline.router_mode
-        if closed.strategy_pipeline.last_settled_epoch is not None:
-            pipeline_last_settled_epoch = closed.strategy_pipeline.last_settled_epoch
-
-    bet_side: str | object = ""
-    bet_size_bnb: float | str = ""
-    p_bull: float | str = ""
-    expected_profit_bnb: float | str = ""
-    selector_score_bnb: float | str = ""
-    if decision is not None:
-        bet_side = getattr(decision, "bet_side", "") or ""
-        bet_size_raw = getattr(decision, "bet_size_bnb", "")
-        if isinstance(bet_size_raw, (int, float)):
-            bet_size_bnb = float(bet_size_raw)
-        p_bull_raw = getattr(decision, "p_bull", None)
-        if isinstance(p_bull_raw, (int, float)):
-            p_bull = float(p_bull_raw)
-        expected_profit_raw = getattr(decision, "expected_profit_bnb", None)
-        if isinstance(expected_profit_raw, (int, float)):
-            expected_profit_bnb = float(expected_profit_raw)
-        selector_score_raw = getattr(decision, "selector_score_bnb", None)
-        if isinstance(selector_score_raw, (int, float)):
-            selector_score_bnb = float(selector_score_raw)
-        if skip_reason is None:
-            skip_reason = getattr(decision, "skip_reason", None)
-
-    bankroll_before = (
-        ""
-        if bankroll_before_action_bnb is None
-        else float(bankroll_before_action_bnb)
-    )
-    bankroll_after = (
-        bankroll_before
-        if bankroll_after_action_bnb is None
-        else float(bankroll_after_action_bnb)
-    )
-    _append_dry_cycle_audit_row(
-        cfg.runtime_state_paths.dry_cycle_audit_path,
-        {
-            "cycle_ts": int(now_ts()),
-            "current_epoch": current_epoch,
-            "locked_epoch": locked_epoch,
-            "lock_ts": lock_ts,
-            "cutoff_ts": cutoff_ts,
-            "locked_price_bnbusd": locked_price_bnbusd,
-            "bankroll_before_action_bnb": bankroll_before,
-            "bankroll_after_action_bnb": bankroll_after,
-            "observed_total_pool_bnb": observed_pool["observed_total_pool_bnb"],
-            "observed_bull_pool_bnb": observed_pool["observed_bull_pool_bnb"],
-            "observed_bear_pool_bnb": observed_pool["observed_bear_pool_bnb"],
-            "observed_total_bets": observed_pool["observed_total_bets"],
-            "observed_bull_bets": observed_pool["observed_bull_bets"],
-            "observed_bear_bets": observed_pool["observed_bear_bets"],
-            "cutoff_used_total_pool_bnb": cutoff_used_pool["cutoff_used_total_pool_bnb"],
-            "cutoff_used_bull_pool_bnb": cutoff_used_pool["cutoff_used_bull_pool_bnb"],
-            "cutoff_used_bear_pool_bnb": cutoff_used_pool["cutoff_used_bear_pool_bnb"],
-            "cutoff_used_total_bets": cutoff_used_pool["cutoff_used_total_bets"],
-            "cutoff_used_bull_bets": cutoff_used_pool["cutoff_used_bull_bets"],
-            "cutoff_used_bear_bets": cutoff_used_pool["cutoff_used_bear_bets"],
-            "router_mode": router_mode,
-            "pipeline_last_settled_epoch": pipeline_last_settled_epoch,
-            "action": action,
-            "decision_stage": decision_stage,
-            "bet_side": bet_side,
-            "bet_size_bnb": bet_size_bnb,
-            "p_bull": p_bull,
-            "selected_side_probability": _selected_side_probability(
-                p_bull=None if p_bull == "" else p_bull,
-                bet_side=None if bet_side == "" else bet_side,
-            ),
-            "expected_profit_bnb": expected_profit_bnb,
-            "selector_score_bnb": selector_score_bnb,
-            "decision_latency_ms": (
-                "" if decision_latency_ms is None else decision_latency_ms
-            ),
-            "skip_reason": "" if skip_reason is None else skip_reason,
-        },
+    record_cycle_audit(
+        closed,
+        cycle_audit_path=_paths.DRY_CYCLE_AUDIT_PATH,
+        current_epoch=current_epoch,
+        locked_epoch=locked_epoch,
+        lock_ts=lock_ts,
+        cutoff_ts=cutoff_ts,
+        locked_price_bnbusd=locked_price_bnbusd,
+        action=action,
+        decision_stage=decision_stage,
+        open_round=open_round,
+        bankroll_before_action_bnb=bankroll_before_action_bnb,
+        bankroll_after_action_bnb=bankroll_after_action_bnb,
+        decision=decision,
+        skip_reason=skip_reason,
+        decision_latency_ms=decision_latency_ms,
+        pool_bull_bnb=pool_bull_bnb,
+        pool_bear_bnb=pool_bear_bnb,
     )
 
 
@@ -783,7 +537,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             raise InvariantError("dry_bet_bnb_type_invalid")
         if bet_bnb <= 0:
             closed.dry_settled_epochs.add(e)
-            _append_dry_settled_epoch(cfg.runtime_state_paths.dry_settled_epochs_path, e)
+            _append_dry_settled_epoch(_paths.DRY_SETTLED_EPOCHS_PATH, e)
             continue
 
         settle = settle_from_round_data(
@@ -855,7 +609,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             placed_ts_val = ""
 
         _append_dry_audit_row(
-            cfg.runtime_state_paths.dry_audit_trades_path,
+            _paths.DRY_TRADES_PATH,
             {
                 "epoch": e,
                 "placed_ts": placed_ts_val,
@@ -879,9 +633,9 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         )
 
         closed.dry_settled_epochs.add(e)
-        _append_dry_settled_epoch(cfg.runtime_state_paths.dry_settled_epochs_path, e)
+        _append_dry_settled_epoch(_paths.DRY_SETTLED_EPOCHS_PATH, e)
         _save_dry_bankroll_state(
-            cfg.runtime_state_paths.dry_bankroll_state_path,
+            _paths.DRY_BANKROLL_STATE_PATH,
             bankroll_bnb=bankroll_after_settle,
             source="settle",
             epoch=e,
@@ -900,28 +654,34 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     closed = _ClosedState(strategy_pipeline=strategy_pipeline)
 
     if cfg.dry:
-        fresh = cfg.runtime_state_paths.dry_fresh_start
+        fresh = cfg.dry_fresh_start
         if fresh:
-            archived = _archive_dry_runtime_state(
-                cfg.runtime_state_paths,
-                reason="startup_fresh_reset",
-                move_files=True,
-            )
-            if archived is not None:
-                archive_log = Path(cfg.runtime_state_paths.dry_archive_root) / archived.name
-                info("RUN", "DRY", "ARCHIVE",
-                     msg=f"Archived previous dry runtime state to {archive_log}")
+            if cfg.dry_no_archive:
+                # --fresh --no-archive: delete existing state without archiving
+                for f in _dry_runtime_state_files():
+                    if f.exists():
+                        f.unlink(missing_ok=True)
+                info("RUN", "DRY", "CLEAN", msg="Deleted previous dry state (--no-archive)")
+            else:
+                archived = _archive_dry_runtime_state(
+                    reason="startup_fresh_reset",
+                    move_files=True,
+                )
+                if archived is not None:
+                    archive_log = Path(_paths.DRY_ARCHIVE_ROOT) / archived.name
+                    info("RUN", "DRY", "ARCHIVE",
+                         msg=f"Archived previous dry runtime state to {archive_log}")
         bankroll_state = _resolve_initial_dry_bankroll_state(cfg)
         closed.simulated_bankroll_bnb = bankroll_state.simulated_bankroll_bnb
-        closed.dry_bets_by_epoch = _load_dry_bets(cfg.runtime_state_paths.dry_bets_path)
-        _ensure_dry_audit_csv(cfg.runtime_state_paths.dry_audit_trades_path)
+        closed.dry_bets_by_epoch = _load_dry_bets(_paths.DRY_PENDING_BETS_PATH)
+        _ensure_dry_audit_csv(_paths.DRY_TRADES_PATH)
         _ensure_dry_cycle_audit_csv(
-            cfg.runtime_state_paths.dry_cycle_audit_path,
+            _paths.DRY_CYCLE_AUDIT_PATH,
             reset=fresh,
         )
-        settled_epochs = _load_dry_settled_epochs(cfg.runtime_state_paths.dry_settled_epochs_path)
+        settled_epochs = _load_dry_settled_epochs(_paths.DRY_SETTLED_EPOCHS_PATH)
         settled_epochs.update(
-            _load_dry_settled_epochs_from_audit(cfg.runtime_state_paths.dry_audit_trades_path)
+            _load_dry_settled_epochs_from_audit(_paths.DRY_TRADES_PATH)
         )
         closed.dry_settled_epochs = settled_epochs
         info(

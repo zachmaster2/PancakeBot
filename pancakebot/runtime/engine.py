@@ -25,6 +25,7 @@ from pancakebot.errors import InvariantError, TransientRpcError
 from pancakebot.log import info, warn
 from pancakebot.money import bankroll_suffix, format_bankroll, usd_suffix
 from pancakebot.runtime.config import RuntimeConfig
+from pancakebot import paths
 from pancakebot.runtime.dry import (
     _ClosedState,
     _archive_dry_runtime_state,
@@ -43,7 +44,6 @@ from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
 _LOCK_SAFETY_MARGIN_SECONDS = 1  # abort bet if wall-clock is within this many seconds of lock_at
-_PREFETCH_OFFSET_SECONDS = 4    # wake this many seconds before cutoff for housekeeping
 _OKX_PUBLISH_DELAY_SECONDS = 0.25  # delay after cutoff to let OKX publish the candle
 
 # Extra cushion added to the claim-check wake time to avoid alignment retries near Graph/RPC boundaries.
@@ -118,7 +118,6 @@ def run_live_loop(cfg: RuntimeConfig) -> None:
     finally:
         if cfg.dry:
             archived = _archive_dry_runtime_state(
-                cfg.runtime_state_paths,
                 reason="shutdown_snapshot",
                 move_files=True,
             )
@@ -127,7 +126,7 @@ def run_live_loop(cfg: RuntimeConfig) -> None:
                     "RUN",
                     "DRY",
                     "ARCHIVE",
-                    msg=f"Saved shutdown dry-state snapshot to {Path(cfg.runtime_state_paths.dry_archive_root) / archived.name}",
+                    msg=f"Saved shutdown dry-state snapshot to {Path(paths.DRY_ARCHIVE_ROOT) / archived.name}",
                 )
 
 
@@ -155,7 +154,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 contract=cfg.contract,
                 wallet_address=cfg.wallet_address,
                 dry=cfg.dry,
-                cursor_path=cfg.runtime_state_paths.claim_scan_cursor_path,
+                cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
                 locked_epoch=locked_epoch,
                 current_epoch=current_epoch,
                 now_ts=int(now_ts()),
@@ -211,7 +210,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Wake early to do epoch check + TLS warmup while we're still
         # waiting for the cutoff moment.  These run OUTSIDE the critical
         # timing window so they don't eat into our bet-submission budget.
-        wake_ts = cutoff_ts_t - _PREFETCH_OFFSET_SECONDS
+        wake_ts = cutoff_ts_t - cfg.prefetch_offset_seconds
         _sleep_until_ts(wake_ts, reason="wait_for_prefetch", epoch=current_epoch)
 
         # Epoch quick-check: verify current_epoch hasn't shifted during sleep.
@@ -388,8 +387,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     amount_wei=amount_wei,
                     gas_limit=GAS_LIMIT_BET,
                     gas_price_wei=gas_price_wei,
-                    wait_receipt=cfg.wait_for_bet_receipt,
-                    receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
+                    wait_receipt=True,
+                    receipt_timeout_seconds=5,
                 )
             elif decision.bet_side == "Bear":
                 tx_submit = cfg.contract.bet_bear_timed(
@@ -397,8 +396,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     amount_wei=amount_wei,
                     gas_limit=GAS_LIMIT_BET,
                     gas_price_wei=gas_price_wei,
-                    wait_receipt=cfg.wait_for_bet_receipt,
-                    receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
+                    wait_receipt=True,
+                    receipt_timeout_seconds=5,
                 )
             else:
                 raise InvariantError(f"unexpected_bet_side: {decision.bet_side}")
@@ -451,7 +450,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     else None
                 ),
             }
-            _append_jsonl(cfg.latency_log_path, latency_record)
+            _append_jsonl("var/live/latency.jsonl", latency_record)
         else:
             # Step 14: Dry bookkeeping (including gas proxy) + record.
             if closed.simulated_bankroll_bnb is None:
@@ -587,14 +586,16 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     claim_ts = close_ts + BUFFER_SECONDS + _CLAIM_CHECK_PADDING_SECONDS
     _sleep_until_ts(claim_ts, reason="wait_for_claim", epoch=claim_epoch)
 
+    # Epoch handshake to refresh round state (both modes).
+    locked_round2, _open_round2, current_epoch2, _open_rd2 = _epoch_handshake(cfg, closed)
+
+    # Live only: claim scan to collect winnings.
     if not cfg.dry:
-        # Live: refresh epochs and run claim scan to collect winnings.
-        locked_round2, _open_round2, current_epoch2, _open_rd2 = _epoch_handshake(cfg, closed)
         claim_scan_cursor(
             contract=cfg.contract,
             wallet_address=cfg.wallet_address,
             dry=False,
-            cursor_path=cfg.runtime_state_paths.claim_scan_cursor_path,
+            cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
             locked_epoch=locked_round2.epoch,
             current_epoch=current_epoch2,
             now_ts=int(now_ts()),
@@ -606,6 +607,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
             min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
         )
 
+    # Dry: settle simulated bets against oracle price.
     _dry_settle_available_bets(cfg, closed)
 
 

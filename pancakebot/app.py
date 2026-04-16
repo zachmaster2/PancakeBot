@@ -15,7 +15,7 @@ from pancakebot.constants import (
     TREASURY_FEE_FRACTION,
 )
 from pancakebot.market_data.okx_client import OkxClient
-from pancakebot.strategy.momentum_gate import MomentumGate
+from pancakebot.strategy.momentum_gate import MomentumGate, MomentumGateConfig
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.market_data.graph_client import GraphClient
 from pancakebot.chain.rpc_pool import choose_rpc_url
@@ -28,45 +28,60 @@ from pancakebot.market_data.sync import sync_runtime_market_data
 from pancakebot.errors import InvariantError
 from pancakebot.log import info
 from pancakebot.chain.pool_watcher import PoolEventWatcher
+from pancakebot import paths
 
 
-
-
-
-
-def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool, live: bool = False) -> None:
+def run_from_config(
+    *,
+    config_path: str,
+    dry: bool,
+    backtest: bool,
+    sync: bool,
+    live: bool = False,
+    fresh: bool = False,
+    no_archive: bool = False,
+) -> None:
     cfg = load_app_config(config_path)
 
     selected_modes = int(dry) + int(backtest) + int(sync) + int(live)
     if selected_modes > 1:
         raise InvariantError("run_modes_mutually_exclusive")
 
+    # Inline MomentumGateConfig -- symbols are hardcoded project constants.
+    momentum_gate_cfg = MomentumGateConfig(
+        enabled=True,
+        bnb_symbol="BNB-USDT",
+        btc_symbol="BTC-USDT",
+        eth_symbol="ETH-USDT",
+        sol_symbol="SOL-USDT",
+    )
+
     if backtest:
-        round_store = ClosedRoundsStore(cfg.closed_rounds_path)
+        round_store = ClosedRoundsStore(paths.CLOSED_ROUNDS_PATH)
         runtime_cfg = RuntimeConfig(
             round_store=round_store,
             contract=None,
             wallet_address="",
-            cutoff_seconds=cfg.cutoff_seconds,
-            latency_log_path=cfg.latency_log_path,
+            cutoff_seconds=cfg.kline_cutoff_seconds,
+            prefetch_offset_seconds=cfg.prefetch_offset_seconds,
             dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
-            wait_for_bet_receipt=False,
-            bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
-            momentum_gate_config=cfg.momentum_gate,
+            momentum_gate_config=momentum_gate_cfg,
             momentum_gate=None,
             dry=dry,
-            runtime_state_paths=cfg.runtime_state_paths,
+            live_min_bet_only=False,
+            dry_fresh_start=False,
+            dry_no_archive=False,
             min_bet_amount_bnb=MIN_BET_AMOUNT_BNB,
             treasury_fee_fraction=TREASURY_FEE_FRACTION,
         )
-        run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var"))
+        run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var/backtest"))
         return
 
     if sync:
         load_env()
         graph_api_key = require_env("THE_GRAPH_API_KEY")
         graph = GraphClient(endpoint=PREDICTION_V2_GRAPH_ENDPOINT, api_key=graph_api_key)
-        round_store = ClosedRoundsStore(cfg.closed_rounds_path)
+        round_store = ClosedRoundsStore(paths.CLOSED_ROUNDS_PATH)
         okx_client = OkxClient(timeout_seconds=10.0)
         okx_client.warmup()
         summary = sync_runtime_market_data(
@@ -90,7 +105,7 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool, 
         )
         return
 
-    # Dry or live mode — both need RPC, live also needs private key.
+    # Dry or live mode -- both need RPC, live also needs private key.
     load_env()
     private_key = require_env("BSC_WALLET_PRIVATE_KEY") if live else ""
     rpc_url = choose_rpc_url(
@@ -102,7 +117,7 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool, 
     contract_cfg = Web3ContractConfig(
         rpc_url=rpc_url,
         rpc_urls=tuple(RPC_URLS),
-        abi_json_path=cfg.abi_json_path,
+        abi_json_path=paths.ABI_JSON_PATH,
         private_key=private_key,
     )
     contract = Web3PredictionContract(contract_cfg)
@@ -121,10 +136,9 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool, 
     )
 
     momentum_gate = None
-    if cfg.momentum_gate.enabled:
-        okx_client = OkxClient(timeout_seconds=10.0)
-        okx_client.warmup()
-        momentum_gate = MomentumGate(config=cfg.momentum_gate, okx_client=okx_client)
+    okx_client = OkxClient(timeout_seconds=10.0)
+    okx_client.warmup()
+    momentum_gate = MomentumGate(config=momentum_gate_cfg, okx_client=okx_client)
 
     # Pool event watcher: subscribes to confirmed BetBull/BetBear events
     # via public WSS for accurate pool tracking (no signup required).
@@ -135,14 +149,14 @@ def run_from_config(*, config_path: str, dry: bool, backtest: bool, sync: bool, 
         round_store=None,
         contract=contract,
         wallet_address=contract.wallet_address,
-        cutoff_seconds=cfg.cutoff_seconds,
-        latency_log_path=cfg.latency_log_path,
+        cutoff_seconds=cfg.kline_cutoff_seconds,
+        prefetch_offset_seconds=cfg.prefetch_offset_seconds,
         dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
-        wait_for_bet_receipt=cfg.wait_for_bet_receipt,
-        bet_receipt_timeout_seconds=cfg.bet_receipt_timeout_seconds,
-        momentum_gate_config=cfg.momentum_gate,
+        momentum_gate_config=momentum_gate_cfg,
         dry=dry,
-        runtime_state_paths=cfg.runtime_state_paths,
+        live_min_bet_only=cfg.live_min_bet_only,
+        dry_fresh_start=fresh,
+        dry_no_archive=no_archive,
         min_bet_amount_bnb=float(min_bet_amount_bnb),
         treasury_fee_fraction=treasury_fee_fraction,
         momentum_gate=momentum_gate,

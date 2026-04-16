@@ -1,7 +1,7 @@
 """Configuration: dataclasses, TOML loading, and env helpers.
 
-Merges the former config/app_config.py, config/load_config.py,
-config/env.py, and backtest/config.py into a single module.
+Simplified config -- most settings are hardcoded as project constants.
+Only user-tunable knobs live in config.toml.
 """
 from __future__ import annotations
 
@@ -14,10 +14,9 @@ import tomllib
 from dotenv import load_dotenv
 
 from pancakebot.errors import InvariantError
-from pancakebot.strategy.momentum_gate import MomentumGateConfig
 
 
-# ── Environment helpers ──────────────────────────────────────────────
+# -- Environment helpers ------------------------------------------------------
 
 def load_env() -> None:
     """Load .env into process environment."""
@@ -31,7 +30,7 @@ def require_env(name: str) -> str:
     return str(v).strip()
 
 
-# ── Backtest config ──────────────────────────────────────────────────
+# -- Backtest config ----------------------------------------------------------
 
 _BACKTEST_RESET_MODES = ("continuous", "chunk_reset")
 
@@ -82,75 +81,29 @@ class BacktestConfig:
                 raise InvariantError("backtest_epoch_start_after_epoch_end")
 
 
-# ── Runtime state paths config ───────────────────────────────────────
-
-@dataclass(frozen=True, slots=True)
-class RuntimeStatePathsConfig:
-    """Filesystem paths for mutable runtime state shared by live and dry modes."""
-
-    claim_scan_cursor_path: str
-    dry_bets_path: str
-    dry_settled_epochs_path: str
-    dry_audit_trades_path: str
-    dry_cycle_audit_path: str
-    dry_bankroll_state_path: str
-    dry_archive_root: str
-    dry_fresh_start: bool
-
-
-# ── App config ───────────────────────────────────────────────────────
+# -- App config ---------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
 class AppConfig:
     """User-facing configuration loaded from config.toml."""
 
-    # Paths
-    closed_rounds_path: str
-    abi_json_path: str
+    kline_cutoff_seconds: int
+    prefetch_offset_seconds: int
+    dry_initial_bankroll_bnb: float
+    live_min_bet_only: bool
+    backtest_simulation_size: int
+    backtest_initial_bankroll_bnb: float
 
-    # Runtime
-    cutoff_seconds: int
-    latency_log_path: str
-    dry_initial_bankroll_bnb: float | None
-    wait_for_bet_receipt: bool
-    bet_receipt_timeout_seconds: int
-
-    # Runtime state paths
-    runtime_state_paths: RuntimeStatePathsConfig
-
-    # OKX momentum gate (live/dry only; ignored by backtest).
-    momentum_gate: MomentumGateConfig
-
-    # Backtest options. Live and dry ignore these.
+    # Full BacktestConfig with validation (kept as inner dataclass).
     backtest: BacktestConfig
 
 
-# ── TOML parsing helpers ─────────────────────────────────────────────
-
-def _req(obj: dict[str, Any], key: str) -> Any:
-    if key not in obj:
-        raise InvariantError(f"missing_config_key: {key}")
-    return obj[key]
-
-
-def _req_str(obj: dict[str, Any], key: str) -> str:
-    v = _req(obj, key)
-    if not isinstance(v, str) or not v.strip():
-        raise InvariantError(f"config_key_not_nonempty_str: {key}")
-    return v.strip()
-
-
-def _opt_str(obj: dict[str, Any], key: str, default: str) -> str:
-    if key not in obj:
-        return str(default)
-    v = obj[key]
-    if not isinstance(v, str) or not v.strip():
-        raise InvariantError(f"config_key_not_nonempty_str: {key}")
-    return v.strip()
-
+# -- TOML parsing helpers -----------------------------------------------------
 
 def _req_int(obj: dict[str, Any], key: str) -> int:
-    v = _req(obj, key)
+    if key not in obj:
+        raise InvariantError(f"missing_config_key: {key}")
+    v = obj[key]
     try:
         i = int(v)
     except (TypeError, ValueError) as e:
@@ -169,12 +122,10 @@ def _opt_int(obj: dict[str, Any], key: str, default: int) -> int:
     return i
 
 
-def _opt_float_or_none(obj: dict[str, Any], key: str) -> float | None:
+def _opt_float(obj: dict[str, Any], key: str, default: float) -> float:
     if key not in obj:
-        return None
+        return float(default)
     v = obj[key]
-    if v is None:
-        return None
     if not isinstance(v, (int, float)):
         raise InvariantError(f"config_key_not_number: {key}")
     return float(v)
@@ -189,25 +140,16 @@ def _opt_bool(obj: dict[str, Any], key: str, default: bool) -> bool:
     return v
 
 
-def _validate_unknown_keys(section_name: str, obj: dict[str, Any], allowed: set[str]) -> None:
-    unknown = sorted([k for k in obj.keys() if k not in allowed])
-    if unknown:
-        raise InvariantError(f"unknown_{section_name}_config_keys: {unknown}")
+def _opt_str(obj: dict[str, Any], key: str, default: str) -> str:
+    if key not in obj:
+        return str(default)
+    v = obj[key]
+    if not isinstance(v, str) or not v.strip():
+        raise InvariantError(f"config_key_not_nonempty_str: {key}")
+    return v.strip()
 
 
-def _validate_distinct_paths(section_name: str, paths: dict[str, str]) -> None:
-    seen: dict[str, str] = {}
-    for key, raw_path in paths.items():
-        normalized = str(Path(str(raw_path))).replace("\\", "/").lower()
-        if normalized in seen:
-            other = seen[normalized]
-            raise InvariantError(
-                f"{section_name}_paths_must_be_distinct: {other} vs {key} -> {raw_path}"
-            )
-        seen[normalized] = str(key)
-
-
-# ── Main loader ──────────────────────────────────────────────────────
+# -- Main loader --------------------------------------------------------------
 
 def load_app_config(path: str) -> AppConfig:
     p = Path(path)
@@ -222,127 +164,56 @@ def load_app_config(path: str) -> AppConfig:
     if not isinstance(raw, dict):
         raise InvariantError("config_root_not_dict")
 
-    paths = raw.get("paths")
-    graph = raw.get("graph")
-    runtime = raw.get("runtime")
-    contract_raw = raw.get("contract", {})
-    backtest = raw.get("backtest", {})
-    momentum_gate_raw = raw.get("momentum_gate", {})
+    runtime = raw.get("runtime", {})
+    dry_sec = raw.get("dry", {})
+    live_sec = raw.get("live", {})
+    backtest_sec = raw.get("backtest", {})
 
-    if not isinstance(paths, dict):
-        raise InvariantError("config_section_missing_or_not_dict: paths")
-    if not isinstance(graph, dict):
-        raise InvariantError("config_section_missing_or_not_dict: graph")
     if not isinstance(runtime, dict):
-        raise InvariantError("config_section_missing_or_not_dict: runtime")
-    if backtest is None:
-        backtest = {}
-    if not isinstance(backtest, dict):
+        raise InvariantError("config_section_not_dict: runtime")
+    if not isinstance(dry_sec, dict):
+        raise InvariantError("config_section_not_dict: dry")
+    if not isinstance(live_sec, dict):
+        raise InvariantError("config_section_not_dict: live")
+    if not isinstance(backtest_sec, dict):
         raise InvariantError("config_section_not_dict: backtest")
-    if contract_raw is None:
-        contract_raw = {}
-    if not isinstance(contract_raw, dict):
-        raise InvariantError("config_section_not_dict: contract")
-    if momentum_gate_raw is None:
-        momentum_gate_raw = {}
-    if not isinstance(momentum_gate_raw, dict):
-        raise InvariantError("config_section_not_dict: momentum_gate")
 
-    allowed_path_keys = {
-        "closed_rounds_path",
-        "claim_scan_cursor_path",
-        "dry_bets_path",
-        "dry_settled_epochs_path",
-        "dry_audit_trades_path",
-        "dry_cycle_audit_path",
-        "dry_bankroll_state_path",
-        "dry_archive_root",
-        "dry_fresh_start",
-    }
-    _validate_unknown_keys("paths", paths, allowed_path_keys)
+    # [runtime]
+    kline_cutoff_seconds = _req_int(runtime, "kline_cutoff_seconds")
+    if kline_cutoff_seconds <= 0:
+        raise InvariantError("kline_cutoff_seconds_must_be_positive")
+    prefetch_offset_seconds = _req_int(runtime, "prefetch_offset_seconds")
+    if prefetch_offset_seconds <= 0:
+        raise InvariantError("prefetch_offset_seconds_must_be_positive")
 
-    closed_rounds_path = _req_str(paths, "closed_rounds_path")
-    claim_scan_cursor_path = _opt_str(paths, "claim_scan_cursor_path", "var/runtime/claim_scan_cursor.txt")
-    dry_bets_path = _opt_str(paths, "dry_bets_path", "var/runtime/dry_bets.jsonl")
-    dry_settled_epochs_path = _opt_str(paths, "dry_settled_epochs_path", "var/runtime/dry_settled_epochs.txt")
-    dry_audit_trades_path = _opt_str(paths, "dry_audit_trades_path", "var/runtime/dry_audit_trades.csv")
-    dry_cycle_audit_path = _opt_str(paths, "dry_cycle_audit_path", "var/runtime/dry_cycle_audit.csv")
-    dry_bankroll_state_path = _opt_str(paths, "dry_bankroll_state_path", "var/runtime/dry_bankroll_state.json")
-    dry_archive_root = _opt_str(paths, "dry_archive_root", "../PancakeBot_var_exp")
-    dry_fresh_start = bool(paths.get("dry_fresh_start", True))
-    _validate_distinct_paths(
-        "runtime_state",
-        {
-            "claim_scan_cursor_path": str(claim_scan_cursor_path),
-            "dry_bets_path": str(dry_bets_path),
-            "dry_settled_epochs_path": str(dry_settled_epochs_path),
-            "dry_audit_trades_path": str(dry_audit_trades_path),
-            "dry_cycle_audit_path": str(dry_cycle_audit_path),
-            "dry_bankroll_state_path": str(dry_bankroll_state_path),
-        },
-    )
-
-    _validate_unknown_keys("graph", graph, {"abi_json_path"})
-    abi_json_path = _req_str(graph, "abi_json_path")
-
-    allowed_runtime_keys = {
-        "cutoff_seconds",
-        "latency_log_path",
-        "dry_initial_bankroll_bnb",
-        "wait_for_bet_receipt",
-        "bet_receipt_timeout_seconds",
-    }
-    _validate_unknown_keys("runtime", runtime, allowed_runtime_keys)
-
-    cutoff_seconds = _req_int(runtime, "cutoff_seconds")
-    if cutoff_seconds <= 0:
-        raise InvariantError("cutoff_seconds_must_be_positive")
-
-    latency_log_path = _opt_str(runtime, "latency_log_path", "var/live_latency.jsonl")
-
-    dry_initial_bankroll_bnb = _opt_float_or_none(runtime, "dry_initial_bankroll_bnb")
-    if dry_initial_bankroll_bnb is not None and float(dry_initial_bankroll_bnb) <= 0.0:
+    # [dry]
+    dry_initial_bankroll_bnb = _opt_float(dry_sec, "initial_bankroll_bnb", 50.0)
+    if dry_initial_bankroll_bnb <= 0.0:
         raise InvariantError("dry_initial_bankroll_bnb_must_be_positive")
 
-    wait_for_bet_receipt = _opt_bool(runtime, "wait_for_bet_receipt", True)
+    # [live]
+    live_min_bet_only = _opt_bool(live_sec, "min_bet_only", True)
 
-    bet_receipt_timeout_seconds = _opt_int(runtime, "bet_receipt_timeout_seconds", 45)
-    if bet_receipt_timeout_seconds <= 0:
-        raise InvariantError("bet_receipt_timeout_seconds_must_be_positive")
-
-    if contract_raw:
-        pass  # silently ignore legacy [contract] section
-
-    allowed_bt_keys = {
-        "simulation_size", "initial_bankroll_bnb", "reset_mode",
-        "reset_every_rounds", "tail_offset_rounds", "epoch_start", "epoch_end",
-    }
-    _validate_unknown_keys("backtest", backtest, allowed_bt_keys)
-
-    simulation_size_v = backtest.get("simulation_size", 5000)
-    if not isinstance(simulation_size_v, int):
-        raise InvariantError("backtest_simulation_size_not_int")
-    if simulation_size_v <= 0:
+    # [backtest]
+    simulation_size = _opt_int(backtest_sec, "simulation_size", 5000)
+    if simulation_size <= 0:
         raise InvariantError("backtest_simulation_size_must_be_positive")
 
-    initial_bankroll_bnb_v = backtest.get("initial_bankroll_bnb", 0.5)
-    if not isinstance(initial_bankroll_bnb_v, (int, float)):
-        raise InvariantError("backtest_initial_bankroll_bnb_not_number")
-    bt_bankroll = float(initial_bankroll_bnb_v)
+    bt_bankroll = _opt_float(backtest_sec, "initial_bankroll_bnb", 50.0)
     if bt_bankroll <= 0.0:
         raise InvariantError("backtest_initial_bankroll_bnb_must_be_positive")
 
-    reset_mode = _opt_str(backtest, "reset_mode", "continuous")
-    reset_every_rounds = _opt_int(backtest, "reset_every_rounds", 0)
-    tail_offset_rounds = _opt_int(backtest, "tail_offset_rounds", 0)
+    reset_mode = _opt_str(backtest_sec, "reset_mode", "continuous")
+    reset_every_rounds = _opt_int(backtest_sec, "reset_every_rounds", 0)
+    tail_offset_rounds = _opt_int(backtest_sec, "tail_offset_rounds", 0)
 
-    epoch_start_raw = backtest.get("epoch_start")
-    epoch_end_raw = backtest.get("epoch_end")
+    epoch_start_raw = backtest_sec.get("epoch_start")
+    epoch_end_raw = backtest_sec.get("epoch_end")
     epoch_start = None if epoch_start_raw is None else int(epoch_start_raw)
     epoch_end = None if epoch_end_raw is None else int(epoch_end_raw)
 
     backtest_cfg = BacktestConfig(
-        simulation_size=simulation_size_v,
+        simulation_size=simulation_size,
         initial_bankroll_bnb=bt_bankroll,
         reset_mode=str(reset_mode),
         reset_every_rounds=int(reset_every_rounds),
@@ -352,40 +223,12 @@ def load_app_config(path: str) -> AppConfig:
     )
     backtest_cfg.validate()
 
-    _validate_unknown_keys("momentum_gate", momentum_gate_raw, {
-        "enabled", "bnb_symbol", "btc_symbol", "eth_symbol", "sol_symbol",
-    })
-    mg_enabled = _opt_bool(momentum_gate_raw, "enabled", False)
-    mg_bnb_symbol = _opt_str(momentum_gate_raw, "bnb_symbol", "BNB-USDT")
-    mg_btc_symbol = _opt_str(momentum_gate_raw, "btc_symbol", "BTC-USDT")
-    mg_eth_symbol = _opt_str(momentum_gate_raw, "eth_symbol", "ETH-USDT")
-    mg_sol_symbol = _opt_str(momentum_gate_raw, "sol_symbol", "SOL-USDT")
-    momentum_gate_cfg = MomentumGateConfig(
-        enabled=mg_enabled,
-        bnb_symbol=mg_bnb_symbol,
-        btc_symbol=mg_btc_symbol,
-        eth_symbol=mg_eth_symbol,
-        sol_symbol=mg_sol_symbol,
-    )
-
     return AppConfig(
-        closed_rounds_path=closed_rounds_path,
-        abi_json_path=abi_json_path,
-        cutoff_seconds=cutoff_seconds,
-        latency_log_path=latency_log_path,
+        kline_cutoff_seconds=kline_cutoff_seconds,
+        prefetch_offset_seconds=prefetch_offset_seconds,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
-        wait_for_bet_receipt=wait_for_bet_receipt,
-        bet_receipt_timeout_seconds=bet_receipt_timeout_seconds,
-        runtime_state_paths=RuntimeStatePathsConfig(
-            claim_scan_cursor_path=claim_scan_cursor_path,
-            dry_bets_path=dry_bets_path,
-            dry_settled_epochs_path=dry_settled_epochs_path,
-            dry_audit_trades_path=dry_audit_trades_path,
-            dry_cycle_audit_path=dry_cycle_audit_path,
-            dry_bankroll_state_path=dry_bankroll_state_path,
-            dry_archive_root=dry_archive_root,
-            dry_fresh_start=dry_fresh_start,
-        ),
-        momentum_gate=momentum_gate_cfg,
+        live_min_bet_only=live_min_bet_only,
+        backtest_simulation_size=simulation_size,
+        backtest_initial_bankroll_bnb=bt_bankroll,
         backtest=backtest_cfg,
     )
