@@ -187,11 +187,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
         )
 
         for i, round_t in enumerate(sim_rounds):
-            decision = pipeline.decide_open_round(
-                round_t=round_t,
-                bankroll_bnb=bankroll,
-                allow_oracle_mode=True,
-            )
+            decision = pipeline.decide_open_round(round_t=round_t)
 
             profit = 0.0
             if decision.action == "BET" and decision.bet_size_bnb > 0.0:

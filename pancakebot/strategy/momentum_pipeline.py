@@ -194,8 +194,6 @@ class MomentumOnlyPipeline:
         self,
         *,
         round_t: Round,
-        bankroll_bnb: float,
-        allow_oracle_mode: bool,
         pool_bull_bnb: float = 0.0,
         pool_bear_bnb: float = 0.0,
         okx_kline_futures: object | None = None,
@@ -323,11 +321,10 @@ class MomentumOnlyPipeline:
                 signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
                 skip_reason="gate_no_btc_klines",
             )
-        bnb_klines = self._bnb_klines_by_epoch.get(epoch, [])
         eth_klines = self._eth_klines_by_epoch.get(epoch)
         sol_klines = self._sol_klines_by_epoch.get(epoch)
         return compute_signal_from_klines(
-            bnb_klines, btc_klines, cutoff_ts_ms,
+            btc_klines, cutoff_ts_ms,
             eth_klines=eth_klines, sol_klines=sol_klines,
         )
 
@@ -358,14 +355,6 @@ class MomentumOnlyPipeline:
             skip_reason=None,
             p_bull=None,
         )
-
-    # ------------------------------------------------------------------
-    # candidate_signals_for_open_round stub (called by audit/logging code)
-    # ------------------------------------------------------------------
-
-    def candidate_signals_for_open_round(self, *, round_t: Round) -> dict:
-        return {}
-
 
 def _pools_from_bets(round_t: Round, cutoff_ts: int) -> tuple[float, float]:
     """Compute bull/bear pool BNB from bets placed strictly before cutoff_ts.

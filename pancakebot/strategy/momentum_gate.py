@@ -238,7 +238,6 @@ def _get_return(closes: list[float], lookback: int) -> float | None:
 
 
 def compute_signal_from_klines(
-    bnb_klines: list[list],
     btc_klines: list[list] | None,
     cutoff_ms: int,
     eth_klines: list[list] | None = None,
@@ -247,8 +246,7 @@ def compute_signal_from_klines(
     """Compute signal from raw kline arrays (backtest path).
 
     Trims klines to the same window the live path fetches, validates
-    BTC (the signal source), then computes the signal.  BNB klines are
-    accepted for interface compat but are not used for signal logic.
+    BTC (the signal source), then computes the signal.
     """
     if btc_klines is not None:
         btc_klines = _trim_to_window(btc_klines, cutoff_ms)

@@ -1,7 +1,6 @@
-"""General utility helpers: exceptions, time, paths, money formatting."""
+"""General utility helpers: exceptions, paths, money formatting."""
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 
@@ -17,12 +16,6 @@ class TransientRpcError(Exception):
 
 class TransientGraphError(Exception):
     pass
-
-
-# -- Time ----------------------------------------------------------
-
-def now_ts() -> int:
-    return int(time.time())
 
 
 # -- Paths ---------------------------------------------------------

@@ -25,7 +25,6 @@ from pancakebot.runtime.audit import (
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot.settlement import settle_from_round_data
 from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline
-from pancakebot.util import now_ts
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
@@ -100,7 +99,7 @@ def _archive_dry_runtime_state(
         return None
     archive_root = Path(_paths.DRY_ARCHIVE_ROOT).resolve()
     archive_root.mkdir(parents=True, exist_ok=True)
-    ts_now = int(now_ts())
+    ts_now = int(time.time())
     archive_dir = _unique_archive_dir(archive_root, ts=ts_now, reason=reason)
     archive_dir.mkdir(parents=True, exist_ok=False)
     file_meta: list[dict[str, object]] = []
@@ -367,7 +366,7 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
             bankroll_bnb=configured_init,
             source="configured_init",
             epoch=None,
-            updated_ts=int(now_ts()),
+            updated_ts=int(time.time()),
         )
     wallet_bnb = _fetch_wallet_balance_bnb_with_retries(
         cfg=cfg,
@@ -378,7 +377,7 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
         bankroll_bnb=wallet_bnb,
         source="wallet_init",
         epoch=None,
-        updated_ts=int(now_ts()),
+        updated_ts=int(time.time()),
     )
 
 
@@ -421,7 +420,6 @@ def _append_dry_settled_epoch(path: str, epoch: int) -> None:
 
 
 def _dry_record_bet(
-    cfg: RuntimeConfig,
     closed: _ClosedState,
     *,
     epoch: int,
@@ -434,7 +432,7 @@ def _dry_record_bet(
 ) -> None:
     if epoch in closed.dry_bets_by_epoch:
         raise InvariantError(f"dry_bet_duplicate_epoch: epoch={epoch}")
-    placed_ts = int(now_ts())
+    placed_ts = int(time.time())
     rec = {
         "epoch": epoch,
         "placed_ts": placed_ts,
@@ -518,7 +516,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         except Exception:
             continue  # transient RPC failure -- will retry next iteration
 
-        if not rd.oracle_called and rd.close_ts > now_ts():
+        if not rd.oracle_called and rd.close_ts > time.time():
             continue  # round not yet closed on-chain
 
         bet_bnb_raw = bet.get("bet_bnb", 0.0)
@@ -594,7 +592,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
                 ),
             )
 
-        settled_ts = int(now_ts())
+        settled_ts = int(time.time())
 
         placed_raw = bet.get("placed_ts")
         if isinstance(placed_raw, int):

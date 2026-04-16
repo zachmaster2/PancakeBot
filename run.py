@@ -49,12 +49,12 @@ def main() -> None:
     try:
         run_from_config(
             config_path=args.config,
-            dry=bool(args.dry),
-            backtest=bool(args.backtest),
-            sync=bool(args.sync),
-            live=bool(args.live),
-            fresh=bool(args.fresh),
-            no_archive=bool(args.no_archive),
+            dry=args.dry,
+            backtest=args.backtest,
+            sync=args.sync,
+            live=args.live,
+            fresh=args.fresh,
+            no_archive=args.no_archive,
         )
     except KeyboardInterrupt:
         info("CORE", "RUN", "EXIT", msg="Caught KeyboardInterrupt: shutting down")
