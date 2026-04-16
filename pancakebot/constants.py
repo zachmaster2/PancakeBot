@@ -21,7 +21,7 @@ TREASURY_FEE_DIVISOR = 10_000
 # are synced from chain by --sync and cached in var/contract_constants.json.
 # See pancakebot/market_data/contract_constants.py.
 
-# Pool cutoff: only use bets with created_at <= lock_at - POOL_CUTOFF_SECONDS.
+# Pool cutoff: only use bets with created_at < lock_at - POOL_CUTOFF_SECONDS.
 # Bets placed this many seconds before lock are guaranteed to have propagated
 # to our node by decision time, ensuring consistency between live and backtest.
 POOL_CUTOFF_SECONDS = 6

@@ -88,13 +88,10 @@ class MomentumGate:
     # ------------------------------------------------------------------
     # Async fetch / evaluate split
     # ------------------------------------------------------------------
-    # The timing budget between wakeup and the lock safety guard is
-    # only ~1 s (cutoff_seconds − safety_margin = 4 − 3).  Several RPC
-    # calls (epoch handshake, lock_ts, round_data) consume ~450 ms of
-    # that budget *before* the gate is even called.
-    #
-    # To avoid exceeding the budget, the runtime loop calls
-    # fetch_klines_async() immediately after waking — the two OKX HTTP
+    # The two-phase timing architecture separates housekeeping (Phase A)
+    # from the critical bet path (Phase B).  Phase A handles epoch check
+    # and TLS warmup; Phase B fetches klines and decides.  The runtime
+    # loop calls fetch_klines_async() at the start of Phase B — the OKX
     # requests run in background threads while the RPC work proceeds.
     # By the time evaluate() is called the data is already waiting.
     # ------------------------------------------------------------------

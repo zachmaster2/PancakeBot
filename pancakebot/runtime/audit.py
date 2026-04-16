@@ -137,7 +137,7 @@ def round_pool_snapshot(
     bull_bets = 0
     bear_bets = 0
     for bet in round_t.bets:
-        if cutoff_ts is not None and bet.created_at > cutoff_ts:
+        if cutoff_ts is not None and bet.created_at >= cutoff_ts:
             continue
         if bet.position == "Bull":
             bull_wei += bet.amount_wei
