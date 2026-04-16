@@ -595,34 +595,25 @@
     <div class="loop-timeline">
       <div class="loop-step">
         <div class="ls-title">Epoch Alignment</div>
-        <div class="ls-desc">Query the BSC smart contract for the current epoch number and round timing (when it locks, when it closes).</div>
+        <div class="ls-desc">Query BSC for current epoch and round timing.</div>
       </div>
       <div class="loop-step">
-        <div class="ls-title">Phase A: Sleep + Housekeeping</div>
-        <div class="ls-desc">Sleep until <strong>6 seconds before lock</strong>. Then perform epoch recheck (BSC RPC), warm 3 OKX TLS connections in parallel, and read pool data from WSS subscription.</div>
-        <div class="ls-time">lock_at &minus; 6s &rarr; all housekeeping outside critical path</div>
+        <div class="ls-title">Phase A: Housekeeping</div>
+        <div class="ls-desc">Epoch recheck, 3-connection OKX TLS warmup, pool data from WSS. Runs outside critical path.</div>
+        <div class="ls-time">lock_at &minus; cutoff &minus; offset &rarr; cutoff and offset are configurable (kline_cutoff_seconds, prefetch_offset_seconds)</div>
       </div>
       <div class="loop-step data">
-        <div class="ls-title">Phase B: Sleep Until Fetch</div>
-        <div class="ls-desc">Sleep until <strong>1.75 seconds before lock</strong> (cutoff + 250ms OKX publish delay). This gives OKX time to finalize the candle at the cutoff moment.</div>
-        <div class="ls-time">lock_at &minus; 1.75s &rarr; critical path begins</div>
-      </div>
-      <div class="loop-step data">
-        <div class="ls-title">Fetch Klines</div>
-        <div class="ls-desc">Fetch BTC, ETH, SOL 1-second candles from OKX in parallel on pre-warmed connections. Typical latency: ~285ms.</div>
-      </div>
-      <div class="loop-step signal">
-        <div class="ls-title">Compute Signal + Size</div>
-        <div class="ls-desc">Run BTC multi-TF gate (primary) or ETH+SOL regime-2 (fallback). Apply pool-adaptive threshold, payout filter, and continuous adaptive sizing.</div>
+        <div class="ls-title">Phase B: Critical Path</div>
+        <div class="ls-desc">Fetch BTC/ETH/SOL klines (&lt;500ms), compute signal + sizing (negligible).</div>
+        <div class="ls-time">lock_at &minus; cutoff + 0.25s &rarr; critical path begins</div>
       </div>
       <div class="loop-step action">
         <div class="ls-title">Timing Guard + Execute</div>
-        <div class="ls-desc">If less than 1 second remains before lock, abort. Otherwise, sign and broadcast the bet transaction to BSC.</div>
-        <div class="ls-time">Safety margin: 1 second (BSC block time ~0.44s)</div>
+        <div class="ls-desc">Safety margin 1s before lock. Submit bet or abort. Live mode: clamp to min bet when <code>min_bet_only=true</code>.</div>
       </div>
       <div class="loop-step settle">
-        <div class="ls-title">Wait + Settle</div>
-        <div class="ls-desc">Sleep until round closes (~5 more minutes). Check outcome via oracle price. If won, claim winnings on-chain. Loop to next round.</div>
+        <div class="ls-title">Claim / Settlement</div>
+        <div class="ls-desc">Sleep until close + 35s. Epoch handshake (both modes). Dry: settle simulated bets. Live: batched claim scan.</div>
       </div>
     </div>
   </div>
@@ -634,22 +625,22 @@
       <div class="mode-card live">
         <div class="mode-flag">--live</div>
         <h3>Live Mode</h3>
-        <p>Real money. Reads wallet balance, signs transactions with a private key, broadcasts bets to BSC. Monitors outcomes and claims winnings automatically.</p>
+        <p>Real-time trading with real BNB. Requires <code>BSC_WALLET_PRIVATE_KEY</code>. <code>min_bet_only</code> clamps sizes for safe testing.</p>
       </div>
       <div class="mode-card dry">
         <div class="mode-flag">--dry</div>
         <h3>Dry Mode</h3>
-        <p>Paper trading. Same signal pipeline and timing as live, but bets are simulated — no transactions hit the chain. Tracks a virtual bankroll to measure strategy performance risk-free.</p>
+        <p>Real-time paper trading. No private key needed. <code>--fresh</code> / <code>--no-archive</code> flags for state management.</p>
       </div>
       <div class="mode-card backtest">
         <div class="mode-flag">--backtest</div>
         <h3>Backtest Mode</h3>
-        <p>Offline historical replay. Loads thousands of past rounds and pre-cached 1s klines, replays the signal pipeline deterministically, and reports win rate and PnL.</p>
+        <p>Offline replay with equity curve generation.</p>
       </div>
       <div class="mode-card sync">
         <div class="mode-flag">--sync</div>
         <h3>Sync Mode</h3>
-        <p>Data preparation. Fetches closed rounds from The Graph and 1s klines from OKX, caching them locally so backtest mode can run without live API calls.</p>
+        <p>Data sync from Graph + OKX + chain constants.</p>
       </div>
     </div>
   </div>
