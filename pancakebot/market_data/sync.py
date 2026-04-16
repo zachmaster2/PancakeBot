@@ -11,6 +11,7 @@ pattern.
 from __future__ import annotations
 
 import json
+import os as _os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -262,8 +263,6 @@ def sync_runtime_market_data(
 
 def _trim_closed_rounds(store: ClosedRoundsStore, valid_epochs: set[int]) -> None:
     """Remove closed rounds whose epochs are not in valid_epochs (atomic)."""
-    import os as _os
-
     all_rounds = list(store.iter_closed_rounds())
     kept = [r for r in all_rounds if int(r.epoch) in valid_epochs]
     kept.sort(key=lambda r: int(r.epoch))
@@ -360,7 +359,7 @@ def _sync_1s_klines(
 
     # --- Pass 2: Prepend (epochs before existing store) ---
     if prepend_rounds:
-        staging_path = store.path_jsonl + f".prepend_staging"
+        staging_path = store.path_jsonl + ".prepend_staging"
         synced, errors = _fetch_to_staging(
             rounds_asc=prepend_rounds, inst_id=inst_id,
             staging_path=staging_path, label=label,
@@ -426,8 +425,6 @@ def _fetch_to_staging(
     cutoff_seconds: int = 2, okx_client: object,
 ) -> tuple[int, int]:
     """Fetch older epochs into a staging file (resumable append-only)."""
-    import os as _os
-
     # Load what's already in the staging file from a prior interrupted run.
     staged_epochs: set[int] = set()
     if _os.path.exists(staging_path):
@@ -470,8 +467,6 @@ def _fetch_to_staging(
 
 def _prepend_staging_to_store(*, store: KlineStore, staging_path: str, label: str) -> None:
     """Merge staging file (older epochs) in front of existing store atomically."""
-    import os as _os
-
     # Read staging records, sort by epoch.
     staging_records: list[dict] = []
     with open(staging_path, "r", encoding="utf-8") as f:

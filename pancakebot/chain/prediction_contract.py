@@ -44,17 +44,17 @@ def _load_abi_list(path: str) -> list[dict[str, Any]]:
     We intentionally do NOT accept {'abi': [...]} to keep inputs unambiguous.
     """
     try:
-        with open(path, 'r') as f:
+        with open(path, "r") as f:
             obj = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        raise InvariantError(f'abi_load_failed: {e}') from e
+        raise InvariantError(f"abi_load_failed: {e}") from e
 
     if not isinstance(obj, list):
-        raise InvariantError('abi_json_must_be_list')
+        raise InvariantError("abi_json_must_be_list")
 
     for i, item in enumerate(obj):
         if not isinstance(item, dict):
-            raise InvariantError(f'abi_item_not_object: idx={i}')
+            raise InvariantError(f"abi_item_not_object: idx={i}")
     return obj  # type: ignore[return-value]
 
 
@@ -102,7 +102,7 @@ class Web3PredictionContract:
         # Create a web3 instance + contract per RPC URL so each keeps
         # its own persistent session (warm TLS connection).
         pk = cfg.private_key.strip()
-        if pk.startswith('0x'):
+        if pk.startswith("0x"):
             pk = pk[2:]
 
         abi = _load_abi_list(cfg.abi_json_path)
@@ -118,7 +118,7 @@ class Web3PredictionContract:
         w3_primary = self._providers[0][0]
         chain_id = int(w3_primary.eth.chain_id)
         if chain_id != int(EXPECTED_CHAIN_ID):
-            raise InvariantError(f'unexpected_chain_id: got={chain_id} expected={EXPECTED_CHAIN_ID}')
+            raise InvariantError(f"unexpected_chain_id: got={chain_id} expected={EXPECTED_CHAIN_ID}")
 
         self._w3 = w3_primary
         self._contract = self._providers[0][1]
@@ -391,7 +391,12 @@ class Web3PredictionContract:
             results = self._batch_eth_calls(chunk_encoded)
             # rounds() returns a large tuple; close_ts is at index 3.
             # ABI: (uint256,uint256,uint256,uint256,int256,int256,uint256,uint256,uint256,uint256,bool)
-            round_types = ["uint256","uint256","uint256","uint256","int256","int256","uint256","uint256","uint256","uint256","bool"]
+            round_types = [
+                "uint256", "uint256", "uint256", "uint256",
+                "int256", "int256",
+                "uint256", "uint256", "uint256", "uint256",
+                "bool",
+            ]
             for e, raw in zip(chunk_epochs, results):
                 if raw is None:
                     out[int(e)] = None
@@ -612,10 +617,10 @@ class Web3PredictionContract:
         fn = self._contract.functions.claim([int(e) for e in epochs])
         tx = fn.build_transaction(
             {
-                'from': self._account.address,
-                'nonce': Web3.to_int(self._w3.eth.get_transaction_count(self._account.address)),
-                'gas': int(gas_limit),
-                'gasPrice': int(gas_price_wei),
+                "from": self._account.address,
+                "nonce": Web3.to_int(self._w3.eth.get_transaction_count(self._account.address)),
+                "gas": int(gas_limit),
+                "gasPrice": int(gas_price_wei),
             }
         )
         signed = self._account.sign_transaction(tx)

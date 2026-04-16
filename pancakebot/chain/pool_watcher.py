@@ -16,9 +16,10 @@ import asyncio
 import json
 import threading
 import time
+import urllib.request as _urllib_req
 from dataclasses import dataclass, field
 
-from pancakebot.constants import BNB_WEI, PREDICTION_V2_CONTRACT_ADDRESS
+from pancakebot.constants import BNB_WEI, PREDICTION_V2_CONTRACT_ADDRESS, RPC_URLS
 from pancakebot.log import info, warn
 
 # Public BSC WebSocket endpoint (no signup, no API key).
@@ -197,7 +198,7 @@ class PoolEventWatcher:
 
             self._connected = True
             info("POOL_WSS", "SUB", "OK",
-                 msg=f"Subscribed to bet events + newHeads")
+                 msg="Subscribed to bet events + newHeads")
 
             while not self._stop_event.is_set():
                 try:
@@ -280,7 +281,6 @@ class PoolEventWatcher:
 
     def _rpc_call(self, rpc: str, method: str, params: list) -> dict | None:
         """Single JSON-RPC call. Returns result or None on error."""
-        import urllib.request as _urllib_req
         req = json.dumps({
             "jsonrpc": "2.0", "id": 1,
             "method": method, "params": params,
@@ -294,7 +294,6 @@ class PoolEventWatcher:
 
     def _rpc_batch(self, rpc: str, calls: list[tuple[str, list]]) -> list[dict | None]:
         """Batch JSON-RPC call. Returns list of results (None for failures)."""
-        import urllib.request as _urllib_req
         batch = [
             {"jsonrpc": "2.0", "id": i, "method": method, "params": params}
             for i, (method, params) in enumerate(calls)
@@ -320,8 +319,6 @@ class PoolEventWatcher:
         Called once by the runtime loop after the first epoch handshake.
         Dedup by tx_hash:log_index prevents double-counting with WSS.
         """
-        from pancakebot.constants import RPC_URLS
-
         _BSC_BLOCK_TIME = 0.5  # conservative (actual ~0.44s)
         _BATCH_SIZE = 100      # BSC free RPCs reject batches > 100
         rpc = RPC_URLS[0]

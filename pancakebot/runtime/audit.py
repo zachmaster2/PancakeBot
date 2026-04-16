@@ -9,7 +9,6 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from pancakebot import paths as _paths
 from pancakebot.constants import BNB_WEI
 from pancakebot.errors import InvariantError
 from pancakebot.time import now_ts
