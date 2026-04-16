@@ -22,7 +22,6 @@ from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.market_data.round_sync import sync_closed_rounds
 from pancakebot.market_data.graph_client import GraphClient
 from pancakebot.market_data.kline_store import KlineStore
-from pancakebot.runtime.config import required_runtime_sync_cache_n
 from time import sleep as sleep_seconds
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
@@ -58,7 +57,6 @@ _SOL_KLINES_PATH = Path(_proj_paths.SOL_SPOT_PRICES_PATH)
 
 @dataclass(frozen=True, slots=True)
 class SyncSummary:
-    warmup_rounds: int
     cache_n: int
     stored_closed_round_count: int
     earliest_closed_epoch: int
@@ -76,14 +74,13 @@ def sync_runtime_market_data(
     round_store: ClosedRoundsStore,
     okx_client: object,
 ) -> SyncSummary:
-    warmup_rounds = int(required_runtime_sync_cache_n())
-    cache_n = max(int(warmup_rounds), int(cfg.backtest.simulation_size))
+    cache_n = int(cfg.backtest.simulation_size)
 
     info(
         "CORE",
         "SYNC",
         "START",
-        msg=f"Sync setup: warmup_rounds={int(warmup_rounds)} simulation_size={int(cfg.backtest.simulation_size)} closed_cache_needed={int(cache_n)}",
+        msg=f"Sync setup: simulation_size={int(cfg.backtest.simulation_size)} closed_cache_needed={int(cache_n)}",
     )
 
     # Phase 1: Sync closed rounds from The Graph.
@@ -245,7 +242,6 @@ def sync_runtime_market_data(
     latest_closed_epoch = int(final_rounds[-1].epoch)
 
     return SyncSummary(
-        warmup_rounds=int(warmup_rounds),
         cache_n=int(cache_n),
         stored_closed_round_count=int(stored_closed_round_count),
         earliest_closed_epoch=int(earliest_closed_epoch),

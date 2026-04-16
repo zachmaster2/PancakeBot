@@ -54,10 +54,3 @@ class RuntimeConfig:
 
     # Pool event watcher: accumulates BetBull/BetBear events for accurate pools
     pool_watcher: PoolEventWatcher | None = None
-
-
-_MOMENTUM_CACHE_N = 10  # retained for sync_mode compatibility
-
-
-def required_runtime_sync_cache_n() -> int:
-    return _MOMENTUM_CACHE_N
