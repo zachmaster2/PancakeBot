@@ -139,9 +139,10 @@ class Web3PredictionContract:
 
     @property
     def wallet_address(self) -> str:
-        if self._account is None:
+        account = self._account
+        if account is None:
             return ""
-        return str(self._account.address)
+        return str(account.address)
 
     def _rpc_call(self, *, op: str, fn: Callable[[], _T]) -> _T:
         self._rotate_rpc()
@@ -317,7 +318,7 @@ class Web3PredictionContract:
                 wallet_address=str(args["sender"]),
                 epoch=int(args["epoch"]),
                 amount_wei=int(args["amount"]),
-                position=str(side),
+                position=side,
                 block_number=int(bn),
                 block_timestamp=int(block_ts_cache[int(bn)]),
                 tx_hash=str(log_obj["transactionHash"].hex()),
@@ -366,6 +367,7 @@ class Web3PredictionContract:
         encoded: list[str] = []
         for offset in range(cursor, total, page_size):
             size = min(page_size, total - offset)
+            # noinspection PyProtectedMember
             encoded.append(
                 self._contract.functions.getUserRounds(checksum, offset, size)._encode_transaction_data()
             )
@@ -386,6 +388,7 @@ class Web3PredictionContract:
         """Fetch close_ts for multiple epochs in one RPC batch."""
         if not epochs:
             return {}
+        # noinspection PyProtectedMember
         encoded = [
             self._contract.functions.rounds(int(e))._encode_transaction_data()
             for e in epochs
@@ -442,6 +445,7 @@ class Web3PredictionContract:
             return {}
         checksum = Web3.to_checksum_address(str(wallet_address))
         encoded: list[str] = []
+        # noinspection PyProtectedMember
         for e in epochs:
             encoded.append(
                 self._contract.functions.claimable(int(e), checksum)._encode_transaction_data()
