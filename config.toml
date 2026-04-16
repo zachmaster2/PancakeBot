@@ -30,8 +30,8 @@ btc_symbol = "BTC-USDT"
 eth_symbol = "ETH-USDT"
 sol_symbol = "SOL-USDT"
 
-# Protocol constants (min_bet_amount_bnb, treasury_fee_fraction) are now
-# in pancakebot/core/constants.py. In live mode they're verified on-chain.
+# Protocol constants are synced from chain by --sync and cached in
+# var/contract_constants.json. Hardcoded defaults in pancakebot/constants.py.
 
 [backtest]
 simulation_size = 35000

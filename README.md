@@ -2,76 +2,90 @@
 
 Automated trading bot for PancakeSwap Prediction V2 on BNB Smart Chain.
 
+## Modes
+
+| Mode | Command | Env vars | Description |
+|------|---------|----------|-------------|
+| Sync | `python run.py --sync` | `THE_GRAPH_API_KEY` | Fetch rounds + klines + contract constants |
+| Backtest | `python run.py --backtest` | (none) | Replay historical data, compute PnL |
+| Dry | `python run.py --dry` | (none) | Real-time paper trading |
+| Live | `python run.py --live` | `BSC_WALLET_PRIVATE_KEY` | Real on-chain bets |
+
+Running with no flags prints help. Modes are mutually exclusive.
+
 ## Strategy
 
-**Signal:** BTC multi-timeframe momentum agreement. BTC 3s, 7s, and 15s
-returns must all agree in direction with `min(|return|) >= threshold`.
+**Signal:** BTC multi-timeframe momentum — 3s, 7s, and 15s returns must all agree in direction with `min(|return|) >= threshold` (pool-adaptive: 0.0002 small / 0.0001 large).
 
-- Pool-adaptive threshold: 0.0002 for pools < 3 BNB, 0.0001 for pools >= 3 BNB
-- Signal fires ~3% of rounds (bear-biased: 90% of PnL from Bear signals)
+**Regime-2:** When BTC is silent, ETH + SOL multi-TF agreement fires as a secondary signal with smaller sizing.
 
-**Regime-2:** When BTC is silent, ETH + SOL multi-TF(3,7,15) agreement fires
-as a secondary signal with smaller sizing.
+**Sizing:** Continuous adaptive based on signal strength, ETH/SOL confirmation, and payout odds.
 
-**Sizing:** Continuous adaptive based on signal strength, ETH/SOL confirmation,
-and payout odds.
+**Filters:** Pool minimum (1.5 BNB), payout floor (1.5x), strong-signal bypass for small pools.
+
+## Project Structure
 
 ```
-effective_strength = btc_min_abs + eth_confirm * 0.3 + sol_confirm * 0.3
-frac = min(0.04 + 100 * effective_strength, 0.30)
-frac = frac * max(0.5, 1.0 + 1.0 * (payout - 2.0))
-bet = max(0.01, min(2.0, pool * frac))
+pancakebot/
+    constants.py, errors.py, log.py     # Shared foundations
+    money.py, time.py, path.py
+    config.py                            # All config: TOML, env, dataclasses
+    types.py, pool_amounts.py            # Domain types (Bet, Round)
+    settlement.py                        # PnL computation
+    app.py                               # Mode dispatch
+
+    strategy/                            # Signal + sizing
+        momentum_gate.py                 # OKX kline fetch + BTC multi-TF signal
+        momentum_pipeline.py             # Signal -> sizing -> filters -> decision
+
+    chain/                               # BSC chain interaction
+        prediction_contract.py           # Web3 contract wrapper
+        contract_config.py, rpc_pool.py
+        pool_watcher.py                  # WSS real-time pool tracking
+
+    market_data/                         # Data fetch + store
+        okx_client.py                    # OKX REST with session pooling
+        graph_client.py                  # The Graph API
+        round_store.py, round_sync.py    # Closed rounds JSONL
+        kline_store.py                   # 1s kline JSONL
+        contract_constants.py            # Chain constants cache
+        sync.py                          # --sync orchestration
+
+    runtime/                             # Real-time loop (dry + live)
+        config.py                        # RuntimeConfig
+        engine.py                        # Two-phase loop, epoch handshake
+        dry.py                           # Dry state, audit, settlement
+        live.py                          # Claim scanning
+
+    backtest/
+        runner.py                        # Offline replay + equity plot
 ```
 
-**Filters:** Pool minimum (1.5 BNB), payout floor (1.5x), strong-signal
-bypass for small pools (BTC strength > 0.0004, pool >= 1.0 BNB).
+## Output
+
+```
+var/
+    closed_rounds.jsonl                  # Synced round history
+    {bnb,btc,eth,sol}_spot_prices.jsonl  # Synced 1s klines
+    contract_constants.json              # Chain constants (from --sync)
+    dry/                                 # Dry mode state (archived on restart)
+    live/                                # Live mode state
+    backtest/                            # Backtest results + equity plot
+```
+
+## Setup
+
+1. Create `.env` with required env vars (see mode table above)
+2. Review `config.toml`
+3. Run `python run.py --sync` to fetch data
+4. Run `python run.py --backtest` to verify
+5. Run `python run.py --dry` for paper trading
 
 ## Architecture
 
 See [docs/architecture.html](docs/architecture.html) for the visual diagram.
 
-**Two-phase runtime loop (per round):**
-
-| Phase | Timing | Actions |
-|-------|--------|---------|
-| A: Housekeeping | lock_at - 6s | Epoch check (BSC RPC), TLS warmup (3 parallel connections to OKX), pool data (BSC WSS) |
-| Sleep | 3-4s | Wait for cutoff moment + OKX publish delay |
-| B: Critical path | lock_at - 1.75s | Fetch BTC/ETH/SOL 1s klines (~285ms), compute signal, sizing, timing guard (lock_at - 1s), submit bet |
-
-**Data sources:**
-
-| Source | Data | Used for |
-|--------|------|----------|
-| OKX public REST API | BTC, ETH, SOL 1s candles | Signal computation |
-| BSC RPC (publicnode) | Epoch state, round data | Timing, bet submission |
-| BSC WSS (publicnode) | Real-time BetBull/BetBear events | Pool tracking |
-| The Graph API | Historical closed rounds | Sync mode (backtest data) |
-
-## Setup
-
-1. Create a `.env` file at the repo root:
-
-   - `THE_GRAPH_API_KEY` - API key for The Graph gateway
-   - `BSC_WALLET_PRIVATE_KEY` - Wallet private key hex (with or without `0x`)
-
-2. Review `config.toml` settings.
-
-3. Run:
-
-   | Mode | Command | Description |
-   |------|---------|-------------|
-   | Sync | `python run.py --sync` | Fetch closed rounds + klines from OKX, then exit |
-   | Backtest | `python run.py --backtest` | Replay signal on historical data |
-   | Dry | `python run.py --dry` | Paper trading with real-time data |
-   | Live | `python run.py` | Real on-chain bets |
-
-## Outputs
-
-- `var/backtest_trades.csv`, `var/backtest_summary.json` - Backtest results
-- `var/runtime/dry_bankroll_state.json` - Dry mode bankroll
-- `var/runtime/dry_cycle_audit.csv` - Per-round decision log
-- `var/runtime/dry_audit_trades.csv` - Dry bet/settlement ledger
-- `var/{bnb,btc,eth,sol}_spot_prices.jsonl` - Synced 1s kline data
-- `var/closed_rounds.jsonl` - Historical round data
-
-Dry state is archived to `../PancakeBot_var_exp/` on startup and shutdown.
+**Two-phase runtime loop:**
+- Phase A (lock_at - 6s): Epoch check + OKX TLS warmup + pool data
+- Phase B (lock_at - 1.75s): Fetch klines (~285ms) + signal + bet
+- Safety margin: 1s before lock
