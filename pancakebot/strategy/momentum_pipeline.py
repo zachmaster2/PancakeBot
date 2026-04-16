@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pancakebot.constants import BNB_WEI
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 from pancakebot.strategy.momentum_gate import (
     MomentumGate,
     MomentumGateConfig,

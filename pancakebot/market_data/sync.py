@@ -16,7 +16,7 @@ from pathlib import Path
 
 from pancakebot import paths as _proj_paths
 from pancakebot.config import AppConfig
-from pancakebot.errors import InvariantError, TransientGraphError
+from pancakebot.util import InvariantError, TransientGraphError
 from pancakebot.log import info
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.market_data.round_sync import sync_closed_rounds

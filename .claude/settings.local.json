@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git rm:*)"
+      "Bash(git rm:*)",
+      "Bash(xargs sed -i 's/from pancakebot\\\\.errors import/from pancakebot.util import/g;:*)",
+      "Bash(sed -i 's/from pancakebot\\\\.errors import/from pancakebot.util import/g;:*)",
+      "Bash(ls pancakebot/*.py)"
     ]
   }
 }

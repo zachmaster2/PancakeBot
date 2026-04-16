@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from pancakebot.chain.prediction_contract import Web3PredictionContract
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 from pancakebot.log import info
 
 _PAGE_SIZE_DEFAULT = 100

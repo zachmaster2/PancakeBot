@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pancakebot.constants import BNB_WEI, GAS_COST_CLAIM_BNB
 from pancakebot.types import Round
 from pancakebot.pool_amounts import compute_pool_amounts_wei
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 
 
 def settle_from_round_data(

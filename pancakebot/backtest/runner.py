@@ -14,7 +14,7 @@ from pathlib import Path
 from pancakebot import paths as _paths
 from pancakebot.config import BacktestConfig
 from pancakebot.constants import GAS_COST_BET_BNB
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 from pancakebot.log import info
 from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline
 from pancakebot.types import Round

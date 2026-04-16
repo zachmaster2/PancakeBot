@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 from pancakebot import paths as _paths
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from pancakebot.market_data.graph_client import GraphClient
 from pancakebot.market_data.round_store import ClosedRoundsStore
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 from pancakebot.log import info
 
 

@@ -9,7 +9,7 @@ from typing import Any
 import tomllib
 from dotenv import load_dotenv
 
-from pancakebot.errors import InvariantError
+from pancakebot.util import InvariantError
 
 
 # -- Environment helpers ------------------------------------------------------
