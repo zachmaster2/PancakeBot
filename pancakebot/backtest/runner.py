@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pancakebot import paths as _paths
 from pancakebot.config import BacktestConfig
 from pancakebot.constants import GAS_COST_BET_BNB
 from pancakebot.errors import InvariantError
@@ -20,10 +21,10 @@ from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline
 from pancakebot.types import Round
 from pancakebot.settlement import settle_bet_against_closed_round
 
-_BNB_KLINES_PATH = Path("var/bnb_spot_prices.jsonl")
-_BTC_KLINES_PATH = Path("var/btc_spot_prices.jsonl")
-_ETH_KLINES_PATH = Path("var/eth_spot_prices.jsonl")
-_SOL_KLINES_PATH = Path("var/sol_spot_prices.jsonl")
+_BNB_KLINES_PATH = Path(_paths.BNB_SPOT_PRICES_PATH)
+_BTC_KLINES_PATH = Path(_paths.BTC_SPOT_PRICES_PATH)
+_ETH_KLINES_PATH = Path(_paths.ETH_SPOT_PRICES_PATH)
+_SOL_KLINES_PATH = Path(_paths.SOL_SPOT_PRICES_PATH)
 
 
 @dataclass(slots=True)
@@ -164,8 +165,8 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
 
     # Output files.
     out_dir.mkdir(parents=True, exist_ok=True)
-    trades_path = out_dir / "backtest_trades.csv"
-    summary_path = out_dir / "backtest_summary.json"
+    trades_path = out_dir / "trades.csv"
+    summary_path = out_dir / "summary.json"
 
     bankroll = initial_bankroll_bnb
     stats = _BacktestStats()

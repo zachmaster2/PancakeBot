@@ -1,38 +1,20 @@
-# PancakeBot configuration
-#
-# No backward compatibility is supported: unknown keys are treated as errors.
-
-[paths]
-closed_rounds_path = "var/closed_rounds.jsonl"
-claim_scan_cursor_path = "var/runtime/claim_scan_cursor.txt"
-dry_bets_path = "var/runtime/dry_bets.jsonl"
-dry_settled_epochs_path = "var/runtime/dry_settled_epochs.txt"
-dry_audit_trades_path = "var/runtime/dry_audit_trades.csv"
-dry_cycle_audit_path = "var/runtime/dry_cycle_audit.csv"
-dry_bankroll_state_path = "var/runtime/dry_bankroll_state.json"
-dry_archive_root = "../PancakeBot_var_exp"
-dry_fresh_start = true
-
-[graph]
-abi_json_path = "abi/prediction_v2_abi.json"
-
 [runtime]
-cutoff_seconds = 2
-latency_log_path = "var/live_latency.jsonl"
-dry_initial_bankroll_bnb = 50.0
-wait_for_bet_receipt = true
-bet_receipt_timeout_seconds = 45
+# How many seconds before lock_at to sample kline data
+kline_cutoff_seconds = 2
+# How many seconds before kline cutoff to wake for housekeeping (epoch check, TLS warmup)
+prefetch_offset_seconds = 4
 
-[momentum_gate]
-enabled = true
-bnb_symbol = "BNB-USDT"
-btc_symbol = "BTC-USDT"
-eth_symbol = "ETH-USDT"
-sol_symbol = "SOL-USDT"
+[dry]
+# Starting bankroll for fresh dry runs (ignored when continuing from existing state)
+initial_bankroll_bnb = 50.0
 
-# Protocol constants are synced from chain by --sync and cached in
-# var/contract_constants.json. Hardcoded defaults in pancakebot/constants.py.
+[live]
+# Override all computed bet sizes to the contract minimum.
+# All strategy logic still runs normally — signal, sizing, filters — but the
+# actual submitted amount is clamped to minBetAmount for safe testing.
+min_bet_only = true
 
 [backtest]
+# Number of most recent rounds to replay. Also controls how many rounds --sync fetches.
 simulation_size = 35000
 initial_bankroll_bnb = 50.0

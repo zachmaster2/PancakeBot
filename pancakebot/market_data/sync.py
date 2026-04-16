@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+from pancakebot import paths as _proj_paths
 from pancakebot.config import AppConfig
 from pancakebot.errors import InvariantError, TransientGraphError
 from pancakebot.log import info
@@ -52,10 +53,10 @@ def _rate_acquire() -> None:
             time.sleep(wait)
         _rate_last = time.monotonic()
 
-_BNB_KLINES_PATH = Path("var/bnb_spot_prices.jsonl")
-_BTC_KLINES_PATH = Path("var/btc_spot_prices.jsonl")
-_ETH_KLINES_PATH = Path("var/eth_spot_prices.jsonl")
-_SOL_KLINES_PATH = Path("var/sol_spot_prices.jsonl")
+_BNB_KLINES_PATH = Path(_proj_paths.BNB_SPOT_PRICES_PATH)
+_BTC_KLINES_PATH = Path(_proj_paths.BTC_SPOT_PRICES_PATH)
+_ETH_KLINES_PATH = Path(_proj_paths.ETH_SPOT_PRICES_PATH)
+_SOL_KLINES_PATH = Path(_proj_paths.SOL_SPOT_PRICES_PATH)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +136,7 @@ def sync_runtime_market_data(
     eth_store = KlineStore(str(_ETH_KLINES_PATH))
     sol_store = KlineStore(str(_SOL_KLINES_PATH))
 
-    cutoff_s = int(cfg.cutoff_seconds)
+    cutoff_s = int(cfg.kline_cutoff_seconds)
     # All 4 pairs run in parallel — the shared _rate_acquire() limiter
     # throttles total OKX requests to 8/s across all threads.
     with ThreadPoolExecutor(max_workers=4) as pool:
