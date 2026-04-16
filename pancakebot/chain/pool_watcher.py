@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.request as _urllib_req
 from dataclasses import dataclass, field
+from typing import Any
 
 from pancakebot.constants import BNB_WEI, PREDICTION_V2_CONTRACT_ADDRESS, RPC_URLS
 from pancakebot.log import info, warn
@@ -80,6 +81,7 @@ class PoolEventWatcher:
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="pool-event-watcher",
         )
+        assert self._thread
         self._thread.start()
         info("POOL_WSS", "START", "OK", msg=f"Pool event watcher started ({self._wss_url})")
 
@@ -277,8 +279,8 @@ class PoolEventWatcher:
             self._block_ts[block_number] = timestamp
 
     @staticmethod
-    def _rpc_call(rpc: str, method: str, params: list) -> dict | None:
-        """Single JSON-RPC call. Returns result or None on error."""
+    def _rpc_call(rpc: str, method: str, params: list) -> Any:
+        """Single JSON-RPC call. Returns result (str/dict/list) or None on error."""
         req = json.dumps({
             "jsonrpc": "2.0", "id": 1,
             "method": method, "params": params,
@@ -325,13 +327,13 @@ class PoolEventWatcher:
         try:
             # Get current block + timestamp
             block_num_hex = self._rpc_call(rpc, "eth_blockNumber", [])
-            if block_num_hex is None:
+            if not isinstance(block_num_hex, str):
                 raise InvariantError("backfill_block_number_failed")
             current_block = int(block_num_hex, 16)
             cur_block_data = self._rpc_call(
                 rpc, "eth_getBlockByNumber", [hex(current_block), False],
             )
-            if cur_block_data is None:
+            if not isinstance(cur_block_data, dict):
                 raise InvariantError("backfill_current_block_fetch_failed")
             current_ts = int(cur_block_data["timestamp"], 16)
 

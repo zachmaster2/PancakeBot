@@ -14,6 +14,13 @@ from pancakebot.log import warn
 RoundState = Literal["open", "locked", "closed"]
 
 
+def _as_float_or_raise(value: Any, err_code: str) -> float:
+    """Narrow a Graph API value (Any | None) to float or raise InvariantError."""
+    if not isinstance(value, (int, float, str)):
+        raise InvariantError(err_code)
+    return float(value)
+
+
 @dataclass(frozen=True, slots=True)
 class GraphClient:
     """Thin The Graph client (fetch-only).
@@ -394,15 +401,14 @@ class GraphClient:
             )
 
         if state == "locked":
-            if lock_price is None:
-                raise InvariantError("locked_round_missing_lock_price")
+            lock_price_f = _as_float_or_raise(lock_price, "locked_round_missing_lock_price")
             if any(x is not None for x in (close_price, position, failed)):
                 raise InvariantError("locked_round_invariant_violation")
             return Round(
                 epoch=epoch,
                 start_at=start_at,
                 lock_at=start_at + interval_seconds,
-                lock_price=float(lock_price),
+                lock_price=lock_price_f,
                 close_price=None,
                 position=None,
                 failed=None,
@@ -412,10 +418,8 @@ class GraphClient:
         # closed usable
         if failed is not False:
             raise InvariantError("closed_round_failed_not_false")
-        if lock_price is None:
-            raise InvariantError("closed_round_missing_lockPrice")
-        if close_price is None:
-            raise InvariantError("closed_round_missing_closePrice")
+        lock_price_closed = _as_float_or_raise(lock_price, "closed_round_missing_lockPrice")
+        close_price_closed = _as_float_or_raise(close_price, "closed_round_missing_closePrice")
         if position is None:
             raise InvariantError("closed_round_missing_position")
 
@@ -427,8 +431,8 @@ class GraphClient:
             epoch=epoch,
             start_at=start_at,
             lock_at=start_at + interval_seconds,
-            lock_price=float(lock_price),
-            close_price=float(close_price),
+            lock_price=lock_price_closed,
+            close_price=close_price_closed,
             position=pos,
             failed=False,
             bets=tuple(bets),

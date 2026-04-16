@@ -115,7 +115,7 @@ class MomentumGate:
         """Compute signal from current OKX data.
 
         If *kline_futures* is provided (from fetch_klines_async()),
-        the already-completed futures are collected instantly.  Otherwise
+        the already-completed futures are collected instantly. Otherwise,
         the klines are fetched inline (parallel) as a fallback.
 
         If BNB klines fail validation because OKX is exactly 1 second
@@ -210,7 +210,7 @@ def _validate_klines(
 
 
 def _validate_klines_raw(
-    klines: list[list], cutoff_ms: int, label: str,
+    klines: list[list] | None, cutoff_ms: int, label: str,
 ) -> str | None:
     """Validate raw kline arrays (backtest path, list-of-lists format)."""
     if not klines or len(klines) < _CANDLE_COUNT:

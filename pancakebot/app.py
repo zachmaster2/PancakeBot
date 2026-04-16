@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from pancakebot.backtest.runner import run_backtest
-from pancakebot.config import load_app_config, load_env, require_env
+from pancakebot.config import BacktestConfig, load_app_config, load_env, require_env
 from pancakebot.constants import (
     BNB_WEI,
     EXPECTED_CHAIN_ID,
@@ -58,6 +58,9 @@ def run_from_config(
     if backtest:
         cc = load_contract_constants()
         round_store = ClosedRoundsStore(paths.CLOSED_ROUNDS_PATH)
+        # noinspection PyTypeChecker
+        backtest_cfg: BacktestConfig = cfg.backtest
+        # noinspection PyTypeChecker
         runtime_cfg = RuntimeConfig(
             round_store=round_store,
             contract=None,
@@ -76,7 +79,7 @@ def run_from_config(
             interval_seconds=cc.interval_seconds,
             buffer_seconds=cc.buffer_seconds,
         )
-        run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=cfg.backtest, out_dir=Path("var/backtest"))
+        run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=backtest_cfg, out_dir=Path("var/backtest"))
         return
 
     if sync:

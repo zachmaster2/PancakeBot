@@ -118,6 +118,12 @@ def _opt_int(obj: dict[str, Any], key: str, default: int) -> int:
     return i
 
 
+def _opt_int_or_none(obj: dict[str, Any], key: str) -> int | None:
+    """Return an int if key exists and value is an int, otherwise None."""
+    v = obj.get(key)
+    return v if isinstance(v, int) else None
+
+
 def _opt_float(obj: dict[str, Any], key: str, default: float) -> float:
     if key not in obj:
         return float(default)
@@ -203,14 +209,8 @@ def load_app_config(path: str) -> AppConfig:
     reset_every_rounds = _opt_int(backtest_sec, "reset_every_rounds", 0)
     tail_offset_rounds = _opt_int(backtest_sec, "tail_offset_rounds", 0)
 
-    epoch_start_raw = backtest_sec.get("epoch_start")
-    epoch_end_raw = backtest_sec.get("epoch_end")
-    epoch_start: int | None = None
-    epoch_end: int | None = None
-    if epoch_start_raw is not None:
-        epoch_start = int(epoch_start_raw)
-    if epoch_end_raw is not None:
-        epoch_end = int(epoch_end_raw)
+    epoch_start = _opt_int_or_none(backtest_sec, "epoch_start")
+    epoch_end = _opt_int_or_none(backtest_sec, "epoch_end")
 
     backtest_cfg = BacktestConfig(
         simulation_size=simulation_size,

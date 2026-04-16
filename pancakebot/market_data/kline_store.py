@@ -83,7 +83,7 @@ class KlineStore:
     def append_after(self, prev_epoch: int, records_asc: list[dict]) -> int:
         """Append epoch-ascending records strictly after prev_epoch.
 
-        Returns the latest epoch after the append.
+        Returns the latest epoch after appending.
         """
         if not records_asc:
             return prev_epoch
