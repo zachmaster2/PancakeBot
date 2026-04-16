@@ -49,7 +49,7 @@ _POOL_THRESH_BOUNDARY = 3.0
 # Regime-2: ETH+SOL multi-TF agreement when BTC is silent.
 # Fills flat periods where primary BTC signal doesn't fire.
 # 5-fold: +2.83/2k (5/5) with separate sizing, 37% more bets.
-# Regime-2 bets have 58.6% WR — lower than primary, so bet smaller.
+# Regime-2 bets have 58.6% WR -- lower than primary, so bet smaller.
 _REGIME2_ENABLED = True
 _REGIME2_MIN_STRENGTH = 0.00015  # min(eth_strength, sol_strength) threshold
 _REGIME2_BASE_FRAC = 0.02       # smaller base (regime-2 WR is lower)
@@ -96,10 +96,10 @@ def _compute_bet_size(
 
     1. Signal-strength sizing: frac = base_frac + SIZING_SLOPE * signal_strength
     2. Payout boost: when our side has high payout (fewer bettors on our side),
-       multiply frac by up to 2x. This is Kelly reasoning — bet more when
+       multiply frac by up to 2x. This is Kelly reasoning -- bet more when
        the odds are favorable.
 
-    Regime-2 bets use smaller base_frac and cap (lower WR → bet less).
+    Regime-2 bets use smaller base_frac and cap (lower WR -> bet less).
     """
     if pool_bnb <= 0:
         return _FLOOR_BNB

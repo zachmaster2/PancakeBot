@@ -10,7 +10,7 @@ initial_bankroll_bnb = 50.0
 
 [live]
 # Override all computed bet sizes to the contract minimum.
-# All strategy logic still runs normally — signal, sizing, filters — but the
+# All strategy logic still runs normally -- signal, sizing, filters -- but the
 # actual submitted amount is clamped to minBetAmount for safe testing.
 min_bet_only = true
 

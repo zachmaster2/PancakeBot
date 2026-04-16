@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 
-# ── Exceptions ────────────────────────────────────────────────────
+# -- Exceptions ----------------------------------------------------
 
 class InvariantError(Exception):
     pass
@@ -19,13 +19,13 @@ class TransientGraphError(Exception):
     pass
 
 
-# ── Time ──────────────────────────────────────────────────────────
+# -- Time ----------------------------------------------------------
 
 def now_ts() -> int:
     return int(time.time())
 
 
-# ── Paths ─────────────────────────────────────────────────────────
+# -- Paths ---------------------------------------------------------
 
 def ensure_parent_dir(path: str) -> None:
     p = Path(path)
@@ -34,7 +34,7 @@ def ensure_parent_dir(path: str) -> None:
         parent.mkdir(parents=True, exist_ok=True)
 
 
-# ── Money ─────────────────────────────────────────────────────────
+# -- Money ---------------------------------------------------------
 
 def usd_value(*, amount_bnb: float, bnbusd_price: float) -> float:
     return amount_bnb * bnbusd_price

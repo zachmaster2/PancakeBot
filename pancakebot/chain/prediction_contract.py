@@ -123,7 +123,7 @@ class Web3PredictionContract:
 
         self._w3 = w3_primary
         self._contract = self._providers[0][1]
-        # Account is optional — only needed for live mode (signing transactions).
+        # Account is optional -- only needed for live mode (signing transactions).
         self._account = w3_primary.eth.account.from_key(pk) if len(pk) == 64 else None
 
     def _rotate_rpc(self) -> None:
