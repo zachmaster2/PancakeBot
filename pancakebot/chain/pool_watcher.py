@@ -27,10 +27,13 @@ from pancakebot.log import info, warn
 from pancakebot.util import InvariantError
 
 # Public BSC WebSocket endpoints — tried in order, round-robin on failure.
+# Tested 2026-04-17: drpc.org and publicnode.com verified working (block within 1s).
+# bsc-rpc.publicnode.com (HTTP timeouts) and bsc.meowrpc.com (HTTP 405) removed.
+# NOTE: only 2 public free endpoints found working from this environment; a third
+# paid endpoint (e.g. NodeReal, QuickNode, Alchemy BSC) is recommended before live.
 BSC_WSS_ENDPOINTS: list[str] = [
-    "wss://bsc-rpc.publicnode.com",
     "wss://bsc.drpc.org",
-    "wss://bsc.meowrpc.com",
+    "wss://bsc.publicnode.com",
 ]
 
 # Keep old constant for backwards-compat imports.

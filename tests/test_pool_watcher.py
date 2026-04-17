@@ -45,9 +45,9 @@ def _endpoint_states(watcher: PoolEventWatcher, n: int = 3) -> list[_EndpointSta
 # ---------------------------------------------------------------------------
 
 class TestEndpointDefaults(unittest.TestCase):
-    def test_default_endpoints_are_three(self):
+    def test_default_endpoints_are_at_least_two(self):
         w = PoolEventWatcher()
-        self.assertEqual(len(w._wss_urls), 3)
+        self.assertGreaterEqual(len(w._wss_urls), 2)
 
     def test_default_endpoints_match_constant(self):
         w = PoolEventWatcher()
