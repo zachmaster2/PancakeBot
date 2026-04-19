@@ -1,21 +1,21 @@
 """WebSocket watcher that accumulates PancakeSwap Prediction V2 bet pools.
 
 Subscribes to BetBull/BetBear logs and newHeads over public BSC WSS
-endpoints, maintains per-epoch pool amounts with block-timestamp-aware
-filtering, and supports RPC backfill for missed bets at startup.
+endpoints, maintains per-epoch pool amounts (bounded to the currently-open
+round and the next) with block-timestamp-aware filtering, and backfills
+bets via RPC on every successful WSS subscription.
 
 Reliability features:
 - Endpoint pool with round-robin failover across multiple public WSS URLs.
-- Per-endpoint exponential backoff with jitter (5→10→20→40→80→120s cap).
-  Backoff resets after staying connected for >60s.
-- Per-endpoint circuit breaker: 3 consecutive failures → skip endpoint for 5min.
-- Watchdog thread: forces reconnect if connected but no event/newHead for 30s.
+- Library-level keepalive via websockets ping_interval=30 / ping_timeout=10
+  (the library raises ConnectionClosedError on silent TCP drops).
+- Exponential backoff (5→10→20→40→80→120s cap) triggered only after
+  cycling through every endpoint without a healthy session.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import random
 import threading
 import time
 import urllib.request as _urllib_req
@@ -43,18 +43,10 @@ BSC_PUBLIC_WSS = BSC_WSS_ENDPOINTS[0]
 _BET_BULL_TOPIC = "0x438122d8cff518d18388099a5181f0d17a12b4f1b55faedf6e4a6acee0060c12"
 _BET_BEAR_TOPIC = "0x0d8c1fe3e67ab767116a81f122b83c2557a8c2564019cb7c4f83de1aeb1f1f0d"
 
-# Backoff schedule (seconds), per endpoint.
+# Backoff schedule (seconds), triggered after cycling through all endpoints without
+# a healthy session. Reset once a session stays connected longer than _BACKOFF_RESET_SECONDS.
 _BACKOFF_STEPS = [5, 10, 20, 40, 80, 120]
-_BACKOFF_JITTER = (0.75, 1.25)
-_BACKOFF_RESET_SECONDS = 60.0   # reset step to 0 after staying connected this long
-
-# Circuit breaker, per endpoint.
-_CB_FAILURE_THRESHOLD = 3       # consecutive failures to open circuit
-_CB_COOLDOWN_SECONDS = 300.0    # 5 minutes
-
-# Watchdog.
-_WATCHDOG_STALE_SECONDS = 30.0  # reconnect if no event/head for this long
-_WATCHDOG_POLL_SECONDS = 5.0
+_BACKOFF_RESET_SECONDS = 60.0
 
 
 @dataclass
@@ -71,42 +63,46 @@ class _EpochPool:
     bets: list[_Bet] = field(default_factory=list)
 
 
-@dataclass
-class _EndpointState:
-    url: str
-    consecutive_failures: int = 0
-    circuit_open_until: float = 0.0    # epoch time; 0 = circuit closed (OK to use)
-    backoff_step: int = 0
-    session_connected_at: float = 0.0  # time.time() when _connected last became True
-
-
 class PoolEventWatcher:
     """Background thread that tracks PancakeSwap pools via confirmed events."""
 
     def __init__(
         self,
         *,
+        interval_seconds: int,
         wss_urls: list[str] | None = None,
         contract_address: str = PREDICTION_V2_CONTRACT_ADDRESS,
     ) -> None:
+        if interval_seconds <= 0:
+            raise InvariantError("interval_seconds_nonpositive")
+        self._interval_seconds: int = interval_seconds
         self._wss_urls: list[str] = wss_urls if wss_urls is not None else list(BSC_WSS_ENDPOINTS)
         self._contract_addr = contract_address
 
         self._lock = threading.Lock()
-        self._pools: dict[int, _EpochPool] = {}   # epoch -> pool
-        self._block_ts: dict[int, int] = {}        # block_number -> timestamp
-        self._seen_tx: set[str] = set()            # dedup by tx hash + log index
+        self._pools: dict[int, _EpochPool] = {}       # epoch -> pool (bounded to 2 entries)
+        self._block_ts: dict[int, int] = {}            # block_number -> timestamp
+        self._seen_tx: dict[int, set[str]] = {}        # epoch -> set of "tx_hash:log_idx"
+
+        # Round-phase state (set by engine via set_round_phase).
+        self._current_epoch: int = -1
+        self._lock_at: int = 0
 
         self._thread: threading.Thread | None = None
-        self._watchdog_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._force_reconnect = threading.Event()
 
         self._connected = False
         self._current_endpoint: str = ""
         self._last_connected_at: float = 0.0
         self._last_event_at: float = 0.0
         self._total_events = 0
+
+        # Failure streak counter (incremented per unhealthy session, reset on healthy one).
+        self._failure_streak: int = 0
+
+        # Backfill tracking.
+        self._backfill_count: int = 0
+        self._last_backfill_at: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -134,41 +130,35 @@ class PoolEventWatcher:
                 "epochs_tracked": len(self._pools),
                 "total_events": self._total_events,
                 "blocks_tracked": len(self._block_ts),
+                "backfill_count": self._backfill_count,
+                "last_backfill_at": self._last_backfill_at,
             }
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
-        self._force_reconnect.clear()
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="pool-event-watcher",
         )
-        self._watchdog_thread = threading.Thread(
-            target=self._watchdog_loop, daemon=True, name="pool-watcher-watchdog",
-        )
         self._thread.start()
-        self._watchdog_thread.start()
         info("POOL_WSS", "START", "OK",
              msg=f"Pool event watcher started ({len(self._wss_urls)} endpoints)")
 
     def stop(self) -> None:
         self._stop_event.set()
-        self._force_reconnect.set()  # unblock any sleeping ws_listen
         if self._thread is not None:
             self._thread.join(timeout=10)
             self._thread = None
-        if self._watchdog_thread is not None:
-            self._watchdog_thread.join(timeout=5)
-            self._watchdog_thread = None
         self._connected = False
         info("POOL_WSS", "STOP", "OK", msg="Pool event watcher stopped")
 
-    def get_pool(self, epoch: int, *, max_ts: int = 0) -> tuple[float, float]:
-        """Return (bull_bnb, bear_bnb) from confirmed events for a given epoch.
-
-        If max_ts > 0, only include bets with block_timestamp < max_ts.
+    def get_pool(self, epoch: int, *, max_ts: int) -> tuple[float, float]:
+        """Return (bull_bnb, bear_bnb) from confirmed events for a given epoch,
+        including only bets with 0 < block_timestamp < max_ts.
         """
+        if max_ts <= 0:
+            raise InvariantError("get_pool_max_ts_nonpositive")
         bull_wei = 0
         bear_wei = 0
 
@@ -183,11 +173,10 @@ class PoolEventWatcher:
                     if ts > 0:
                         bet.block_ts = ts
 
-                if max_ts > 0:
-                    if bet.block_ts == 0:
-                        continue
-                    if bet.block_ts >= max_ts:
-                        continue
+                if bet.block_ts == 0:
+                    continue
+                if bet.block_ts >= max_ts:
+                    continue
 
                 if bet.side == "Bull":
                     bull_wei += bet.amount_wei
@@ -196,144 +185,107 @@ class PoolEventWatcher:
 
         return bull_wei / BNB_WEI, bear_wei / BNB_WEI
 
-    def clear_old_epochs(self, keep_after: int) -> None:
+    def set_round_phase(self, *, current_epoch: int, lock_at: int) -> None:
+        """Engine-driven state sync; called once per runtime iteration.
+
+        Always strictly advances `current_epoch` after the first call
+        (enforced as an invariant — the engine loop structure guarantees
+        strictly increasing epochs between iterations that reach this
+        method). On first call, triggers the initial backfill if a WSS
+        session is already connected.
+        """
+        if current_epoch < 0:
+            raise InvariantError("set_round_phase_negative_epoch")
+        if lock_at <= 0:
+            raise InvariantError("set_round_phase_lock_at_nonpositive")
+
         with self._lock:
-            stale = [e for e in self._pools if e <= keep_after]
-            for e in stale:
-                del self._pools[e]
+            prev_epoch = self._current_epoch
+            is_first_call = (prev_epoch == -1)
+
+            if not is_first_call and current_epoch <= prev_epoch:
+                raise InvariantError(
+                    f"set_round_phase_non_advancing: prev={prev_epoch} new={current_epoch}"
+                )
+
+            if is_first_call:
+                info("POOL_WSS", "EPOCH", "INIT",
+                     msg=f"Initialized at epoch {current_epoch}",
+                     epoch=current_epoch)
+                self._current_epoch = current_epoch
+            else:
+                # Drop stale epochs (strictly less than new current_epoch) from
+                # both _pools and _seen_tx. The "+1" next-epoch entries are kept.
+                stale_pools = [e for e in self._pools if e < current_epoch]
+                stale_seen = [e for e in self._seen_tx if e < current_epoch]
+                for e in stale_pools:
+                    del self._pools[e]
+                for e in stale_seen:
+                    del self._seen_tx[e]
+                self._current_epoch = current_epoch
+
+            self._lock_at = lock_at
+
+            # Bounded _block_ts: keep most recent 500 once we exceed 1000.
+            # (Migrated from clear_old_epochs; behavior unchanged.)
             if len(self._block_ts) > 1000:
                 sorted_blocks = sorted(self._block_ts.keys())
-                for b in sorted_blocks[:-500]:
-                    del self._block_ts[b]
+                for bn in sorted_blocks[:-500]:
+                    del self._block_ts[bn]
 
-    # ------------------------------------------------------------------
-    # Internal: watchdog
-    # ------------------------------------------------------------------
+            trigger_backfill = is_first_call and self._connected
 
-    def _watchdog_loop(self) -> None:
-        while not self._stop_event.is_set():
-            self._stop_event.wait(timeout=_WATCHDOG_POLL_SECONDS)
-            if self._stop_event.is_set():
-                break
-            if not self._connected:
-                continue
-            age = time.time() - self._last_event_at
-            if age > _WATCHDOG_STALE_SECONDS:
-                warn("POOL_WSS", "WDG", "STALE",
-                     msg=f"No events for {age:.0f}s on {self._current_endpoint}, forcing reconnect")
-                self._connected = False
-                self._force_reconnect.set()
+        # Outside the lock: backfill_round does HTTP and re-acquires self._lock
+        # via _process_bet_event.
+        if trigger_backfill:
+            self.backfill_round(lock_at - self._interval_seconds)
 
     # ------------------------------------------------------------------
     # Internal: connection loop
     # ------------------------------------------------------------------
 
-    def _interruptible_sleep(self, seconds: float) -> None:
-        deadline = time.time() + seconds
-        while not self._stop_event.is_set():
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            time.sleep(min(0.1, remaining))
-
     def _run_loop(self) -> None:
-        ep_states = [_EndpointState(url=url) for url in self._wss_urls]
-        ep_idx = 0
+        n = len(self._wss_urls)
+        idx = 0
 
         while not self._stop_event.is_set():
-            # --- Circuit breaker: find next available endpoint ---
-            now = time.time()
-            n = len(ep_states)
-            available_indices = [
-                i for i in range(n) if ep_states[i].circuit_open_until <= now
-            ]
-
-            if not available_indices:
-                # All circuit-open; wait for the soonest to re-close.
-                soonest = min(s.circuit_open_until for s in ep_states)
-                wait = max(1.0, soonest - now)
-                warn("POOL_WSS", "CB", "ALL_OPEN",
-                     msg=f"All endpoints circuit-open, waiting {wait:.0f}s for cooldown")
-                self._interruptible_sleep(min(wait, 30.0))
-                continue
-
-            # Round-robin within available endpoints: pick smallest index >= ep_idx,
-            # or wrap to the first available.
-            skipped = [ep_states[i].url for i in range(n) if ep_states[i].circuit_open_until > now]
-            if skipped:
-                remaining = min(ep_states[i].circuit_open_until - now
-                                for i in range(n) if ep_states[i].circuit_open_until > now)
-                info("POOL_WSS", "CB", "SKIP",
-                     msg=f"Skipping circuit-open: {skipped} (soonest re-open in {remaining:.0f}s)")
-            chosen = None
-            for i in available_indices:
-                if i >= ep_idx:
-                    chosen = i
-                    break
-            if chosen is None:
-                chosen = available_indices[0]
-
-            ep_idx = chosen
-            state = ep_states[ep_idx]
-
-            # --- Backoff delay (skip on very first attempt, step==0 + no prior failures) ---
-            if state.backoff_step > 0 or state.consecutive_failures > 0:
-                step = min(state.backoff_step, len(_BACKOFF_STEPS) - 1)
-                base = _BACKOFF_STEPS[step]
-                delay = base * random.uniform(*_BACKOFF_JITTER)
-                warn("POOL_WSS", "RETRY", "WAIT",
-                     msg=f"Endpoint {state.url} backoff {delay:.1f}s "
-                         f"(step={step}, failures={state.consecutive_failures})")
-                self._interruptible_sleep(delay)
-
-            if self._stop_event.is_set():
-                break
-
-            # --- Attempt connection ---
-            self._current_endpoint = state.url
-            state.session_connected_at = 0.0
-            self._force_reconnect.clear()
+            url = self._wss_urls[idx]
+            self._current_endpoint = url
+            session_start = time.time()
 
             try:
-                asyncio.run(self._ws_listen(state))
+                asyncio.run(self._ws_listen(url))
             except Exception as e:
-                self._connected = False
                 warn("POOL_WSS", "ERR", "RECONN",
-                     msg=f"Endpoint {state.url}: {type(e).__name__}: {e}")
+                     msg=f"Endpoint {url}: {type(e).__name__}: {e}")
+            self._connected = False
 
-            # --- Post-session: update backoff / circuit breaker ---
-            session_duration = 0.0
-            if state.session_connected_at > 0:
-                session_duration = time.time() - state.session_connected_at
-
+            session_duration = time.time() - session_start
             if session_duration >= _BACKOFF_RESET_SECONDS:
-                # Healthy session — reset this endpoint's failure counters.
-                state.backoff_step = 0
-                state.consecutive_failures = 0
-                info("POOL_WSS", "EP", "RESET",
-                     msg=f"Endpoint {state.url} healthy ({session_duration:.0f}s), backoff reset")
+                self._failure_streak = 0  # healthy session
             else:
-                state.consecutive_failures += 1
-                state.backoff_step = min(state.backoff_step + 1, len(_BACKOFF_STEPS) - 1)
+                self._failure_streak += 1
 
-                if state.consecutive_failures >= _CB_FAILURE_THRESHOLD:
-                    state.circuit_open_until = time.time() + _CB_COOLDOWN_SECONDS
-                    warn("POOL_WSS", "CB", "OPEN",
-                         msg=f"Endpoint {state.url} circuit-open 5min "
-                             f"(failures={state.consecutive_failures})")
+            idx = (idx + 1) % n
 
-            # Advance to next endpoint for the next attempt.
-            ep_idx = (ep_idx + 1) % n
+            # Back off only when we've cycled through every endpoint without a healthy session.
+            if self._failure_streak >= n:
+                step = min(self._failure_streak - n, len(_BACKOFF_STEPS) - 1)
+                delay = _BACKOFF_STEPS[step]
+                warn("POOL_WSS", "RETRY", "WAIT",
+                     msg=f"All endpoints failed; backoff {delay}s (streak={self._failure_streak})")
+                if self._stop_event.wait(timeout=delay):
+                    break
 
     # ------------------------------------------------------------------
     # Internal: WebSocket session
     # ------------------------------------------------------------------
 
-    async def _ws_listen(self, state: _EndpointState) -> None:
+    async def _ws_listen(self, url: str) -> None:
         import websockets
 
         async with websockets.connect(
-            state.url, ping_interval=None, open_timeout=10,
+            url, ping_interval=30, ping_timeout=10, open_timeout=15,
         ) as ws:
             # Subscribe to BetBull/BetBear events
             await ws.send(json.dumps({
@@ -347,7 +299,7 @@ class PoolEventWatcher:
             logs_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
             if "result" not in logs_resp:
                 warn("POOL_WSS", "SUB", "FAIL",
-                     msg=f"Logs subscription failed on {state.url}: {logs_resp}")
+                     msg=f"Logs subscription failed on {url}: {logs_resp}")
                 await asyncio.sleep(2)
                 return
 
@@ -362,7 +314,7 @@ class PoolEventWatcher:
             heads_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
             if "result" not in heads_resp:
                 warn("POOL_WSS", "SUB", "FAIL",
-                     msg=f"newHeads subscription failed on {state.url}: {heads_resp}")
+                     msg=f"newHeads subscription failed on {url}: {heads_resp}")
                 await asyncio.sleep(2)
                 return
 
@@ -373,26 +325,26 @@ class PoolEventWatcher:
             self._connected = True
             self._last_connected_at = now
             self._last_event_at = now
-            state.session_connected_at = now
+            session_start_at = now
             session_events = 0
             info("POOL_WSS", "SUB", "OK",
-                 msg=f"Subscribed on {state.url}")
+                 msg=f"Subscribed on {url}")
+
+            # Reconnect-triggered backfill. Skip only when the engine hasn't
+            # yet established round-phase state (first process start, pre-iter-1);
+            # set_round_phase will trigger it instead.
+            if self._lock_at > 0:
+                self.backfill_round(self._lock_at - self._interval_seconds)
 
             disconnect_reason = "stop"
-            while not self._stop_event.is_set() and not self._force_reconnect.is_set():
+            while not self._stop_event.is_set():
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 except asyncio.TimeoutError:
-                    # No message for 10s — send ping to confirm liveness.
-                    if self._force_reconnect.is_set():
-                        disconnect_reason = "force_reconnect"
-                        break
-                    try:
-                        pong = await ws.ping()
-                        await asyncio.wait_for(pong, timeout=5)
-                    except Exception:
-                        disconnect_reason = "ping_timeout"
-                        break
+                    # Short timeout exists only so the _stop_event check fires.
+                    # Library-level ping_interval=30 / ping_timeout=10 handles
+                    # real liveness: a silent TCP drop raises ConnectionClosedError
+                    # out of ws.recv(), bubbling to _run_loop.
                     continue
 
                 self._last_event_at = time.time()
@@ -410,14 +362,11 @@ class PoolEventWatcher:
                 elif sub_id == heads_sub_id:
                     self._process_new_head(result)
 
-            if self._force_reconnect.is_set() and disconnect_reason == "stop":
-                disconnect_reason = "force_reconnect"
-
         # Log session summary before marking disconnected.
-        duration = time.time() - state.session_connected_at if state.session_connected_at > 0 else 0
+        duration = time.time() - session_start_at
         if duration > 0:
             warn("POOL_WSS", "WS", "CLOSED",
-                 msg=f"Session ended on {state.url}: reason={disconnect_reason} "
+                 msg=f"Session ended on {url}: reason={disconnect_reason} "
                      f"duration={duration:.0f}s events={session_events}")
         self._connected = False
 
@@ -448,15 +397,24 @@ class PoolEventWatcher:
         if amount_wei <= 0:
             return
 
+        # Epoch gate: accept only the tracked pair {current_epoch, current_epoch+1}.
+        # Short-circuit before phase is initialized so backfill-before-first-phase
+        # can populate _pools freely.
+        if self._current_epoch >= 0 and epoch not in (
+            self._current_epoch, self._current_epoch + 1
+        ):
+            return
+
         tx_hash = log.get("transactionHash", "")
         log_idx = log.get("logIndex", "")
         dedup_key = f"{tx_hash}:{log_idx}"
 
         with self._lock:
-            if dedup_key and dedup_key in self._seen_tx:
+            seen = self._seen_tx.setdefault(epoch, set())
+            if dedup_key and dedup_key in seen:
                 return
             if dedup_key:
-                self._seen_tx.add(dedup_key)
+                seen.add(dedup_key)
 
             block_ts = self._block_ts.get(block_number, 0)
 
@@ -626,6 +584,10 @@ class PoolEventWatcher:
                                 count += 1
                                 bet_blocks.add(bn)
                     blocks_with_bets += len(bet_blocks)
+
+            with self._lock:
+                self._backfill_count += 1
+                self._last_backfill_at = time.time()
 
             info("POOL_WSS", "BKFILL", "OK",
                  msg=f"Backfilled {count} bets from {blocks_with_bets} blocks "

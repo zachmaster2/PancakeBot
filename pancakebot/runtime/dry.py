@@ -36,7 +36,6 @@ _BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
 class _ClosedState:
     strategy_pipeline: MomentumOnlyPipeline | None = None
     claim_scan_initialized: bool = False
-    pool_backfill_done: bool = False
     simulated_bankroll_bnb: float | None = None
     dry_bets_by_epoch: dict[int, dict[str, object]] = field(default_factory=dict)
     dry_settled_epochs: set[int] = field(default_factory=set)

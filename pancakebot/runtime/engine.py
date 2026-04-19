@@ -166,13 +166,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if lock_ts_t <= 0:
             raise InvariantError("lock_ts_t_invalid")
 
-        # Step 4b: Backfill pool data on first iteration only.
-        # After this, WSS subscription catches all bets in real time.
-        if cfg.pool_watcher is not None and not closed.pool_backfill_done:
-            round_start_ts = lock_ts_t - cfg.interval_seconds
-            cfg.pool_watcher.backfill_round(round_start_ts)
-            closed.pool_backfill_done = True
-
         # Step 5: cutoff_ts(t) = lock_ts(t) - cutoff_seconds.
         cutoff_ts_t = lock_ts_t - cfg.cutoff_seconds
 
@@ -246,6 +239,15 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             if gate is not None:
                 gate.warmup_session()
 
+        # Sync round-phase state into pool_watcher. Runs regardless of
+        # connection state so phase advances are recorded and backfill can
+        # pick up on the next successful reconnect.
+        if cfg.pool_watcher is not None:
+            cfg.pool_watcher.set_round_phase(
+                current_epoch=current_epoch,
+                lock_at=lock_ts_t,
+            )
+
         # Pool data from WSS subscription (no RPC needed, ~0 ms).
         pool_bull_bnb = 0.0
         pool_bear_bnb = 0.0
@@ -259,8 +261,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 info("POOL_WSS", "ROUND", "DATA",
                      epoch=current_epoch, pool_bnb=f"{pool_total:.4f}",
                      endpoint=cfg.pool_watcher.current_endpoint)
-            if locked_epoch > 2:
-                cfg.pool_watcher.clear_old_epochs(keep_after=locked_epoch - 2)
         elif cfg.pool_watcher is not None:
             info("POOL_WSS", "ROUND", "DISC",
                  epoch=current_epoch,
