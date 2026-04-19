@@ -119,6 +119,16 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         locked_round, _open_round, current_epoch, _open_rd = _epoch_handshake(cfg)
         locked_epoch = locked_round.epoch
 
+        # Sync round-phase state into pool_watcher immediately after handshake.
+        # This triggers the initial backfill within seconds of WSS subscription
+        # rather than after the prefetch sleep, giving the first cycle accurate
+        # pool data without delay.
+        if cfg.pool_watcher is not None:
+            cfg.pool_watcher.set_round_phase(
+                current_epoch=current_epoch,
+                lock_at=int(_open_round.lock_at),
+            )
+
         if locked_round.lock_price is None:
             raise InvariantError("locked_round_missing_lock_price")
         bnbusd_price = locked_round.lock_price
@@ -238,15 +248,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             gate = closed.strategy_pipeline._gate
             if gate is not None:
                 gate.warmup_session()
-
-        # Sync round-phase state into pool_watcher. Runs regardless of
-        # connection state so phase advances are recorded and backfill can
-        # pick up on the next successful reconnect.
-        if cfg.pool_watcher is not None:
-            cfg.pool_watcher.set_round_phase(
-                current_epoch=current_epoch,
-                lock_at=lock_ts_t,
-            )
 
         # Pool data from WSS subscription (no RPC needed, ~0 ms).
         pool_bull_bnb = 0.0
