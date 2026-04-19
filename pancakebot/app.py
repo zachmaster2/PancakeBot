@@ -146,7 +146,7 @@ def run_from_config(
 
     # Pool event watcher: subscribes to confirmed BetBull/BetBear events
     # via public WSS for accurate pool tracking (no signup required).
-    pool_watcher = PoolEventWatcher()
+    pool_watcher = PoolEventWatcher(interval_seconds=interval_seconds)
     pool_watcher.start()
 
     runtime_cfg = RuntimeConfig(
