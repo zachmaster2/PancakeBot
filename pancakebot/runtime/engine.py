@@ -253,6 +253,36 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         pool_bull_bnb = 0.0
         pool_bear_bnb = 0.0
         if cfg.pool_watcher is not None and cfg.pool_watcher.connected:
+            # Gate: if backfill is still running, our pool data is incomplete.
+            # Skip rather than decide on partial data.
+            if not cfg.pool_watcher.is_backfill_done():
+                if cfg.dry:
+                    if closed.simulated_bankroll_bnb is None:
+                        raise InvariantError("dry_bankroll_uninitialized")
+                    bankroll_bnb = closed.simulated_bankroll_bnb
+                else:
+                    bankroll_bnb = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
+                warn("POOL_WSS", "BKFILL", "INCOMPL",
+                     msg=f"Skip epoch {current_epoch}: backfill_incomplete")
+                _record_dry_cycle_audit(
+                    cfg,
+                    closed,
+                    current_epoch=current_epoch,
+                    locked_epoch=locked_epoch,
+                    lock_ts=lock_ts_t,
+                    cutoff_ts=cutoff_ts_t,
+                    locked_price_bnbusd=bnbusd_price,
+                    action="SKIP",
+                    decision_stage="pipeline",
+                    open_round=open_round,
+                    bankroll_before_action_bnb=bankroll_bnb,
+                    bankroll_after_action_bnb=bankroll_bnb,
+                    skip_reason="backfill_incomplete",
+                )
+                info("RUN", "ACT", "SKIP",
+                     msg=f"Skip epoch {current_epoch}: backfill_incomplete")
+                _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
+                return
             pool_ts_cutoff = lock_ts_t - POOL_CUTOFF_SECONDS
             pool_bull_bnb, pool_bear_bnb = cfg.pool_watcher.get_pool(
                 epoch=current_epoch, max_ts=pool_ts_cutoff,
