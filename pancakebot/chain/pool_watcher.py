@@ -104,6 +104,20 @@ class PoolEventWatcher:
         self._backfill_count: int = 0
         self._last_backfill_at: float = 0.0
 
+        # First newHead of current session — used as overlap target so the
+        # RPC backfill scans up to at least that block (closes the gap
+        # between RPC node and WSS node).
+        self._first_newhead_block: int = 0
+
+        # Per-session flag: only one backfill is triggered per WSS session.
+        # Reset on every new _ws_listen connection.
+        self._backfill_triggered_this_session: bool = False
+
+        # Set when no backfill is in flight. Engine gates decisions on this.
+        # Initially set: nothing pending.
+        self._backfill_done_event: threading.Event = threading.Event()
+        self._backfill_done_event.set()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -133,6 +147,34 @@ class PoolEventWatcher:
                 "backfill_count": self._backfill_count,
                 "last_backfill_at": self._last_backfill_at,
             }
+
+    def is_backfill_done(self) -> bool:
+        """True when no backfill is currently in flight (initial state is True)."""
+        return self._backfill_done_event.is_set()
+
+    def _try_trigger_backfill(self) -> None:
+        """Called under self._lock. Fires backfill in a daemon thread when both
+        first_newhead and lock_at are set, and backfill hasn't yet been
+        triggered this session."""
+        if self._backfill_triggered_this_session:
+            return
+        if self._first_newhead_block == 0:
+            return
+        if self._lock_at <= 0:
+            return
+        target = self._first_newhead_block
+        round_start_ts = self._lock_at - self._interval_seconds
+        self._backfill_triggered_this_session = True
+        self._backfill_done_event.clear()
+        info("POOL_WSS", "BKFILL", "TRIG",
+             msg=f"Triggering backfill in thread, target_block={target}",
+             round_start_ts=round_start_ts, min_to_block=target)
+        threading.Thread(
+            target=self.backfill_round,
+            kwargs={"round_start_ts": round_start_ts, "min_to_block": target},
+            daemon=True,
+            name="pool-backfill",
+        ).start()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -191,8 +233,9 @@ class PoolEventWatcher:
         Always strictly advances `current_epoch` after the first call
         (enforced as an invariant — the engine loop structure guarantees
         strictly increasing epochs between iterations that reach this
-        method). On first call, triggers the initial backfill if a WSS
-        session is already connected.
+        method). Calls `_try_trigger_backfill` after updating `_lock_at`:
+        actual backfill fires only when a first newHead has also arrived
+        on the current WSS session.
         """
         if current_epoch < 0:
             raise InvariantError("set_round_phase_negative_epoch")
@@ -233,12 +276,7 @@ class PoolEventWatcher:
                 for bn in sorted_blocks[:-500]:
                     del self._block_ts[bn]
 
-            trigger_backfill = is_first_call and self._connected
-
-        # Outside the lock: backfill_round does HTTP and re-acquires self._lock
-        # via _process_bet_event.
-        if trigger_backfill:
-            self.backfill_round(lock_at - self._interval_seconds)
+            self._try_trigger_backfill()
 
     # ------------------------------------------------------------------
     # Internal: connection loop
@@ -283,6 +321,15 @@ class PoolEventWatcher:
 
     async def _ws_listen(self, url: str) -> None:
         import websockets
+
+        # Reset session-scoped state for this fresh subscription.
+        # Backfill is triggered by the first newHead on this session (in
+        # _process_new_head) or by the first set_round_phase call after
+        # a newHead has arrived — never directly here.
+        with self._lock:
+            self._first_newhead_block = 0
+            self._backfill_triggered_this_session = False
+            self._backfill_done_event.set()  # nothing pending yet
 
         async with websockets.connect(
             url, ping_interval=30, ping_timeout=10, open_timeout=15,
@@ -329,12 +376,6 @@ class PoolEventWatcher:
             session_events = 0
             info("POOL_WSS", "SUB", "OK",
                  msg=f"Subscribed on {url}")
-
-            # Reconnect-triggered backfill. Skip only when the engine hasn't
-            # yet established round-phase state (first process start, pre-iter-1);
-            # set_round_phase will trigger it instead.
-            if self._lock_at > 0:
-                self.backfill_round(self._lock_at - self._interval_seconds)
 
             disconnect_reason = "stop"
             while not self._stop_event.is_set():
@@ -435,6 +476,9 @@ class PoolEventWatcher:
 
         with self._lock:
             self._block_ts[block_number] = timestamp
+            if self._first_newhead_block == 0:
+                self._first_newhead_block = block_number
+                self._try_trigger_backfill()
 
     # ------------------------------------------------------------------
     # Internal: RPC helpers (for backfill)
@@ -470,7 +514,7 @@ class PoolEventWatcher:
         by_id = {r["id"]: r.get("result") for r in body} if isinstance(body, list) else {}
         return [by_id.get(i) for i in range(len(calls))]
 
-    def backfill_round(self, round_start_ts: int) -> None:
+    def backfill_round(self, round_start_ts: int, min_to_block: int = 0) -> None:
         """Backfill bets by scanning blocks from round_start_ts to now.
 
         Uses batched eth_getBlockByNumber with full transactions (works on
@@ -478,7 +522,16 @@ class PoolEventWatcher:
         Filters transactions to the prediction contract and parses
         bet events from transaction receipts.
 
-        Called once by the runtime loop after the first epoch handshake.
+        If min_to_block > 0, polls eth_blockNumber until the RPC node has
+        reached at least that block (overlap target: the first newHead block
+        from WSS). This closes the gap between the RPC node and the WSS node
+        so the scan range is guaranteed to cover everything the WSS will
+        subsequently deliver.
+
+        Always sets `_backfill_done_event` in the finally clause so callers
+        (e.g. engine gate) can rely on completion signaling regardless of
+        success, exception, or early return on stop_event.
+
         Dedup by tx_hash:log_index prevents double-counting with WSS.
         """
         _BSC_BLOCK_TIME = 0.5  # conservative (actual ~0.44s)
@@ -490,6 +543,24 @@ class PoolEventWatcher:
             if not isinstance(block_num_hex, str):
                 raise InvariantError("backfill_block_number_failed")
             current_block = int(block_num_hex, 16)
+
+            # Poll until RPC node catches up to the WSS node's first-newhead
+            # block so the scan covers everything WSS will deliver.
+            if min_to_block > 0 and current_block < min_to_block:
+                poll_start = time.time()
+                while current_block < min_to_block:
+                    if self._stop_event.is_set():
+                        return
+                    if time.time() - poll_start > 30.0:
+                        warn("POOL_WSS", "BKFILL", "POLL_TO",
+                             msg=f"RPC at block {current_block}, target {min_to_block}; proceeding")
+                        break
+                    if self._stop_event.wait(timeout=0.5):
+                        return
+                    block_num_hex = self._rpc_call(rpc, "eth_blockNumber", [])
+                    if isinstance(block_num_hex, str):
+                        current_block = int(block_num_hex, 16)
+
             cur_block_data = self._rpc_call(
                 rpc, "eth_getBlockByNumber", [hex(current_block), False],
             )
@@ -599,3 +670,7 @@ class PoolEventWatcher:
 
         except Exception as e:
             warn("POOL_WSS", "BKFILL", "FAIL", msg=f"{e}")
+        finally:
+            # Always signal completion so any waiter (engine decision gate)
+            # is unblocked, even on exception or early stop_event return.
+            self._backfill_done_event.set()
