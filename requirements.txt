@@ -10,3 +10,4 @@ torch>=2.11.0
 matplotlib>=3.10.8
 web3>=7.15.0
 websockets>=14.0,<16.0  # pinned by web3 7.x
+psutil>=5.9.0
