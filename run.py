@@ -46,6 +46,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if args.dry or args.live:
+        from pancakebot.runtime.single_instance import find_duplicate_bots
+        from pancakebot.log import error
+        dupes = find_duplicate_bots()
+        if dupes:
+            for p in dupes:
+                error("CORE", "START", "DUP_PROC",
+                      msg="another dry/live bot already running",
+                      pid=p["pid"], cmdline=p["cmdline"], started_at=p["started_at"])
+            sys.exit(2)
     try:
         run_from_config(
             config_path=args.config,
