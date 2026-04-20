@@ -47,6 +47,12 @@ class MomentumGateResult:
     eth_signal_strength: float = 0.0     # ETH min(|r|) when its own multi-TF fires
     sol_signal: str | None = None        # SOL's own multi-TF direction
     sol_signal_strength: float = 0.0     # SOL min(|r|) when its own multi-TF fires
+    # BTC 2-of-3 (secondary regime; fires when BTC 3-of-3 doesn't).
+    # NOTE: whenever BTC 3-of-3 fires, BTC 2-of-3 also fires (3-of-3 is a
+    # strict subset). The pipeline uses 3-of-3 first, only falling back to
+    # 2-of-3 on the 3-of-3 silent path.
+    btc_2of3_signal: str | None = None   # "Bull" / "Bear" / None
+    btc_2of3_strength: float = 0.0       # min(|r|) across the 2+ agreeing lookbacks
 
 
 class MomentumGate:
@@ -307,6 +313,33 @@ def _compute_pair_multi_tf(
     return None, 0.0
 
 
+def _compute_pair_2of3(
+    closes: list[float] | None,
+) -> tuple[str | None, float]:
+    """Compute 2-of-3 multi-TF agreement for a single pair.
+
+    Returns (direction, min_abs_of_agreeing_lookbacks) if 2 or 3 of the 3
+    lookback returns agree in direction; else (None, 0.0).
+
+    NOTE: 3-of-3 is a strict subset of 2-of-3. Whenever `_compute_pair_multi_tf`
+    fires, this function also fires with the same direction (and identical
+    min_abs, since all 3 agree ⇒ "the 2+ agreeing" is all 3).
+    """
+    if closes is None:
+        return None, 0.0
+    rets_opt = [_get_return(closes, lb) for lb in _MTF_LOOKBACKS]
+    if any(r is None for r in rets_opt):
+        return None, 0.0
+    rets: list[float] = [r for r in rets_opt if r is not None]
+    pos = [r for r in rets if r > 0]
+    neg = [r for r in rets if r < 0]
+    if len(pos) >= 2:
+        return "Bull", min(abs(r) for r in pos)
+    if len(neg) >= 2:
+        return "Bear", min(abs(r) for r in neg)
+    return None, 0.0
+
+
 def _compute_signal(
     btc_closes: list[float] | None,
     eth_closes: list[float] | None = None,
@@ -324,12 +357,18 @@ def _compute_signal(
     eth_sig, eth_sig_str = _compute_pair_multi_tf(eth_closes)
     sol_sig, sol_sig_str = _compute_pair_multi_tf(sol_closes)
 
+    # Always compute BTC 2-of-3 (used by btc_2of3 secondary regime).
+    # Independent of the 3-of-3 check below; whenever 3-of-3 fires, 2-of-3
+    # also fires with the same direction (subset relationship).
+    btc_2of3_sig, btc_2of3_str = _compute_pair_2of3(btc_closes)
+
     def _no_btc_result(skip_reason: str) -> MomentumGateResult:
         return MomentumGateResult(
             signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
             skip_reason=skip_reason,
             eth_signal=eth_sig, eth_signal_strength=eth_sig_str,
             sol_signal=sol_sig, sol_signal_strength=sol_sig_str,
+            btc_2of3_signal=btc_2of3_sig, btc_2of3_strength=btc_2of3_str,
         )
 
     if btc_closes is None:
@@ -372,4 +411,5 @@ def _compute_signal(
         sol_confirmation_strength=sol_confirm,
         eth_signal=eth_sig, eth_signal_strength=eth_sig_str,
         sol_signal=sol_sig, sol_signal_strength=sol_sig_str,
+        btc_2of3_signal=btc_2of3_sig, btc_2of3_strength=btc_2of3_str,
     )
