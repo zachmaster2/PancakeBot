@@ -42,23 +42,6 @@ pool_size_boundary_bnb = 3.0
 base_fraction = 0.04
 max_bet_bnb = 2.0
 
-# NEW secondary regime: 2-of-3 BTC lookback agreement with tighter gates.
-# Priority: primary(3-of-3) -> btc_2of3 -> eth_sol_fallback -> no-signal.
-# Fires only when primary is silent.
-[strategy.btc_2of3]
-enabled = false
-
-[strategy.btc_2of3.signal]
-threshold = 0.0003             # stricter than primary
-
-[strategy.btc_2of3.filter]
-min_pool_bnb = 2.0             # stricter than primary's 1.5
-min_payout = 2.0               # stricter than primary's 1.5
-
-[strategy.btc_2of3.sizing]
-base_fraction = 0.02
-max_bet_bnb = 0.5
-
 [strategy.eth_sol_fallback.signal]
 min_strength = 0.00015
 
