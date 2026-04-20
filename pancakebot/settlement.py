@@ -101,14 +101,20 @@ def settle_bet_against_closed_round(
     """
     if bet_bnb < 0.0:
         raise InvariantError("settle_bet_bnb_negative")
-    if round_closed.position is None:
-        raise InvariantError("settle_round_not_closed")
     if not (0.0 <= treasury_fee_fraction < 1.0):
         raise InvariantError("settle_treasury_fee_fraction_out_of_range")
 
     bet_side_u = bet_side.upper()
     if bet_side_u not in ("BULL", "BEAR"):
         raise InvariantError("settle_bet_side_invalid")
+
+    # Failed rounds must be handled BEFORE the position check: on-chain-failed
+    # rounds have position=None (no winner), and all bets are refunded in full.
+    if round_closed.failed:
+        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
+
+    if round_closed.position is None:
+        raise InvariantError("settle_round_not_closed")
 
     winner_u = round_closed.position.upper()
 
@@ -117,9 +123,6 @@ def settle_bet_against_closed_round(
     pools_wei = compute_pool_amounts_wei(bets=round_closed.bets)
     bull_pool_bnb = pools_wei.bull_wei / BNB_WEI
     bear_pool_bnb = pools_wei.bear_wei / BNB_WEI
-
-    if round_closed.failed:
-        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
     if winner_u not in ("BULL", "BEAR", "HOUSE"):
         raise InvariantError("settle_winner_invalid")

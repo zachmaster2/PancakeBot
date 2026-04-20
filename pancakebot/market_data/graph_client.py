@@ -55,11 +55,8 @@ class GraphClient:
         query = """query LatestUsableClosedEpoch {
   rounds(
     where: {
-      failed: false,
-      startAt_not: null,
-      lockPrice_not: null,
-      closePrice_not: null,
-      position_in: [\"Bull\", \"Bear\", \"House\"]
+      failed_not: null,
+      startAt_not: null
     },
     first: 1,
     orderBy: epoch,
@@ -190,11 +187,8 @@ class GraphClient:
             raise InvariantError("fetch_closed_rounds_requires_epoch_bound")
 
         where_parts = [
-            "failed: false",
+            "failed_not: null",
             "startAt_not: null",
-            "lockPrice_not: null",
-            "closePrice_not: null",
-            'position_in: ["Bull","Bear","House"]',
         ]
         if epoch_gte is not None:
             where_parts.append("epoch_gte: $epoch_gte")
@@ -415,9 +409,32 @@ class GraphClient:
                 bets=tuple(bets),
             )
 
-        # closed usable
-        if failed is not False:
-            raise InvariantError("closed_round_failed_not_false")
+        # closed — either usable (failed=False) or on-chain-failed (failed=True).
+        if failed is None:
+            raise InvariantError("closed_round_failed_null")
+        if failed is not True and failed is not False:
+            raise InvariantError("closed_round_failed_not_bool")
+
+        if failed:
+            # Failed round: executeRound() never successfully closed. lockPrice
+            # MAY be set (round reached lock), closePrice/position always null.
+            # All bets on such rounds are refunded per contract semantics.
+            lock_price_failed = (
+                None if lock_price is None
+                else _as_float_or_raise(lock_price, "failed_round_bad_lockPrice")
+            )
+            return Round(
+                epoch=epoch,
+                start_at=start_at,
+                lock_at=start_at + interval_seconds,
+                lock_price=lock_price_failed,
+                close_price=None,
+                position=None,
+                failed=True,
+                bets=tuple(bets),
+            )
+
+        # failed=False → usable closed round
         lock_price_closed = _as_float_or_raise(lock_price, "closed_round_missing_lockPrice")
         close_price_closed = _as_float_or_raise(close_price, "closed_round_missing_closePrice")
         if position is None:
