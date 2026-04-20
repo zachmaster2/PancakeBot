@@ -29,8 +29,7 @@ _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 
 _KLINES_PER_ROUND = 31  # Must match momentum_gate._CANDLE_COUNT
 _FETCH_WORKERS = 4      # concurrent OKX fetches per batch
-_FETCH_RETRIES = 3      # retry failed OKX requests
-_RETRY_DELAY_S = 1.0    # base delay between retries (doubles each attempt)
+# Retry is now handled inside OkxClient.fetch_raw (centralized policy).
 
 # Global rate limiter: OKX allows 20 req/2s per endpoint per IP = 10/s.
 # All sync threads share this to avoid 429 errors.
@@ -164,64 +163,19 @@ def sync_runtime_market_data(
         eth_synced = eth_fut.result()
         sol_synced = sol_fut.result()
 
-    # Phase 3: Integrity -- trim all stores to the exact intersection so
-    # every closed round has klines in ALL 4 stores.  Retry transient
-    # failures first, then trim any epochs that genuinely have no data.
+    # Phase 3: Integrity assertion -- with centralized retry inside OkxClient,
+    # a successful Phase 2 means every pair has the full expected epoch set by
+    # construction. Any fetch failure would have raised InvariantError already.
+    # We keep the assertion as a hard-stop tripwire for unexpected drift.
     all_stores = [
-        ("BNB-USDT", bnb_store, "BNB-retry"),
-        ("BTC-USDT", btc_store, "BTC-retry"),
-        ("ETH-USDT", eth_store, "ETH-retry"),
-        ("SOL-USDT", sol_store, "SOL-retry"),
+        ("BNB-USDT", bnb_store),
+        ("BTC-USDT", btc_store),
+        ("ETH-USDT", eth_store),
+        ("SOL-USDT", sol_store),
     ]
-    _MAX_RETRY_PASSES = 3
-
-    for retry_pass in range(_MAX_RETRY_PASSES):
-        covered_epochs = set.intersection(*(s.load_done_epochs() for _, s, _ in all_stores))
-        all_epochs = {int(r.epoch) for r in tail_rounds}
-        uncovered = all_epochs - covered_epochs
-        if not uncovered:
-            break
-
-        info(
-            "CORE", "SYNC", "INTEG",
-            msg=(
-                f"Retry pass {retry_pass + 1}/{_MAX_RETRY_PASSES}: "
-                f"{len(uncovered)} rounds still missing klines "
-                f"(epochs {min(uncovered)}..{max(uncovered)})"
-            ),
-        )
-        uncovered_rounds = [r for r in tail_rounds if int(r.epoch) in uncovered]
-        for inst_id, store, label in all_stores:
-            _sync_1s_klines(
-                rounds=uncovered_rounds, inst_id=inst_id,
-                store=store, label=label, cutoff_seconds=cutoff_s,
-                okx_client=okx_client,
-            )
-
-    # After retries, trim stores to the exact intersection across all 4 kline
-    # stores: every closed round must have klines in ALL stores.
-    all_round_epochs = {int(r.epoch) for r in rounds_all}
-    all_kline_epoch_sets = [s.load_done_epochs() for _, s, _ in all_stores]
-    valid_epochs = all_round_epochs & set.intersection(*all_kline_epoch_sets)
-
-    trimmed_rounds = len(all_round_epochs) - len(valid_epochs)
-    if trimmed_rounds > 0:
-        _trim_closed_rounds(round_store, valid_epochs)
-        info("CORE", "SYNC", "TRIM",
-             msg=f"Trimmed closed_rounds: {len(all_round_epochs)} -> {len(valid_epochs)}")
-    for inst_id, store, _ in all_stores:
-        store_epochs = store.load_done_epochs()
-        trimmed = len(store_epochs) - len(valid_epochs)
-        if trimmed > 0:
-            _trim_kline_store(store, valid_epochs)
-            label = inst_id.split("-")[0]  # "BNB-USDT" -> "BNB"
-            info("CORE", "SYNC", "TRIM",
-                 msg=f"Trimmed {label} klines: {len(store_epochs)} -> {len(valid_epochs)}")
-
-    # Re-read final state after any trimming.
     final_rounds = list(round_store.iter_closed_rounds())
     final_round_epochs = {int(r.epoch) for r in final_rounds}
-    for inst_id, store, _ in all_stores:
+    for inst_id, store in all_stores:
         store_epochs = store.load_done_epochs()
         if final_round_epochs != store_epochs:
             raise InvariantError(
@@ -233,8 +187,7 @@ def sync_runtime_market_data(
         "CORE", "SYNC", "INTEG",
         msg=(
             f"Stores aligned: {len(final_round_epochs)} epochs "
-            f"[{min(final_round_epochs)}..{max(final_round_epochs)}] "
-            f"(trimmed {trimmed_rounds} rounds)"
+            f"[{min(final_round_epochs)}..{max(final_round_epochs)}]"
         ),
     )
 
@@ -252,33 +205,6 @@ def sync_runtime_market_data(
         eth_klines_synced=int(eth_synced),
         sol_klines_synced=int(sol_synced),
     )
-
-
-def _trim_closed_rounds(store: ClosedRoundsStore, valid_epochs: set[int]) -> None:
-    """Remove closed rounds whose epochs are not in valid_epochs (atomic)."""
-    all_rounds = list(store.iter_closed_rounds())
-    kept = [r for r in all_rounds if int(r.epoch) in valid_epochs]
-    kept.sort(key=lambda r: int(r.epoch))
-
-    tmp = store.path_jsonl + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        for r in kept:
-            f.write(json.dumps(r.to_json(), separators=(",", ":")) + "\n")
-    _os.replace(tmp, store.path_jsonl)
-
-    info("CORE", "SYNC", "TRIM",
-         msg=f"Trimmed closed rounds: {len(all_rounds)} -> {len(kept)}")
-
-
-def _trim_kline_store(store: KlineStore, valid_epochs: set[int]) -> None:
-    """Remove kline records whose epochs are not in valid_epochs (atomic)."""
-    all_records = list(store.iter_records())
-    kept = [r for r in all_records if int(r["epoch"]) in valid_epochs]
-    kept.sort(key=lambda r: int(r["epoch"]))
-    store.rewrite(kept)
-
-    info("CORE", "SYNC", "TRIM",
-         msg=f"Trimmed kline store: {len(all_records)} -> {len(kept)}")
 
 
 _BATCH_SIZE = 50  # fetch+flush in small ordered batches for resumability
@@ -304,11 +230,6 @@ def _sync_1s_klines(
     Both passes survive interruption: the append pass writes incrementally,
     and the prepend staging file is resumed on restart.
     """
-    # Purge any legacy error records so those epochs get retried.
-    purged = store.purge_and_rewrite()
-    if purged > 0:
-        info("SYNC", "1S_KL", label, msg=f"Purged {purged} error records for retry")
-
     done_epochs = store.load_done_epochs()
     remaining = [r for r in rounds if int(r.epoch) not in done_epochs]
     if not remaining:
@@ -338,36 +259,29 @@ def _sync_1s_klines(
     )
 
     total_synced = 0
-    total_errors = 0
 
     # --- Pass 1: Append (epochs after existing store) ---
+    # Raises InvariantError on unrecoverable OKX failure (caller's sync fails loud).
     if append_rounds:
-        synced, errors = _fetch_and_append(
+        total_synced += _fetch_and_append(
             rounds_asc=append_rounds, inst_id=inst_id, store=store, label=label,
             latest_on_disk=latest_on_disk, done_count=len(done_epochs),
             cutoff_seconds=cutoff_seconds, okx_client=okx_client,
         )
-        total_synced += synced
-        total_errors += errors
 
     # --- Pass 2: Prepend (epochs before existing store) ---
     if prepend_rounds:
         staging_path = store.path_jsonl + ".prepend_staging"
-        synced, errors = _fetch_to_staging(
+        synced = _fetch_to_staging(
             rounds_asc=prepend_rounds, inst_id=inst_id,
             staging_path=staging_path, label=label,
             cutoff_seconds=cutoff_seconds, okx_client=okx_client,
         )
-        total_errors += errors
         if synced > 0:
             _prepend_staging_to_store(store=store, staging_path=staging_path, label=label)
             total_synced += synced
 
-    if total_errors > 0:
-        info("SYNC", "1S_KL", label,
-             msg=f"WARNING: {total_errors} epochs failed -- re-run sync to retry them")
-
-    info("SYNC", "1S_KL", label, msg=f"Done: {total_synced} synced, {total_errors} failed")
+    info("SYNC", "1S_KL", label, msg=f"Done: {total_synced} synced")
     return total_synced
 
 
@@ -375,10 +289,13 @@ def _fetch_and_append(
     *, rounds_asc: list, inst_id: str, store: KlineStore, label: str,
     latest_on_disk: int | None, done_count: int, cutoff_seconds: int = 2,
     okx_client: OkxClient,
-) -> tuple[int, int]:
-    """Fetch epochs in ordered batches and append each to store immediately."""
+) -> int:
+    """Fetch epochs in ordered batches and append each to store immediately.
+
+    Raises InvariantError on unrecoverable OKX failure (any batch fetch that
+    exhausts retries inside OkxClient).
+    """
     synced = 0
-    errors = 0
     prev_epoch = latest_on_disk if latest_on_disk is not None else 0
 
     for batch_start in range(0, len(rounds_asc), _BATCH_SIZE):
@@ -386,8 +303,7 @@ def _fetch_and_append(
         if batch_start > 0:
             time.sleep(1.0)
 
-        results, batch_errors = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds, okx_client=okx_client)
-        errors += batch_errors
+        results = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds, okx_client=okx_client)
         if not results:
             continue
 
@@ -408,16 +324,19 @@ def _fetch_and_append(
 
         if (batch_start + _BATCH_SIZE) % 200 < _BATCH_SIZE:
             info("SYNC", "1S_KL", label,
-                 msg=f"  append: {done_count + synced} done, {errors} errors")
+                 msg=f"  append: {done_count + synced} done")
 
-    return synced, errors
+    return synced
 
 
 def _fetch_to_staging(
     *, rounds_asc: list, inst_id: str, staging_path: str, label: str,
     cutoff_seconds: int = 2, okx_client: OkxClient,
-) -> tuple[int, int]:
-    """Fetch older epochs into a staging file (resumable append-only)."""
+) -> int:
+    """Fetch older epochs into a staging file (resumable append-only).
+
+    Raises InvariantError on unrecoverable OKX failure.
+    """
     # Load what's already in the staging file from a prior interrupted run.
     staged_epochs: set[int] = set()
     if _os.path.exists(staging_path):
@@ -430,10 +349,9 @@ def _fetch_to_staging(
 
     still_needed = [r for r in rounds_asc if int(r.epoch) not in staged_epochs]
     if not still_needed:
-        return len(staged_epochs), 0
+        return len(staged_epochs)
 
     synced = len(staged_epochs)
-    errors = 0
 
     # Append to staging file incrementally (batch by batch).
     _os.makedirs(_os.path.dirname(staging_path) or ".", exist_ok=True)
@@ -443,8 +361,7 @@ def _fetch_to_staging(
             if batch_start > 0:
                 time.sleep(1.0)
 
-            results, batch_errors = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds, okx_client=okx_client)
-            errors += batch_errors
+            results = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds, okx_client=okx_client)
 
             for rec in results:
                 staging_f.write(json.dumps(rec, separators=(",", ":")) + "\n")
@@ -453,9 +370,9 @@ def _fetch_to_staging(
 
             if (batch_start + _BATCH_SIZE) % 200 < _BATCH_SIZE:
                 info("SYNC", "1S_KL", label,
-                     msg=f"  prepend staging: {synced} staged, {errors} errors")
+                     msg=f"  prepend staging: {synced} staged")
 
-    return synced, errors
+    return synced
 
 
 def _prepend_staging_to_store(*, store: KlineStore, staging_path: str, label: str) -> None:
@@ -486,49 +403,41 @@ def _prepend_staging_to_store(*, store: KlineStore, staging_path: str, label: st
          msg=f"  prepended {len(staging_records)} older epochs into store")
 
 
-def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient, cutoff_seconds: int = 2) -> tuple[list[dict], int]:
-    """Fetch a batch of rounds in parallel. Returns (results, error_count)."""
+def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient, cutoff_seconds: int = 2) -> list[dict]:
+    """Fetch a batch of rounds in parallel.
+
+    Returns the list of kline records. Propagates any exception raised by
+    `_fetch_one_kline` (OkxClient's retry exhaustion surfaces as InvariantError).
+    """
     results: list[dict] = []
-    errors = 0
     with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
         futures = {pool.submit(_fetch_one_kline, rnd, inst_id, okx_client, cutoff_seconds): rnd for rnd in batch}
         for fut in as_completed(futures):
-            # noinspection PyBroadException
-            try:
-                rec = fut.result()
-            except Exception:
-                # Any fetch failure counts as an error.
-                errors += 1
-                continue
-            if rec is None:
-                errors += 1
-                continue
+            rec = fut.result()  # propagates exception on failure
             results.append(rec)
-    return results, errors
+    return results
 
 
-def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient, cutoff_seconds: int = 2) -> dict | None:
-    """Fetch 1s klines for a single round. Returns record dict or None."""
+def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient, cutoff_seconds: int = 2) -> dict:
+    """Fetch 1s klines for a single round. Returns record dict.
+
+    Raises InvariantError via _fetch_1s_klines if OkxClient's retry exhausts.
+    """
     epoch = int(rnd.epoch)
-    lock_at = rnd.lock_at
-    if lock_at is None:
-        return None
-    cutoff_ms = int(lock_at) * 1000 - cutoff_seconds * 1000
+    lock_at = int(rnd.lock_at)
+    cutoff_ms = lock_at * 1000 - cutoff_seconds * 1000
     klines = _fetch_1s_klines(inst_id=inst_id, anchor_ms=cutoff_ms, okx_client=okx_client)
-    if klines is None:
-        return None
-    return {"epoch": epoch, "lock_at": int(lock_at), "klines_1s": klines}
+    return {"epoch": epoch, "lock_at": lock_at, "klines_1s": klines}
 
 
-def _fetch_1s_klines(*, inst_id: str, anchor_ms: int, okx_client: OkxClient) -> list[list] | None:
-    """Fetch 1s klines ending just before anchor_ms from OKX.
+def _fetch_1s_klines(*, inst_id: str, anchor_ms: int, okx_client: OkxClient) -> list[list]:
+    """Fetch 1s klines ending just before anchor_ms from OKX (sync mode).
 
-    Uses the shared OkxClient session (keep-alive) for fast fetches.
-    Tries history-candles first, falls back to the live candles endpoint.
-    Each endpoint is retried up to _FETCH_RETRIES times.
+    Tries history-candles first, falls back to the candles endpoint on
+    InvariantError from the primary. Retry is handled inside OkxClient.fetch_raw.
 
-    Returns list of [ts_ms, open, high, low, close, volume] sorted
-    oldest-first, or None on failure.
+    Returns list of [ts_ms, open, high, low, close, volume] sorted oldest-first.
+    Raises InvariantError if both endpoints exhaust retries.
     """
     params = {
         "instId": inst_id,
@@ -536,31 +445,27 @@ def _fetch_1s_klines(*, inst_id: str, anchor_ms: int, okx_client: OkxClient) -> 
         "limit": str(_KLINES_PER_ROUND),
         "after": str(anchor_ms),
     }
-    for endpoint in ("history-candles", "candles"):
-        for attempt in range(_FETCH_RETRIES):
-            _rate_acquire()
-            body = okx_client.fetch_raw(endpoint=endpoint, params=params)
+    endpoints = ("history-candles", "candles")
+    for i, endpoint in enumerate(endpoints):
+        is_last = (i == len(endpoints) - 1)
+        try:
+            body = okx_client.fetch_raw(
+                endpoint=endpoint,
+                params=params,
+                expected_count=_KLINES_PER_ROUND,
+                rate_acquire_fn=_rate_acquire,
+            )
+        except InvariantError:
+            if is_last:
+                raise
+            continue  # try fallback endpoint
 
-            if body is None:
-                time.sleep(_RETRY_DELAY_S * (2 ** attempt))
-                continue
+        rows = body["data"]  # newest first; OkxClient guarantees len == _KLINES_PER_ROUND
+        return [
+            [int(row[0]), float(row[1]), float(row[2]), float(row[3]),
+             float(row[4]), float(row[5])]
+            for row in reversed(rows)
+        ]
 
-            if body.get("code") != "0" or not body.get("data"):
-                break  # non-transient: try next endpoint
-
-            rows = body["data"]  # newest first
-            if len(rows) < _KLINES_PER_ROUND * 0.9:
-                break  # insufficient data: try next endpoint
-
-            out = []
-            for row in reversed(rows):
-                out.append([
-                    int(row[0]),
-                    float(row[1]),
-                    float(row[2]),
-                    float(row[3]),
-                    float(row[4]),
-                    float(row[5]),
-                ])
-            return out
-    return None
+    # Unreachable: loop either returns or raises on the last iteration.
+    raise InvariantError(f"okx_sync_unreachable: inst={inst_id}")

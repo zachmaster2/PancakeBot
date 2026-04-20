@@ -47,14 +47,28 @@ def _safe_rate(num: int, den: int) -> float:
     return num / den if den > 0 else 0.0
 
 
-def _load_all_rounds(runtime_cfg) -> list[Round]:
-    """Load closed rounds from round_store (JSONL) or market_data_store (SQLite)."""
+def _load_all_rounds(runtime_cfg, *, include_failed: bool = False) -> list[Round]:
+    """Load closed rounds from round_store (JSONL) or market_data_store (SQLite).
+
+    `include_failed=False` (default) excludes on-chain-failed rounds from the
+    returned list. Backtests call with the default to match live betting
+    economics: failed rounds refund all bets, so they contribute no signal
+    information and would only inflate the iteration count.
+
+    Callers needing the full raw set (e.g. sync-integrity checks, recovery
+    tools) pass `include_failed=True`.
+    """
     market_data_store = getattr(runtime_cfg, "market_data_store", None)
     if market_data_store is not None and hasattr(market_data_store, "iter_closed_rounds"):
-        return list(market_data_store.iter_closed_rounds())
-    if runtime_cfg.round_store is not None:
-        return list(runtime_cfg.round_store.iter_closed_rounds())
-    raise InvariantError("backtest_no_round_store_available")
+        rounds = list(market_data_store.iter_closed_rounds())
+    elif runtime_cfg.round_store is not None:
+        rounds = list(runtime_cfg.round_store.iter_closed_rounds())
+    else:
+        raise InvariantError("backtest_no_round_store_available")
+
+    if not include_failed:
+        rounds = [r for r in rounds if not r.failed]
+    return rounds
 
 
 def _load_klines_from(path: Path) -> dict[int, list[list]]:
