@@ -212,13 +212,10 @@ class MomentumOnlyPipeline:
                 pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, pool_cutoff_ts)
         pool_total = pool_bull_bnb + pool_bear_bnb
 
-        # Determine signal source via priority order:
-        #   primary (BTC 3-of-3) -> btc_2of3 -> eth_sol_fallback -> no-signal.
-        # btc_2of3 is gated by self._strategy.btc_2of3.enabled (default False).
+        # Determine signal source: primary (BTC) or regime-2 (ETH+SOL)
         signal_dir = None
         effective_strength = 0.0
         is_regime2 = False
-        is_btc_2of3 = False
 
         if result.signal is not None:
             # Primary: BTC multi-TF fires
@@ -233,30 +230,6 @@ class MomentumOnlyPipeline:
                     effective_strength += result.eth_confirmation_strength * _ETH_SIZING_WEIGHT
                 if result.sol_confirmation_strength > 0:
                     effective_strength += result.sol_confirmation_strength * _SOL_SIZING_WEIGHT
-
-        if signal_dir is None and self._strategy.btc_2of3.enabled:
-            # btc_2of3 secondary: fires only when primary is silent. Applies
-            # its own stricter threshold + pool + payout filters inline so a
-            # true positive is selected only when all three conditions pass.
-            # Whenever primary 3-of-3 fires, 2-of-3 also fires (subset), so
-            # primary-first priority means this branch only runs on the
-            # primary-silent path.
-            b2 = self._strategy.btc_2of3
-            if (result.btc_2of3_signal is not None
-                    and result.btc_2of3_strength >= b2.signal.threshold
-                    and pool_total >= b2.filter.min_pool_bnb):
-                candidate_dir = result.btc_2of3_signal
-                candidate_our_side = (
-                    pool_bull_bnb if candidate_dir == "Bull" else pool_bear_bnb
-                )
-                candidate_payout = (
-                    pool_total * (1.0 - self._treasury_fee_fraction) / candidate_our_side
-                    if candidate_our_side > 0 else float("inf")
-                )
-                if candidate_payout >= b2.filter.min_payout:
-                    signal_dir = candidate_dir
-                    effective_strength = result.btc_2of3_strength
-                    is_btc_2of3 = True
 
         if signal_dir is None and _REGIME2_ENABLED:
             # Regime-2: ETH+SOL both fire same direction, BTC silent
@@ -277,14 +250,9 @@ class MomentumOnlyPipeline:
 
         # Pool filter: skip if visible pool is too small (dilution kills edge).
         # Exception: very strong primary signals can bypass on pools >= floor.
-        # btc_2of3 does NOT participate in strong-bypass (its stricter filters
-        # already ran inline above, and by construction its pool_total is
-        # already >= btc_2of3.filter.min_pool_bnb which should be >= the
-        # generic pool_filter floor).
         is_strong_bypass = False
         if pool_total < self._strategy.pool_filter.min_pool_bnb:
             if (not is_regime2
-                    and not is_btc_2of3
                     and result.signal_strength >= _STRONG_BYPASS_STRENGTH
                     and pool_total >= _STRONG_BYPASS_POOL_FLOOR):
                 is_strong_bypass = True
@@ -307,15 +275,6 @@ class MomentumOnlyPipeline:
                 our_side_bnb=our_side,
                 base_frac=es_sizing.base_fraction,
                 cap_bnb=es_sizing.max_bet_bnb,
-            )
-        elif is_btc_2of3:
-            b2_sizing = self._strategy.btc_2of3.sizing
-            bet_size = _compute_bet_size(
-                signal_strength=effective_strength,
-                pool_bnb=pool_total,
-                our_side_bnb=our_side,
-                base_frac=b2_sizing.base_fraction,
-                cap_bnb=b2_sizing.max_bet_bnb,
             )
         elif is_strong_bypass:
             bet_size = _compute_bet_size(
