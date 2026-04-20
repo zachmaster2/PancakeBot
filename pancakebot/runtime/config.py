@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pancakebot.config import StrategyConfig
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.chain.prediction_contract import Web3PredictionContract
 from pancakebot.strategy.momentum_gate import MomentumGate
@@ -51,6 +52,9 @@ class RuntimeConfig:
 
     # No-archive: delete (don't archive) existing dry state on --fresh
     dry_no_archive: bool
+
+    # Strategy config (10 knobs; loaded from config.toml [strategy.*] sections)
+    strategy: StrategyConfig
 
     # Pool event watcher: accumulates BetBull/BetBear events for accurate pools
     pool_watcher: PoolEventWatcher | None = None

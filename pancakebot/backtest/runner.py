@@ -161,6 +161,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     gate_config: MomentumGateConfig = runtime_cfg.momentum_gate_config  # type: ignore[assignment]
     pipeline = MomentumOnlyPipeline(
         config=gate_config,
+        strategy_config=runtime_cfg.strategy,
         gate=None,
         cutoff_seconds=runtime_cfg.cutoff_seconds,
         min_bet_amount_bnb=runtime_cfg.min_bet_amount_bnb,
