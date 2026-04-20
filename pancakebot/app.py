@@ -78,6 +78,7 @@ def run_from_config(
             treasury_fee_fraction=cc.treasury_fee_fraction,
             interval_seconds=cc.interval_seconds,
             buffer_seconds=cc.buffer_seconds,
+            strategy=cfg.strategy,
         )
         run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=backtest_cfg, out_dir=Path("var/backtest"))
         return
@@ -165,6 +166,7 @@ def run_from_config(
         treasury_fee_fraction=treasury_fee_fraction,
         interval_seconds=interval_seconds,
         buffer_seconds=buffer_seconds,
+        strategy=cfg.strategy,
         momentum_gate=momentum_gate,
         pool_watcher=pool_watcher,
     )

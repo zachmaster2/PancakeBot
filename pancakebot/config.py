@@ -53,6 +53,122 @@ class BacktestConfig:
                 raise InvariantError("backtest_epoch_start_after_epoch_end")
 
 
+# -- Strategy config ----------------------------------------------------------
+#
+# 10 knobs exposed for TOML configuration. Three sections match the strategy's
+# logical layers: pool-admission filters, BTC primary signal, ETH+SOL fallback.
+# Other strategy values (multi-TF lookbacks, sizing slopes, cross-pair weights,
+# strong-signal bypass params) remain as module-level constants in
+# pancakebot/strategy/momentum_pipeline.py — they're more like algorithm
+# identity than experiment knobs.
+
+
+@dataclass(frozen=True, slots=True)
+class PoolFilterConfig:
+    """Pool-admission filters applied before any signal evaluation."""
+    min_pool_bnb: float
+    min_payout: float
+
+
+@dataclass(frozen=True, slots=True)
+class BtcPrimaryThresholdConfig:
+    """BTC primary signal thresholds, pool-size-adaptive."""
+    small_pool: float
+    large_pool: float
+    pool_size_boundary_bnb: float
+
+
+@dataclass(frozen=True, slots=True)
+class BtcPrimarySizingConfig:
+    """BTC primary bet sizing."""
+    base_fraction: float
+    max_bet_bnb: float
+
+
+@dataclass(frozen=True, slots=True)
+class BtcPrimaryConfig:
+    threshold: BtcPrimaryThresholdConfig
+    sizing: BtcPrimarySizingConfig
+
+
+@dataclass(frozen=True, slots=True)
+class EthSolFallbackSignalConfig:
+    """ETH+SOL fallback signal (fires when BTC primary is silent)."""
+    min_strength: float
+
+
+@dataclass(frozen=True, slots=True)
+class EthSolFallbackSizingConfig:
+    """ETH+SOL fallback bet sizing (smaller than primary due to lower WR)."""
+    base_fraction: float
+    max_bet_bnb: float
+
+
+@dataclass(frozen=True, slots=True)
+class EthSolFallbackConfig:
+    signal: EthSolFallbackSignalConfig
+    sizing: EthSolFallbackSizingConfig
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyConfig:
+    pool_filter: PoolFilterConfig
+    btc_primary: BtcPrimaryConfig
+    eth_sol_fallback: EthSolFallbackConfig
+
+    def validate(self) -> None:
+        """Assert invariants; raise InvariantError on any violation."""
+        pf = self.pool_filter
+        if pf.min_pool_bnb <= 0.0:
+            raise InvariantError("strategy_pool_filter_min_pool_bnb_must_be_positive")
+        if pf.min_payout < 1.0:
+            raise InvariantError("strategy_pool_filter_min_payout_must_be_at_least_1")
+
+        bt = self.btc_primary.threshold
+        if bt.small_pool <= 0.0:
+            raise InvariantError("strategy_btc_primary_threshold_small_pool_must_be_positive")
+        if bt.large_pool <= 0.0:
+            raise InvariantError("strategy_btc_primary_threshold_large_pool_must_be_positive")
+        if bt.pool_size_boundary_bnb <= 0.0:
+            raise InvariantError("strategy_btc_primary_threshold_pool_size_boundary_bnb_must_be_positive")
+
+        bs = self.btc_primary.sizing
+        if not (0.0 < bs.base_fraction < 1.0):
+            raise InvariantError("strategy_btc_primary_sizing_base_fraction_out_of_range")
+        if bs.max_bet_bnb <= 0.0:
+            raise InvariantError("strategy_btc_primary_sizing_max_bet_bnb_must_be_positive")
+
+        es = self.eth_sol_fallback.signal
+        if es.min_strength <= 0.0:
+            raise InvariantError("strategy_eth_sol_fallback_signal_min_strength_must_be_positive")
+
+        ez = self.eth_sol_fallback.sizing
+        if not (0.0 < ez.base_fraction < 1.0):
+            raise InvariantError("strategy_eth_sol_fallback_sizing_base_fraction_out_of_range")
+        if ez.max_bet_bnb <= 0.0:
+            raise InvariantError("strategy_eth_sol_fallback_sizing_max_bet_bnb_must_be_positive")
+
+
+# Default strategy values — match the module-level constants they replaced in
+# pancakebot/strategy/momentum_pipeline.py, so a config.toml without any
+# [strategy.*] sections reproduces the pre-refactor behavior exactly.
+_DEFAULT_STRATEGY = StrategyConfig(
+    pool_filter=PoolFilterConfig(min_pool_bnb=1.5, min_payout=1.5),
+    btc_primary=BtcPrimaryConfig(
+        threshold=BtcPrimaryThresholdConfig(
+            small_pool=0.0002,
+            large_pool=0.0001,
+            pool_size_boundary_bnb=3.0,
+        ),
+        sizing=BtcPrimarySizingConfig(base_fraction=0.04, max_bet_bnb=2.0),
+    ),
+    eth_sol_fallback=EthSolFallbackConfig(
+        signal=EthSolFallbackSignalConfig(min_strength=0.00015),
+        sizing=EthSolFallbackSizingConfig(base_fraction=0.02, max_bet_bnb=0.5),
+    ),
+)
+
+
 # -- App config ---------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +184,8 @@ class AppConfig:
 
     # Full BacktestConfig with validation (kept as inner dataclass).
     backtest: BacktestConfig
+    # Full StrategyConfig (defaults match pre-refactor module constants).
+    strategy: StrategyConfig
 
 
 # -- TOML parsing helpers -----------------------------------------------------
@@ -116,6 +234,78 @@ def _opt_bool(obj: dict[str, Any], key: str, default: bool) -> bool:
     if not isinstance(v, bool):
         raise InvariantError(f"config_key_not_bool: {key}")
     return v
+
+
+def _opt_section(parent: dict[str, Any], key: str) -> dict[str, Any]:
+    """Return parent[key] as a dict, or an empty dict if absent.
+
+    Used for nested [strategy.*] sections in config.toml — missing sections
+    fall back to defaults instead of raising.
+    """
+    v = parent.get(key)
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        raise InvariantError(f"config_section_not_dict: {key}")
+    return v
+
+
+def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
+    """Build StrategyConfig from the parsed TOML root dict.
+
+    Missing [strategy.*] sections or missing keys fall back to the defaults
+    in _DEFAULT_STRATEGY (which match the pre-refactor module constants).
+    """
+    strat_sec = _opt_section(cfg_toml, "strategy")
+    pf_sec = _opt_section(strat_sec, "pool_filter")
+    btc_sec = _opt_section(strat_sec, "btc_primary")
+    btc_thresh_sec = _opt_section(btc_sec, "threshold")
+    btc_sizing_sec = _opt_section(btc_sec, "sizing")
+    es_sec = _opt_section(strat_sec, "eth_sol_fallback")
+    es_signal_sec = _opt_section(es_sec, "signal")
+    es_sizing_sec = _opt_section(es_sec, "sizing")
+
+    d = _DEFAULT_STRATEGY
+    cfg = StrategyConfig(
+        pool_filter=PoolFilterConfig(
+            min_pool_bnb=_opt_float(pf_sec, "min_pool_bnb", d.pool_filter.min_pool_bnb),
+            min_payout=_opt_float(pf_sec, "min_payout", d.pool_filter.min_payout),
+        ),
+        btc_primary=BtcPrimaryConfig(
+            threshold=BtcPrimaryThresholdConfig(
+                small_pool=_opt_float(btc_thresh_sec, "small_pool", d.btc_primary.threshold.small_pool),
+                large_pool=_opt_float(btc_thresh_sec, "large_pool", d.btc_primary.threshold.large_pool),
+                pool_size_boundary_bnb=_opt_float(
+                    btc_thresh_sec, "pool_size_boundary_bnb",
+                    d.btc_primary.threshold.pool_size_boundary_bnb,
+                ),
+            ),
+            sizing=BtcPrimarySizingConfig(
+                base_fraction=_opt_float(btc_sizing_sec, "base_fraction", d.btc_primary.sizing.base_fraction),
+                max_bet_bnb=_opt_float(btc_sizing_sec, "max_bet_bnb", d.btc_primary.sizing.max_bet_bnb),
+            ),
+        ),
+        eth_sol_fallback=EthSolFallbackConfig(
+            signal=EthSolFallbackSignalConfig(
+                min_strength=_opt_float(
+                    es_signal_sec, "min_strength",
+                    d.eth_sol_fallback.signal.min_strength,
+                ),
+            ),
+            sizing=EthSolFallbackSizingConfig(
+                base_fraction=_opt_float(
+                    es_sizing_sec, "base_fraction",
+                    d.eth_sol_fallback.sizing.base_fraction,
+                ),
+                max_bet_bnb=_opt_float(
+                    es_sizing_sec, "max_bet_bnb",
+                    d.eth_sol_fallback.sizing.max_bet_bnb,
+                ),
+            ),
+        ),
+    )
+    cfg.validate()
+    return cfg
 
 
 # -- Main loader --------------------------------------------------------------
@@ -183,6 +373,8 @@ def load_app_config(path: str) -> AppConfig:
     )
     backtest_cfg.validate()
 
+    strategy_cfg = load_strategy_config(raw)
+
     return AppConfig(
         kline_cutoff_seconds=kline_cutoff_seconds,
         prefetch_offset_seconds=prefetch_offset_seconds,
@@ -191,4 +383,5 @@ def load_app_config(path: str) -> AppConfig:
         backtest_simulation_size=simulation_size,
         backtest_initial_bankroll_bnb=bt_bankroll,
         backtest=backtest_cfg,
+        strategy=strategy_cfg,
     )

@@ -701,6 +701,7 @@ def _build_momentum_pipeline(*, cfg: RuntimeConfig) -> MomentumOnlyPipeline:
     gate_config: MomentumGateConfig = cfg.momentum_gate_config  # type: ignore[assignment]
     return MomentumOnlyPipeline(
         config=gate_config,
+        strategy_config=cfg.strategy,
         gate=cfg.momentum_gate,
         cutoff_seconds=cfg.cutoff_seconds,
         min_bet_amount_bnb=cfg.min_bet_amount_bnb,

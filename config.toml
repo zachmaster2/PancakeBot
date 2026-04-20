@@ -18,3 +18,33 @@ min_bet_only = true
 # Number of most recent rounds to replay. Also controls how many rounds --sync fetches.
 simulation_size = 35000
 initial_bankroll_bnb = 50.0
+
+# ================================================================
+# Strategy configuration
+#
+# IMPORTANT: All pool-related settings refer to the CUTOFF POOL
+# (the partial pool observed at lock_at - POOL_CUTOFF_SECONDS,
+# ~6s before lock), NOT the final pool at settlement. The live bot
+# only observes pool growth up to this cutoff to maintain
+# deterministic decision-making.
+# ================================================================
+
+[strategy.pool_filter]
+min_pool_bnb = 1.5
+min_payout = 1.5
+
+[strategy.btc_primary.threshold]
+small_pool = 0.0002
+large_pool = 0.0001
+pool_size_boundary_bnb = 3.0
+
+[strategy.btc_primary.sizing]
+base_fraction = 0.04
+max_bet_bnb = 2.0
+
+[strategy.eth_sol_fallback.signal]
+min_strength = 0.00015
+
+[strategy.eth_sol_fallback.sizing]
+base_fraction = 0.02
+max_bet_bnb = 0.5
