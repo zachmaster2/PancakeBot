@@ -10,7 +10,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
-from pancakebot.market_data.okx_client import OkxClient
+from pancakebot.market_data.okx_client import OkxClient, OkxTransientError
 from pancakebot.log import warn
 
 # Number of 1s candles fetched and used by all modes (live, sync, backtest).
@@ -175,10 +175,17 @@ class MomentumGate:
         return result
 
     def _fetch_klines(self, symbol: str, count: int, after_ms: int | None = None) -> list[dict] | None:
+        """Live-mode OKX fetch: transient errors → skip round; permanent errors → crash.
+
+        OkxTransientError (retryable or insufficient-data): log warn + return None
+        so the caller skips the round on this pair. InvariantError (permanent
+        OKX error: bad instId, auth issue, etc.) propagates as a hard stop per
+        the project's error-handling policy.
+        """
         try:
             return self._client.fetch_1s_klines(symbol=symbol, count=count, after_ms=after_ms)
-        except Exception as e:
-            warn("GATE", "OKX", "FETCH_FAIL", symbol=symbol, reason=str(e))
+        except OkxTransientError as e:
+            warn("GATE", "OKX", "SKIP", symbol=symbol, reason=str(e))
             return None
 
     @staticmethod
