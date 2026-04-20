@@ -13,6 +13,7 @@ from pancakebot.config import StrategyConfig
 from pancakebot.constants import BNB_WEI
 from pancakebot.util import InvariantError
 from pancakebot.strategy.momentum_gate import (
+    _CANDLE_COUNT,
     MomentumGate,
     MomentumGateConfig,
     MomentumGateResult,
@@ -193,17 +194,24 @@ class MomentumOnlyPipeline:
         lock_at = int(round_t.lock_at)
         cutoff_ts_ms = (lock_at - self._cutoff_seconds) * 1000
 
+        vf = self._strategy.btc_primary.volatility_filter
         if self._gate is not None:
             # Live/dry: fetch from OKX (use async-fetched data if available)
             result = self._gate.evaluate(
                 cutoff_ts_ms=int(cutoff_ts_ms),
                 kline_futures=okx_kline_futures,
+                volatility_filter_enabled=vf.enabled,
+                min_range=vf.min_range,
+                volatility_window_candles=vf.window_candles,
             )
         else:
             # Backtest: use cached 1s klines
             result = self._evaluate_from_cache(
                 epoch=int(round_t.epoch),
                 cutoff_ts_ms=int(cutoff_ts_ms),
+                volatility_filter_enabled=vf.enabled,
+                min_range=vf.min_range,
+                volatility_window_candles=vf.window_candles,
             )
             # Compute pools from round bets if not provided externally.
             if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
@@ -308,6 +316,9 @@ class MomentumOnlyPipeline:
         *,
         epoch: int,
         cutoff_ts_ms: int,
+        volatility_filter_enabled: bool = False,
+        min_range: float = 0.0,
+        volatility_window_candles: int = _CANDLE_COUNT,
     ) -> MomentumGateResult:
         """Run signal logic on cached klines (backtest path)."""
         btc_klines = self._btc_klines_by_epoch.get(epoch)
@@ -321,6 +332,9 @@ class MomentumOnlyPipeline:
         return compute_signal_from_klines(
             btc_klines, cutoff_ts_ms,
             eth_klines=eth_klines, sol_klines=sol_klines,
+            volatility_filter_enabled=volatility_filter_enabled,
+            min_range=min_range,
+            volatility_window_candles=volatility_window_candles,
         )
 
     @staticmethod

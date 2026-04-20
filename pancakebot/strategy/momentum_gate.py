@@ -111,6 +111,9 @@ class MomentumGate:
         *,
         cutoff_ts_ms: int,
         kline_futures: tuple | None = None,
+        volatility_filter_enabled: bool = False,
+        min_range: float = 0.0,
+        volatility_window_candles: int = _CANDLE_COUNT,
     ) -> MomentumGateResult:
         """Compute signal from current OKX data.
 
@@ -120,6 +123,9 @@ class MomentumGate:
 
         If BNB klines fail validation because OKX is exactly 1 second
         behind (stale candle), retries once after a short delay.
+
+        *volatility_filter_enabled* / *min_range* are forwarded to
+        _compute_signal; when disabled (default) the filter is a no-op.
         """
         if not self._cfg.enabled:
             return MomentumGateResult(
@@ -167,7 +173,12 @@ class MomentumGate:
 
         self.last_btc_closes = btc_closes
 
-        result = _compute_signal(btc_closes, eth_closes, sol_closes)
+        result = _compute_signal(
+            btc_closes, eth_closes, sol_closes,
+            volatility_filter_enabled=volatility_filter_enabled,
+            min_range=min_range,
+            volatility_window_candles=volatility_window_candles,
+        )
 
         # NOTE: No logging here -- caller logs AFTER timing guard so
         # file I/O doesn't delay bet submission in the critical path.
@@ -252,11 +263,18 @@ def compute_signal_from_klines(
     cutoff_ms: int,
     eth_klines: list[list] | None = None,
     sol_klines: list[list] | None = None,
+    *,
+    volatility_filter_enabled: bool = False,
+    min_range: float = 0.0,
+    volatility_window_candles: int = _CANDLE_COUNT,
 ) -> MomentumGateResult:
     """Compute signal from raw kline arrays (backtest path).
 
     Trims klines to the same window the live path fetches, validates
     BTC (the signal source), then computes the signal.
+
+    *volatility_filter_enabled* / *min_range* are forwarded to
+    _compute_signal; when disabled (default) the filter is a no-op.
     """
     if btc_klines is not None:
         btc_klines = _trim_to_window(btc_klines, cutoff_ms)
@@ -281,7 +299,12 @@ def compute_signal_from_klines(
     if sol_klines and len(sol_klines) >= _CANDLE_COUNT:
         sol_closes = [k[4] for k in sol_klines]
 
-    return _compute_signal(btc_closes, eth_closes, sol_closes)
+    return _compute_signal(
+        btc_closes, eth_closes, sol_closes,
+        volatility_filter_enabled=volatility_filter_enabled,
+        min_range=min_range,
+        volatility_window_candles=volatility_window_candles,
+    )
 
 
 def _trim_to_window(klines: list[list], cutoff_ms: int) -> list[list]:
@@ -311,6 +334,10 @@ def _compute_signal(
     btc_closes: list[float] | None,
     eth_closes: list[float] | None = None,
     sol_closes: list[float] | None = None,
+    *,
+    volatility_filter_enabled: bool = False,
+    min_range: float = 0.0,
+    volatility_window_candles: int = _CANDLE_COUNT,
 ) -> MomentumGateResult:
     """Core signal logic shared by live and backtest paths.
 
@@ -319,6 +346,13 @@ def _compute_signal(
 
     ETH/SOL confirmation: if ETH or SOL multi-TF also fires in the same
     direction, their confirmation strengths are set for sizing boost.
+
+    When *volatility_filter_enabled*, the BTC signal is additionally
+    rejected ("gate_low_volatility") if the last *volatility_window_candles*
+    BTC closes have (max - min) / mean below *min_range*. This is a
+    BTC-primary filter only; ETH/SOL independent signals (regime-2) are
+    unaffected, so rejecting BTC here still allows regime-2 to fire
+    downstream.
     """
     # Always compute independent ETH/SOL multi-TF (used by regime-2).
     eth_sig, eth_sig_str = _compute_pair_multi_tf(eth_closes)
@@ -351,6 +385,21 @@ def _compute_signal(
         return _no_btc_result("gate_no_signal")
 
     direction = "Bull" if returns[0] > 0 else "Bear"
+
+    # Optional volatility filter: reject BTC signal when the price range
+    # over the last *volatility_window_candles* closes is too small
+    # (likely a single-move artifact). Regime-2 (ETH+SOL) is unaffected
+    # because _no_btc_result preserves eth_signal / sol_signal; the
+    # pipeline's fallback branch sees the BTC signal as None and can
+    # still fire ETH+SOL.
+    if volatility_filter_enabled:
+        window = btc_closes[-volatility_window_candles:]
+        mean_close = sum(window) / len(window)
+        if mean_close <= 0:
+            return _no_btc_result("gate_low_volatility")
+        price_range = (max(window) - min(window)) / mean_close
+        if price_range < min_range:
+            return _no_btc_result("gate_low_volatility")
 
     # Check ETH/SOL confirmation for sizing boost (reuse pre-computed signals)
     btc_positive = returns[0] > 0

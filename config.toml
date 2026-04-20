@@ -42,6 +42,17 @@ pool_size_boundary_bnb = 3.0
 base_fraction = 0.04
 max_bet_bnb = 2.0
 
+[strategy.btc_primary.volatility_filter]
+# When enabled, require BTC price range (max-min)/mean over the last
+# window_candles closes >= min_range. Each candle is a 1s bucket, so N
+# candles span N-1 seconds; the default 16 matches the multi-TF's 15s
+# lookback exactly. Filters out single-trade-window signals where 3-of-3
+# lookbacks agree only because one pre-15s move is the sole price change.
+# Rejection is BTC-only; regime-2 (ETH+SOL) can still fire on rejected rounds.
+enabled = false
+min_range = 0.0
+window_candles = 16
+
 [strategy.eth_sol_fallback.signal]
 min_strength = 0.00015
 
