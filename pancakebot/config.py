@@ -111,9 +111,39 @@ class EthSolFallbackConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class BtcTwoOfThreeSignalConfig:
+    """BTC 2-of-3 multi-TF agreement threshold (stricter than primary's 3-of-3)."""
+    threshold: float
+
+
+@dataclass(frozen=True, slots=True)
+class BtcTwoOfThreeFilterConfig:
+    """BTC 2-of-3 gating filters (stricter than primary's pool_filter)."""
+    min_pool_bnb: float
+    min_payout: float
+
+
+@dataclass(frozen=True, slots=True)
+class BtcTwoOfThreeSizingConfig:
+    """BTC 2-of-3 sizing (smaller than primary; expected lower WR)."""
+    base_fraction: float
+    max_bet_bnb: float
+
+
+@dataclass(frozen=True, slots=True)
+class BtcTwoOfThreeConfig:
+    """BTC 2-of-3 secondary regime (between primary and eth_sol_fallback)."""
+    enabled: bool
+    signal: BtcTwoOfThreeSignalConfig
+    filter: BtcTwoOfThreeFilterConfig
+    sizing: BtcTwoOfThreeSizingConfig
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyConfig:
     pool_filter: PoolFilterConfig
     btc_primary: BtcPrimaryConfig
+    btc_2of3: BtcTwoOfThreeConfig
     eth_sol_fallback: EthSolFallbackConfig
 
     def validate(self) -> None:
@@ -138,6 +168,20 @@ class StrategyConfig:
         if bs.max_bet_bnb <= 0.0:
             raise InvariantError("strategy_btc_primary_sizing_max_bet_bnb_must_be_positive")
 
+        b2 = self.btc_2of3
+        if not isinstance(b2.enabled, bool):
+            raise InvariantError("strategy_btc_2of3_enabled_not_bool")
+        if b2.signal.threshold <= 0.0:
+            raise InvariantError("strategy_btc_2of3_signal_threshold_must_be_positive")
+        if b2.filter.min_pool_bnb <= 0.0:
+            raise InvariantError("strategy_btc_2of3_filter_min_pool_bnb_must_be_positive")
+        if b2.filter.min_payout < 1.0:
+            raise InvariantError("strategy_btc_2of3_filter_min_payout_must_be_at_least_1")
+        if not (0.0 < b2.sizing.base_fraction < 1.0):
+            raise InvariantError("strategy_btc_2of3_sizing_base_fraction_out_of_range")
+        if b2.sizing.max_bet_bnb <= 0.0:
+            raise InvariantError("strategy_btc_2of3_sizing_max_bet_bnb_must_be_positive")
+
         es = self.eth_sol_fallback.signal
         if es.min_strength <= 0.0:
             raise InvariantError("strategy_eth_sol_fallback_signal_min_strength_must_be_positive")
@@ -152,6 +196,8 @@ class StrategyConfig:
 # Default strategy values — match the module-level constants they replaced in
 # pancakebot/strategy/momentum_pipeline.py, so a config.toml without any
 # [strategy.*] sections reproduces the pre-refactor behavior exactly.
+# btc_2of3 is DISABLED by default (untested secondary regime; enable only for
+# research sweeps with explicit validation).
 _DEFAULT_STRATEGY = StrategyConfig(
     pool_filter=PoolFilterConfig(min_pool_bnb=1.5, min_payout=1.5),
     btc_primary=BtcPrimaryConfig(
@@ -161,6 +207,12 @@ _DEFAULT_STRATEGY = StrategyConfig(
             pool_size_boundary_bnb=3.0,
         ),
         sizing=BtcPrimarySizingConfig(base_fraction=0.04, max_bet_bnb=2.0),
+    ),
+    btc_2of3=BtcTwoOfThreeConfig(
+        enabled=False,
+        signal=BtcTwoOfThreeSignalConfig(threshold=0.0003),
+        filter=BtcTwoOfThreeFilterConfig(min_pool_bnb=2.0, min_payout=2.0),
+        sizing=BtcTwoOfThreeSizingConfig(base_fraction=0.02, max_bet_bnb=0.5),
     ),
     eth_sol_fallback=EthSolFallbackConfig(
         signal=EthSolFallbackSignalConfig(min_strength=0.00015),
@@ -261,6 +313,10 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
     btc_sec = _opt_section(strat_sec, "btc_primary")
     btc_thresh_sec = _opt_section(btc_sec, "threshold")
     btc_sizing_sec = _opt_section(btc_sec, "sizing")
+    b2_sec = _opt_section(strat_sec, "btc_2of3")
+    b2_signal_sec = _opt_section(b2_sec, "signal")
+    b2_filter_sec = _opt_section(b2_sec, "filter")
+    b2_sizing_sec = _opt_section(b2_sec, "sizing")
     es_sec = _opt_section(strat_sec, "eth_sol_fallback")
     es_signal_sec = _opt_section(es_sec, "signal")
     es_sizing_sec = _opt_section(es_sec, "sizing")
@@ -283,6 +339,20 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
             sizing=BtcPrimarySizingConfig(
                 base_fraction=_opt_float(btc_sizing_sec, "base_fraction", d.btc_primary.sizing.base_fraction),
                 max_bet_bnb=_opt_float(btc_sizing_sec, "max_bet_bnb", d.btc_primary.sizing.max_bet_bnb),
+            ),
+        ),
+        btc_2of3=BtcTwoOfThreeConfig(
+            enabled=_opt_bool(b2_sec, "enabled", d.btc_2of3.enabled),
+            signal=BtcTwoOfThreeSignalConfig(
+                threshold=_opt_float(b2_signal_sec, "threshold", d.btc_2of3.signal.threshold),
+            ),
+            filter=BtcTwoOfThreeFilterConfig(
+                min_pool_bnb=_opt_float(b2_filter_sec, "min_pool_bnb", d.btc_2of3.filter.min_pool_bnb),
+                min_payout=_opt_float(b2_filter_sec, "min_payout", d.btc_2of3.filter.min_payout),
+            ),
+            sizing=BtcTwoOfThreeSizingConfig(
+                base_fraction=_opt_float(b2_sizing_sec, "base_fraction", d.btc_2of3.sizing.base_fraction),
+                max_bet_bnb=_opt_float(b2_sizing_sec, "max_bet_bnb", d.btc_2of3.sizing.max_bet_bnb),
             ),
         ),
         eth_sol_fallback=EthSolFallbackConfig(
