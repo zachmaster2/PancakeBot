@@ -86,23 +86,9 @@ class BtcPrimarySizingConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class BtcPrimaryVolatilityFilterConfig:
-    """BTC primary volatility filter: reject low-range windows.
-
-    When enabled, require BTC price range (max - min) / mean >= min_range over
-    the last *window_candles* BTC closes. Intended to filter signals that fire
-    only because of a single small move in an otherwise flat window.
-    """
-    enabled: bool
-    min_range: float
-    window_candles: int
-
-
-@dataclass(frozen=True, slots=True)
 class BtcPrimaryConfig:
     threshold: BtcPrimaryThresholdConfig
     sizing: BtcPrimarySizingConfig
-    volatility_filter: BtcPrimaryVolatilityFilterConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,19 +138,6 @@ class StrategyConfig:
         if bs.max_bet_bnb <= 0.0:
             raise InvariantError("strategy_btc_primary_sizing_max_bet_bnb_must_be_positive")
 
-        vf = self.btc_primary.volatility_filter
-        if not isinstance(vf.enabled, bool):
-            raise InvariantError("strategy_btc_primary_volatility_filter_enabled_not_bool")
-        if vf.min_range < 0.0:
-            raise InvariantError("strategy_btc_primary_volatility_filter_min_range_must_be_non_negative")
-        # Upper bound ties to the BTC kline fetch size; imported locally to
-        # keep config.py free of strategy-module top-level imports.
-        from pancakebot.strategy.momentum_gate import _CANDLE_COUNT
-        if not isinstance(vf.window_candles, int) or isinstance(vf.window_candles, bool):
-            raise InvariantError("strategy_btc_primary_volatility_filter_window_candles_not_int")
-        if not (1 < vf.window_candles <= _CANDLE_COUNT):
-            raise InvariantError("strategy_btc_primary_volatility_filter_window_candles_out_of_range")
-
         es = self.eth_sol_fallback.signal
         if es.min_strength <= 0.0:
             raise InvariantError("strategy_eth_sol_fallback_signal_min_strength_must_be_positive")
@@ -188,9 +161,6 @@ _DEFAULT_STRATEGY = StrategyConfig(
             pool_size_boundary_bnb=3.0,
         ),
         sizing=BtcPrimarySizingConfig(base_fraction=0.04, max_bet_bnb=2.0),
-        volatility_filter=BtcPrimaryVolatilityFilterConfig(
-            enabled=False, min_range=0.0, window_candles=16,
-        ),
     ),
     eth_sol_fallback=EthSolFallbackConfig(
         signal=EthSolFallbackSignalConfig(min_strength=0.00015),
@@ -291,7 +261,6 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
     btc_sec = _opt_section(strat_sec, "btc_primary")
     btc_thresh_sec = _opt_section(btc_sec, "threshold")
     btc_sizing_sec = _opt_section(btc_sec, "sizing")
-    btc_vf_sec = _opt_section(btc_sec, "volatility_filter")
     es_sec = _opt_section(strat_sec, "eth_sol_fallback")
     es_signal_sec = _opt_section(es_sec, "signal")
     es_sizing_sec = _opt_section(es_sec, "sizing")
@@ -314,20 +283,6 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
             sizing=BtcPrimarySizingConfig(
                 base_fraction=_opt_float(btc_sizing_sec, "base_fraction", d.btc_primary.sizing.base_fraction),
                 max_bet_bnb=_opt_float(btc_sizing_sec, "max_bet_bnb", d.btc_primary.sizing.max_bet_bnb),
-            ),
-            volatility_filter=BtcPrimaryVolatilityFilterConfig(
-                enabled=_opt_bool(
-                    btc_vf_sec, "enabled",
-                    d.btc_primary.volatility_filter.enabled,
-                ),
-                min_range=_opt_float(
-                    btc_vf_sec, "min_range",
-                    d.btc_primary.volatility_filter.min_range,
-                ),
-                window_candles=_opt_int(
-                    btc_vf_sec, "window_candles",
-                    d.btc_primary.volatility_filter.window_candles,
-                ),
             ),
         ),
         eth_sol_fallback=EthSolFallbackConfig(
