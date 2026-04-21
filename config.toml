@@ -48,3 +48,13 @@ min_strength = 0.00015
 [strategy.eth_sol_fallback.sizing]
 base_fraction = 0.02
 max_bet_bnb = 0.5
+
+[strategy.pool_predictor]
+# Replaces the gate's identity-based pool view (partial_total / partial_winner)
+# with a trained linear predictor of final pool state. model="none" means the
+# predictor is never loaded -- behavior is byte-identical to pre-predictor code.
+# Requires a fitted coefficients JSON (see research/phase2_pool_predictor.py).
+model = "none"               # "none" | "P2" | "P2_minimal" | "P3_lite"
+coefficients_path = ""       # path to JSON file with fitted coefficients
+use_for_gate = false         # substitute in payout-floor admission check
+use_for_sizing = false       # substitute in bet sizing Kelly formula

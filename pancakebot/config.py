@@ -111,10 +111,29 @@ class EthSolFallbackConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class PoolPredictorConfig:
+    """Pool predictor integration (see pancakebot.strategy.pool_predictor).
+
+    When enabled, replaces the gate's identity-based partial-pool view with a
+    trained linear regression predicting final pool state at settlement time.
+    model="none" keeps the predictor unloaded and all integration code dormant,
+    producing byte-identical behavior to pre-predictor code.
+    """
+    model: str               # "none" | "P2" | "P2_minimal" | "P3_lite"
+    coefficients_path: str   # JSON file with fitted coefficients (required when model != "none")
+    use_for_gate: bool       # substitute in payout-floor admission check
+    use_for_sizing: bool     # substitute in bet sizing Kelly formula
+
+
+_VALID_POOL_PREDICTOR_MODELS = ("none", "P2", "P2_minimal", "P3_lite")
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyConfig:
     pool_filter: PoolFilterConfig
     btc_primary: BtcPrimaryConfig
     eth_sol_fallback: EthSolFallbackConfig
+    pool_predictor: PoolPredictorConfig
 
     def validate(self) -> None:
         """Assert invariants; raise InvariantError on any violation."""
@@ -148,6 +167,24 @@ class StrategyConfig:
         if ez.max_bet_bnb <= 0.0:
             raise InvariantError("strategy_eth_sol_fallback_sizing_max_bet_bnb_must_be_positive")
 
+        pp = self.pool_predictor
+        if pp.model not in _VALID_POOL_PREDICTOR_MODELS:
+            raise InvariantError(
+                f"strategy_pool_predictor_model_invalid: got={pp.model!r} "
+                f"allowed={_VALID_POOL_PREDICTOR_MODELS}"
+            )
+        if not isinstance(pp.use_for_gate, bool):
+            raise InvariantError("strategy_pool_predictor_use_for_gate_not_bool")
+        if not isinstance(pp.use_for_sizing, bool):
+            raise InvariantError("strategy_pool_predictor_use_for_sizing_not_bool")
+        if pp.model != "none":
+            if not pp.coefficients_path:
+                raise InvariantError("strategy_pool_predictor_coefficients_path_required_when_model_enabled")
+            if not Path(pp.coefficients_path).exists():
+                raise InvariantError(
+                    f"strategy_pool_predictor_coefficients_path_missing: {pp.coefficients_path}"
+                )
+
 
 # Default strategy values — match the module-level constants they replaced in
 # pancakebot/strategy/momentum_pipeline.py, so a config.toml without any
@@ -165,6 +202,12 @@ _DEFAULT_STRATEGY = StrategyConfig(
     eth_sol_fallback=EthSolFallbackConfig(
         signal=EthSolFallbackSignalConfig(min_strength=0.00015),
         sizing=EthSolFallbackSizingConfig(base_fraction=0.02, max_bet_bnb=0.5),
+    ),
+    pool_predictor=PoolPredictorConfig(
+        model="none",
+        coefficients_path="",
+        use_for_gate=False,
+        use_for_sizing=False,
     ),
 )
 
@@ -236,6 +279,15 @@ def _opt_bool(obj: dict[str, Any], key: str, default: bool) -> bool:
     return v
 
 
+def _opt_str(obj: dict[str, Any], key: str, default: str) -> str:
+    if key not in obj:
+        return str(default)
+    v = obj[key]
+    if not isinstance(v, str):
+        raise InvariantError(f"config_key_not_str: {key}")
+    return v
+
+
 def _opt_section(parent: dict[str, Any], key: str) -> dict[str, Any]:
     """Return parent[key] as a dict, or an empty dict if absent.
 
@@ -264,6 +316,7 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
     es_sec = _opt_section(strat_sec, "eth_sol_fallback")
     es_signal_sec = _opt_section(es_sec, "signal")
     es_sizing_sec = _opt_section(es_sec, "sizing")
+    pp_sec = _opt_section(strat_sec, "pool_predictor")
 
     d = _DEFAULT_STRATEGY
     cfg = StrategyConfig(
@@ -303,8 +356,30 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
                 ),
             ),
         ),
+        pool_predictor=PoolPredictorConfig(
+            model=_opt_str(pp_sec, "model", d.pool_predictor.model),
+            coefficients_path=_opt_str(
+                pp_sec, "coefficients_path", d.pool_predictor.coefficients_path,
+            ),
+            use_for_gate=_opt_bool(
+                pp_sec, "use_for_gate", d.pool_predictor.use_for_gate,
+            ),
+            use_for_sizing=_opt_bool(
+                pp_sec, "use_for_sizing", d.pool_predictor.use_for_sizing,
+            ),
+        ),
     )
     cfg.validate()
+
+    # Soft warning: predictor configured but both integration flags off -- loaded but unused.
+    if cfg.pool_predictor.model != "none" and not (
+        cfg.pool_predictor.use_for_gate or cfg.pool_predictor.use_for_sizing
+    ):
+        from pancakebot.log import warn
+        warn("CFG", "STRAT", "PP_UNUSED",
+             model=cfg.pool_predictor.model,
+             reason="pool_predictor_loaded_but_flags_all_false")
+
     return cfg
 
 
