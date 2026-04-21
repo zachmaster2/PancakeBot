@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pancakebot.config import StrategyConfig
-from pancakebot.constants import BNB_WEI, POOL_CUTOFF_SECONDS
+from pancakebot.constants import BNB_WEI
 from pancakebot.util import InvariantError
 from pancakebot.strategy.momentum_gate import (
     MomentumGate,
@@ -18,7 +18,6 @@ from pancakebot.strategy.momentum_gate import (
     MomentumGateResult,
     compute_signal_from_klines,
 )
-from pancakebot.strategy.pool_predictor import PoolPredictor
 from pancakebot.types import Round
 
 # Continuous adaptive sizing with payout boost.
@@ -135,11 +134,6 @@ class MomentumOnlyPipeline:
         self._btc_klines_by_epoch: dict[int, list[list]] = {}
         self._eth_klines_by_epoch: dict[int, list[list]] = {}
         self._sol_klines_by_epoch: dict[int, list[list]] = {}
-        # Pool predictor: None when strategy_config.pool_predictor.model == "none".
-        # Integration branches below are gated on this + use_for_gate / use_for_sizing.
-        self._pool_predictor: PoolPredictor | None = PoolPredictor.from_config(
-            strategy_config.pool_predictor
-        )
 
     # ------------------------------------------------------------------
     # Required interface: StrategyPipeline-compatible
@@ -213,45 +207,10 @@ class MomentumOnlyPipeline:
             )
             # Compute pools from round bets if not provided externally.
             if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
+                from pancakebot.constants import POOL_CUTOFF_SECONDS
                 pool_cutoff_ts = lock_at - POOL_CUTOFF_SECONDS
                 pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, pool_cutoff_ts)
         pool_total = pool_bull_bnb + pool_bear_bnb
-
-        # Pool-predictor features: computed lazily and only when a predictor is
-        # loaded AND at least one integration flag is on. Produces byte-identical
-        # behavior to pre-predictor code when model="none" (the default).
-        pp_cfg = self._strategy.pool_predictor
-        pp_active: bool = (
-            self._pool_predictor is not None
-            and (pp_cfg.use_for_gate or pp_cfg.use_for_sizing)
-        )
-        predicted_bull: float | None = None
-        predicted_bear: float | None = None
-        if pp_active:
-            assert self._pool_predictor is not None  # for the type checker
-            pool_cutoff_ts_pp = lock_at - POOL_CUTOFF_SECONDS
-            recent_start_pp = pool_cutoff_ts_pp - 20
-            num_bets_pre_cutoff_pp = 0
-            recent_bets_20s_pp = 0
-            for _bet in round_t.bets:
-                created_at = int(_bet.created_at)
-                if created_at < pool_cutoff_ts_pp:
-                    num_bets_pre_cutoff_pp += 1
-                    if created_at >= recent_start_pp:
-                        recent_bets_20s_pp += 1
-            bnb_klines_pp = None
-            if self._pool_predictor.requires_klines:
-                # Backtest: read from cache. Live mode would need a separate
-                # BNB fetch (not plumbed yet) -- P3_lite live-mode raises
-                # via predict() when bnb_klines is None.
-                bnb_klines_pp = self._bnb_klines_by_epoch.get(int(round_t.epoch))
-            predicted_bull, predicted_bear = self._pool_predictor.predict(
-                partial_bull=pool_bull_bnb,
-                partial_bear=pool_bear_bnb,
-                num_bets_pre_cutoff=num_bets_pre_cutoff_pp,
-                recent_bets_20s=recent_bets_20s_pp,
-                bnb_klines=bnb_klines_pp,
-            )
 
         # Determine signal source: primary (BTC) or regime-2 (ETH+SOL)
         signal_dir = None
@@ -303,44 +262,25 @@ class MomentumOnlyPipeline:
         our_side = pool_bull_bnb if signal_dir == "Bull" else pool_bear_bnb
 
         # Payout floor: skip if payout on our side is too low.
-        # When use_for_gate is on and a predictor is active, replace the
-        # partial-based denominator with the predicted-final denominator ONLY
-        # for this admission check. pool_filter (min_pool_bnb) and
-        # strong_bypass remain on the partial (observed) pool.
         if our_side > 0 and pool_total > 0:
-            if pp_cfg.use_for_gate and predicted_bull is not None:
-                gate_total = predicted_bull + predicted_bear
-                gate_our_side = predicted_bull if signal_dir == "Bull" else predicted_bear
-                payout = gate_total * (1.0 - self._treasury_fee_fraction) / gate_our_side
-            else:
-                payout = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
+            payout = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
             if payout < self._strategy.pool_filter.min_payout:
                 return self._skip("payout_below_floor")
-
-        # Sizing pool/our_side: swap in predicted equivalents when use_for_sizing
-        # is on and a predictor is active. When off, the assignments are exact
-        # aliases of the partial values (byte-identical to pre-predictor code).
-        if pp_cfg.use_for_sizing and predicted_bull is not None:
-            sizing_pool = predicted_bull + predicted_bear
-            sizing_our_side = predicted_bull if signal_dir == "Bull" else predicted_bear
-        else:
-            sizing_pool = pool_total
-            sizing_our_side = our_side
 
         if is_regime2:
             es_sizing = self._strategy.eth_sol_fallback.sizing
             bet_size = _compute_bet_size(
                 signal_strength=effective_strength,
-                pool_bnb=sizing_pool,
-                our_side_bnb=sizing_our_side,
+                pool_bnb=pool_total,
+                our_side_bnb=our_side,
                 base_frac=es_sizing.base_fraction,
                 cap_bnb=es_sizing.max_bet_bnb,
             )
         elif is_strong_bypass:
             bet_size = _compute_bet_size(
                 signal_strength=effective_strength,
-                pool_bnb=sizing_pool,
-                our_side_bnb=sizing_our_side,
+                pool_bnb=pool_total,
+                our_side_bnb=our_side,
                 base_frac=_STRONG_BYPASS_BASE_FRAC,
                 cap_bnb=_STRONG_BYPASS_CAP_BNB,
             )
@@ -348,8 +288,8 @@ class MomentumOnlyPipeline:
             bt_sizing = self._strategy.btc_primary.sizing
             bet_size = _compute_bet_size(
                 signal_strength=effective_strength,
-                pool_bnb=sizing_pool,
-                our_side_bnb=sizing_our_side,
+                pool_bnb=pool_total,
+                our_side_bnb=our_side,
                 base_frac=bt_sizing.base_fraction,
                 cap_bnb=bt_sizing.max_bet_bnb,
             )
