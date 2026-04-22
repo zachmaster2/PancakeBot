@@ -563,7 +563,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
 
         # Forward post-settlement bankroll to tracker (no-op if unwired).
         closed.strategy_pipeline.record_settlement(
-            bankroll=bankroll_after_settle, start_at=int(rd.start_at),
+            bankroll=bankroll_after_settle, start_at=int(rd.start_ts),
         )
 
         bnbusd_price = rd.close_price_usd if rd.close_price_usd > 0 else rd.lock_price_usd
