@@ -56,6 +56,8 @@ def _dry_runtime_state_files() -> list[Path]:
         Path(_paths.DRY_TRADES_PATH),
         Path(_paths.DRY_CYCLE_AUDIT_PATH),
         Path(_paths.DRY_BANKROLL_STATE_PATH),
+        Path(_paths.DRY_BANKROLL_HISTORY_PATH),
+        Path(_paths.DRY_BANKROLL_HISTORY_PATH).parent / "pause_state.json",
     ]
 
 
@@ -559,6 +561,11 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         closed.simulated_bankroll_bnb += credit_bnb
         bankroll_after_settle = closed.simulated_bankroll_bnb
 
+        # Forward post-settlement bankroll to tracker (no-op if unwired).
+        closed.strategy_pipeline.record_settlement(
+            bankroll=bankroll_after_settle, start_at=int(rd.start_at),
+        )
+
         bnbusd_price = rd.close_price_usd if rd.close_price_usd > 0 else rd.lock_price_usd
 
         # Brief INFO log (no key=value fields)
@@ -674,6 +681,18 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
                          msg=f"Archived previous dry runtime state to {archive_log}")
         bankroll_state = _resolve_initial_dry_bankroll_state(cfg)
         closed.simulated_bankroll_bnb = bankroll_state.simulated_bankroll_bnb
+        # Wire PersistedBankrollTracker now that we know the initial bankroll.
+        # Writes to var/dry/bankroll_history.jsonl + pause_state.json — fresh
+        # paths, disjoint from the existing bankroll.json used by the settled
+        # state machine. On a --fresh start the history file is already purged
+        # by the archive/unlink logic above (it lives under var/dry/).
+        from pancakebot.bankroll_tracker import PersistedBankrollTracker
+        tracker = PersistedBankrollTracker(
+            path=Path(_paths.DRY_BANKROLL_HISTORY_PATH),
+            initial_bankroll=bankroll_state.simulated_bankroll_bnb,
+            window_days=cfg.strategy.risk.window_days,
+        )
+        strategy_pipeline.set_bankroll_tracker(tracker)
         closed.dry_bets_by_epoch = _load_dry_bets(_paths.DRY_PENDING_BETS_PATH)
         _ensure_dry_audit_csv(_paths.DRY_TRADES_PATH)
         _ensure_dry_cycle_audit_csv(

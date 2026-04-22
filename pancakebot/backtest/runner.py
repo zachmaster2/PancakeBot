@@ -157,8 +157,13 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
         info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s klines for {len(sol_klines)} epochs")
 
     # Build momentum pipeline (no live gate -- backtest uses cached 1s klines).
+    from pancakebot.bankroll_tracker import InMemoryBankrollTracker
     from pancakebot.strategy.momentum_gate import MomentumGateConfig
     gate_config: MomentumGateConfig = runtime_cfg.momentum_gate_config  # type: ignore[assignment]
+    bankroll_tracker = InMemoryBankrollTracker(
+        initial_bankroll=initial_bankroll_bnb,
+        window_days=runtime_cfg.strategy.risk.window_days,
+    )
     pipeline = MomentumOnlyPipeline(
         config=gate_config,
         strategy_config=runtime_cfg.strategy,
@@ -166,6 +171,7 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
         cutoff_seconds=runtime_cfg.cutoff_seconds,
         min_bet_amount_bnb=runtime_cfg.min_bet_amount_bnb,
         treasury_fee_fraction=runtime_cfg.treasury_fee_fraction,
+        bankroll_tracker=bankroll_tracker,
     )
     pipeline.refresh_bnb_klines(bnb_klines_by_epoch=bnb_klines)
     pipeline.refresh_btc_klines(btc_klines_by_epoch=btc_klines)
@@ -249,6 +255,10 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
                     bankroll,
                 ]
             )
+
+            # Forward the post-settlement bankroll snapshot to the tracker so
+            # the risk checks see up-to-date current_bankroll / peak.
+            pipeline.record_settlement(bankroll=bankroll, start_at=int(round_t.start_at))
 
             pipeline.settle_closed_rounds(rounds=[round_t])
 

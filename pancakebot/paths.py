@@ -13,6 +13,7 @@ SOL_SPOT_PRICES_PATH = "var/sol_spot_prices.jsonl"
 
 # -- Dry mode --
 DRY_BANKROLL_STATE_PATH = "var/dry/bankroll.json"
+DRY_BANKROLL_HISTORY_PATH = "var/dry/bankroll_history.jsonl"
 DRY_PENDING_BETS_PATH = "var/dry/pending_bets.jsonl"
 DRY_CYCLE_AUDIT_PATH = "var/dry/cycle_audit.csv"
 DRY_TRADES_PATH = "var/dry/trades.csv"
@@ -20,6 +21,7 @@ DRY_SETTLED_EPOCHS_PATH = "var/dry/settled_epochs.txt"
 DRY_ARCHIVE_ROOT = "var/dry/archive"
 
 # -- Live mode --
+LIVE_BANKROLL_HISTORY_PATH = "var/live/bankroll_history.jsonl"
 LIVE_CLAIM_CURSOR_PATH = "var/live/claim_cursor.txt"
 LIVE_CYCLE_AUDIT_PATH = "var/live/cycle_audit.csv"
 LIVE_TRADES_PATH = "var/live/trades.csv"

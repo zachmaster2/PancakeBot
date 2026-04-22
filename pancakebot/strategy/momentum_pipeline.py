@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pancakebot.bankroll_tracker import BankrollTracker
 from pancakebot.config import StrategyConfig
 from pancakebot.constants import BNB_WEI
 from pancakebot.util import InvariantError
@@ -78,17 +79,25 @@ def _compute_bet_size(
     our_side_bnb: float,
     base_frac: float,
     cap_bnb: float,
+    current_bankroll: float | None = None,
+    max_bet_frac_of_bankroll: float = 1.0,
 ) -> float:
-    """Continuous adaptive sizing with payout-proportional boost.
+    """Continuous adaptive sizing with payout-proportional boost + bankroll cap.
 
     1. Signal-strength sizing: frac = base_frac + SIZING_SLOPE * signal_strength
     2. Payout boost: when our side has high payout (fewer bettors on our side),
        multiply frac by up to 2x. This is Kelly reasoning -- bet more when
        the odds are favorable.
+    3. bet = pool_bnb * frac
+    4. Bankroll cap (when current_bankroll is not None): bet <=
+       max_bet_frac_of_bankroll * current_bankroll. Prevents oversized bets
+       relative to the session bankroll.
+    5. Absolute BNB cap (cap_bnb) and floor (_FLOOR_BNB).
 
     base_frac and cap_bnb are supplied by the caller (from StrategyConfig):
     primary (btc) and fallback (eth+sol) and strong-bypass each use different
-    values for their different WR profiles.
+    values for their different WR profiles. current_bankroll defaults to None
+    which disables the bankroll cap (backward-compatible).
     """
     if pool_bnb <= 0:
         return _FLOOR_BNB
@@ -102,6 +111,11 @@ def _compute_bet_size(
         frac = min(frac * payout_mult, _MAX_FRAC)
 
     bet = pool_bnb * frac
+
+    # Bankroll cap (risk control). When current_bankroll is None, no-op.
+    if current_bankroll is not None and current_bankroll > 0:
+        bet = min(bet, max_bet_frac_of_bankroll * current_bankroll)
+
     return max(_FLOOR_BNB, min(cap_bnb, bet))
 
 
@@ -121,6 +135,7 @@ class MomentumOnlyPipeline:
         cutoff_seconds: int,
         min_bet_amount_bnb: float,
         treasury_fee_fraction: float,
+        bankroll_tracker: BankrollTracker | None = None,
     ) -> None:
         self._cfg = config
         self._strategy = strategy_config
@@ -134,6 +149,12 @@ class MomentumOnlyPipeline:
         self._btc_klines_by_epoch: dict[int, list[list]] = {}
         self._eth_klines_by_epoch: dict[int, list[list]] = {}
         self._sol_klines_by_epoch: dict[int, list[list]] = {}
+        # Risk tracker: None disables risk checks (backward-compatible). When
+        # present, decide_open_round runs pre-signal gates (min_bankroll,
+        # cooldown, drawdown-from-peak) and _compute_bet_size applies the
+        # max_bet_frac_of_bankroll cap. Callers record settlements via
+        # pipeline.record_settlement(bankroll, start_at).
+        self._bankroll_tracker: BankrollTracker | None = bankroll_tracker
 
     # ------------------------------------------------------------------
     # Required interface: StrategyPipeline-compatible
@@ -174,6 +195,25 @@ class MomentumOnlyPipeline:
         """Set last_settled_epoch from the warmup batch. No ML state."""
         self.settle_closed_rounds(rounds=rounds)
 
+    def record_settlement(self, *, bankroll: float, start_at: int) -> None:
+        """Forward a post-settlement bankroll snapshot to the tracker (if wired).
+
+        Caller responsibility: call this AFTER the round's bankroll has been
+        updated (post bet-debit + settle-credit), using the round's start_at
+        as the timestamp anchor for the rolling window.
+        """
+        if self._bankroll_tracker is not None:
+            self._bankroll_tracker.record_settlement(bankroll, start_at)
+
+    def set_bankroll_tracker(self, tracker: BankrollTracker | None) -> None:
+        """Wire (or rewire) the bankroll tracker after pipeline construction.
+
+        Needed for dry/live runtime where the initial bankroll is resolved
+        AFTER the pipeline is built (bankroll depends on on-chain wallet
+        balance or persisted dry state). Pass None to disable risk checks.
+        """
+        self._bankroll_tracker = tracker
+
     # ------------------------------------------------------------------
     # Core decision
     # ------------------------------------------------------------------
@@ -192,6 +232,29 @@ class MomentumOnlyPipeline:
             raise InvariantError("round_lock_at_missing")
         lock_at = int(round_t.lock_at)
         cutoff_ts_ms = (lock_at - self._cutoff_seconds) * 1000
+
+        # Risk checks (when tracker is wired). Runs BEFORE signal computation so
+        # we don't waste kline fetches on paused / low-bankroll rounds.
+        # When tracker is None, this block is a complete no-op.
+        if self._bankroll_tracker is not None:
+            risk = self._strategy.risk
+            start_at = int(round_t.start_at)
+            # Check 1: cooldown paused. Tick the counter on every paused round
+            # observed by the pipeline so the cooldown actually winds down.
+            if self._bankroll_tracker.is_paused(start_at):
+                self._bankroll_tracker.tick_cooldown()
+                return self._skip("risk_cooldown_active")
+            # Check 2: bankroll below minimum -- skip without firing cooldown.
+            current = self._bankroll_tracker.current_bankroll()
+            if current < risk.min_bankroll_bnb:
+                return self._skip("risk_bankroll_below_min")
+            # Check 3: drawdown from peak. If >= threshold, fire cooldown.
+            peak = self._bankroll_tracker.peak_bankroll(start_at)
+            if peak > 0:
+                dd_frac = (peak - current) / peak
+                if dd_frac >= risk.max_drawdown_frac_from_peak:
+                    self._bankroll_tracker.set_paused(risk.cooldown_rounds, start_at)
+                    return self._skip("risk_drawdown_breaker_fired")
 
         if self._gate is not None:
             # Live/dry: fetch from OKX (use async-fetched data if available)
@@ -267,6 +330,13 @@ class MomentumOnlyPipeline:
             if payout < self._strategy.pool_filter.min_payout:
                 return self._skip("payout_below_floor")
 
+        # Bankroll for the bankroll cap kwarg (None when no tracker -> cap disabled).
+        br_current = (
+            self._bankroll_tracker.current_bankroll()
+            if self._bankroll_tracker is not None else None
+        )
+        br_cap_frac = self._strategy.risk.max_bet_frac_of_bankroll
+
         if is_regime2:
             es_sizing = self._strategy.eth_sol_fallback.sizing
             bet_size = _compute_bet_size(
@@ -275,6 +345,8 @@ class MomentumOnlyPipeline:
                 our_side_bnb=our_side,
                 base_frac=es_sizing.base_fraction,
                 cap_bnb=es_sizing.max_bet_bnb,
+                current_bankroll=br_current,
+                max_bet_frac_of_bankroll=br_cap_frac,
             )
         elif is_strong_bypass:
             bet_size = _compute_bet_size(
@@ -283,6 +355,8 @@ class MomentumOnlyPipeline:
                 our_side_bnb=our_side,
                 base_frac=_STRONG_BYPASS_BASE_FRAC,
                 cap_bnb=_STRONG_BYPASS_CAP_BNB,
+                current_bankroll=br_current,
+                max_bet_frac_of_bankroll=br_cap_frac,
             )
         else:
             bt_sizing = self._strategy.btc_primary.sizing
@@ -292,6 +366,8 @@ class MomentumOnlyPipeline:
                 our_side_bnb=our_side,
                 base_frac=bt_sizing.base_fraction,
                 cap_bnb=bt_sizing.max_bet_bnb,
+                current_bankroll=br_current,
+                max_bet_frac_of_bankroll=br_cap_frac,
             )
 
         if bet_size < self._min_bet_amount_bnb:

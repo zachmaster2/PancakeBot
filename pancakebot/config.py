@@ -111,10 +111,29 @@ class EthSolFallbackConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RiskConfig:
+    """Risk controls applied by MomentumOnlyPipeline when a BankrollTracker is active.
+
+    - max_bet_frac_of_bankroll: stake <= this fraction of current bankroll.
+    - min_bankroll_bnb: skip all bets while bankroll < this.
+    - max_drawdown_frac_from_peak: fire cooldown when (peak-current)/peak >= this.
+      Set to 1.0 to disable the circuit breaker.
+    - cooldown_rounds: number of rounds to pause after drawdown breaker fires.
+    - window_days: rolling window (days) for the drawdown-from-peak calculation.
+    """
+    max_bet_frac_of_bankroll: float
+    min_bankroll_bnb: float
+    max_drawdown_frac_from_peak: float
+    cooldown_rounds: int
+    window_days: int
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyConfig:
     pool_filter: PoolFilterConfig
     btc_primary: BtcPrimaryConfig
     eth_sol_fallback: EthSolFallbackConfig
+    risk: RiskConfig
 
     def validate(self) -> None:
         """Assert invariants; raise InvariantError on any violation."""
@@ -148,6 +167,18 @@ class StrategyConfig:
         if ez.max_bet_bnb <= 0.0:
             raise InvariantError("strategy_eth_sol_fallback_sizing_max_bet_bnb_must_be_positive")
 
+        rk = self.risk
+        if not (0.0 < rk.max_bet_frac_of_bankroll <= 1.0):
+            raise InvariantError("strategy_risk_max_bet_frac_of_bankroll_out_of_range")
+        if rk.min_bankroll_bnb < 0.0:
+            raise InvariantError("strategy_risk_min_bankroll_bnb_must_be_non_negative")
+        if not (0.0 < rk.max_drawdown_frac_from_peak <= 1.0):
+            raise InvariantError("strategy_risk_max_drawdown_frac_from_peak_out_of_range")
+        if rk.cooldown_rounds < 0:
+            raise InvariantError("strategy_risk_cooldown_rounds_must_be_non_negative")
+        if rk.window_days <= 0:
+            raise InvariantError("strategy_risk_window_days_must_be_positive")
+
 
 # Default strategy values — match the module-level constants they replaced in
 # pancakebot/strategy/momentum_pipeline.py, so a config.toml without any
@@ -165,6 +196,13 @@ _DEFAULT_STRATEGY = StrategyConfig(
     eth_sol_fallback=EthSolFallbackConfig(
         signal=EthSolFallbackSignalConfig(min_strength=0.00015),
         sizing=EthSolFallbackSizingConfig(base_fraction=0.02, max_bet_bnb=0.5),
+    ),
+    risk=RiskConfig(
+        max_bet_frac_of_bankroll=0.10,
+        min_bankroll_bnb=0.20,
+        max_drawdown_frac_from_peak=0.50,
+        cooldown_rounds=72,
+        window_days=7,
     ),
 )
 
@@ -264,6 +302,7 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
     es_sec = _opt_section(strat_sec, "eth_sol_fallback")
     es_signal_sec = _opt_section(es_sec, "signal")
     es_sizing_sec = _opt_section(es_sec, "sizing")
+    risk_sec = _opt_section(strat_sec, "risk")
 
     d = _DEFAULT_STRATEGY
     cfg = StrategyConfig(
@@ -301,6 +340,25 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
                     es_sizing_sec, "max_bet_bnb",
                     d.eth_sol_fallback.sizing.max_bet_bnb,
                 ),
+            ),
+        ),
+        risk=RiskConfig(
+            max_bet_frac_of_bankroll=_opt_float(
+                risk_sec, "max_bet_frac_of_bankroll",
+                d.risk.max_bet_frac_of_bankroll,
+            ),
+            min_bankroll_bnb=_opt_float(
+                risk_sec, "min_bankroll_bnb", d.risk.min_bankroll_bnb,
+            ),
+            max_drawdown_frac_from_peak=_opt_float(
+                risk_sec, "max_drawdown_frac_from_peak",
+                d.risk.max_drawdown_frac_from_peak,
+            ),
+            cooldown_rounds=_opt_int(
+                risk_sec, "cooldown_rounds", d.risk.cooldown_rounds,
+            ),
+            window_days=_opt_int(
+                risk_sec, "window_days", d.risk.window_days,
             ),
         ),
     )
