@@ -24,10 +24,10 @@ from pancakebot.types import Round
 # Continuous adaptive sizing with payout boost.
 # Signal strength sizing: frac = base_fraction + SIZING_SLOPE * signal_strength
 # Payout boost: frac *= max(0.5, 1.0 + PAYOUT_SLOPE * (payout - 2.0))
-# Payout floor / pool floor / thresholds / max-bet / base-fraction now live in
-# StrategyConfig (see pancakebot.config). Only strategy-identity constants stay
-# here: multi-TF lookbacks, sizing slopes, cross-pair weights, fractional caps,
-# and the strong-signal bypass parameters.
+# Payout floor / pool floor / thresholds / max-bet / base-fraction / strong-bypass
+# params now live in StrategyConfig (see pancakebot.config). Only strategy-identity
+# constants stay here: multi-TF lookbacks, sizing slopes, cross-pair weights,
+# fractional caps.
 # Validated: 5-fold +2.21/2k (5/5 positive), nested CV +1.59/2k (4/5 positive).
 _SIZING_SLOPE = 100        # scales with min(|r3|, |r7|, |r15|)
 _PAYOUT_SLOPE = 1.0        # bet more when our side has high payout
@@ -43,13 +43,9 @@ _FLOOR_BNB = 0.01
 # Min-strength and sizing now live in StrategyConfig.eth_sol_fallback.
 _REGIME2_ENABLED = True
 
-# Strong-signal bypass: allow bets on pools below strategy.pool_filter.min_pool_bnb
-# if the BTC signal is very strong. Pools must still exceed this floor.
-# 5-fold: +2.85/2k (5/5), 113 extra bets at 58.4% WR.
-_STRONG_BYPASS_STRENGTH = 0.0004  # BTC min(|r3|,|r7|,|r15|) threshold
-_STRONG_BYPASS_POOL_FLOOR = 1.0   # minimum pool even for strong signals
-_STRONG_BYPASS_BASE_FRAC = 0.03   # conservative sizing on small pools
-_STRONG_BYPASS_CAP_BNB = 0.3      # small cap to limit dilution
+# Strong-signal bypass thresholds + sizing now live in
+# StrategyConfig.strong_bypass (see pancakebot.config). Validated historical:
+# 5-fold +2.85/2k (5/5), 113 extra bets at 58.4% WR.
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,9 +311,10 @@ class MomentumOnlyPipeline:
         # Exception: very strong primary signals can bypass on pools >= floor.
         is_strong_bypass = False
         if pool_total < self._strategy.pool_filter.min_pool_bnb:
+            sb_thresh = self._strategy.strong_bypass.threshold
             if (not is_regime2
-                    and result.signal_strength >= _STRONG_BYPASS_STRENGTH
-                    and pool_total >= _STRONG_BYPASS_POOL_FLOOR):
+                    and result.signal_strength >= sb_thresh.min_strength
+                    and pool_total >= sb_thresh.min_pool_bnb):
                 is_strong_bypass = True
             else:
                 return self._skip("pool_below_minimum")
@@ -349,12 +346,13 @@ class MomentumOnlyPipeline:
                 max_bet_frac_of_bankroll=br_cap_frac,
             )
         elif is_strong_bypass:
+            sb_sizing = self._strategy.strong_bypass.sizing
             bet_size = _compute_bet_size(
                 signal_strength=effective_strength,
                 pool_bnb=pool_total,
                 our_side_bnb=our_side,
-                base_frac=_STRONG_BYPASS_BASE_FRAC,
-                cap_bnb=_STRONG_BYPASS_CAP_BNB,
+                base_frac=sb_sizing.base_fraction,
+                cap_bnb=sb_sizing.max_bet_bnb,
                 current_bankroll=br_current,
                 max_bet_frac_of_bankroll=br_cap_frac,
             )
