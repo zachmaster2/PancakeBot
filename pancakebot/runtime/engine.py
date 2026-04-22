@@ -70,11 +70,28 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         if closed_state.simulated_bankroll_bnb is None:
             raise InvariantError("dry_bankroll_uninitialized")
         bankroll_bnb = closed_state.simulated_bankroll_bnb
+        # PersistedBankrollTracker for dry mode is already wired by
+        # _init_closed_state (after bankroll resolution). No-op here.
     else:
         bankroll_bnb = _fetch_wallet_balance_bnb_with_retries(
             cfg=cfg,
             reason="live_wallet_bootstrap",
         )
+        # Live mode: wire PersistedBankrollTracker now that wallet balance is known.
+        # TODO: live mode only seeds the tracker at startup; it does not yet
+        # update on per-round settlements. Claims are async (batched on-chain),
+        # so record_settlement needs to hook into claim-confirmation events.
+        # Until that's added, the risk checks run against the STARTUP bankroll
+        # only -- initial bounds still work, but drawdown-from-peak won't fire.
+        from pathlib import Path
+        from pancakebot.bankroll_tracker import PersistedBankrollTracker
+        from pancakebot import paths as _paths
+        tracker = PersistedBankrollTracker(
+            path=Path(_paths.LIVE_BANKROLL_HISTORY_PATH),
+            initial_bankroll=bankroll_bnb,
+            window_days=cfg.strategy.risk.window_days,
+        )
+        closed_state.strategy_pipeline.set_bankroll_tracker(tracker)
     info(
         "CORE",
         "RUN",
