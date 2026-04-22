@@ -39,6 +39,12 @@ class _ClosedState:
     simulated_bankroll_bnb: float | None = None
     dry_bets_by_epoch: dict[int, dict[str, object]] = field(default_factory=dict)
     dry_settled_epochs: set[int] = field(default_factory=set)
+    # Process-health: incremented at top of each _run_one_iteration;
+    # ``last_seen_epoch`` is the most-recent current_epoch the loop has
+    # observed. Both are reported in heartbeat.json so the supervisor +
+    # crash handler can pinpoint where the bot "was" at failure.
+    iteration_count: int = 0
+    last_seen_epoch: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
