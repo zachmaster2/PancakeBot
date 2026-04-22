@@ -256,6 +256,57 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         else:
             open_round = _open_round
 
+        # -- Housekeeping bankroll resolution (moved from critical path) --
+        # Live mode fetches wallet balance from RPC BEFORE the cutoff so the
+        # post-cutoff critical path doesn't pay that 50-500ms latency. The
+        # tracker is fed the freshest value so risk gates + decide_open_round
+        # see it. On TransientRpcError we refuse to bet on stale bankroll and
+        # SKIP the iteration. Dry mode reads from in-memory state (no latency).
+        if cfg.dry:
+            if closed.simulated_bankroll_bnb is None:
+                raise InvariantError("dry_bankroll_uninitialized")
+            bankroll_bnb = closed.simulated_bankroll_bnb
+        else:
+            try:
+                bankroll_bnb = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
+            except TransientRpcError as e:
+                # Last-known tracker value for audit snapshot; 0.0 if unwired.
+                last_known_bankroll = 0.0
+                if closed.strategy_pipeline is not None:
+                    # noinspection PyProtectedMember
+                    _tracker = closed.strategy_pipeline._bankroll_tracker
+                    if _tracker is not None:
+                        last_known_bankroll = _tracker.current_bankroll()
+                warn("RUN", "WALLET", "STALE",
+                     msg=f"Skip epoch {current_epoch}: risk_bankroll_stale err={e}")
+                _record_dry_cycle_audit(
+                    cfg,
+                    closed,
+                    current_epoch=current_epoch,
+                    locked_epoch=locked_epoch,
+                    lock_ts=lock_ts_t,
+                    cutoff_ts=cutoff_ts_t,
+                    locked_price_bnbusd=bnbusd_price,
+                    action="SKIP",
+                    decision_stage="pipeline",
+                    open_round=open_round,
+                    bankroll_before_action_bnb=last_known_bankroll,
+                    bankroll_after_action_bnb=last_known_bankroll,
+                    skip_reason="risk_bankroll_stale",
+                )
+                info("RUN", "ACT", "SKIP",
+                     msg=f"Skip epoch {current_epoch}: risk_bankroll_stale")
+                _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
+                return
+            # Forward freshest bankroll to tracker (live only; dry records its
+            # own settlements via dry.py after credit/debit). Risk gates read
+            # from the tracker in decide_open_round below.
+            if closed.strategy_pipeline is not None:
+                closed.strategy_pipeline.record_settlement(
+                    bankroll=bankroll_bnb,
+                    start_at=int(open_round.start_at),
+                )
+
         # TLS warmup: re-establish OKX keep-alive connection (dies after
         # ~60 s idle between 5-minute rounds).  Subsequent kline fetches
         # hit the warm connection (~50 ms instead of ~2 s).
@@ -271,14 +322,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         pool_bear_bnb = 0.0
         if cfg.pool_watcher is not None and cfg.pool_watcher.connected:
             # Gate: if backfill is still running, our pool data is incomplete.
-            # Skip rather than decide on partial data.
+            # Skip rather than decide on partial data. bankroll_bnb was already
+            # resolved in the housekeeping block above -- reuse it for audit.
             if not cfg.pool_watcher.is_backfill_done():
-                if cfg.dry:
-                    if closed.simulated_bankroll_bnb is None:
-                        raise InvariantError("dry_bankroll_uninitialized")
-                    bankroll_bnb = closed.simulated_bankroll_bnb
-                else:
-                    bankroll_bnb = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
                 warn("POOL_WSS", "BKFILL", "INCOMPL",
                      msg=f"Skip epoch {current_epoch}: backfill_incomplete")
                 _record_dry_cycle_audit(
@@ -325,15 +371,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if gate is not None:
             okx_kline_futures = gate.fetch_klines_async(cutoff_ts_ms=int(cutoff_ts_t * 1000))
 
-        # Step 8: Decide.
+        # Step 8: Decide.  bankroll_bnb + tracker record_settlement were both
+        # resolved in the housekeeping block above -- nothing on the critical
+        # path between cutoff and lock reads from RPC.
         t_features_start_ms = _mono_ms()
         pred_p_final = 0.5
-        if cfg.dry:
-            if closed.simulated_bankroll_bnb is None:
-                raise InvariantError("dry_bankroll_uninitialized")
-            bankroll_bnb = closed.simulated_bankroll_bnb
-        else:
-            bankroll_bnb = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
 
         if closed.strategy_pipeline is None:
             raise InvariantError("strategy_pipeline_missing")
