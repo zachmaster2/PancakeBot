@@ -6,7 +6,7 @@ prefetch_offset_seconds = 4
 
 [dry]
 # Starting bankroll for fresh dry runs (ignored when continuing from existing state)
-initial_bankroll_bnb = 50.0
+initial_bankroll_bnb = 5.0
 
 [live]
 # Override all computed bet sizes to the contract minimum.
