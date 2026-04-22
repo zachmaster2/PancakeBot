@@ -55,10 +55,10 @@ class BacktestConfig:
 
 # -- Strategy config ----------------------------------------------------------
 #
-# 10 knobs exposed for TOML configuration. Three sections match the strategy's
-# logical layers: pool-admission filters, BTC primary signal, ETH+SOL fallback.
-# Other strategy values (multi-TF lookbacks, sizing slopes, cross-pair weights,
-# strong-signal bypass params) remain as module-level constants in
+# 14 knobs exposed for TOML configuration. Four sections match the strategy's
+# logical layers: pool-admission filters, BTC primary signal, ETH+SOL fallback,
+# and the strong-signal bypass. Other strategy values (multi-TF lookbacks,
+# sizing slopes, cross-pair weights) remain as module-level constants in
 # pancakebot/strategy/momentum_pipeline.py — they're more like algorithm
 # identity than experiment knobs.
 
@@ -109,6 +109,35 @@ class EthSolFallbackConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class StrongBypassThresholdConfig:
+    """Strong-bypass admission thresholds.
+
+    When BTC signal strength exceeds ``min_strength`` and the partial pool is at
+    least ``min_pool_bnb``, the standard strategy.pool_filter.min_pool_bnb gate
+    is bypassed so we can still bet on small-pool rounds with strong signal.
+    """
+    min_strength: float
+    min_pool_bnb: float
+
+
+@dataclass(frozen=True, slots=True)
+class StrongBypassSizingConfig:
+    """Strong-bypass bet sizing.
+
+    Conservative ``base_fraction`` (smaller than BTC primary) and an absolute
+    per-bet BNB cap to limit dilution on small-pool rounds.
+    """
+    base_fraction: float
+    max_bet_bnb: float
+
+
+@dataclass(frozen=True, slots=True)
+class StrongBypassConfig:
+    threshold: StrongBypassThresholdConfig
+    sizing: StrongBypassSizingConfig
+
+
+@dataclass(frozen=True, slots=True)
 class RiskConfig:
     """Risk controls applied by MomentumOnlyPipeline when a BankrollTracker is active.
 
@@ -135,6 +164,7 @@ class StrategyConfig:
     pool_filter: PoolFilterConfig
     btc_primary: BtcPrimaryConfig
     eth_sol_fallback: EthSolFallbackConfig
+    strong_bypass: StrongBypassConfig
     risk: RiskConfig
 
     def validate(self) -> None:
@@ -164,6 +194,18 @@ class StrategyConfig:
         ez = self.eth_sol_fallback.sizing
         if not (0.0 < ez.base_fraction < 1.0):
             raise InvariantError("strategy_eth_sol_fallback_sizing_base_fraction_out_of_range")
+
+        sbt = self.strong_bypass.threshold
+        if sbt.min_strength <= 0.0:
+            raise InvariantError("strategy_strong_bypass_threshold_min_strength_must_be_positive")
+        if sbt.min_pool_bnb < 0.0:
+            raise InvariantError("strategy_strong_bypass_threshold_min_pool_bnb_must_be_non_negative")
+
+        sbs = self.strong_bypass.sizing
+        if not (0.0 < sbs.base_fraction <= 1.0):
+            raise InvariantError("strategy_strong_bypass_sizing_base_fraction_out_of_range")
+        if sbs.max_bet_bnb <= 0.0:
+            raise InvariantError("strategy_strong_bypass_sizing_max_bet_bnb_must_be_positive")
 
         rk = self.risk
         if not (0.0 < rk.max_bet_frac_of_bankroll <= 1.0):
@@ -198,6 +240,16 @@ _DEFAULT_STRATEGY = StrategyConfig(
     eth_sol_fallback=EthSolFallbackConfig(
         signal=EthSolFallbackSignalConfig(min_strength=0.00015),
         sizing=EthSolFallbackSizingConfig(base_fraction=0.02),
+    ),
+    strong_bypass=StrongBypassConfig(
+        threshold=StrongBypassThresholdConfig(
+            min_strength=0.0004,
+            min_pool_bnb=1.0,
+        ),
+        sizing=StrongBypassSizingConfig(
+            base_fraction=0.03,
+            max_bet_bnb=0.3,
+        ),
     ),
     risk=RiskConfig(
         max_bet_frac_of_bankroll=0.05,
@@ -306,6 +358,9 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
     es_sec = _opt_section(strat_sec, "eth_sol_fallback")
     es_signal_sec = _opt_section(es_sec, "signal")
     es_sizing_sec = _opt_section(es_sec, "sizing")
+    sb_sec = _opt_section(strat_sec, "strong_bypass")
+    sb_thresh_sec = _opt_section(sb_sec, "threshold")
+    sb_sizing_sec = _opt_section(sb_sec, "sizing")
     risk_sec = _opt_section(strat_sec, "risk")
 
     d = _DEFAULT_STRATEGY
@@ -338,6 +393,28 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
                 base_fraction=_opt_float(
                     es_sizing_sec, "base_fraction",
                     d.eth_sol_fallback.sizing.base_fraction,
+                ),
+            ),
+        ),
+        strong_bypass=StrongBypassConfig(
+            threshold=StrongBypassThresholdConfig(
+                min_strength=_opt_float(
+                    sb_thresh_sec, "min_strength",
+                    d.strong_bypass.threshold.min_strength,
+                ),
+                min_pool_bnb=_opt_float(
+                    sb_thresh_sec, "min_pool_bnb",
+                    d.strong_bypass.threshold.min_pool_bnb,
+                ),
+            ),
+            sizing=StrongBypassSizingConfig(
+                base_fraction=_opt_float(
+                    sb_sizing_sec, "base_fraction",
+                    d.strong_bypass.sizing.base_fraction,
+                ),
+                max_bet_bnb=_opt_float(
+                    sb_sizing_sec, "max_bet_bnb",
+                    d.strong_bypass.sizing.max_bet_bnb,
                 ),
             ),
         ),
