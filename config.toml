@@ -40,22 +40,26 @@ pool_size_boundary_bnb = 3.0
 
 [strategy.btc_primary.sizing]
 base_fraction = 0.04
-max_bet_bnb = 2.0
 
 [strategy.eth_sol_fallback.signal]
 min_strength = 0.00015
 
 [strategy.eth_sol_fallback.sizing]
 base_fraction = 0.02
-max_bet_bnb = 0.5
 
 [strategy.risk]
 # Risk controls active when a BankrollTracker is wired in (backtest always,
 # dry/live when runtime constructs a PersistedBankrollTracker). All checks
-# are no-ops when tracker is None. Defaults chosen to be non-binding under
-# baseline conditions (initial_bankroll=50.0, historical max DD ~10%).
-max_bet_frac_of_bankroll = 0.10        # bet <= 10% of current bankroll
+# are no-ops when tracker is None. Defaults tuned to protect against
+# worst-case deposit timing (peak-window sweep showed risk-OFF zeros the
+# bankroll in a ~5k-round post-peak drawdown regime). These defaults ARE
+# binding on the full backtest -- accepted PnL reduction buys insurance
+# against catastrophic drawdown for small initial bankrolls.
+max_bet_frac_of_bankroll = 0.05        # bet <= 5% of current bankroll
 min_bankroll_bnb = 0.20                # pause all bets while bankroll < this
-max_drawdown_frac_from_peak = 0.50     # 1.0 = disabled; 0.50 = fire at 50% drawdown
+max_drawdown_frac_from_peak = 0.15     # 1.0 = disabled; fires in normal regimes
 cooldown_rounds = 72                   # 6 hours at 5-min rounds
 window_days = 7                        # rolling window for peak calculation
+# Absolute per-bet BNB caps (formerly under btc_primary.sizing / eth_sol_fallback.sizing).
+max_bet_bnb_btc_primary = 2.0          # hard cap on BTC primary stake
+max_bet_bnb_eth_sol_fallback = 0.5     # hard cap on ETH+SOL regime-2 stake

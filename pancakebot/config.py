@@ -80,9 +80,8 @@ class BtcPrimaryThresholdConfig:
 
 @dataclass(frozen=True, slots=True)
 class BtcPrimarySizingConfig:
-    """BTC primary bet sizing."""
+    """BTC primary bet sizing. (max_bet_bnb moved to RiskConfig.)"""
     base_fraction: float
-    max_bet_bnb: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,9 +98,8 @@ class EthSolFallbackSignalConfig:
 
 @dataclass(frozen=True, slots=True)
 class EthSolFallbackSizingConfig:
-    """ETH+SOL fallback bet sizing (smaller than primary due to lower WR)."""
+    """ETH+SOL fallback bet sizing. (max_bet_bnb moved to RiskConfig.)"""
     base_fraction: float
-    max_bet_bnb: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,12 +118,16 @@ class RiskConfig:
       Set to 1.0 to disable the circuit breaker.
     - cooldown_rounds: number of rounds to pause after drawdown breaker fires.
     - window_days: rolling window (days) for the drawdown-from-peak calculation.
+    - max_bet_bnb_btc_primary: absolute BNB cap for BTC primary bets.
+    - max_bet_bnb_eth_sol_fallback: absolute BNB cap for regime-2 ETH+SOL bets.
     """
     max_bet_frac_of_bankroll: float
     min_bankroll_bnb: float
     max_drawdown_frac_from_peak: float
     cooldown_rounds: int
     window_days: int
+    max_bet_bnb_btc_primary: float
+    max_bet_bnb_eth_sol_fallback: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,8 +156,6 @@ class StrategyConfig:
         bs = self.btc_primary.sizing
         if not (0.0 < bs.base_fraction < 1.0):
             raise InvariantError("strategy_btc_primary_sizing_base_fraction_out_of_range")
-        if bs.max_bet_bnb <= 0.0:
-            raise InvariantError("strategy_btc_primary_sizing_max_bet_bnb_must_be_positive")
 
         es = self.eth_sol_fallback.signal
         if es.min_strength <= 0.0:
@@ -164,8 +164,6 @@ class StrategyConfig:
         ez = self.eth_sol_fallback.sizing
         if not (0.0 < ez.base_fraction < 1.0):
             raise InvariantError("strategy_eth_sol_fallback_sizing_base_fraction_out_of_range")
-        if ez.max_bet_bnb <= 0.0:
-            raise InvariantError("strategy_eth_sol_fallback_sizing_max_bet_bnb_must_be_positive")
 
         rk = self.risk
         if not (0.0 < rk.max_bet_frac_of_bankroll <= 1.0):
@@ -178,6 +176,10 @@ class StrategyConfig:
             raise InvariantError("strategy_risk_cooldown_rounds_must_be_non_negative")
         if rk.window_days <= 0:
             raise InvariantError("strategy_risk_window_days_must_be_positive")
+        if rk.max_bet_bnb_btc_primary <= 0.0:
+            raise InvariantError("strategy_risk_max_bet_bnb_btc_primary_must_be_positive")
+        if rk.max_bet_bnb_eth_sol_fallback <= 0.0:
+            raise InvariantError("strategy_risk_max_bet_bnb_eth_sol_fallback_must_be_positive")
 
 
 # Default strategy values — match the module-level constants they replaced in
@@ -191,18 +193,20 @@ _DEFAULT_STRATEGY = StrategyConfig(
             large_pool=0.0001,
             pool_size_boundary_bnb=3.0,
         ),
-        sizing=BtcPrimarySizingConfig(base_fraction=0.04, max_bet_bnb=2.0),
+        sizing=BtcPrimarySizingConfig(base_fraction=0.04),
     ),
     eth_sol_fallback=EthSolFallbackConfig(
         signal=EthSolFallbackSignalConfig(min_strength=0.00015),
-        sizing=EthSolFallbackSizingConfig(base_fraction=0.02, max_bet_bnb=0.5),
+        sizing=EthSolFallbackSizingConfig(base_fraction=0.02),
     ),
     risk=RiskConfig(
-        max_bet_frac_of_bankroll=0.10,
+        max_bet_frac_of_bankroll=0.05,
         min_bankroll_bnb=0.20,
-        max_drawdown_frac_from_peak=0.50,
+        max_drawdown_frac_from_peak=0.15,
         cooldown_rounds=72,
         window_days=7,
+        max_bet_bnb_btc_primary=2.0,
+        max_bet_bnb_eth_sol_fallback=0.5,
     ),
 )
 
@@ -321,7 +325,6 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
             ),
             sizing=BtcPrimarySizingConfig(
                 base_fraction=_opt_float(btc_sizing_sec, "base_fraction", d.btc_primary.sizing.base_fraction),
-                max_bet_bnb=_opt_float(btc_sizing_sec, "max_bet_bnb", d.btc_primary.sizing.max_bet_bnb),
             ),
         ),
         eth_sol_fallback=EthSolFallbackConfig(
@@ -335,10 +338,6 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
                 base_fraction=_opt_float(
                     es_sizing_sec, "base_fraction",
                     d.eth_sol_fallback.sizing.base_fraction,
-                ),
-                max_bet_bnb=_opt_float(
-                    es_sizing_sec, "max_bet_bnb",
-                    d.eth_sol_fallback.sizing.max_bet_bnb,
                 ),
             ),
         ),
@@ -359,6 +358,14 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
             ),
             window_days=_opt_int(
                 risk_sec, "window_days", d.risk.window_days,
+            ),
+            max_bet_bnb_btc_primary=_opt_float(
+                risk_sec, "max_bet_bnb_btc_primary",
+                d.risk.max_bet_bnb_btc_primary,
+            ),
+            max_bet_bnb_eth_sol_fallback=_opt_float(
+                risk_sec, "max_bet_bnb_eth_sol_fallback",
+                d.risk.max_bet_bnb_eth_sol_fallback,
             ),
         ),
     )
