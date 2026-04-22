@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 from pancakebot.constants import (
     BNB_WEI,
@@ -26,6 +29,7 @@ from pancakebot.runtime.dry import (
     _record_dry_cycle_audit,
 )
 from pancakebot.runtime.live import claim_scan_cursor
+from pancakebot.runtime.process_health import write_heartbeat
 from pancakebot.strategy.momentum_pipeline import StrategyPipelineDecision
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
@@ -41,6 +45,65 @@ _BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 _ONE_MINUTE_MS = 60_000
+
+
+# -- Heartbeat context -------------------------------------------------------
+# _run_one_iteration refreshes this at the top of every tick; _sleep_until_ts
+# reads it to emit a per-second heartbeat during long sleeps (deadlock
+# detector). Both writes target the same heartbeat.json path -- supervisor
+# only cares about mtime.
+
+@dataclass(slots=True)
+class _HeartbeatCtx:
+    pid: int
+    heartbeat_path: Path
+    bankroll_bnb: float | None
+    iteration_count: int
+    last_epoch: int | None
+
+
+_latest_heartbeat_ctx: _HeartbeatCtx | None = None
+
+
+def _heartbeat_path_for_mode(dry: bool) -> Path:
+    return Path(paths.DRY_HEARTBEAT_PATH if dry else paths.LIVE_HEARTBEAT_PATH)
+
+
+def _update_heartbeat_ctx(
+    *,
+    dry: bool,
+    bankroll_bnb: float | None,
+    iteration_count: int,
+    last_epoch: int | None,
+) -> None:
+    """Refresh the module-level heartbeat context used by _sleep_until_ts."""
+    global _latest_heartbeat_ctx
+    _latest_heartbeat_ctx = _HeartbeatCtx(
+        pid=os.getpid(),
+        heartbeat_path=_heartbeat_path_for_mode(dry),
+        bankroll_bnb=bankroll_bnb,
+        iteration_count=iteration_count,
+        last_epoch=last_epoch,
+    )
+
+
+def _write_heartbeat_from_ctx() -> None:
+    """Emit a heartbeat using the latest stored context. No-op if unset.
+
+    Called from the per-second _sleep_until_ts loop. Errors are swallowed by
+    write_heartbeat itself (with WARN logging); this wrapper stays quiet.
+    """
+    ctx = _latest_heartbeat_ctx
+    if ctx is None:
+        return
+    write_heartbeat(
+        ctx.heartbeat_path,
+        pid=ctx.pid,
+        ts_wall=time.time(),
+        last_epoch=ctx.last_epoch,
+        bankroll_bnb=ctx.bankroll_bnb,
+        iteration_count=ctx.iteration_count,
+    )
 
 
 def _fetch_current_bnb_price_usd(cfg: RuntimeConfig) -> float:
@@ -129,12 +192,36 @@ def _mono_ms() -> float:
 
 
 def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
+    # Process-health: bump the iteration counter and emit a heartbeat before we
+    # start doing anything network-bound. Writes ``last_seen_epoch`` carried
+    # over from the previous iteration -- gets refreshed after the handshake
+    # below. _sleep_until_ts reads this context for per-second heartbeats.
+    closed.iteration_count += 1
+    _update_heartbeat_ctx(
+        dry=cfg.dry,
+        bankroll_bnb=closed.simulated_bankroll_bnb,
+        iteration_count=closed.iteration_count,
+        last_epoch=closed.last_seen_epoch,
+    )
+    _write_heartbeat_from_ctx()
+
     # Alignment + cutoff anchoring can be noisy around epoch shifts. Ensure we only
     # take an action using a coherent epoch snapshot.
     while True:
         # Step 1: Epoch alignment handshake (shift-aware) with retries.
         locked_round, _open_round, current_epoch, _open_rd = _epoch_handshake(cfg)
         locked_epoch = locked_round.epoch
+
+        # Process-health: once the handshake gives us a current_epoch, refresh
+        # the heartbeat context so sleep-loop heartbeats carry fresh state and
+        # the crash handler can point at the epoch the bot was on.
+        closed.last_seen_epoch = current_epoch
+        _update_heartbeat_ctx(
+            dry=cfg.dry,
+            bankroll_bnb=closed.simulated_bankroll_bnb,
+            iteration_count=closed.iteration_count,
+            last_epoch=current_epoch,
+        )
 
         # Sync round-phase state into pool_watcher immediately after handshake.
         # This triggers the initial backfill within seconds of WSS subscription
@@ -715,3 +802,7 @@ def _sleep_until_ts(target_ts: float, *, reason: str, epoch: int | None = None) 
         if remaining2 <= 0:
             return
         sleep_seconds(min(1.0, remaining2))
+        # Per-second heartbeat during long sleeps. Catches deadlocks where
+        # the iteration's outer heartbeat would otherwise go stale for a
+        # full round. No-op before the first _run_one_iteration has run.
+        _write_heartbeat_from_ctx()

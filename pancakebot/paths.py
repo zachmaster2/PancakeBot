@@ -20,11 +20,22 @@ DRY_TRADES_PATH = "var/dry/trades.csv"
 DRY_SETTLED_EPOCHS_PATH = "var/dry/settled_epochs.txt"
 DRY_ARCHIVE_ROOT = "var/dry/archive"
 
+# Process-health artifacts (Phase 2a -- heartbeat, crash.json, PID file).
+# The runtime writes these; an out-of-process supervisor consumes them.
+DRY_HEARTBEAT_PATH = "var/dry/heartbeat.json"
+DRY_CRASH_PATH = "var/dry/crash.json"
+DRY_PID_PATH = "var/dry/bot.pid"
+
 # -- Live mode --
 LIVE_BANKROLL_HISTORY_PATH = "var/live/bankroll_history.jsonl"
 LIVE_CLAIM_CURSOR_PATH = "var/live/claim_cursor.txt"
 LIVE_CYCLE_AUDIT_PATH = "var/live/cycle_audit.csv"
 LIVE_TRADES_PATH = "var/live/trades.csv"
+
+# Process-health artifacts (live mirror of the dry trio above).
+LIVE_HEARTBEAT_PATH = "var/live/heartbeat.json"
+LIVE_CRASH_PATH = "var/live/crash.json"
+LIVE_PID_PATH = "var/live/bot.pid"
 
 # -- Backtest mode --
 BACKTEST_TRADES_PATH = "var/backtest/trades.csv"
