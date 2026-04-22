@@ -344,7 +344,7 @@ class MomentumOnlyPipeline:
                 pool_bnb=pool_total,
                 our_side_bnb=our_side,
                 base_frac=es_sizing.base_fraction,
-                cap_bnb=es_sizing.max_bet_bnb,
+                cap_bnb=self._strategy.risk.max_bet_bnb_eth_sol_fallback,
                 current_bankroll=br_current,
                 max_bet_frac_of_bankroll=br_cap_frac,
             )
@@ -365,7 +365,7 @@ class MomentumOnlyPipeline:
                 pool_bnb=pool_total,
                 our_side_bnb=our_side,
                 base_frac=bt_sizing.base_fraction,
-                cap_bnb=bt_sizing.max_bet_bnb,
+                cap_bnb=self._strategy.risk.max_bet_bnb_btc_primary,
                 current_bankroll=br_current,
                 max_bet_frac_of_bankroll=br_cap_frac,
             )
