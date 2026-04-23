@@ -23,7 +23,8 @@ without duplicating them.
 
 .PARAMETER VenvPython
 Override the path to the venv python executable. Defaults to
-``<repo>\.venv\Scripts\python.exe``.
+``<repo>\.venv\Scripts\pythonw.exe`` (the windowless variant -- avoids the
+console-window focus-steal every time a scheduled task fires).
 
 .PARAMETER IntervalMinutes
 How often each task runs. Default 3 minutes.
@@ -54,7 +55,10 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 
 if (-not $VenvPython) {
-    $VenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+    # pythonw.exe is the windowless Python variant. Using python.exe here would
+    # flash a console window every 3 minutes and steal keyboard/mouse focus
+    # from whatever the user is doing -- unacceptable for a background task.
+    $VenvPython = Join-Path $RepoRoot ".venv\Scripts\pythonw.exe"
 }
 
 if (-not (Test-Path $VenvPython)) {

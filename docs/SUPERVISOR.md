@@ -105,27 +105,44 @@ Expected content for a healthy bot:
 
 ## Upgrade to Tier 2 (Discord alerting)
 
-### 1. Create Discord webhooks
+### 1. Create three Discord webhooks
 
-In your Discord server:
+In your Discord server, create one webhook per channel (Server Settings →
+Integrations → Webhooks → **New Webhook** → select channel → Copy Webhook URL):
 
-1. Open any channel's settings → Integrations → Webhooks → **New Webhook**.
-2. Name it (e.g. "PancakeBot-dry") and select the target channel.
-3. Click **Copy Webhook URL**.
-4. Do the same for a second webhook named "PancakeBot-live" (recommend a
-   different channel so you can mute dry alerts without silencing live).
+| Webhook name         | Channel                 | Routed alerts                                                                                           |
+|----------------------|-------------------------|---------------------------------------------------------------------------------------------------------|
+| PancakeBot Dry Alerts  | `pancakebot-dry-alerts`  | STALE / CRASHED / DOWN + escalations for **dry** bot. Actionable for the dry operator.                  |
+| PancakeBot Live Alerts | `pancakebot-live-alerts` | Same as dry, but for the **live** bot. Separate channel so you can mute dry without silencing live.      |
+| PancakeBot General     | `pancakebot-general`     | `UNINSTRUMENTED` (legacy pre-Phase-2a bot running — informational) and supervisor-self errors (rare). |
 
-### 2. Set environment variables (persisted, per-user)
+Three separate channels keep the actionable alerts clean. When you're
+staring at `#pancakebot-live-alerts` expecting to see real problems, you
+don't want it cluttered with "legacy bot still running" pings.
+
+### 2. Set environment variables (persisted, Machine-scope)
 
 ```powershell
-setx DRY_DISCORD_ALERT_WEBHOOK_URL  "https://discord.com/api/webhooks/..."
-setx LIVE_DISCORD_ALERT_WEBHOOK_URL "https://discord.com/api/webhooks/..."
+# Machine-scope so Task Scheduler sees the vars without needing a logon.
+# Requires an elevated PowerShell (or setx /M with suitable permissions).
+setx PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL  "https://discord.com/api/webhooks/..." /M
+setx PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL "https://discord.com/api/webhooks/..." /M
+setx PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL     "https://discord.com/api/webhooks/..." /M
 ```
 
-`setx` writes to the user's registry hive. **Currently-open** PowerShell
-windows and **already-scheduled** tasks won't see these until they're
-restarted. The scheduled tasks pick up the new env at next firing because
-Task Scheduler reads the user environment on each task launch.
+`setx /M` writes to `HKLM`. **Currently-open** PowerShell windows and
+**already-running** processes won't see the change until restart, but
+each Task Scheduler firing is a fresh process that reads Machine env
+anew — the next scheduled supervisor run picks up the new URLs
+automatically.
+
+Verify names are set (values intentionally not printed):
+
+```powershell
+[Environment]::GetEnvironmentVariables("Machine").GetEnumerator() |
+  Where-Object { $_.Key -like "PANCAKEBOT*" } |
+  ForEach-Object { $_.Key }
+```
 
 ### 3. Change the task action to include `--alert`
 
@@ -135,11 +152,18 @@ schtasks /change /tn PancakeBotSupervisorDry /tr "`"$repo\.venv\Scripts\python.e
 schtasks /change /tn PancakeBotSupervisorLive /tr "`"$repo\.venv\Scripts\python.exe`" `"$repo\scripts\supervisor.py`" --mode live --alert"
 ```
 
-After the next fire, any non-UP/non-STARTING classification will POST to
-Discord. Missing webhook env var → `alert=DISABLED` (soft fallback).
-Discord 4xx/5xx or network error → `alert=SEND_FAILED` (logged, not
-crashed). Rate limit: max one alert per `(mode, classification)` per
-5 minutes — tracked in `var/<mode>/last_alert.json`.
+After the next fire, non-UP / non-STARTING classifications POST to Discord:
+
+- **STALE / CRASHED / DOWN + escalations** → mode's `*-alerts` channel
+- **UNINSTRUMENTED** → `general` channel
+- **Supervisor-self errors** (classify raised unexpectedly) → `general` channel
+
+Behavior when env vars are missing: `alert=DISABLED` (soft fallback,
+classification still logged). HTTP failure (bad URL, timeout, 4xx/5xx)
+→ `alert=SEND_FAILED` (logged to stderr + supervisor.log, not crashed).
+Rate limit: max one alert per `(mode, classification-or-escalation)`
+per 5 minutes, tracked in `var/<mode>/last_alert.json`. Supervisor-self
+errors have their own `SUPERVISOR_ERROR` cooldown bucket.
 
 ## Upgrade to Tier 3 (auto-restart)
 
