@@ -11,6 +11,7 @@ from pancakebot import paths
 from pancakebot.app import run_from_config
 from pancakebot.log import info
 from pancakebot.runtime.process_health import (
+    archive_stale_crash,
     clear_pid_file,
     read_last_heartbeat,
     write_crash,
@@ -96,6 +97,16 @@ def main() -> None:
         pid_path, heartbeat_path, crash_path = _resolve_process_health_paths(args.dry)
         write_pid_file(pid_path, os.getpid())
         atexit.register(clear_pid_file, pid_path)
+        # Archive any crash.json left behind by a previous bot (renamed with
+        # its original mtime as a timestamp suffix -- forensic data preserved,
+        # not deleted). Prevents the supervisor from re-firing CRASHED alerts
+        # on every invocation after a previous bot died. A crash.json newer
+        # than 60s is left alone to avoid clobbering a report that's still
+        # being processed by whatever wrote it.
+        archived = archive_stale_crash(crash_path)
+        if archived is not None:
+            info("CORE", "RUN", "CRASH_ARCH",
+                 msg=f"archived stale crash.json -> {archived.name}")
 
     try:
         run_from_config(

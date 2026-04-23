@@ -203,3 +203,64 @@ def write_crash(path: Path, exc: BaseException, *, last_epoch: int | None) -> No
     except Exception:
         # Last-ditch: can't do anything useful if this fails.
         pass
+
+
+_STALE_CRASH_MIN_AGE_SECONDS: float = 60.0
+
+
+def archive_stale_crash(crash_path: Path, *, min_age_seconds: float = _STALE_CRASH_MIN_AGE_SECONDS) -> Path | None:
+    """Rename an existing crash.json to crash_archive_<ts>.json on bot startup.
+
+    Preserves forensic data (no deletion) while preventing the supervisor from
+    classifying a fresh bot as CRASHED based on a leftover crash marker from a
+    previous bot. Called from run.py immediately after the bot writes its PID
+    file, before the main runtime loop begins writing heartbeats.
+
+    Returns the archive path on success, ``None`` if:
+      - the crash file doesn't exist (no-op, the common case), or
+      - the file is younger than ``min_age_seconds`` (pathological race where
+        a crash.json was just written by a concurrent process -- don't clobber
+        a fresh crash report; its Discord alert is still in flight), or
+      - any error occurred (silently swallowed; bot startup must not be blocked
+        by a cleanup failure).
+
+    The 60s default for ``min_age_seconds`` targets *crash-loop* scenarios:
+    if the previous bot died seconds ago and the supervisor's auto-restart
+    has brought up a new one already, we'd rather keep the fresh crash.json
+    so its Discord alert still reflects real state. A normal operator-driven
+    restart (minutes-to-hours after the crash) safely exceeds 60s.
+
+    The archive filename uses the ORIGINAL crash timestamp (file mtime), so
+    the filename remains chronologically meaningful across many archives:
+    ``crash_archive_YYYYMMDD-HHMMSS.json``. Collisions (multiple crashes in
+    the same second, or re-archive) get a numeric suffix.
+
+    Concurrent-startup safety: run.py calls ``find_duplicate_bots`` BEFORE
+    this helper runs (see run.py), so two supervisor-spawned bots can't both
+    reach this line. A residual TOCTOU between ``archive.exists()`` and
+    ``os.rename`` exists only in the theoretical path where the dup-check
+    misses a truly simultaneous spawn -- the swallow-all handler then loses
+    at most one archive, and the winner still archives successfully.
+    """
+    # noinspection PyBroadException
+    try:
+        if not crash_path.exists():
+            return None
+        st = crash_path.stat()
+        age = time.time() - st.st_mtime
+        if age < min_age_seconds:
+            return None
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(st.st_mtime))
+        archive = crash_path.parent / f"crash_archive_{stamp}.json"
+        # Collision handling: multiple archives at the same second-granularity
+        # stamp (rare; only if a previous archive was created from a crash at
+        # the same wall-clock second) get a numeric suffix.
+        suffix = 1
+        while archive.exists():
+            archive = crash_path.parent / f"crash_archive_{stamp}_{suffix}.json"
+            suffix += 1
+        os.rename(str(crash_path), str(archive))
+        return archive
+    except Exception:
+        # Never block bot startup on a cleanup failure.
+        return None
