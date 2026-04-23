@@ -106,6 +106,17 @@ def _format_ts_human(ts_sent: str) -> str:
         return ts_sent
 
 
+def _local_time_str() -> str:
+    """Human-readable local time in America/New_York for Discord messages."""
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/New_York")
+        now = datetime.now(tz)
+        return now.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def _send_discord(webhook_url: str, content: str) -> tuple[bool, str]:
     try:
         import requests
@@ -159,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         f"**Subject:** {subject}\n"
         f"**Summary:** {summary}\n"
         f"**Sent:** {_format_ts_human(ts_sent)}\n"
+        f"**Local now:** {_local_time_str()}\n"
         f"**ID:** `{entry.get('id')}`\n"
         f"\n"
         f"Reply in the Cowork app or reply here."

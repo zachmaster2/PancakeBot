@@ -425,9 +425,30 @@ def _classify(
 # -- Logging ---------------------------------------------------------------
 
 def _iso_utc_now() -> str:
-    """2026-04-22T19:55:00Z-style ISO-8601 UTC timestamp."""
+    """2026-04-22T19:55:00Z-style ISO-8601 UTC timestamp.
+
+    Used for supervisor.log entries (keep machine-parseable UTC) and for
+    the `at <UTC>` header in Discord messages. For Discord only, callers
+    also render ``_local_time_str()`` on a separate line for human reading.
+    """
     now = datetime.datetime.now(datetime.timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _local_time_str() -> str:
+    """Human-readable local time in America/New_York (EDT/EST, auto-adjusted).
+
+    Used only for Discord messages. Log files stay UTC for parseability.
+    Falls back to a plain UTC timestamp if the zoneinfo lookup fails
+    (extremely unlikely on Python 3.9+ stdlib, but defensive).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/New_York")
+        now = datetime.datetime.now(tz)
+        return now.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _format_fields(fields: dict[str, Any]) -> str:
@@ -510,6 +531,7 @@ def _build_discord_message(
     """Build the Discord message body for the given classification."""
     hostname = socket.gethostname()
     ts = _iso_utc_now()
+    local = _local_time_str()
 
     header_emoji = {
         "STALE": ":warning:",
@@ -521,7 +543,7 @@ def _build_discord_message(
     header = f"{header_emoji} **{status}** `PancakeBot-{mode}` on `{hostname}` at `{ts}`"
     if escalation:
         header = f":fire: **{escalation}** -- {header}"
-    lines: list[str] = [header]
+    lines: list[str] = [header, f"Local: `{local}`"]
 
     # Common context.
     for k in ("pid", "bankroll", "iterations", "last_epoch"):
@@ -661,9 +683,11 @@ def _maybe_send_supervisor_error_alert(
             return
         hostname = socket.gethostname()
         ts = _iso_utc_now()
+        local = _local_time_str()
         tb = _clip_text(traceback.format_exc(), max_lines=20, max_chars=1500)
         msg_lines = [
             f":fire: **SUPERVISOR ERROR** `PancakeBot-{mode}` on `{hostname}` at `{ts}`",
+            f"Local: `{local}`",
             f"exc: `{type(exc).__name__}`",
             f"repr: `{exc!r}`",
         ]
