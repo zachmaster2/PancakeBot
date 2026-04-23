@@ -12,11 +12,15 @@ Both run as the CURRENT USER (no admin elevation required, no SYSTEM
 credentials, no saved password). They fire every 3 minutes, starting 1
 minute after installation.
 
-**Phase 2e default: classify+log only (NO --alert, NO --restart).**
-That is intentional. Run this way for a few days / a week so that you
-observe the classifier against your actual workload before turning on
-alerts or auto-restart. Upgrade instructions are printed at the end of
-this script and also live in docs/SUPERVISOR.md.
+**Default behaviour (as of Phase 2c-on):** classify + log + Discord alerts
+(`--alert`). Webhook URLs come from the Machine-level env vars
+``PANCAKEBOT_{DRY_ALERTS,LIVE_ALERTS,GENERAL}_DISCORD_WEBHOOK_URL``.
+`--restart` (auto-respawn) is still OFF -- that's the next gate.
+
+If you want tier-1 (log-only, no Discord) back, remove `--alert` from the
+task action via ``schtasks /change`` or edit this script's ``$argString``.
+Upgrade / downgrade instructions are printed at the end of this script
+and also live in ``docs/SUPERVISOR.md``.
 
 Idempotent: re-running this script deletes and recreates both tasks
 without duplicating them.
@@ -86,7 +90,11 @@ function Register-SupervisorTask {
     # Quote the supervisor script path in case the repo lives under a path
     # with spaces (e.g. "C:\Users\zking\My Stuff\..."). The executable itself
     # is passed unquoted via -Execute; arguments are the rest.
-    $argString = "`"$SupervisorScript`" --mode $Mode"
+    #
+    # --alert is enabled by default now that the Discord webhooks have been
+    # tested end-to-end. --restart stays OFF; enabling it is the next
+    # validation gate (see docs/SUPERVISOR.md).
+    $argString = "`"$SupervisorScript`" --mode $Mode --alert"
 
     $action = New-ScheduledTaskAction `
         -Execute $VenvPython `
@@ -145,15 +153,14 @@ Write-Host "Supervisor output accumulates in:"
 Write-Host "  $RepoRoot\var\dry\supervisor.log"
 Write-Host "  $RepoRoot\var\live\supervisor.log"
 Write-Host ""
-Write-Host "--- Next steps (DO NOT do these until you've validated classify-only mode) ---" -ForegroundColor Yellow
+Write-Host "--- Next steps ---" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  See docs/SUPERVISOR.md for the full tier-1 -> tier-2 -> tier-3 upgrade playbook."
+Write-Host "  Tasks installed with --alert enabled (Discord notifications live)."
+Write-Host "  Verify webhooks are set:"
+Write-Host "    [Environment]::GetEnvironmentVariables('Machine').GetEnumerator() |"
+Write-Host "      Where-Object { `$_.Key -like 'PANCAKEBOT*' } | ForEach-Object { `$_.Key }"
 Write-Host ""
-Write-Host "  Short version:"
-Write-Host "    Tier 2 (add --alert):   create Discord webhook, setx the *_DISCORD_ALERT_WEBHOOK_URL,"
-Write-Host "                            then schtasks /change /tr (see docs) to append --alert."
-Write-Host "    Tier 3 (add --restart): only after --alert has been observed working; change the"
-Write-Host "                            task action to include --alert --restart."
+Write-Host "  When ready to enable auto-restart (--restart), see docs/SUPERVISOR.md."
 Write-Host ""
 Write-Host "  Uninstall:"
 Write-Host "    schtasks /delete /tn PancakeBotSupervisorDry /f"
