@@ -158,6 +158,20 @@ class Tier2SizingConfig:
       of ``decide_open_round`` (``bet_size_below_min`` skip) handles the
       on-chain contract minimum check; the two are intentionally distinct.
 
+      **Note (Phase 2 ablation finding, 2026-04-23):** a 5-value sweep
+      across {0.005, 0.010, 0.015, 0.020, 0.050} produced byte-identical
+      5-fold PnL (+50.6179 BNB) at the first four values -- the floor
+      **never bound** on observed data because (a) ``base_fraction ×
+      pool`` produces bets comfortably above 0.01 BNB for most rounds
+      and (b) the pipeline's own contract-minimum skip already filters
+      tiny bets before this floor matters. Only 0.050 (5x default) clipped
+      any bets, and only pennies. Retained as a configurable knob for
+      forward compatibility: if ``min_bet_amount_bnb`` drops (contract
+      change) or any ``base_fraction`` decreases into a regime where
+      sub-0.01-BNB computed bets become common, this floor starts to
+      matter and a sweep will surface that. Not worth deleting; not worth
+      sweeping again on the current dataset.
+
     These were previously hardcoded module constants
     (_PAYOUT_SLOPE / _ETH_SIZING_WEIGHT / _SOL_SIZING_WEIGHT / _FLOOR_BNB)
     in ``pancakebot/strategy/momentum_pipeline.py``. Extracted for Tier-2
