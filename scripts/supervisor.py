@@ -23,17 +23,27 @@ Exit codes:
   SUPPRESSED_FAST_CRASHLOOP=6, supervisor error=99.
 
 Actions (opt-in):
-  --alert    POST a Discord message on STALE/CRASHED/UNINSTRUMENTED/DOWN.
-             Webhook URL comes from env vars:
-               DRY_DISCORD_ALERT_WEBHOOK_URL  (for --mode dry)
-               LIVE_DISCORD_ALERT_WEBHOOK_URL (for --mode live)
-             If the relevant env var is missing the alert is silently
-             suppressed (one DISCORD_DISABLED note in supervisor.log) --
-             the supervisor still classifies and logs as usual. A Discord
-             send failure (HTTP error, timeout, bad URL) never crashes
-             the supervisor; it logs DISCORD_SEND_FAILED and moves on.
-             Rate limit: one alert per (mode, classification) per 5 min
-             (tracked in ``var/<mode>/last_alert.json``).
+  --alert    POST a Discord message on STALE/CRASHED/UNINSTRUMENTED/DOWN and
+             on SUPPRESSED_FAST_CRASHLOOP / SLOW_CRASHLOOP_WARNING escalations.
+             Webhook URLs come from env vars:
+               PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL   (mode-specific, dry)
+               PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL  (mode-specific, live)
+               PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL      (UNINSTRUMENTED +
+                                                            supervisor-self
+                                                            errors)
+             Routing:
+               STALE / CRASHED / DOWN + escalations -> mode-specific channel
+                 (actionable: bot needs attention or restart).
+               UNINSTRUMENTED                       -> general channel
+                 (informational: legacy pre-Phase-2a bot running; no action).
+               Supervisor classify-itself errors    -> general channel
+                 (cross-cutting, rare, distinct cooldown bucket).
+             Missing env var -> soft fallback, one DISCORD_DISABLED note
+             in supervisor.log, classification still logged as usual. HTTP
+             failure (bad URL, timeout, 4xx/5xx) never crashes the supervisor;
+             logs DISCORD_SEND_FAILED and moves on. Rate limit: one alert per
+             (mode, classification-or-escalation) per 5 minutes, tracked in
+             ``var/<mode>/last_alert.json``.
 
   --restart  On STALE/CRASHED/DOWN, spawn a fresh ``python -u run.py --<mode>``
              detached from this supervisor (Windows: CREATE_NEW_PROCESS_GROUP).
@@ -150,8 +160,35 @@ def _artifacts_for_mode(mode: str) -> dict[str, Path]:
     raise ValueError(f"unknown_mode: {mode!r}")
 
 
+# Env var that holds the "general" / informational Discord webhook URL.
+# Used for UNINSTRUMENTED alerts (legacy-bot informational, not actionable for
+# dry/live operators) and supervisor-itself errors (cross-cutting, no clean
+# mode-specific channel to route to).
+GENERAL_WEBHOOK_ENV = "PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL"
+
+
 def _env_var_for_mode(mode: str) -> str:
-    return "DRY_DISCORD_ALERT_WEBHOOK_URL" if mode == "dry" else "LIVE_DISCORD_ALERT_WEBHOOK_URL"
+    """Mode-specific alerts webhook env var. Raises on unknown mode."""
+    if mode == "dry":
+        return "PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL"
+    if mode == "live":
+        return "PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL"
+    raise ValueError(f"unknown_mode: {mode!r}")
+
+
+def _resolve_webhook_env(mode: str, status: str) -> str:
+    """Pick which Discord env var to use for *status*.
+
+    UNINSTRUMENTED is informational (a legacy pre-Phase-2a bot is running;
+    nothing the dry/live channel readers need to act on) and goes to the
+    general channel so dry/live alert feeds stay actionable.
+
+    Everything else (STALE / CRASHED / DOWN + escalations) is mode-specific
+    and routes to the dry or live alerts channel.
+    """
+    if status == "UNINSTRUMENTED":
+        return GENERAL_WEBHOOK_ENV
+    return _env_var_for_mode(mode)
 
 
 # -- Safe reads (BLOCKER #2: atomic read, never hold handle) -----------------
@@ -575,7 +612,7 @@ def _maybe_send_discord(
     if status not in _ALERT_STATES and escalation is None:
         return "NOT_APPLICABLE"
 
-    env_var = _env_var_for_mode(mode)
+    env_var = _resolve_webhook_env(mode, status)
     webhook = os.environ.get(env_var, "").strip()
     if not webhook:
         return "DISABLED"
@@ -597,6 +634,46 @@ def _maybe_send_discord(
     # without needing to tail the log file.
     sys.stderr.write(f"discord_send_failed mode={mode} status={status} detail={detail}\n")
     return "SEND_FAILED"
+
+
+def _maybe_send_supervisor_error_alert(
+    *,
+    mode: str,
+    exc: BaseException,
+    art: dict[str, Path],
+) -> None:
+    """Fire a best-effort general-channel alert when the supervisor itself errors.
+
+    Called from the outer except-block in main() when _classify raises an
+    unexpected exception. Uses the general channel (GENERAL_WEBHOOK_ENV) since
+    supervisor-self errors are cross-cutting and don't belong in the dry/live
+    per-mode feeds. Rate-limited via the mode's last_alert.json under the
+    distinct key ``SUPERVISOR_ERROR`` so a persistent supervisor bug fired
+    every 3 minutes by schtasks doesn't flood Discord.
+
+    Never raises; runs from an already-failing context.
+    """
+    try:
+        webhook = os.environ.get(GENERAL_WEBHOOK_ENV, "").strip()
+        if not webhook:
+            return
+        if not _rate_limit_ok(art["last_alert"], "SUPERVISOR_ERROR", time.time()):
+            return
+        hostname = socket.gethostname()
+        ts = _iso_utc_now()
+        tb = _clip_text(traceback.format_exc(), max_lines=20, max_chars=1500)
+        msg_lines = [
+            f":fire: **SUPERVISOR ERROR** `PancakeBot-{mode}` on `{hostname}` at `{ts}`",
+            f"exc: `{type(exc).__name__}`",
+            f"repr: `{exc!r}`",
+        ]
+        if tb:
+            msg_lines.append("```\n" + tb + "\n```")
+        _send_discord(webhook, mode, "\n".join(msg_lines))
+    except Exception:
+        # Last-ditch; don't let alerting failure cascade from an already-failing
+        # supervisor context.
+        pass
 
 
 # -- Auto-restart + crashloop limiter (Phase 2d) ---------------------------
@@ -778,10 +855,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--alert", action="store_true",
         help="Send a Discord alert on STALE/CRASHED/UNINSTRUMENTED/DOWN and on "
-             "SUPPRESSED_FAST_CRASHLOOP / SLOW_CRASHLOOP_WARNING. Webhook URL "
-             "comes from the DRY_DISCORD_ALERT_WEBHOOK_URL or "
-             "LIVE_DISCORD_ALERT_WEBHOOK_URL env var; missing env var is a soft "
-             "fallback to log-only.",
+             "SUPPRESSED_FAST_CRASHLOOP / SLOW_CRASHLOOP_WARNING. Webhook URLs "
+             "come from PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL, "
+             "PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL (mode-specific), or "
+             "PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL (UNINSTRUMENTED + supervisor-"
+             "self errors). Missing env var is a soft fallback to log-only.",
     )
     p.add_argument(
         "--restart", action="store_true",
@@ -812,6 +890,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    # Resolve paths BEFORE _classify so the supervisor-error alert path has
+    # somewhere to rate-limit against if classification itself blows up.
+    art = _artifacts_for_mode(args.mode)
     try:
         status, fields = _classify(
             args.mode,
@@ -820,11 +901,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception as e:
         # Supervisor errored during classification -- log to stderr, exit 99.
+        # When --alert is set, also fire a general-channel alert so the
+        # supervisor's own failures don't stay hidden.
         sys.stderr.write(f"supervisor_classify_failed: {type(e).__name__}: {e}\n")
         sys.stderr.write(traceback.format_exc())
+        if args.alert:
+            _maybe_send_supervisor_error_alert(mode=args.mode, exc=e, art=art)
         return EXIT_ERROR
-
-    art = _artifacts_for_mode(args.mode)
 
     # -- Phase 2d: auto-restart (opt-in) --
     action_taken: str | None = None
