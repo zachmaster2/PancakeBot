@@ -60,6 +60,16 @@ min_pool_bnb = 1.0        # absolute pool floor (bypasses pool_filter.min_pool_b
 base_fraction = 0.03      # conservative base fraction (smaller than btc_primary.sizing.base_fraction)
 max_bet_bnb = 0.3         # absolute per-bet BNB cap for bypass bets
 
+[strategy.tier2_sizing]
+# Cross-regime sizing knobs (apply uniformly across btc_primary, regime-2,
+# strong_bypass paths). Extracted from module-level constants in
+# pancakebot/strategy/momentum_pipeline.py for Tier-2 research sweeps.
+# Defaults preserve pre-refactor behaviour.
+payout_slope = 1.0        # Kelly-like payout-boost gain. 0 disables the boost.
+eth_sizing_weight = 0.3   # coefficient on ETH signal (primary boost + regime-2 component)
+sol_sizing_weight = 0.3   # mirror for SOL
+floor_bnb = 0.01          # absolute minimum bet in BNB
+
 [strategy.risk]
 # Risk controls active when a BankrollTracker is wired in (backtest always,
 # dry/live when runtime constructs a PersistedBankrollTracker). All checks

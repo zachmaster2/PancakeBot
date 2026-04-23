@@ -23,18 +23,14 @@ from pancakebot.types import Round
 
 # Continuous adaptive sizing with payout boost.
 # Signal strength sizing: frac = base_fraction + SIZING_SLOPE * signal_strength
-# Payout boost: frac *= max(0.5, 1.0 + PAYOUT_SLOPE * (payout - 2.0))
-# Payout floor / pool floor / thresholds / max-bet / base-fraction / strong-bypass
-# params now live in StrategyConfig (see pancakebot.config). Only strategy-identity
-# constants stay here: multi-TF lookbacks, sizing slopes, cross-pair weights,
-# fractional caps.
+# Payout boost: frac *= max(0.5, 1.0 + payout_slope * (payout - 2.0))
+# Tier-2 sizing knobs (payout_slope, eth/sol_sizing_weight, floor_bnb) live
+# in StrategyConfig.tier2_sizing. Only shape-defining constants stay here:
+# multi-TF lookbacks, sizing slope (gain on signal_strength), max fractional
+# cap. Changes to these require a design discussion, not just a sweep.
 # Validated: 5-fold +2.21/2k (5/5 positive), nested CV +1.59/2k (4/5 positive).
 _SIZING_SLOPE = 100        # scales with min(|r3|, |r7|, |r15|)
-_PAYOUT_SLOPE = 1.0        # bet more when our side has high payout
-_ETH_SIZING_WEIGHT = 0.3   # add ETH confirming strength * weight to signal_strength
-_SOL_SIZING_WEIGHT = 0.3   # add SOL confirming strength * weight to signal_strength
 _MAX_FRAC = 0.30           # cap the pool fraction
-_FLOOR_BNB = 0.01
 
 # Regime-2: ETH+SOL multi-TF agreement when BTC is silent.
 # Fills flat periods where primary BTC signal doesn't fire.
@@ -75,6 +71,8 @@ def _compute_bet_size(
     our_side_bnb: float,
     base_frac: float,
     cap_bnb: float,
+    payout_slope: float,
+    floor_bnb: float,
     current_bankroll: float | None = None,
     max_bet_frac_of_bankroll: float = 1.0,
 ) -> float:
@@ -83,27 +81,30 @@ def _compute_bet_size(
     1. Signal-strength sizing: frac = base_frac + SIZING_SLOPE * signal_strength
     2. Payout boost: when our side has high payout (fewer bettors on our side),
        multiply frac by up to 2x. This is Kelly reasoning -- bet more when
-       the odds are favorable.
+       the odds are favorable. ``payout_slope`` controls the gain; 0 disables.
     3. bet = pool_bnb * frac
     4. Bankroll cap (when current_bankroll is not None): bet <=
        max_bet_frac_of_bankroll * current_bankroll. Prevents oversized bets
        relative to the session bankroll.
-    5. Absolute BNB cap (cap_bnb) and floor (_FLOOR_BNB).
+    5. Absolute BNB cap (cap_bnb) and floor (``floor_bnb``).
 
-    base_frac and cap_bnb are supplied by the caller (from StrategyConfig):
-    primary (btc) and fallback (eth+sol) and strong-bypass each use different
-    values for their different WR profiles. current_bankroll defaults to None
-    which disables the bankroll cap (backward-compatible).
+    base_frac, cap_bnb, payout_slope, floor_bnb are supplied by the caller
+    (from StrategyConfig):
+      - base_frac / cap_bnb are per-regime (btc_primary / eth_sol_fallback /
+        strong_bypass each have their own).
+      - payout_slope and floor_bnb are cross-regime, from
+        StrategyConfig.tier2_sizing (uniform for the whole pipeline).
+    current_bankroll defaults to None which disables the bankroll cap.
     """
     if pool_bnb <= 0:
-        return _FLOOR_BNB
+        return floor_bnb
 
     frac = min(base_frac + _SIZING_SLOPE * signal_strength, _MAX_FRAC)
 
     # Payout-proportional boost: bet more when our side has high payout.
     if our_side_bnb > 0:
         payout = pool_bnb * 0.97 / our_side_bnb  # 3% treasury fee
-        payout_mult = max(0.5, 1.0 + _PAYOUT_SLOPE * (payout - 2.0))
+        payout_mult = max(0.5, 1.0 + payout_slope * (payout - 2.0))
         frac = min(frac * payout_mult, _MAX_FRAC)
 
     bet = pool_bnb * frac
@@ -112,7 +113,7 @@ def _compute_bet_size(
     if current_bankroll is not None and current_bankroll > 0:
         bet = min(bet, max_bet_frac_of_bankroll * current_bankroll)
 
-    return max(_FLOOR_BNB, min(cap_bnb, bet))
+    return max(floor_bnb, min(cap_bnb, bet))
 
 
 class MomentumOnlyPipeline:
@@ -285,10 +286,11 @@ class MomentumOnlyPipeline:
             if result.signal_strength >= min_thresh:
                 signal_dir = result.signal
                 effective_strength = result.signal_strength
+                t2 = self._strategy.tier2_sizing
                 if result.eth_confirmation_strength > 0:
-                    effective_strength += result.eth_confirmation_strength * _ETH_SIZING_WEIGHT
+                    effective_strength += result.eth_confirmation_strength * t2.eth_sizing_weight
                 if result.sol_confirmation_strength > 0:
-                    effective_strength += result.sol_confirmation_strength * _SOL_SIZING_WEIGHT
+                    effective_strength += result.sol_confirmation_strength * t2.sol_sizing_weight
 
         if signal_dir is None and _REGIME2_ENABLED:
             # Regime-2: ETH+SOL both fire same direction, BTC silent
@@ -298,9 +300,10 @@ class MomentumOnlyPipeline:
                 r2_str = min(result.eth_signal_strength, result.sol_signal_strength)
                 if r2_str >= self._strategy.eth_sol_fallback.signal.min_strength:
                     signal_dir = result.eth_signal
+                    t2 = self._strategy.tier2_sizing
                     effective_strength = (
-                        result.eth_signal_strength * _ETH_SIZING_WEIGHT
-                        + result.sol_signal_strength * _SOL_SIZING_WEIGHT
+                        result.eth_signal_strength * t2.eth_sizing_weight
+                        + result.sol_signal_strength * t2.sol_sizing_weight
                     )
                     is_regime2 = True
 
@@ -333,6 +336,7 @@ class MomentumOnlyPipeline:
             if self._bankroll_tracker is not None else None
         )
         br_cap_frac = self._strategy.risk.max_bet_frac_of_bankroll
+        t2 = self._strategy.tier2_sizing
 
         if is_regime2:
             es_sizing = self._strategy.eth_sol_fallback.sizing
@@ -342,6 +346,8 @@ class MomentumOnlyPipeline:
                 our_side_bnb=our_side,
                 base_frac=es_sizing.base_fraction,
                 cap_bnb=self._strategy.risk.max_bet_bnb_eth_sol_fallback,
+                payout_slope=t2.payout_slope,
+                floor_bnb=t2.floor_bnb,
                 current_bankroll=br_current,
                 max_bet_frac_of_bankroll=br_cap_frac,
             )
@@ -353,6 +359,8 @@ class MomentumOnlyPipeline:
                 our_side_bnb=our_side,
                 base_frac=sb_sizing.base_fraction,
                 cap_bnb=sb_sizing.max_bet_bnb,
+                payout_slope=t2.payout_slope,
+                floor_bnb=t2.floor_bnb,
                 current_bankroll=br_current,
                 max_bet_frac_of_bankroll=br_cap_frac,
             )
@@ -364,6 +372,8 @@ class MomentumOnlyPipeline:
                 our_side_bnb=our_side,
                 base_frac=bt_sizing.base_fraction,
                 cap_bnb=self._strategy.risk.max_bet_bnb_btc_primary,
+                payout_slope=t2.payout_slope,
+                floor_bnb=t2.floor_bnb,
                 current_bankroll=br_current,
                 max_bet_frac_of_bankroll=br_cap_frac,
             )

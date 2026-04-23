@@ -138,6 +138,38 @@ class StrongBypassConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class Tier2SizingConfig:
+    """Cross-cutting sizing knobs used by every regime (BTC primary, regime-2,
+    strong-bypass). These fields live inside ``_compute_bet_size`` and in the
+    effective-strength composition for BTC-primary ETH/SOL confirmation and
+    for regime-2's ETH+SOL-only weighting.
+
+    - payout_slope: Kelly-like payout-multiplier slope. Larger -> bet more
+      when our side's payout is high. 0.0 disables the boost.
+    - eth_sizing_weight: coefficient on ETH confirmation strength (BTC-
+      primary boost) AND on the ETH contribution to the regime-2 signal.
+      0.0 zeros out ETH's contribution in both paths.
+    - sol_sizing_weight: mirror of eth_sizing_weight for SOL.
+    - floor_bnb: computed-stake floor applied inside ``_compute_bet_size``
+      before final caps (``max(floor_bnb, min(cap_bnb, bet))``). Must be
+      strictly less than every per-bet BNB cap or it would silently beat
+      the caps at the ``max`` step -- ``StrategyConfig.validate`` enforces
+      this. The separate ``min_bet_amount_bnb`` pipeline guard at the end
+      of ``decide_open_round`` (``bet_size_below_min`` skip) handles the
+      on-chain contract minimum check; the two are intentionally distinct.
+
+    These were previously hardcoded module constants
+    (_PAYOUT_SLOPE / _ETH_SIZING_WEIGHT / _SOL_SIZING_WEIGHT / _FLOOR_BNB)
+    in ``pancakebot/strategy/momentum_pipeline.py``. Extracted for Tier-2
+    research sweeps; defaults preserve pre-refactor behaviour exactly.
+    """
+    payout_slope: float
+    eth_sizing_weight: float
+    sol_sizing_weight: float
+    floor_bnb: float
+
+
+@dataclass(frozen=True, slots=True)
 class RiskConfig:
     """Risk controls applied by MomentumOnlyPipeline when a BankrollTracker is active.
 
@@ -165,6 +197,7 @@ class StrategyConfig:
     btc_primary: BtcPrimaryConfig
     eth_sol_fallback: EthSolFallbackConfig
     strong_bypass: StrongBypassConfig
+    tier2_sizing: Tier2SizingConfig
     risk: RiskConfig
 
     def validate(self) -> None:
@@ -207,6 +240,20 @@ class StrategyConfig:
         if sbs.max_bet_bnb <= 0.0:
             raise InvariantError("strategy_strong_bypass_sizing_max_bet_bnb_must_be_positive")
 
+        t2 = self.tier2_sizing
+        # payout_slope = 0 disables the Kelly boost (valid sweep point);
+        # negative would silently invert -> forbid.
+        if t2.payout_slope < 0.0:
+            raise InvariantError("strategy_tier2_sizing_payout_slope_must_be_non_negative")
+        if t2.eth_sizing_weight < 0.0:
+            raise InvariantError("strategy_tier2_sizing_eth_sizing_weight_must_be_non_negative")
+        if t2.sol_sizing_weight < 0.0:
+            raise InvariantError("strategy_tier2_sizing_sol_sizing_weight_must_be_non_negative")
+        # floor_bnb is a live-side stake floor; zero would mean "no floor"
+        # which opens a class of sub-min-bet failures. Must be positive.
+        if t2.floor_bnb <= 0.0:
+            raise InvariantError("strategy_tier2_sizing_floor_bnb_must_be_positive")
+
         rk = self.risk
         if not (0.0 < rk.max_bet_frac_of_bankroll <= 1.0):
             raise InvariantError("strategy_risk_max_bet_frac_of_bankroll_out_of_range")
@@ -222,6 +269,21 @@ class StrategyConfig:
             raise InvariantError("strategy_risk_max_bet_bnb_btc_primary_must_be_positive")
         if rk.max_bet_bnb_eth_sol_fallback <= 0.0:
             raise InvariantError("strategy_risk_max_bet_bnb_eth_sol_fallback_must_be_positive")
+
+        # Cross-field invariant: floor_bnb must be strictly less than every
+        # per-bet cap. Otherwise ``max(floor_bnb, min(cap_bnb, bet))`` in
+        # _compute_bet_size silently beats the cap -- a typo like
+        # floor_bnb=5.0 would blow past max_bet_bnb_btc_primary=2.0.
+        min_cap = min(
+            rk.max_bet_bnb_btc_primary,
+            rk.max_bet_bnb_eth_sol_fallback,
+            self.strong_bypass.sizing.max_bet_bnb,
+        )
+        if t2.floor_bnb >= min_cap:
+            raise InvariantError(
+                f"strategy_tier2_sizing_floor_bnb_must_be_less_than_smallest_cap "
+                f"(floor_bnb={t2.floor_bnb}, smallest_cap={min_cap})"
+            )
 
 
 # Default strategy values — match the module-level constants they replaced in
@@ -250,6 +312,12 @@ _DEFAULT_STRATEGY = StrategyConfig(
             base_fraction=0.03,
             max_bet_bnb=0.3,
         ),
+    ),
+    tier2_sizing=Tier2SizingConfig(
+        payout_slope=1.0,
+        eth_sizing_weight=0.3,
+        sol_sizing_weight=0.3,
+        floor_bnb=0.01,
     ),
     risk=RiskConfig(
         max_bet_frac_of_bankroll=0.05,
@@ -361,6 +429,7 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
     sb_sec = _opt_section(strat_sec, "strong_bypass")
     sb_thresh_sec = _opt_section(sb_sec, "threshold")
     sb_sizing_sec = _opt_section(sb_sec, "sizing")
+    t2_sec = _opt_section(strat_sec, "tier2_sizing")
     risk_sec = _opt_section(strat_sec, "risk")
 
     d = _DEFAULT_STRATEGY
@@ -416,6 +485,20 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
                     sb_sizing_sec, "max_bet_bnb",
                     d.strong_bypass.sizing.max_bet_bnb,
                 ),
+            ),
+        ),
+        tier2_sizing=Tier2SizingConfig(
+            payout_slope=_opt_float(
+                t2_sec, "payout_slope", d.tier2_sizing.payout_slope,
+            ),
+            eth_sizing_weight=_opt_float(
+                t2_sec, "eth_sizing_weight", d.tier2_sizing.eth_sizing_weight,
+            ),
+            sol_sizing_weight=_opt_float(
+                t2_sec, "sol_sizing_weight", d.tier2_sizing.sol_sizing_weight,
+            ),
+            floor_bnb=_opt_float(
+                t2_sec, "floor_bnb", d.tier2_sizing.floor_bnb,
             ),
         ),
         risk=RiskConfig(
