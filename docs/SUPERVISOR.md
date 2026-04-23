@@ -62,11 +62,27 @@ or churn through live-mode wallet gas.
 
 That creates two Windows scheduled tasks:
 
-- `PancakeBotSupervisorDry`   -> `supervisor.py --mode dry`
-- `PancakeBotSupervisorLive`  -> `supervisor.py --mode live`
+- `PancakeBotSupervisorDry`   -> `supervisor.py --mode dry --alert`  (enabled)
+- `PancakeBotSupervisorLive`  -> `supervisor.py --mode live --alert` (**disabled**)
 
 Both run as the current user (no admin elevation, no SYSTEM credentials,
 no saved password), every 3 minutes, starting 1 minute after install.
+
+**The live supervisor is installed-but-disabled by default.** Until live
+mode is actually deployed, every 3-minute fire would classify DOWN (no
+live bot to supervise) and page the live-alerts Discord channel for a
+non-issue. When you deploy live mode, enable it with one command:
+
+```powershell
+Enable-ScheduledTask -TaskName PancakeBotSupervisorLive
+```
+
+Conversely, to mute either mode temporarily without uninstalling:
+
+```powershell
+Disable-ScheduledTask -TaskName PancakeBotSupervisorDry
+Disable-ScheduledTask -TaskName PancakeBotSupervisorLive
+```
 
 The script is idempotent — re-running it deletes and re-registers each
 task via `Register-ScheduledTask -Force`.

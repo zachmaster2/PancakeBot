@@ -142,8 +142,16 @@ function Register-SupervisorTask {
 Register-SupervisorTask -TaskName "PancakeBotSupervisorDry"  -Mode "dry"
 Register-SupervisorTask -TaskName "PancakeBotSupervisorLive" -Mode "live"
 
+# Live mode isn't deployed yet -- disable the live supervisor task until it is,
+# otherwise every 3-minute fire sees DOWN and pages Discord for a
+# non-existent bot. Re-enable with `Enable-ScheduledTask -TaskName
+# PancakeBotSupervisorLive` when you actually deploy live mode.
+Disable-ScheduledTask -TaskName "PancakeBotSupervisorLive" | Out-Null
+Write-Host "  [OK] PancakeBotSupervisorLive disabled (live mode not yet deployed)" -ForegroundColor Yellow
+
 Write-Host ""
-Write-Host "Both tasks registered. First run kicks off ~1 minute from now, then every $IntervalMinutes min." -ForegroundColor Cyan
+Write-Host "Dry task registered & firing. Live task registered but DISABLED (no noise until deployed)." -ForegroundColor Cyan
+Write-Host "First dry run kicks off ~1 minute from now, then every $IntervalMinutes min."
 Write-Host ""
 Write-Host "--- Verification ---" -ForegroundColor Yellow
 Write-Host "  schtasks /query /tn PancakeBotSupervisorDry"
@@ -159,6 +167,9 @@ Write-Host "  Tasks installed with --alert enabled (Discord notifications live).
 Write-Host "  Verify webhooks are set:"
 Write-Host "    [Environment]::GetEnvironmentVariables('Machine').GetEnumerator() |"
 Write-Host "      Where-Object { `$_.Key -like 'PANCAKEBOT*' } | ForEach-Object { `$_.Key }"
+Write-Host ""
+Write-Host "  When live mode is deployed, enable the live supervisor task:"
+Write-Host "    Enable-ScheduledTask -TaskName PancakeBotSupervisorLive"
 Write-Host ""
 Write-Host "  When ready to enable auto-restart (--restart), see docs/SUPERVISOR.md."
 Write-Host ""
