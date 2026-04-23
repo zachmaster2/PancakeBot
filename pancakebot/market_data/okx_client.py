@@ -98,14 +98,47 @@ class OkxClient:
         self._session = requests.Session()
 
     def warmup(self, connections: int = 3) -> None:
-        """Fill the connection pool so parallel fetches hit warm connections."""
+        """Fill the connection pool so parallel fetches hit warm connections.
+
+        Best-effort. Transient network errors (``requests.RequestException``
+        and raw ``OSError``/``ConnectionResetError`` that can occasionally
+        escape the requests/urllib3 wrapping) are logged WARN and swallowed:
+
+        - A cold/broken connection here just means the next real fetch pays
+          the TLS-handshake latency itself; the round's signal logic still
+          works.
+        - If the underlying network is genuinely down, the next
+          ``fetch_1s_klines`` call will raise ``OkxTransientError`` on its
+          own, which the pipeline handles with a ``gate_no_btc_klines``
+          skip. No reason to kill the bot from a warmup hiccup.
+
+        Pre-fix history: OKX sporadically resets established sockets
+        (`WinError 10054 / ConnectionResetError`). The uncaught re-raise
+        here killed the dry bot twice in 24h (2026-04-22 22:58 EDT and
+        2026-04-22 23:59 EDT). Supervisor reported CRASHED correctly both
+        times but the process was still dead until manual restart.
+        """
         from concurrent.futures import ThreadPoolExecutor
         url = f"{_OKX_BASE_URL}/api/v5/public/time"
         with ThreadPoolExecutor(max_workers=connections) as pool:
             futs = [pool.submit(self._session.get, url, timeout=self._timeout_seconds)
                     for _ in range(connections)]
-            for f in futs:
-                f.result()
+            for i, f in enumerate(futs):
+                # Catch both the requests-wrapped exceptions (ConnectionError,
+                # Timeout, etc.) and raw OSError/ConnectionResetError that
+                # Python 3.13 can surface directly from the ssl/socket layer
+                # before requests wraps them. Any non-network bug still
+                # propagates so we don't mask real errors.
+                try:
+                    f.result()
+                except requests.RequestException as e:
+                    warn("NET", "OKX", "WARM_SKIP",
+                         msg=f"warmup conn {i} failed (transient, ignored): "
+                             f"{type(e).__name__}: {e}")
+                except (ConnectionResetError, OSError) as e:
+                    warn("NET", "OKX", "WARM_SKIP",
+                         msg=f"warmup conn {i} raw socket error (transient, "
+                             f"ignored): {type(e).__name__}: {e}")
 
     # ----------------------------------------------------------------
     # Sync mode: retry-enabled fetch. Raises on permanent/exhaustion.
