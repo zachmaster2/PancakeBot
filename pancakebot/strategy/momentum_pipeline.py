@@ -1,8 +1,8 @@
 """MomentumOnlyPipeline: BTC primary signal plus ETH+SOL regime-2 with adaptive sizing.
 
 Drives bet/skip decisions from MomentumGate output (live/dry) or cached klines
-(backtest), applies pool-adaptive thresholds, a strong-signal pool bypass, a
-payout floor, and continuous sizing scaled by signal strength.
+(backtest), applies pool-adaptive thresholds, a payout floor, and continuous
+sizing scaled by signal strength.
 """
 
 from __future__ import annotations
@@ -39,9 +39,13 @@ _MAX_FRAC = 0.30           # cap the pool fraction
 # Min-strength and sizing now live in StrategyConfig.eth_sol_fallback.
 _REGIME2_ENABLED = True
 
-# Strong-signal bypass thresholds + sizing now live in
-# StrategyConfig.strong_bypass (see pancakebot.config). Validated historical:
-# 5-fold +2.85/2k (5/5), 113 extra bets at 58.4% WR.
+# Strong-signal pool bypass was removed 2026-04-24 after Phase 2 ablation
+# (research/phase_strong_bypass_sweep.py, var/sweep/phase_strong_bypass/)
+# showed it contributed only +0.1226 BNB over 5 folds (50.6179 with bypass
+# vs 50.4953 without, SB-KILL=min_strength=0.01). Fold-5 actually IMPROVED
+# with bypass off (+1.5703 vs +1.3825 BNB). Historical threshold that lived
+# here for the record: min_strength=0.0004 required strong BTC signal;
+# min_pool_bnb=1.0 hard floor; base_fraction=0.03; max_bet_bnb=0.3 cap.
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,8 +94,8 @@ def _compute_bet_size(
 
     base_frac, cap_bnb, payout_slope, floor_bnb are supplied by the caller
     (from StrategyConfig):
-      - base_frac / cap_bnb are per-regime (btc_primary / eth_sol_fallback /
-        strong_bypass each have their own).
+      - base_frac / cap_bnb are per-regime (btc_primary and eth_sol_fallback
+        each have their own).
       - payout_slope and floor_bnb are cross-regime, from
         StrategyConfig.tier2_sizing (uniform for the whole pipeline).
     current_bankroll defaults to None which disables the bankroll cap.
@@ -311,16 +315,8 @@ class MomentumOnlyPipeline:
             return self._skip("gate_no_signal")
 
         # Pool filter: skip if visible pool is too small (dilution kills edge).
-        # Exception: very strong primary signals can bypass on pools >= floor.
-        is_strong_bypass = False
         if pool_total < self._strategy.pool_filter.min_pool_bnb:
-            sb_thresh = self._strategy.strong_bypass.threshold
-            if (not is_regime2
-                    and result.signal_strength >= sb_thresh.min_strength
-                    and pool_total >= sb_thresh.min_pool_bnb):
-                is_strong_bypass = True
-            else:
-                return self._skip("pool_below_minimum")
+            return self._skip("pool_below_minimum")
 
         our_side = pool_bull_bnb if signal_dir == "Bull" else pool_bear_bnb
 
@@ -346,19 +342,6 @@ class MomentumOnlyPipeline:
                 our_side_bnb=our_side,
                 base_frac=es_sizing.base_fraction,
                 cap_bnb=self._strategy.risk.max_bet_bnb_eth_sol_fallback,
-                payout_slope=t2.payout_slope,
-                floor_bnb=t2.floor_bnb,
-                current_bankroll=br_current,
-                max_bet_frac_of_bankroll=br_cap_frac,
-            )
-        elif is_strong_bypass:
-            sb_sizing = self._strategy.strong_bypass.sizing
-            bet_size = _compute_bet_size(
-                signal_strength=effective_strength,
-                pool_bnb=pool_total,
-                our_side_bnb=our_side,
-                base_frac=sb_sizing.base_fraction,
-                cap_bnb=sb_sizing.max_bet_bnb,
                 payout_slope=t2.payout_slope,
                 floor_bnb=t2.floor_bnb,
                 current_bankroll=br_current,
