@@ -47,22 +47,9 @@ min_strength = 0.00015
 [strategy.eth_sol_fallback.sizing]
 base_fraction = 0.02
 
-[strategy.strong_bypass]
-# Strong-bypass admission: when BTC signal strength is unusually high, bypass
-# the standard strategy.pool_filter.min_pool_bnb gate so we can still bet on
-# small-pool rounds. A dedicated (smaller) sizing + BNB cap limits dilution.
-
-[strategy.strong_bypass.threshold]
-min_strength = 0.0004     # BTC min(|r3|,|r7|,|r15|) required for bypass
-min_pool_bnb = 1.0        # absolute pool floor (bypasses pool_filter.min_pool_bnb above this)
-
-[strategy.strong_bypass.sizing]
-base_fraction = 0.03      # conservative base fraction (smaller than btc_primary.sizing.base_fraction)
-max_bet_bnb = 0.3         # absolute per-bet BNB cap for bypass bets
-
 [strategy.tier2_sizing]
-# Cross-regime sizing knobs (apply uniformly across btc_primary, regime-2,
-# strong_bypass paths). Extracted from module-level constants in
+# Cross-regime sizing knobs (apply uniformly across btc_primary and regime-2
+# paths). Extracted from module-level constants in
 # pancakebot/strategy/momentum_pipeline.py for Tier-2 research sweeps.
 # Defaults preserve pre-refactor behaviour.
 payout_slope = 1.0        # Kelly-like payout-boost gain. 0 disables the boost.
