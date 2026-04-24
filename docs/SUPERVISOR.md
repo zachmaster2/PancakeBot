@@ -185,6 +185,10 @@ errors have their own `SUPERVISOR_ERROR` cooldown bucket.
 
 Only after Tier 2 has been running a while with accurate alerts.
 
+**Dry mode is on Tier 3 as of 2026-04-24** (commit `0ebee57` validated
+the read-layer retry fix; see "Retry-once on transient reads" below).
+Live mode is still disabled pending live deployment.
+
 ```powershell
 $repo = "C:\Users\zking\Documents\GitHub\PancakeBot"
 schtasks /change /tn PancakeBotSupervisorDry /tr "`"$repo\.venv\Scripts\python.exe`" `"$repo\scripts\supervisor.py`" --mode dry --alert --restart"
@@ -226,6 +230,34 @@ Examples:
 2026-04-23T00:07:32Z STATUS=DOWN mode=live action=SLOW_CRASHLOOP_WARNING new_pid=8348 alert=SENT
 2026-04-23T00:07:22Z STATUS=DOWN mode=live action=SUPPRESSED_FAST_CRASHLOOP
 ```
+
+## Retry-once on transient reads (Option C, 2026-04-24)
+
+On 2026-04-23 the supervisor fired a false-DOWN Discord alert for the
+dry bot. Post-incident investigation showed the bot was healthy
+throughout: `_safe_read_json(heartbeat.json)` returned `None` and
+`_pid_is_our_bot` had a transient `psutil` failure simultaneously.
+Classifier saw both negative signals and logged `DOWN` with an alert.
+
+Fix landed in commit `0ebee57` (tests: `tests/test_supervisor_retry.py`):
+
+- `_safe_read_json` retries once after `_TRANSIENT_READ_BACKOFF_S`
+  (500ms) when the first read returns `None`. On save-by-retry it
+  emits `DIAGNOSTIC safe_read_json_retry_recovered path=...` to
+  `supervisor.log` (and stderr).
+- `_pid_is_our_bot` retries once after exception. `pid_exists=False`
+  and cmdline-mismatch are clean misses — no retry. On exhausted retry
+  it emits `DIAGNOSTIC pid_is_our_bot_retry_exhausted pid=... mode=...`.
+
+Worst-case added latency: 4 retry paths × 500ms = 2.0s per invocation.
+Schtask budget is 2 min, cadence 3 min — fully inside budget. Retries
+never mask persistent failures (both-None still classifies DOWN).
+
+To confirm the retry is active, tail `var/<mode>/supervisor.log` for
+`DIAGNOSTIC` lines; they should be rare (most invocations read
+cleanly). A spike of `safe_read_json_retry_recovered` lines is a
+signal that Windows AV or disk contention is getting worse —
+investigate before it escalates to exhausted retries.
 
 ## Pause / resume / uninstall
 
