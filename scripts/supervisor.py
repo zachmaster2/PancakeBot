@@ -193,21 +193,88 @@ def _resolve_webhook_env(mode: str, status: str) -> str:
 
 # -- Safe reads (BLOCKER #2: atomic read, never hold handle) -----------------
 
+# Retry-once backoff for transient read failures (Windows AV file-lock race,
+# atomic-rename windows, psutil process-iter transients). 500ms is enough to
+# clear the typical AV scan window and the os.replace handoff in process_health.
+# Worst case when all four read paths retry (heartbeat, crash.json, two
+# _pid_is_our_bot calls): 4 * 0.5 = 2.0s extra wall time per supervisor
+# invocation. Schtask budget is 2 min, cadence is 3 min, so 2s is trivial.
+_TRANSIENT_READ_BACKOFF_S = 0.5
+
+
+# Diagnostic sink for retry-save events. When set (by main() once the mode is
+# resolved), retry-recovered and retry-exhausted events append a DIAGNOSTIC
+# line to the mode's supervisor.log so they survive the schtask's exit-0
+# stderr-discard path (Windows Task Scheduler captures stderr only on task
+# failure -- a classification-UP run that retried silently would otherwise
+# lose the retry-save signal).
+#
+# Remains None during tests / standalone invocation, in which case the events
+# still appear on stderr (preserving unit-test visibility).
+_RETRY_LOG_SINK: Path | None = None
+
+
+def _emit_retry_diagnostic(event: str) -> None:
+    """Record a retry diagnostic to stderr and (if configured) supervisor.log.
+
+    stderr preserves live-dev visibility and test observability. The file
+    append ensures the event survives in production schtask runs where
+    stderr is discarded on exit 0.
+    """
+    sys.stderr.write(event + ("\n" if not event.endswith("\n") else ""))
+    sink = _RETRY_LOG_SINK
+    if sink is None:
+        return
+    try:
+        sink.parent.mkdir(parents=True, exist_ok=True)
+        ts = _iso_utc_now()
+        with sink.open("a", encoding="utf-8") as f:
+            f.write(f"{ts} DIAGNOSTIC {event.strip()}\n")
+    except Exception:
+        # Logging must never raise. The stderr write already happened.
+        pass
+
+
 def _safe_read_json(path: Path) -> dict | None:
-    """Atomic open-read-close. Never holds a file handle. None on any error."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except (PermissionError, OSError):
-        return None
-    try:
-        obj = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(obj, dict):
-        return None
-    return obj
+    """Atomic open-read-close. Never holds a file handle. None on any error.
+
+    Retry-once: if the first read returns None (either I/O exception or
+    content error), sleep ``_TRANSIENT_READ_BACKOFF_S`` and retry once.
+    Targets the false-DOWN mode where Windows AV briefly locks the file
+    or where the bot is mid-atomic-rewrite when we catch it. The retry
+    costs 500ms only on failed first reads; healthy UP paths return on
+    attempt 1 with zero extra latency.
+
+    When retry rescues a failed first read, emit a single stderr line so
+    investigations can see the save-by-retry events.
+    """
+    def _once() -> dict | None:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (PermissionError, OSError):
+            return None
+        try:
+            obj = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(obj, dict):
+            return None
+        return obj
+
+    first = _once()
+    if first is not None:
+        return first
+    time.sleep(_TRANSIENT_READ_BACKOFF_S)
+    second = _once()
+    if second is not None:
+        # Only log when the retry actually saved us. Noisy logs on every
+        # genuinely-missing file would drown the real signal.
+        _emit_retry_diagnostic(
+            f"safe_read_json_retry_recovered path={path.name}"
+        )
+    return second
 
 
 def _safe_read_pid_file(path: Path) -> int | None:
@@ -253,16 +320,48 @@ def _pid_is_our_bot(pid: int, mode: str) -> bool:
     PIDs -- a stale bot.pid could point at a PID now owned by svchost.exe or
     any other unrelated process. The cmdline check ensures we only report a
     PID as "our bot alive" when it actually is one.
+
+    Retry-once semantics distinguish transient psutil failures from clean
+    False outcomes:
+
+      - psutil raises (NoSuchProcess, AccessDenied, random I/O error):
+            transient -> sleep _TRANSIENT_READ_BACKOFF_S, try once more
+      - psutil.pid_exists returns False:
+            clean miss -> no retry (PID genuinely doesn't exist; reading
+            again won't change the answer). Residual risk: psutil can in
+            rare Windows corner cases return False without raising when
+            an internal handle-open fails transiently. That's the same
+            exposure the pre-change code had; the heartbeat retry covers
+            the dominant false-DOWN mode observed 2026-04-23. If a second
+            false-DOWN pattern shows up traced to pid_exists specifically,
+            extend the retry here.
+      - cmdline doesn't contain the mode needle:
+            clean miss -> no retry (PID is alive but it's not our bot,
+            reading again won't change the answer)
+
+    This was added in response to a 2026-04-23 false-DOWN where both the
+    heartbeat read AND the psutil scan briefly failed under system load,
+    classifying a healthy bot as DOWN and firing a spurious Discord alert.
     """
-    try:
-        import psutil
-        if not psutil.pid_exists(int(pid)):
+    needle = f"run.py --{mode}"
+    for attempt in range(2):
+        try:
+            import psutil
+            if not psutil.pid_exists(int(pid)):
+                return False  # clean miss -- no retry
+            proc = psutil.Process(int(pid))
+            cmdline = " ".join(proc.cmdline() or [])
+            return needle in cmdline  # clean result (True or False)
+        except Exception:
+            if attempt == 0:
+                time.sleep(_TRANSIENT_READ_BACKOFF_S)
+                continue
+            # Second attempt also raised -- log then give up.
+            _emit_retry_diagnostic(
+                f"pid_is_our_bot_retry_exhausted pid={pid} mode={mode}"
+            )
             return False
-        proc = psutil.Process(int(pid))
-        cmdline = " ".join(proc.cmdline() or [])
-    except Exception:
-        return False
-    return f"run.py --{mode}" in cmdline
+    return False  # unreachable
 
 
 def _find_legacy_bot_pid(mode: str) -> int | None:
@@ -917,6 +1016,10 @@ def main(argv: list[str] | None = None) -> int:
     # Resolve paths BEFORE _classify so the supervisor-error alert path has
     # somewhere to rate-limit against if classification itself blows up.
     art = _artifacts_for_mode(args.mode)
+    # Route retry diagnostics to the mode's supervisor.log (in addition to
+    # stderr) so schtask runs that exit 0 don't lose the retry-save signal.
+    global _RETRY_LOG_SINK
+    _RETRY_LOG_SINK = art["supervisor_log"]
     try:
         status, fields = _classify(
             args.mode,
