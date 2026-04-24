@@ -91,10 +91,12 @@ function Register-SupervisorTask {
     # with spaces (e.g. "C:\Users\zking\My Stuff\..."). The executable itself
     # is passed unquoted via -Execute; arguments are the rest.
     #
-    # --alert is enabled by default now that the Discord webhooks have been
-    # tested end-to-end. --restart stays OFF; enabling it is the next
-    # validation gate (see docs/SUPERVISOR.md).
-    $argString = "`"$SupervisorScript`" --mode $Mode --alert"
+    # --alert and --restart are both enabled by default as of 2026-04-24.
+    # Dry mode was validated at Tier 3 after commit 0ebee57 (retry-once on
+    # transient reads) cleared the false-DOWN false-positive mode that
+    # would otherwise cause spurious auto-restarts. See docs/SUPERVISOR.md
+    # "Retry-once on transient reads" section.
+    $argString = "`"$SupervisorScript`" --mode $Mode --alert --restart"
 
     $action = New-ScheduledTaskAction `
         -Execute $VenvPython `
