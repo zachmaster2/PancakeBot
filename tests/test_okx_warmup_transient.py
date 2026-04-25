@@ -149,24 +149,16 @@ def test_warmup_partial_failure_succeeds():
 def test_fetch_1s_klines_still_wraps_connection_error():
     """Ensure the pre-existing ``fetch_1s_klines`` path still converts
     ConnectionError -> OkxTransientError. (This is pre-fix behaviour; we
-    verify the fix didn't regress it.)
-
-    fetch_1s_klines now creates its own per-call Session (within-round
-    affinity break, 2026-04-25). So we patch the Session constructor
-    instead of c._session.
-    """
-    c = OkxClient(timeout_seconds=5.0)
-    fresh = MagicMock()
-    fresh.get = MagicMock(side_effect=requests.exceptions.ConnectionError("Connection aborted."))
-    fresh.close = MagicMock()
+    verify the fix didn't regress it.)"""
+    c = _make_client_with_session_that_raises(
+        requests.exceptions.ConnectionError("Connection aborted.")
+    )
     raised = False
-    with patch("pancakebot.market_data.okx_client.requests.Session", return_value=fresh):
-        try:
-            c.fetch_1s_klines(symbol="BTC-USDT", count=25)
-        except OkxTransientError:
-            raised = True
+    try:
+        c.fetch_1s_klines(symbol="BTC-USDT", count=25)
+    except OkxTransientError:
+        raised = True
     assert raised, "fetch_1s_klines should wrap ConnectionError as OkxTransientError"
-    fresh.close.assert_called_once()
 
 
 def main() -> int:
