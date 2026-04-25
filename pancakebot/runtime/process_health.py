@@ -205,7 +205,16 @@ def write_crash(path: Path, exc: BaseException, *, last_epoch: int | None) -> No
         pass
 
 
-_STALE_CRASH_MIN_AGE_SECONDS: float = 60.0
+# Default: 0 (always archive on startup). Any crash.json present when a
+# new bot is calling this helper must be from a previous bot incarnation;
+# the new bot has just acquired the PID file slot, so it isn't its own
+# crash. Leaving a stale crash.json in place caused 2026-04-25 false-CRASHED
+# events where the supervisor saw an old crash.json an hour after the
+# original crash and killed a healthy bot. The previous 60s threshold
+# was justified as "give the writer time to finish" -- but the writer
+# is the dead previous bot, and the supervisor's CRASHED alert (the only
+# other reader) has already fired by the time it triggers --restart.
+_STALE_CRASH_MIN_AGE_SECONDS: float = 0.0
 
 
 def archive_stale_crash(crash_path: Path, *, min_age_seconds: float = _STALE_CRASH_MIN_AGE_SECONDS) -> Path | None:
@@ -218,17 +227,16 @@ def archive_stale_crash(crash_path: Path, *, min_age_seconds: float = _STALE_CRA
 
     Returns the archive path on success, ``None`` if:
       - the crash file doesn't exist (no-op, the common case), or
-      - the file is younger than ``min_age_seconds`` (pathological race where
-        a crash.json was just written by a concurrent process -- don't clobber
-        a fresh crash report; its Discord alert is still in flight), or
+      - the file is younger than ``min_age_seconds`` (default 0 -- always
+        archive; can be raised by the caller for special cases), or
       - any error occurred (silently swallowed; bot startup must not be blocked
         by a cleanup failure).
 
-    The 60s default for ``min_age_seconds`` targets *crash-loop* scenarios:
-    if the previous bot died seconds ago and the supervisor's auto-restart
-    has brought up a new one already, we'd rather keep the fresh crash.json
-    so its Discord alert still reflects real state. A normal operator-driven
-    restart (minutes-to-hours after the crash) safely exceeds 60s.
+    Default policy: always archive. Any crash.json present at bot startup
+    must be from a previous bot (we wouldn't be running run.py if our own
+    process had crashed). The supervisor's CRASHED alert is fired BEFORE
+    it triggers a --restart, so by the time this helper runs the alert
+    has already gone out -- archiving the file doesn't lose any signal.
 
     The archive filename uses the ORIGINAL crash timestamp (file mtime), so
     the filename remains chronologically meaningful across many archives:
