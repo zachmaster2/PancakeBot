@@ -132,6 +132,22 @@ class OkxClient:
     def warmup(self, connections: int = 3) -> None:
         """Fill the connection pool so parallel fetches hit warm connections.
 
+        Per-round freshness: BEFORE filling the pool, close the existing
+        ``self._session`` and replace it with a brand-new
+        ``requests.Session()``. This breaks any connection-reuse-induced
+        backend affinity carried over from prior rounds. Without this,
+        kline fetches in subsequent rounds get sticky-routed to the same
+        OKX backend via TCP keep-alive, and that backend can serve stale
+        data (1-3s lag in 75% of dry-bot rounds, occasional stuck-cache
+        for 5.8%). A fresh session per round breaks the affinity.
+
+        Verified by A/B probe 2026-04-25
+        (research/okx_connection_ab.py): fresh_conn cuts mean lag
+        458ms -> 95ms (first run) and 256ms -> -3ms (extended run).
+        Definitively NOT CDN caching -- all 270 probe responses had
+        ``cf-cache-status: DYNAMIC`` and ``age: 0``. The fix targets
+        connection-reuse affinity below the IP layer.
+
         Best-effort. Transient network errors (``requests.RequestException``
         and raw ``OSError``/``ConnectionResetError`` that can occasionally
         escape the requests/urllib3 wrapping) are logged WARN and swallowed:
@@ -150,6 +166,18 @@ class OkxClient:
         2026-04-22 23:59 EDT). Supervisor reported CRASHED correctly both
         times but the process was still dead until manual restart.
         """
+        # Step 1: close the stale session (breaks any backend affinity from
+        # prior rounds). Best-effort -- a failed close just leaks a few
+        # idle sockets that the OS will reap anyway. Don't crash on cleanup.
+        try:
+            self._session.close()
+        except Exception:  # noqa: BLE001 -- swallow cleanup errors
+            pass
+        # Step 2: brand-new session for this round's pool.
+        self._session = requests.Session()
+        # NOTE: per-symbol _last_response_headers dict is preserved across
+        # this swap (it's an OkxClient instance attr, not on Session).
+        # Step 3: pre-warm the new pool with parallel GETs.
         from concurrent.futures import ThreadPoolExecutor
         url = f"{_OKX_BASE_URL}/api/v5/public/time"
         with ThreadPoolExecutor(max_workers=connections) as pool:
