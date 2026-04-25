@@ -57,18 +57,39 @@ def test_old_file_gets_archived():
         assert data["exc_type"] == "FakeError"
 
 
-def test_young_file_is_preserved():
-    """A crash.json younger than min_age_seconds is NOT archived.
+def test_default_always_archives_regardless_of_age():
+    """Default min_age_seconds=0 means even a freshly-written crash.json
+    is archived on bot startup.
 
-    Rationale: protects against a pathological race where the archive
-    happens while the crash handler is still writing (extremely unlikely
-    since atomic write -> rename is fast, but belt + suspenders).
+    Rationale: by the time a NEW bot calls this helper, any crash.json
+    must be from a previous bot (we just acquired the PID slot, our own
+    crash hasn't happened yet). Previously the default was 60s, which
+    caused 2026-04-25 false-CRASHED events: a bot crashed at T=0,
+    auto-restart spawned a new bot at T=58s (under threshold), the
+    crash.json sat un-archived, and the supervisor's next 3-minute cycle
+    classified the healthy new bot as CRASHED based on the stale file
+    and killed it. Always archiving fixes this without losing forensic
+    data (the file is renamed, not deleted).
     """
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "crash.json"
-        _write_fake_crash(p, age_s=5)  # 5s old, default threshold 60s
+        _write_fake_crash(p, age_s=5)  # 5s old -- under the OLD 60s threshold
         result = archive_stale_crash(p)
-        assert result is None, "young crash.json should NOT have been archived"
+        assert result is not None, "default policy now archives unconditionally"
+        assert not p.exists(), "original crash.json should have been renamed"
+        assert result.exists(), "archive file should exist"
+        assert result.name.startswith("crash_archive_")
+
+
+def test_explicit_min_age_still_preserves_young_file():
+    """When the caller explicitly sets a min_age_seconds threshold,
+    young files are still preserved -- behavior preserved for callers
+    that need the old semantics."""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "crash.json"
+        _write_fake_crash(p, age_s=5)
+        result = archive_stale_crash(p, min_age_seconds=60.0)
+        assert result is None, "explicit min_age_seconds=60 should preserve a 5s-old file"
         assert p.exists(), "original crash.json should still be in place"
 
 
