@@ -71,6 +71,13 @@ class MomentumGate:
         self.last_eth_klines_raw: list[dict] | None = None
         self.last_sol_klines_raw: list[dict] | None = None
         self.last_returns: dict[str, float | None] | None = None
+        # Diagnostic HTTP response headers from each kline fetch, populated
+        # only when PANCAKEBOT_CAPTURE_OKX_HEADERS env var is set (off by
+        # default). Used to investigate upstream-cache behavior on lagged
+        # responses. Same lifetime + threading semantics as last_*_klines_raw.
+        self.last_btc_response_headers: dict[str, str] | None = None
+        self.last_eth_response_headers: dict[str, str] | None = None
+        self.last_sol_response_headers: dict[str, str] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -179,6 +186,22 @@ class MomentumGate:
         self.last_btc_klines_raw = list(btc_klines) if btc_klines is not None else None
         self.last_eth_klines_raw = list(eth_klines) if eth_klines is not None else None
         self.last_sol_klines_raw = list(sol_klines) if sol_klines is not None else None
+        # Snapshot diagnostic HTTP headers (only populated when env var
+        # is set; client returns None otherwise). Unconditionally pull
+        # via getattr in case the client doesn't have the method (older
+        # OkxClient instance from a stale path).
+        self.last_btc_response_headers = (
+            self._client.last_response_headers(self._cfg.btc_symbol)
+            if hasattr(self._client, "last_response_headers") else None
+        )
+        self.last_eth_response_headers = (
+            self._client.last_response_headers(self._cfg.eth_symbol)
+            if hasattr(self._client, "last_response_headers") else None
+        )
+        self.last_sol_response_headers = (
+            self._client.last_response_headers(self._cfg.sol_symbol)
+            if hasattr(self._client, "last_response_headers") else None
+        )
         # last_returns will be re-set below once we have closes; default
         # to closes-from-raw which work even on partial data.
         _btc_closes_for_snap = (

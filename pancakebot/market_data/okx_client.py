@@ -93,9 +93,41 @@ def _classify_exception(exc: Exception) -> tuple[_OkxErrorClass, str]:
 class OkxClient:
     """OKX Spot public REST client (unauthenticated) with retry and classification."""
 
+    # Headers to extract from each OKX response when header capture is enabled.
+    # These are the upstream-cache diagnostic fields: cache-control, age (CDN
+    # response age in seconds), x-cache (varnish-style HIT/MISS), cf-cache-status
+    # (CloudFlare HIT/MISS/EXPIRED), x-served-by (which edge node), via, server.
+    # We don't want to capture EVERY header (privacy + bloat), just the ones
+    # diagnostic for "is this a cached response" investigations.
+    _CAPTURED_HEADER_NAMES: tuple[str, ...] = (
+        "cache-control", "age", "x-cache", "cf-cache-status",
+        "x-served-by", "via", "server", "date", "x-amz-cf-id",
+        "x-amz-cf-pop", "expires", "etag",
+    )
+
     def __init__(self, *, timeout_seconds: float) -> None:
         self._timeout_seconds = timeout_seconds
         self._session = requests.Session()
+        # Per-symbol cache of the most-recent response headers, populated
+        # only when capture is enabled. Read by MomentumGate to forward
+        # into the kline_capture JSONL. Keyed by symbol (e.g. "BTC-USDT").
+        # Empty dict on each new request to that symbol.
+        self._last_response_headers: dict[str, dict[str, str]] = {}
+
+    def last_response_headers(self, symbol: str) -> dict[str, str] | None:
+        """Return the most-recent captured headers for *symbol*, or None.
+
+        Always returns None when ``OkxClient._capture_headers_enabled()``
+        was False at fetch time (i.e. the env var was unset). Otherwise
+        returns the diagnostic header subset.
+        """
+        return self._last_response_headers.get(symbol)
+
+    @staticmethod
+    def _capture_headers_enabled() -> bool:
+        """Opt-in via env var. Default OFF to avoid bloating capture file."""
+        import os
+        return os.environ.get("PANCAKEBOT_CAPTURE_OKX_HEADERS", "").lower() in ("1", "true", "yes")
 
     def warmup(self, connections: int = 3) -> None:
         """Fill the connection pool so parallel fetches hit warm connections.
@@ -239,12 +271,28 @@ class OkxClient:
         if after_ms is not None:
             params["after"] = str(after_ms)
 
+        resp = None
         try:
             resp = self._session.get(url, params=params, timeout=self._timeout_seconds)
         except requests.RequestException as e:
             cls, detail = _classify_exception(e)
         else:
             cls, detail = _classify_response(resp, count)
+
+        # Capture diagnostic headers if env-var-enabled. Always update the
+        # per-symbol slot (overwrite the previous response's headers) so
+        # the gate sees the headers from THIS request. When capture is
+        # disabled or no response was received, leave the slot untouched.
+        if resp is not None and self._capture_headers_enabled():
+            try:
+                hdrs = {
+                    name: resp.headers.get(name, "")
+                    for name in self._CAPTURED_HEADER_NAMES
+                    if resp.headers.get(name) is not None
+                }
+                self._last_response_headers[symbol] = hdrs
+            except Exception:  # noqa: BLE001 -- never fail the fetch on header capture
+                pass
 
         if cls == _OkxErrorClass.SUCCESS:
             body = resp.json()
