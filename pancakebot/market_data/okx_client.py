@@ -299,13 +299,35 @@ class OkxClient:
         if after_ms is not None:
             params["after"] = str(after_ms)
 
+        # Per-call fresh session to defeat WITHIN-round connection
+        # affinity. The per-round warmup() reset addresses BETWEEN-round
+        # affinity (eliminated stuck-cache mode entirely, 0/17 post-fix
+        # vs 8/145 pre-fix), but n=17 measurement showed 100% any-lag
+        # because warmup connections from the same round are re-used by
+        # the kline fetch via urllib3's PoolManager. urllib3 keys the
+        # pool on (scheme, host, port) so /public/time warmup connections
+        # and /market/candles fetch connections share the same pool.
+        # Standalone A/B (research/okx_connection_ab.py) confirmed:
+        # `fresh_conn` (one Session per fetch) achieves mean lag ~0ms
+        # vs `session_reuse` ~250ms even on quiet network conditions.
+        # Cost: ~100-200ms TLS handshake per fetch, parallelised across
+        # the 3 BTC/ETH/SOL fetches in fetch_klines_async via the gate's
+        # ThreadPoolExecutor. Comfortably under the 1.75s budget between
+        # cutoff+0.25s fetch and lock-1s safety margin.
         resp = None
+        fresh_session = requests.Session()
         try:
-            resp = self._session.get(url, params=params, timeout=self._timeout_seconds)
-        except requests.RequestException as e:
-            cls, detail = _classify_exception(e)
-        else:
-            cls, detail = _classify_response(resp, count)
+            try:
+                resp = fresh_session.get(url, params=params, timeout=self._timeout_seconds)
+            except requests.RequestException as e:
+                cls, detail = _classify_exception(e)
+            else:
+                cls, detail = _classify_response(resp, count)
+        finally:
+            try:
+                fresh_session.close()
+            except Exception:  # noqa: BLE001 -- never crash the fetch on cleanup
+                pass
 
         # Capture diagnostic headers if env-var-enabled. Always update the
         # per-symbol slot (overwrite the previous response's headers) so
