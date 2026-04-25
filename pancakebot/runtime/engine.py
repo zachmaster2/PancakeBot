@@ -154,7 +154,9 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         # so record_settlement needs to hook into claim-confirmation events.
         # Until that's added, the risk checks run against the STARTUP bankroll
         # only -- initial bounds still work, but drawdown-from-peak won't fire.
-        from pathlib import Path
+        # NOTE: Path is already imported at module level; do not re-import
+        # locally or it shadows the module-level binding for the whole
+        # function (Python locals-vs-globals scope rule).
         from pancakebot.bankroll_tracker import PersistedBankrollTracker
         from pancakebot import paths as _paths
         tracker = PersistedBankrollTracker(
