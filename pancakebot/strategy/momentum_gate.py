@@ -61,6 +61,16 @@ class MomentumGate:
         # Per-pair fetch timing (ms) -- set each evaluate(), logged by caller
         # AFTER timing guard so file I/O doesn't delay bet submission.
         self.last_fetch_timing: dict[str, int] | None = None
+        # Raw kline arrays + computed returns from the most recent evaluate().
+        # Consumed by pancakebot.runtime.kline_capture for off-critical-path
+        # observability writes. Strategy decisions never read these -- they're
+        # set on the gate purely as a side-effect for the capture module to
+        # snapshot post-decision. None when evaluate() didn't run (gate
+        # disabled, no klines fetched, or evaluate aborted before signal step).
+        self.last_btc_klines_raw: list[dict] | None = None
+        self.last_eth_klines_raw: list[dict] | None = None
+        self.last_sol_klines_raw: list[dict] | None = None
+        self.last_returns: dict[str, float | None] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -167,6 +177,25 @@ class MomentumGate:
 
         self.last_btc_closes = btc_closes
 
+        # Snapshot raw klines + per-pair returns for off-critical-path
+        # capture (see pancakebot.runtime.kline_capture). These assignments
+        # are passive observability -- nothing in the decision path reads
+        # them. Order doesn't matter for correctness because the capture
+        # site reads them only AFTER decide_open_round returns, but we
+        # set them before _compute_signal to keep the critical line
+        # _compute_signal at the very end of evaluate().
+        #
+        # IMPORTANT: the kline dicts are shared by reference with the
+        # gate's local btc_klines/eth_klines/sol_klines. Do not mutate
+        # them in place anywhere downstream -- always reassign these
+        # last_*_klines_raw attributes to fresh lists. The capture
+        # worker (a separate thread) reads these dicts; in-place
+        # mutation would race with serialisation.
+        self.last_btc_klines_raw = list(btc_klines) if btc_klines is not None else None
+        self.last_eth_klines_raw = list(eth_klines) if eth_klines is not None else None
+        self.last_sol_klines_raw = list(sol_klines) if sol_klines is not None else None
+        self.last_returns = _snapshot_returns(btc_closes, eth_closes, sol_closes)
+
         result = _compute_signal(btc_closes, eth_closes, sol_closes)
 
         # NOTE: No logging here -- caller logs AFTER timing guard so
@@ -230,6 +259,27 @@ def _validate_klines_raw(
         return f"gate_{label}_unexpected_newest:got={newest_ts},expected={expected_ts}"
 
     return None
+
+
+def _snapshot_returns(
+    btc_closes: list[float] | None,
+    eth_closes: list[float] | None,
+    sol_closes: list[float] | None,
+) -> dict[str, float | None]:
+    """Compute per-pair, per-lookback returns for capture.
+
+    Used only by ``pancakebot.runtime.kline_capture`` -- this is not on
+    the decision path. None values mean the closes list was missing or
+    too short for that lookback; the gate's own no-signal logic handles
+    those cases independently.
+    """
+    out: dict[str, float | None] = {}
+    pairs = (("btc", btc_closes), ("eth", eth_closes), ("sol", sol_closes))
+    for name, closes in pairs:
+        for lb in _MTF_LOOKBACKS:
+            key = f"{name}_r{lb}"
+            out[key] = _get_return(closes, lb) if closes is not None else None
+    return out
 
 
 def _get_return(closes: list[float], lookback: int) -> float | None:

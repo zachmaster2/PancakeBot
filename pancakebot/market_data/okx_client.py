@@ -253,9 +253,17 @@ class OkxClient:
             for row in reversed(rows):
                 if not isinstance(row, list) or len(row) < 6:
                     raise InvariantError("okx_client_1s_row_invalid")
+                # Full OHLCV is captured for replay analysis (see
+                # pancakebot.runtime.kline_capture). Strategy code path
+                # only reads ``close_price`` so the extra fields are
+                # passive observability data.
                 result.append({
                     "open_time_ms": int(row[0]),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
                     "close_price": float(row[4]),
+                    "volume": float(row[5]),
                 })
             return result
 
