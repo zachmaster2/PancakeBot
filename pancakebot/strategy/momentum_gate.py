@@ -165,7 +165,39 @@ class MomentumGate:
                 eth_klines = eth_fut.result()
                 sol_klines = sol_fut.result()
 
-        # Validate BTC klines (the signal source).  We require exactly
+        # Snapshot raw klines for off-critical-path capture, BEFORE any
+        # validation early-return. This ensures we capture even partial
+        # / stale fetches that fail validation -- exactly the cases we
+        # need to investigate for live-vs-history divergence. Order:
+        # snapshot first, then validate, then signal-compute.
+        #
+        # IMPORTANT: the kline dicts are shared by reference with the
+        # local btc_klines/eth_klines/sol_klines. Do not mutate them
+        # downstream -- always reassign last_*_klines_raw to fresh
+        # lists. The capture worker (a separate thread) reads these
+        # dicts; in-place mutation would race with serialisation.
+        self.last_btc_klines_raw = list(btc_klines) if btc_klines is not None else None
+        self.last_eth_klines_raw = list(eth_klines) if eth_klines is not None else None
+        self.last_sol_klines_raw = list(sol_klines) if sol_klines is not None else None
+        # last_returns will be re-set below once we have closes; default
+        # to closes-from-raw which work even on partial data.
+        _btc_closes_for_snap = (
+            [k["close_price"] for k in btc_klines]
+            if btc_klines is not None else None
+        )
+        _eth_closes_for_snap = (
+            [k["close_price"] for k in eth_klines]
+            if eth_klines is not None else None
+        )
+        _sol_closes_for_snap = (
+            [k["close_price"] for k in sol_klines]
+            if sol_klines is not None else None
+        )
+        self.last_returns = _snapshot_returns(
+            _btc_closes_for_snap, _eth_closes_for_snap, _sol_closes_for_snap,
+        )
+
+        # Validate BTC klines (the signal source). We require exactly
         # _CANDLE_COUNT contiguous 1s candles ending at cutoff - 1.
         btc_reason = _validate_klines(btc_klines, cutoff_ts_ms, "btc")
         if btc_reason is not None or btc_klines is None:
@@ -176,25 +208,6 @@ class MomentumGate:
         sol_closes = [k["close_price"] for k in sol_klines] if sol_klines and len(sol_klines) >= _CANDLE_COUNT else None
 
         self.last_btc_closes = btc_closes
-
-        # Snapshot raw klines + per-pair returns for off-critical-path
-        # capture (see pancakebot.runtime.kline_capture). These assignments
-        # are passive observability -- nothing in the decision path reads
-        # them. Order doesn't matter for correctness because the capture
-        # site reads them only AFTER decide_open_round returns, but we
-        # set them before _compute_signal to keep the critical line
-        # _compute_signal at the very end of evaluate().
-        #
-        # IMPORTANT: the kline dicts are shared by reference with the
-        # gate's local btc_klines/eth_klines/sol_klines. Do not mutate
-        # them in place anywhere downstream -- always reassign these
-        # last_*_klines_raw attributes to fresh lists. The capture
-        # worker (a separate thread) reads these dicts; in-place
-        # mutation would race with serialisation.
-        self.last_btc_klines_raw = list(btc_klines) if btc_klines is not None else None
-        self.last_eth_klines_raw = list(eth_klines) if eth_klines is not None else None
-        self.last_sol_klines_raw = list(sol_klines) if sol_klines is not None else None
-        self.last_returns = _snapshot_returns(btc_closes, eth_closes, sol_closes)
 
         result = _compute_signal(btc_closes, eth_closes, sol_closes)
 

@@ -39,6 +39,8 @@ def run_from_config(
     live: bool = False,
     fresh: bool = False,
     no_archive: bool = False,
+    kline_source: str = "history",
+    captured_path: str | None = None,
 ) -> None:
     cfg = load_app_config(config_path)
 
@@ -80,7 +82,13 @@ def run_from_config(
             buffer_seconds=cc.buffer_seconds,
             strategy=cfg.strategy,
         )
-        run_backtest(runtime_cfg=runtime_cfg, backtest_cfg=backtest_cfg, out_dir=Path("var/backtest"))
+        run_backtest(
+            runtime_cfg=runtime_cfg,
+            backtest_cfg=backtest_cfg,
+            out_dir=Path("var/backtest"),
+            kline_source=kline_source,
+            captured_path=captured_path,
+        )
         return
 
     if sync:

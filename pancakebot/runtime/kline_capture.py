@@ -429,6 +429,44 @@ def record_round_decision(
 # Reader (used by backtest replay; trivially used by tests)
 # ---------------------------------------------------------------------------
 
+def load_klines_from_capture(
+    path: Path,
+    asset: str,
+) -> dict[int, list[list]]:
+    """Load per-epoch klines for one asset from a capture file.
+
+    Returns ``{epoch: [[ts_ms, o, h, l, c, v], ...]}`` -- the same
+    shape as ``pancakebot.backtest.runner._load_klines_from`` so the
+    backtest pipeline can swap sources without other changes.
+
+    *asset* is one of ``"btc"``, ``"eth"``, ``"sol"``. (BNB klines are
+    not captured at decision time -- only the gate's BTC/ETH/SOL
+    fetches are -- so BNB always comes from history.)
+
+    Captures with the chosen asset's ``klines_<asset>`` field == None
+    (e.g. ETH/SOL fetches that returned no data live) are skipped --
+    those epochs simply won't appear in the returned dict, and the
+    caller can fall back to history for them.
+
+    Forward-compat: records with an unknown ``schema_version`` are
+    skipped.
+    """
+    if asset not in ("btc", "eth", "sol"):
+        raise ValueError(f"asset must be btc/eth/sol, got {asset!r}")
+    field_name = f"klines_{asset}"
+    out: dict[int, list[list]] = {}
+    for rec in iter_captures(path):
+        if int(rec.get("schema_version", 0)) > CAPTURE_SCHEMA_VERSION:
+            continue
+        klines = rec.get(field_name)
+        if klines is None or not isinstance(klines, list):
+            continue
+        # The capture stores klines as [[ts, o, h, l, c, v], ...] arrays
+        # already (see _kline_dict_to_array). Pass through as-is.
+        out[int(rec["epoch"])] = klines
+    return out
+
+
 def iter_captures(path: Path):
     """Stream captures from a JSONL file. Skips malformed lines.
 
