@@ -90,7 +90,59 @@ def _load_klines_from(path: Path) -> dict[int, list[list]]:
     return result
 
 
-def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) -> None:
+def _merge_captured_with_history(
+    *,
+    asset: str,
+    captured_path: Path,
+    history_path: Path,
+) -> tuple[dict[int, list[list]], int, int]:
+    """Build the per-epoch kline dict using captured first, history as fallback.
+
+    Returns ``(merged_dict, n_from_capture, n_from_history)``. Loads
+    capture klines for *asset* (btc/eth/sol), then for any epoch missing
+    from capture, fills in from the history file.
+
+    BNB klines aren't captured (the gate doesn't fetch them at decision
+    time), so callers should always read BNB from history directly.
+    """
+    from pancakebot.runtime.kline_capture import load_klines_from_capture
+
+    captured = load_klines_from_capture(captured_path, asset)
+    history = _load_klines_from(history_path)
+    merged: dict[int, list[list]] = dict(history)
+    # captured wins where both have the epoch
+    for ep, klines in captured.items():
+        merged[ep] = klines
+    n_from_capture = len(captured)
+    n_from_history = len(merged) - n_from_capture
+    return merged, n_from_capture, n_from_history
+
+
+def run_backtest(
+    *,
+    runtime_cfg,
+    backtest_cfg: BacktestConfig,
+    out_dir: Path,
+    kline_source: str = "history",
+    captured_path: str | None = None,
+) -> None:
+    """Replay historical rounds + klines and produce trades + summary.
+
+    *kline_source*:
+        "history"  -- load BTC/ETH/SOL klines from the OKX history-candles
+                      cache files (var/{btc,eth,sol}_spot_prices.jsonl,
+                      populated by `--sync`). Default; preserves all
+                      pre-capture sweep behaviour.
+        "captured" -- load BTC/ETH/SOL klines from the live-bot capture
+                      file first (the actual data the bot saw at
+                      decision time), then fall back to history for any
+                      epoch missing from the capture. BNB klines are
+                      always history (the gate doesn't fetch them).
+
+    *captured_path* overrides the default capture path
+    (var/dry/captured_klines.jsonl) -- e.g. to replay live mode's
+    captures or a backed-up snapshot.
+    """
     backtest_cfg.validate()
 
     simulation_size = backtest_cfg.simulation_size
@@ -144,17 +196,40 @@ def run_backtest(*, runtime_cfg, backtest_cfg: BacktestConfig, out_dir: Path) ->
     else:
         info("BACK", "SETUP", "BNB_KL", msg="No BNB klines found -- backtest will skip all rounds")
 
-    btc_klines = _load_klines_from(_BTC_KLINES_PATH)
-    if btc_klines:
-        info("BACK", "SETUP", "BTC_KL", msg=f"Loaded BTC 1s klines for {len(btc_klines)} epochs")
-
-    eth_klines = _load_klines_from(_ETH_KLINES_PATH) if _ETH_KLINES_PATH.exists() else {}
-    if eth_klines:
-        info("BACK", "SETUP", "ETH_KL", msg=f"Loaded ETH 1s klines for {len(eth_klines)} epochs")
-
-    sol_klines = _load_klines_from(_SOL_KLINES_PATH) if _SOL_KLINES_PATH.exists() else {}
-    if sol_klines:
-        info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s klines for {len(sol_klines)} epochs")
+    if kline_source == "captured":
+        cap_path = Path(captured_path) if captured_path else Path(_paths.DRY_CAPTURE_PATH)
+        if not cap_path.exists():
+            raise InvariantError(
+                f"backtest_capture_file_missing: {cap_path} -- run dry bot to populate captures, "
+                f"or use --kline-source history"
+            )
+        info("BACK", "SETUP", "SOURCE", msg=f"kline_source=captured path={cap_path}")
+        btc_klines, btc_n_cap, btc_n_hist = _merge_captured_with_history(
+            asset="btc", captured_path=cap_path, history_path=_BTC_KLINES_PATH,
+        )
+        eth_klines, eth_n_cap, eth_n_hist = _merge_captured_with_history(
+            asset="eth", captured_path=cap_path, history_path=_ETH_KLINES_PATH,
+        )
+        sol_klines, sol_n_cap, sol_n_hist = _merge_captured_with_history(
+            asset="sol", captured_path=cap_path, history_path=_SOL_KLINES_PATH,
+        )
+        info("BACK", "SETUP", "BTC_KL",
+             msg=f"BTC: {len(btc_klines)} epochs (captured={btc_n_cap} history={btc_n_hist})")
+        info("BACK", "SETUP", "ETH_KL",
+             msg=f"ETH: {len(eth_klines)} epochs (captured={eth_n_cap} history={eth_n_hist})")
+        info("BACK", "SETUP", "SOL_KL",
+             msg=f"SOL: {len(sol_klines)} epochs (captured={sol_n_cap} history={sol_n_hist})")
+    else:
+        info("BACK", "SETUP", "SOURCE", msg="kline_source=history")
+        btc_klines = _load_klines_from(_BTC_KLINES_PATH)
+        if btc_klines:
+            info("BACK", "SETUP", "BTC_KL", msg=f"Loaded BTC 1s klines for {len(btc_klines)} epochs")
+        eth_klines = _load_klines_from(_ETH_KLINES_PATH) if _ETH_KLINES_PATH.exists() else {}
+        if eth_klines:
+            info("BACK", "SETUP", "ETH_KL", msg=f"Loaded ETH 1s klines for {len(eth_klines)} epochs")
+        sol_klines = _load_klines_from(_SOL_KLINES_PATH) if _SOL_KLINES_PATH.exists() else {}
+        if sol_klines:
+            info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s klines for {len(sol_klines)} epochs")
 
     # Build momentum pipeline (no live gate -- backtest uses cached 1s klines).
     from pancakebot.bankroll_tracker import InMemoryBankrollTracker

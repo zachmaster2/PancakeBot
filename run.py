@@ -57,6 +57,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Archive existing dry state and start fresh (--dry only)")
     p.add_argument("--no-archive", action="store_true",
                    help="Delete (don't archive) existing state on --fresh (--dry only)")
+    p.add_argument(
+        "--kline-source",
+        type=str,
+        choices=("history", "captured"),
+        default="history",
+        help=(
+            "Backtest only: select where 1s klines come from. "
+            "'history' (default) reads var/{btc,eth,sol}_spot_prices.jsonl "
+            "(populated by --sync from OKX history-candles). "
+            "'captured' reads var/dry/captured_klines.jsonl (the bot's own "
+            "live OKX fetches at decision time). Falls back to history "
+            "for any epoch missing from the capture file."
+        ),
+    )
+    p.add_argument(
+        "--captured-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to capture JSONL (only with --kline-source captured). "
+            "Default: var/dry/captured_klines.jsonl. Use var/live/... when "
+            "replaying live captures."
+        ),
+    )
     args = p.parse_args(argv)
 
     selected = [args.sync, args.backtest, args.dry, args.live]
@@ -70,6 +94,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--fresh is only valid with --dry")
     if args.no_archive and not args.fresh:
         p.error("--no-archive requires --fresh")
+    if args.kline_source != "history" and not args.backtest:
+        p.error("--kline-source is only valid with --backtest")
+    if args.captured_path is not None and args.kline_source != "captured":
+        p.error("--captured-path requires --kline-source captured")
 
     return args
 
@@ -117,6 +145,8 @@ def main() -> None:
             live=args.live,
             fresh=args.fresh,
             no_archive=args.no_archive,
+            kline_source=args.kline_source,
+            captured_path=args.captured_path,
         )
     except KeyboardInterrupt:
         info("CORE", "RUN", "EXIT", msg="Caught KeyboardInterrupt: shutting down")
