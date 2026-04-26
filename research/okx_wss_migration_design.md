@@ -396,9 +396,12 @@ post-WSS bot's captured.jsonl is consumable by every existing tool.
 ### Backtest hash check (CI / pre-merge)
 
 `python run.py --backtest` produces hash
-`c8e53948bc6182faf939c90a82d92154` (current post-sync baseline) with
-`use_wss = false` AND with `use_wss = true` (since backtest doesn't
-construct WSS — proves no inadvertent coupling).
+`c8e53948bc6182faf939c90a82d92154` (current post-sync baseline). The
+backtest entrypoint (`runner.py:run_backtest`) never invokes
+`engine.run_realtime_loop`, so `OkxWssClient` is never constructed
+in backtest mode (proven in "Backtest equivalence preservation"
+above). Hash equivalence is therefore guaranteed by construction —
+no `use_wss`-style flag exists to test against.
 
 ## Reviewer's blocker checklist
 
