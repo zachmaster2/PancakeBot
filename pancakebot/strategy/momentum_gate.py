@@ -7,11 +7,9 @@ strengths for use by the pipeline's sizing and regime-2 logic.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
-from pancakebot.market_data.okx_client import OkxClient, OkxTransientError
-from pancakebot.log import warn
+from pancakebot.market_data.okx_client import OkxClient
 
 # Number of 1s candles fetched and used by all modes (live, sync, backtest).
 _CANDLE_COUNT = 31
@@ -116,16 +114,19 @@ class MomentumGate:
         self,
         *,
         cutoff_ts_ms: int,
-        kline_futures: tuple | None = None,
     ) -> MomentumGateResult:
-        """Compute signal from current OKX data.
+        """Compute signal from the WSS in-memory ring buffers.
 
-        If *kline_futures* is provided (from fetch_klines_async()),
-        the already-completed futures are collected instantly. Otherwise,
-        the klines are fetched inline (parallel) as a fallback.
+        Live mode: reads ``self._wss.get_window(symbol, cutoff_ms)`` for
+        BTC, ETH, SOL. ETH/SOL are independent feeds (regime-2 signal /
+        BTC-confirmation source). Sub-millisecond decision-time read.
 
-        If BNB klines fail validation because OKX is exactly 1 second
-        behind (stale candle), retries once after a short delay.
+        Multi-instrument independence (per design doc):
+          - BTC stale -> _skip("risk_kline_wss_stale")
+          - ETH+SOL both stale -> _skip("risk_kline_wss_correlated_stale")
+          - One of ETH/SOL stale alone -> degraded BTC-primary
+            (no regime-2 signal that round)
+          - BNB never read here (capture-only, not in decision path)
         """
         if not self._cfg.enabled:
             return MomentumGateResult(
@@ -133,114 +134,90 @@ class MomentumGate:
                 skip_reason=None,
             )
 
-        # Collect klines -- BTC/ETH/SOL only (BNB not needed for signal).
-        import time as _time
-        btc_klines: list[dict] | None = None
-        eth_klines: list[dict] | None = None
-        sol_klines: list[dict] | None = None
-        if kline_futures is not None:
-            _t0 = _time.monotonic()
-            btc_klines = kline_futures[0].result()
-            _t_btc = _time.monotonic()
-            eth_klines = kline_futures[1].result() if len(kline_futures) > 1 else None
-            _t_eth = _time.monotonic()
-            sol_klines = kline_futures[2].result() if len(kline_futures) > 2 else None
-            _t_sol = _time.monotonic()
-            # Store timing for caller to log AFTER timing guard (no file I/O here)
-            self.last_fetch_timing = {
-                "btc_ms": int((_t_btc - _t0) * 1000),
-                "eth_ms": int((_t_eth - _t_btc) * 1000),
-                "sol_ms": int((_t_sol - _t_eth) * 1000),
-            }
-        else:
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _CANDLE_COUNT, cutoff_ts_ms)
-                eth_fut = pool.submit(self._fetch_klines, self._cfg.eth_symbol, _CANDLE_COUNT, cutoff_ts_ms)
-                sol_fut = pool.submit(self._fetch_klines, self._cfg.sol_symbol, _CANDLE_COUNT, cutoff_ts_ms)
-                btc_klines = btc_fut.result()
-                eth_klines = eth_fut.result()
-                sol_klines = sol_fut.result()
+        if self._wss is None:
+            # Live runtime should always provide wss_client. This branch
+            # protects test paths that construct MomentumGate without WSS;
+            # they get a clean skip rather than a confusing AttributeError.
+            return self._skip("gate_no_wss_client")
 
-        # Snapshot raw klines for off-critical-path capture, BEFORE any
-        # validation early-return. This ensures we capture even partial
-        # / stale fetches that fail validation -- exactly the cases we
-        # need to investigate for live-vs-history divergence. Order:
-        # snapshot first, then validate, then signal-compute.
-        #
-        # IMPORTANT: the kline dicts are shared by reference with the
-        # local btc_klines/eth_klines/sol_klines. Do not mutate them
-        # downstream -- always reassign last_*_klines_raw to fresh
-        # lists. The capture worker (a separate thread) reads these
-        # dicts; in-place mutation would race with serialisation.
-        self.last_btc_klines_raw = list(btc_klines) if btc_klines is not None else None
-        self.last_eth_klines_raw = list(eth_klines) if eth_klines is not None else None
-        self.last_sol_klines_raw = list(sol_klines) if sol_klines is not None else None
-        # Snapshot diagnostic HTTP headers (only populated when env var
-        # is set; client returns None otherwise). Unconditionally pull
-        # via getattr in case the client doesn't have the method (older
-        # OkxClient instance from a stale path).
-        self.last_btc_response_headers = (
-            self._client.last_response_headers(self._cfg.btc_symbol)
-            if hasattr(self._client, "last_response_headers") else None
-        )
-        self.last_eth_response_headers = (
-            self._client.last_response_headers(self._cfg.eth_symbol)
-            if hasattr(self._client, "last_response_headers") else None
-        )
-        self.last_sol_response_headers = (
-            self._client.last_response_headers(self._cfg.sol_symbol)
-            if hasattr(self._client, "last_response_headers") else None
-        )
-        # last_returns will be re-set below once we have closes; default
-        # to closes-from-raw which work even on partial data.
-        _btc_closes_for_snap = (
-            [k["close_price"] for k in btc_klines]
-            if btc_klines is not None else None
-        )
-        _eth_closes_for_snap = (
-            [k["close_price"] for k in eth_klines]
-            if eth_klines is not None else None
-        )
-        _sol_closes_for_snap = (
-            [k["close_price"] for k in sol_klines]
-            if sol_klines is not None else None
-        )
+        # ----- Read rings -----
+        # Returns (klines, skip_reason). klines is list of
+        # [ts_ms, o, h, l, c, v] arrays oldest-first; None on stale or
+        # insufficient.
+        btc_arr, btc_reason = self._wss.get_window(self._cfg.btc_symbol, cutoff_ts_ms, _CANDLE_COUNT)
+        eth_arr, eth_reason = self._wss.get_window(self._cfg.eth_symbol, cutoff_ts_ms, _CANDLE_COUNT)
+        sol_arr, sol_reason = self._wss.get_window(self._cfg.sol_symbol, cutoff_ts_ms, _CANDLE_COUNT)
+
+        # In-memory read; no fetch-timing meaningful (sub-ms).
+        self.last_fetch_timing = {"btc_ms": 0, "eth_ms": 0, "sol_ms": 0}
+
+        # ----- Capture snapshot (BEFORE validation early-return) -----
+        # Materialize dict-shaped wrappers for the capture module's
+        # _kline_dict_to_array reader. This preserves the existing
+        # captured.jsonl schema unchanged from the REST era.
+        def _arr_to_dicts(arrs: list[list] | None) -> list[dict] | None:
+            if arrs is None:
+                return None
+            return [
+                {"open_time_ms": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                 "low": float(k[3]), "close_price": float(k[4]),
+                 "volume": float(k[5]) if len(k) > 5 else 0.0}
+                for k in arrs
+            ]
+
+        self.last_btc_klines_raw = _arr_to_dicts(btc_arr)
+        self.last_eth_klines_raw = _arr_to_dicts(eth_arr)
+        self.last_sol_klines_raw = _arr_to_dicts(sol_arr)
+        # response_headers no longer apply (no per-round HTTP). Always None.
+        self.last_btc_response_headers = None
+        self.last_eth_response_headers = None
+        self.last_sol_response_headers = None
+        # Returns snapshot (uses available closes; partial data still produces
+        # something for capture, even on stale paths).
+        _btc_closes_snap = [float(k[4]) for k in btc_arr] if btc_arr else None
+        _eth_closes_snap = [float(k[4]) for k in eth_arr] if eth_arr else None
+        _sol_closes_snap = [float(k[4]) for k in sol_arr] if sol_arr else None
         self.last_returns = _snapshot_returns(
-            _btc_closes_for_snap, _eth_closes_for_snap, _sol_closes_for_snap,
+            _btc_closes_snap, _eth_closes_snap, _sol_closes_snap,
         )
 
-        # Validate BTC klines (the signal source). We require exactly
-        # _CANDLE_COUNT contiguous 1s candles ending at cutoff - 1.
-        btc_reason = _validate_klines(btc_klines, cutoff_ts_ms, "btc")
-        if btc_reason is not None or btc_klines is None:
-            return self._skip(btc_reason or "gate_no_btc_klines")
+        # ----- Multi-instrument independence policy -----
+        # BTC stale = hard block.
+        if btc_arr is None:
+            return self._skip("risk_kline_wss_stale" if btc_reason == "wss_stale"
+                              else f"gate_btc_{btc_reason}")
+        # ETH+SOL both stale (correlated outage indicator) = block.
+        if eth_arr is None and sol_arr is None and eth_reason == "wss_stale" and sol_reason == "wss_stale":
+            return self._skip("risk_kline_wss_correlated_stale")
+        # Either ETH or SOL alone stale: degrade -- pass None so
+        # _compute_signal treats them as silent and we lose only the
+        # regime-2 / confirmation paths.
+        # (No additional code needed; _compute_signal accepts None closes.)
 
-        btc_closes = [k["close_price"] for k in btc_klines]
-        eth_closes = [k["close_price"] for k in eth_klines] if eth_klines and len(eth_klines) >= _CANDLE_COUNT else None
-        sol_closes = [k["close_price"] for k in sol_klines] if sol_klines and len(sol_klines) >= _CANDLE_COUNT else None
+        # ----- Validate (legacy-equivalent) -----
+        # Validation now amounts to: BTC has >= _CANDLE_COUNT candles AND
+        # the newest candle's open_time matches cutoff_ms - 1000. WSS commits
+        # candles aligned to UTC seconds via the confirm=="1" gate, so the
+        # newest-ts check is a sanity assertion rather than a reliability
+        # gate (the ring won't include in-progress candles in the first
+        # place).
+        if len(btc_arr) < _CANDLE_COUNT:
+            return self._skip("gate_btc_wss_insufficient")
+        if int(btc_arr[-1][0]) != cutoff_ts_ms - 1000:
+            return self._skip(
+                f"gate_btc_unexpected_newest:got={btc_arr[-1][0]},expected={cutoff_ts_ms - 1000}"
+            )
 
+        # ----- Compute signal -----
+        btc_closes = [float(k[4]) for k in btc_arr]
+        eth_closes = (
+            [float(k[4]) for k in eth_arr] if eth_arr and len(eth_arr) >= _CANDLE_COUNT else None
+        )
+        sol_closes = (
+            [float(k[4]) for k in sol_arr] if sol_arr and len(sol_arr) >= _CANDLE_COUNT else None
+        )
         self.last_btc_closes = btc_closes
-
-        result = _compute_signal(btc_closes, eth_closes, sol_closes)
-
-        # NOTE: No logging here -- caller logs AFTER timing guard so
-        # file I/O doesn't delay bet submission in the critical path.
-
-        return result
-
-    def _fetch_klines(self, symbol: str, count: int, after_ms: int | None = None) -> list[dict] | None:
-        """Live-mode OKX fetch: transient errors → skip round; permanent errors → crash.
-
-        OkxTransientError (retryable or insufficient-data): log warn + return None
-        so the caller skips the round on this pair. InvariantError (permanent
-        OKX error: bad instId, auth issue, etc.) propagates as a hard stop per
-        the project's error-handling policy.
-        """
-        try:
-            return self._client.fetch_1s_klines(symbol=symbol, count=count, after_ms=after_ms)
-        except OkxTransientError as e:
-            warn("GATE", "OKX", "SKIP", symbol=symbol, reason=str(e))
-            return None
+        return _compute_signal(btc_closes, eth_closes, sol_closes)
 
     @staticmethod
     def _skip(reason: str) -> MomentumGateResult:
@@ -248,26 +225,6 @@ class MomentumGate:
             signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
             skip_reason=reason,
         )
-
-
-def _validate_klines(
-    klines: list[dict] | None, cutoff_ts_ms: int, label: str,
-) -> str | None:
-    """Verify we received the expected kline window.
-
-    Returns a skip reason string on failure, or None if valid.
-    """
-    if klines is None or len(klines) < _CANDLE_COUNT:
-        n = 0 if klines is None else len(klines)
-        return f"gate_{label}_fetch_failed:got={n}"
-
-    # Newest candle must be at cutoff - 1 (the last completed second)
-    newest_ts = int(klines[-1]["open_time_ms"])
-    expected_ts = cutoff_ts_ms - 1000
-    if newest_ts != expected_ts:
-        return f"gate_{label}_unexpected_newest:got={newest_ts},expected={expected_ts}"
-
-    return None
 
 
 def _validate_klines_raw(

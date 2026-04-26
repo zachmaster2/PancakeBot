@@ -310,6 +310,14 @@ class AppConfig:
     # Full StrategyConfig (defaults match pre-refactor module constants).
     strategy: StrategyConfig
 
+    # OKX WSS subscription config (live mode only; ignored in backtest).
+    # Stale-data refusal threshold: if the WSS ring hasn't received a
+    # candle update within this many milliseconds, the gate refuses to
+    # bet (`risk_kline_wss_stale`). 5000ms = 5s = 5 missed pushes at 1s
+    # candle cadence -- clear outage signal. Configurable for tuning
+    # if soak data shows different optimal threshold.
+    okx_wss_stale_threshold_ms: int = 5000
+
 
 # -- TOML parsing helpers -----------------------------------------------------
 
@@ -536,6 +544,12 @@ def load_app_config(path: str) -> AppConfig:
 
     strategy_cfg = load_strategy_config(raw)
 
+    # OKX WSS subscription config (optional [okx] TOML section).
+    okx_sec = _opt_section(raw, "okx")
+    wss_stale_ms = _opt_int(okx_sec, "wss_stale_threshold_ms", 5000)
+    if wss_stale_ms <= 0:
+        raise InvariantError("okx_wss_stale_threshold_ms_must_be_positive")
+
     return AppConfig(
         kline_cutoff_seconds=kline_cutoff_seconds,
         prefetch_offset_seconds=prefetch_offset_seconds,
@@ -545,4 +559,5 @@ def load_app_config(path: str) -> AppConfig:
         backtest_initial_bankroll_bnb=bt_bankroll,
         backtest=backtest_cfg,
         strategy=strategy_cfg,
+        okx_wss_stale_threshold_ms=wss_stale_ms,
     )

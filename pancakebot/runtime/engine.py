@@ -36,7 +36,7 @@ from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
 _LOCK_SAFETY_MARGIN_SECONDS = 1  # abort bet if wall-clock is within this many seconds of lock_at
-_OKX_PUBLISH_DELAY_SECONDS = 0.25  # delay after cutoff to let OKX publish the candle
+_OKX_PUBLISH_DELAY_SECONDS = 0.05  # delay after cutoff for WSS to commit the cutoff-1 candle (confirm=="1" arrives ~50ms after second boundary)
 
 # Extra cushion added to the claim-check wake time to avoid alignment retries near RPC boundaries.
 _CLAIM_CHECK_PADDING_SECONDS = 5
@@ -490,15 +490,15 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     start_at=int(open_round.start_at),
                 )
 
-        # TLS warmup: re-establish OKX keep-alive connection (dies after
-        # ~60 s idle between 5-minute rounds).  Subsequent kline fetches
-        # hit the warm connection (~50 ms instead of ~2 s).
+        # WSS migration: per-round REST kline fetch is REMOVED. Live
+        # candles arrive continuously via the OkxWssClient daemon thread
+        # subscribed at startup; gate.evaluate() reads the in-memory
+        # ring buffers (sub-ms). No per-round TLS warmup needed.
         gate = None
         if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, "_gate"):
             # noinspection PyProtectedMember
             gate = closed.strategy_pipeline._gate
             if gate is not None:
-                gate.warmup_session()
                 # Refresh OKX clock skew off the critical path. Used by
                 # _utc_now() for skew-corrected scheduling. ~150-500ms;
                 # absorbed comfortably in the housekeeping window.
@@ -549,18 +549,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                  last_ok=f"{cfg.pool_watcher.last_connected_at:.0f}")
 
         # -- Phase B: Critical path (after cutoff) --
-        # Sleep until cutoff + delay, then fetch -> decide -> bet.
+        # Sleep until cutoff + small grace, then read WSS ring -> decide -> bet.
+        # WSS commits closed candles within ~50ms of the second boundary
+        # (confirm=="1"); a small grace ensures cutoff-1 is in the ring.
         fetch_ts = cutoff_ts_t + _OKX_PUBLISH_DELAY_SECONDS
         _sleep_until_ts(fetch_ts, reason="wait_for_okx_publish", epoch=current_epoch)
 
-        # Kick off kline fetches on warm connection.
-        okx_kline_futures = None
-        if gate is not None:
-            okx_kline_futures = gate.fetch_klines_async(cutoff_ts_ms=int(cutoff_ts_t * 1000))
-
-        # Step 8: Decide.  bankroll_bnb + tracker record_settlement were both
-        # resolved in the housekeeping block above -- nothing on the critical
-        # path between cutoff and lock reads from RPC.
+        # Step 8: Decide.  Gate reads WSS ring buffers (sub-ms in-memory
+        # lookup). No futures, no per-round REST fetch.
         t_features_start_ms = _mono_ms()
         pred_p_final = 0.5
 
@@ -570,7 +566,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             round_t=open_round,
             pool_bull_bnb=pool_bull_bnb,
             pool_bear_bnb=pool_bear_bnb,
-            okx_kline_futures=okx_kline_futures,
         )
         if decision.p_bull is not None:
             pred_p_final = decision.p_bull
