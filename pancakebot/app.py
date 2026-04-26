@@ -151,7 +151,29 @@ def run_from_config(
 
     okx_client = OkxClient(timeout_seconds=10.0)
     okx_client.warmup()
-    momentum_gate = MomentumGate(config=momentum_gate_cfg, okx_client=okx_client)
+
+    # WSS migration (research/okx_wss_migration_design.md): live runtime
+    # subscribes to OKX `candle1s` for BTC/ETH/SOL once at startup; gate
+    # reads in-memory ring buffers at decision time. No per-round REST.
+    # Bootstrap: REST `/history-candles` initial fill blocks startup
+    # until all 3 rings have completed the 3-step bootstrap (REST done,
+    # subscribe ack, first strictly-newer confirm-1 push). Failure to
+    # bootstrap raises -- no fallback to REST in live mode.
+    from pancakebot.market_data.okx_wss_client import OkxWssClient
+    wss_client = OkxWssClient(
+        okx_client=okx_client,
+        instruments=("BTC-USDT", "ETH-USDT", "SOL-USDT"),
+        stale_threshold_ms=int(cfg.okx_wss_stale_threshold_ms),
+    )
+    wss_client.start()  # blocks until is_ready() or raises
+    import atexit as _atexit
+    _atexit.register(wss_client.stop)
+
+    momentum_gate = MomentumGate(
+        config=momentum_gate_cfg,
+        okx_client=okx_client,
+        wss_client=wss_client,
+    )
 
     # Pool event watcher: subscribes to confirmed BetBull/BetBear events
     # via public WSS for accurate pool tracking (no signup required).

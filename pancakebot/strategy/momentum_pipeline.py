@@ -225,7 +225,6 @@ class MomentumOnlyPipeline:
         round_t: Round,
         pool_bull_bnb: float = 0.0,
         pool_bear_bnb: float = 0.0,
-        okx_kline_futures: tuple | None = None,
     ) -> StrategyPipelineDecision:
         """Return BET or SKIP from BTC primary / ETH+SOL regime-2 signals."""
 
@@ -258,10 +257,9 @@ class MomentumOnlyPipeline:
                     return self._skip("risk_drawdown_breaker_fired")
 
         if self._gate is not None:
-            # Live/dry: fetch from OKX (use async-fetched data if available)
+            # Live/dry: gate reads OKX WSS in-memory ring buffer (sub-ms).
             result = self._gate.evaluate(
                 cutoff_ts_ms=int(cutoff_ts_ms),
-                kline_futures=okx_kline_futures,
             )
         else:
             # Backtest: use cached 1s klines
