@@ -50,31 +50,60 @@ class MomentumGateResult:
 
 
 class MomentumGate:
-    """Multi-asset momentum gate: fetches BNB + BTC + ETH + SOL 1s klines."""
+    """Multi-asset momentum gate: reads BTC + ETH + SOL 1s klines from
+    OKX WSS in-memory ring buffers (live mode).
 
-    def __init__(self, *, config: MomentumGateConfig, okx_client: OkxClient) -> None:
+    Per the WSS migration (research/okx_wss_migration_design.md): live
+    mode reads from ``OkxWssClient`` ring buffers; the per-round REST
+    fetch path is REMOVED. Bootstrap REST and reconnect gap-fill REST
+    survive inside ``OkxWssClient`` for initialization-only purposes.
+
+    The OkxClient reference is preserved for those bootstrap/gap-fill
+    calls and for the capture-time response_headers diagnostic
+    (which is no longer applicable in WSS path -- left for backwards
+    compat with the captured.jsonl schema; always None now).
+    """
+
+    def __init__(
+        self,
+        *,
+        config: MomentumGateConfig,
+        okx_client: OkxClient,
+        wss_client=None,
+    ) -> None:
         self._cfg = config
         self._client = okx_client
+        # WSS client is REQUIRED for live runtime use (engine constructs
+        # it before instantiating the gate). It's accepted as Optional
+        # so backtest-side code paths can construct a "no-op" gate via
+        # MomentumOnlyPipeline(gate=None) without setting up WSS.
+        # If ``evaluate()`` is called with wss_client=None it raises --
+        # the live runtime should never reach that state.
+        self._wss = wss_client
         # Cached after each evaluate() so the pipeline can use data
         # for auxiliary signals and regime-adaptive sizing without re-fetching.
         self.last_btc_closes: list[float] | None = None
         # Per-pair fetch timing (ms) -- set each evaluate(), logged by caller
         # AFTER timing guard so file I/O doesn't delay bet submission.
+        # In WSS path, "fetch" is an in-memory dict lookup (sub-ms), so this
+        # field is set to {} per evaluate to keep the capture-format
+        # invariant. Pre-fix REST path tracked actual TLS+fetch latency.
         self.last_fetch_timing: dict[str, int] | None = None
         # Raw kline arrays + computed returns from the most recent evaluate().
         # Consumed by pancakebot.runtime.kline_capture for off-critical-path
-        # observability writes. Strategy decisions never read these -- they're
-        # set on the gate purely as a side-effect for the capture module to
-        # snapshot post-decision. None when evaluate() didn't run (gate
-        # disabled, no klines fetched, or evaluate aborted before signal step).
+        # observability writes. Schema unchanged from REST-era: capture
+        # serializes [ts, o, h, l, c, v] arrays as dicts via the existing
+        # _kline_dict_to_array path, but in WSS mode these are ALREADY
+        # arrays (the ring stores arrays). We materialize lightweight dict
+        # wrappers below to keep capture's reader contract stable.
         self.last_btc_klines_raw: list[dict] | None = None
         self.last_eth_klines_raw: list[dict] | None = None
         self.last_sol_klines_raw: list[dict] | None = None
         self.last_returns: dict[str, float | None] | None = None
-        # Diagnostic HTTP response headers from each kline fetch, populated
-        # only when PANCAKEBOT_CAPTURE_OKX_HEADERS env var is set (off by
-        # default). Used to investigate upstream-cache behavior on lagged
-        # responses. Same lifetime + threading semantics as last_*_klines_raw.
+        # Diagnostic HTTP response headers were used for the REST-era
+        # cache investigation (commit 1cb2b20). With WSS there are no
+        # per-round HTTP responses, so these are always None now.
+        # Kept for capture schema compatibility; readers tolerate None.
         self.last_btc_response_headers: dict[str, str] | None = None
         self.last_eth_response_headers: dict[str, str] | None = None
         self.last_sol_response_headers: dict[str, str] | None = None
@@ -82,46 +111,6 @@ class MomentumGate:
     @property
     def enabled(self) -> bool:
         return self._cfg.enabled
-
-    def warmup_session(self) -> None:
-        """Re-warm the OKX TLS connection before fetching klines."""
-        self._client.warmup()
-
-    # ------------------------------------------------------------------
-    # Async fetch / evaluate split
-    # ------------------------------------------------------------------
-    # The two-phase timing architecture separates housekeeping (Phase A)
-    # from the critical bet path (Phase B).  Phase A handles epoch check
-    # and TLS warmup; Phase B fetches klines and decides.  The runtime
-    # loop calls fetch_klines_async() at the start of Phase B -- the OKX
-    # requests run in background threads while the RPC work proceeds.
-    # By the time evaluate() is called the data is already waiting.
-    # ------------------------------------------------------------------
-
-    def fetch_klines_async(self, *, cutoff_ts_ms: int) -> tuple | None:
-        """Kick off BTC + ETH + SOL kline fetches in parallel.
-
-        Call this immediately after waking from sleep, *before* the
-        RPC calls (epoch handshake, lock_ts, round_data).  Returns a
-        3-tuple of Futures that evaluate() will collect, or None when
-        the gate is disabled.
-
-        BNB klines are NOT fetched here -- they aren't used for signal
-        computation (only for sync/backtest data collection).  Skipping
-        BNB saves one OKX HTTP request in the critical bet path.
-
-        *cutoff_ts_ms* is passed to OKX as the ``after`` parameter so
-        only completed candles (open_time < cutoff) are returned --
-        the in-progress bar is never fetched.
-        """
-        if not self._cfg.enabled:
-            return None
-        pool = ThreadPoolExecutor(max_workers=3)
-        btc_fut = pool.submit(self._fetch_klines, self._cfg.btc_symbol, _CANDLE_COUNT, cutoff_ts_ms)
-        eth_fut = pool.submit(self._fetch_klines, self._cfg.eth_symbol, _CANDLE_COUNT, cutoff_ts_ms)
-        sol_fut = pool.submit(self._fetch_klines, self._cfg.sol_symbol, _CANDLE_COUNT, cutoff_ts_ms)
-        pool.shutdown(wait=False)   # let threads finish on their own
-        return btc_fut, eth_fut, sol_fut
 
     def evaluate(
         self,
