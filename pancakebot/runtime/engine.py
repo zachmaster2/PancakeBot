@@ -48,6 +48,77 @@ _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 _ONE_MINUTE_MS = 60_000
 
 
+# -- Clock skew compensation -------------------------------------------------
+# The bot's scheduling uses chain-anchored timestamps (lock_at from BSC, in
+# true UTC) but wakes/compares against ``time.time()`` (local clock). On
+# Windows with stale/unsynced w32tm, local can drift seconds ahead of UTC,
+# which makes the bot fire OKX kline fetches BEFORE OKX has had time to
+# publish the requested candle window. Result: 75%+ of fetches return a
+# lagged window, validation rejects them as ``gate_btc_unexpected_newest``,
+# bot skips the round.
+#
+# Fix: measure (local - okx) skew via ``OkxClient.measure_clock_skew()`` once
+# per round in housekeeping, cache it, and use ``_utc_now()`` everywhere we
+# compare local time to a chain-anchored value. This converts all scheduling
+# decisions from "wait until LOCAL time hits X" to "wait until OKX-frame time
+# hits X" without changing any request CONTENT.
+#
+# Documented diagnosis: research/okx_lag_root_cause_clock_skew.md.
+# Mechanism verification: research/okx_artificial_delay_probe.py (lag goes to
+# 0ms when fired at correct true-UTC anchor).
+_clock_skew_seconds: float = 0.0
+
+
+def _utc_now() -> float:
+    """Best-effort estimate of the current OKX/UTC second.
+
+    Returns ``time.time() - _clock_skew_seconds``. Falls back to local time
+    when ``_clock_skew_seconds`` is 0.0 (initial value, or every refresh
+    failed). Caller code that compares local time against a chain-anchored
+    value (lock_at, cutoff_ts, claim_ts) MUST use this instead of
+    ``time.time()`` so the comparison is in OKX/UTC frame.
+    """
+    return time.time() - _clock_skew_seconds
+
+
+def _refresh_clock_skew(gate) -> None:
+    """Best-effort skew re-measurement via OKX /api/v5/public/time.
+
+    Called once per round in the housekeeping phase (off the critical path).
+    Updates the module-level ``_clock_skew_seconds`` if measurement
+    succeeds. On failure, keeps the prior cached value.
+
+    No-op when *gate* is None (backtest mode, sync mode) -- those paths
+    don't care about skew.
+    """
+    global _clock_skew_seconds
+    if gate is None:
+        return
+    try:
+        client = getattr(gate, "_client", None)
+        if client is None or not hasattr(client, "measure_clock_skew"):
+            return
+        new_skew = client.measure_clock_skew(samples=3)
+    except Exception:  # noqa: BLE001 -- never crash the round on skew refresh
+        return
+    if new_skew is None:
+        warn("CLOCK", "SKEW", "REFRESH",
+             msg="OKX /public/time unreachable; using prior cached skew",
+             cached_skew_s=f"{_clock_skew_seconds:.3f}")
+        return
+    delta = abs(new_skew - _clock_skew_seconds)
+    prev = _clock_skew_seconds
+    _clock_skew_seconds = float(new_skew)
+    if delta >= 0.1 or prev == 0.0:
+        # Log meaningful changes (>100ms drift) and the initial measurement.
+        info("CLOCK", "SKEW", "UPDATE",
+             msg=f"clock skew (local - okx) refreshed: {prev:.3f}s -> {new_skew:.3f}s")
+    if abs(new_skew) >= 5.0:
+        warn("CLOCK", "SKEW", "LARGE",
+             msg=f"large clock skew detected: {new_skew:.3f}s. Consider running w32tm /resync.",
+             skew_s=f"{new_skew:.3f}")
+
+
 # -- Heartbeat context -------------------------------------------------------
 # _run_one_iteration refreshes this at the top of every tick; _sleep_until_ts
 # reads it to emit a per-second heartbeat during long sleeps (deadlock
@@ -135,6 +206,18 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
     from pancakebot.runtime.kline_capture import init_capture_worker
     capture_path = Path(paths.DRY_CAPTURE_PATH if cfg.dry else paths.LIVE_CAPTURE_PATH)
     init_capture_worker(capture_path)
+
+    # Bootstrap OKX clock-skew measurement BEFORE the first round starts.
+    # The per-round refresh in housekeeping won't have fired yet; if local
+    # clock is significantly skewed and we don't bootstrap, the first
+    # round's _sleep_until_ts will fire too early in OKX frame and the
+    # initial fetch will rejected by validation. See _refresh_clock_skew.
+    if closed_state.strategy_pipeline is not None and hasattr(closed_state.strategy_pipeline, "_gate"):
+        # noinspection PyProtectedMember
+        _bootstrap_gate = closed_state.strategy_pipeline._gate
+        if _bootstrap_gate is not None:
+            info("CLOCK", "SKEW", "BOOT", msg="bootstrapping OKX clock skew measurement...")
+            _refresh_clock_skew(_bootstrap_gate)
 
     bnbusd_price = _fetch_current_bnb_price_usd(cfg)
     if cfg.dry:
@@ -259,7 +342,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
                     locked_epoch=locked_epoch,
                     current_epoch=current_epoch,
-                    now_ts=int(time.time()),
+                    now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
                     buffer_seconds=cfg.buffer_seconds,
                     page_size=100,
                     gas_limit=GAS_LIMIT_CLAIM,
@@ -300,7 +383,10 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if locked_round.lock_at is None:
             raise InvariantError("locked_round_lock_at_missing")
         claim_ts = locked_round.lock_at + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
-        if time.time() < claim_ts < cutoff_ts_t:
+        # claim_ts and cutoff_ts_t are both chain-anchored true UTC; compare
+        # against skew-corrected _utc_now() so a skewed local clock doesn't
+        # make us miss the wake-for-claim window.
+        if _utc_now() < claim_ts < cutoff_ts_t:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
 
@@ -413,6 +499,10 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             gate = closed.strategy_pipeline._gate
             if gate is not None:
                 gate.warmup_session()
+                # Refresh OKX clock skew off the critical path. Used by
+                # _utc_now() for skew-corrected scheduling. ~150-500ms;
+                # absorbed comfortably in the housekeeping window.
+                _refresh_clock_skew(gate)
 
         # Pool data from WSS subscription (no RPC needed, ~0 ms).
         pool_bull_bnb = 0.0
@@ -535,8 +625,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             return
 
         # Step 11: Execution timing guard (float precision -- int truncation
-        # was randomly shaving 0-1 s off the budget).
-        if time.time() >= lock_ts_t - _LOCK_SAFETY_MARGIN_SECONDS:
+        # was randomly shaving 0-1 s off the budget). lock_ts_t is chain-
+        # anchored true UTC; compare via _utc_now() (skew-corrected). With
+        # local-only comparison + skew, the guard fires far too early in
+        # true UTC and the bot self-aborts almost every round.
+        if _utc_now() >= lock_ts_t - _LOCK_SAFETY_MARGIN_SECONDS:
             _record_dry_cycle_audit(
                 cfg,
                 closed,
@@ -835,7 +928,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
             cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
             locked_epoch=locked_round2.epoch,
             current_epoch=current_epoch2,
-            now_ts=int(time.time()),
+            now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
             buffer_seconds=cfg.buffer_seconds,
             page_size=100,
             gas_limit=GAS_LIMIT_CLAIM,
@@ -848,7 +941,14 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
 
 
 def _sleep_until_ts(target_ts: float, *, reason: str, epoch: int | None = None) -> None:
-    remaining = target_ts - time.time()
+    """Sleep until OKX/UTC time hits ``target_ts``.
+
+    *target_ts* is treated as a chain-anchored / OKX-frame UTC second.
+    The comparison uses ``_utc_now()`` (skew-corrected) instead of
+    ``time.time()`` so a skewed local clock doesn't make the bot fire
+    early. See ``_clock_skew_seconds`` docs above.
+    """
+    remaining = target_ts - _utc_now()
     if remaining <= 0.5:
         return
 
@@ -858,7 +958,7 @@ def _sleep_until_ts(target_ts: float, *, reason: str, epoch: int | None = None) 
     info("RUN", "LOOP", "SLEEP", msg=msg)
 
     while True:
-        remaining2 = target_ts - time.time()
+        remaining2 = target_ts - _utc_now()
         if remaining2 <= 0:
             return
         sleep_seconds(min(1.0, remaining2))
