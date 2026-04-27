@@ -246,9 +246,10 @@ class MomentumOnlyPipeline:
                     return self._skip("risk_drawdown_breaker_fired")
 
         if self._gate is not None:
-            # Live/dry: gate reads OKX WSS in-memory ring buffer (sub-ms).
+            # Live/dry: gate fetches BTC/ETH/SOL/BNB klines in parallel via
+            # OKX REST and computes the signal off the returned arrays.
             result = self._gate.evaluate(
-                cutoff_ts_ms=int(cutoff_ts_ms),
+                lock_at_ms=lock_at * 1000,
             )
         else:
             # Backtest: use cached 1s klines

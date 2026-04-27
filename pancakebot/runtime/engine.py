@@ -36,7 +36,6 @@ from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
 _LOCK_SAFETY_MARGIN_SECONDS = 1  # abort bet if wall-clock is within this many seconds of lock_at
-_OKX_PUBLISH_DELAY_SECONDS = 0.05  # delay after cutoff for WSS to commit the cutoff-1 candle (confirm=="1" arrives ~50ms after second boundary)
 
 # Extra cushion added to the claim-check wake time to avoid alignment retries near RPC boundaries.
 _CLAIM_CHECK_PADDING_SECONDS = 5
@@ -79,32 +78,6 @@ def _utc_now() -> float:
     ``time.time()`` so the comparison is in OKX/UTC frame.
     """
     return time.time() - _clock_skew_seconds
-
-
-def _check_wss_health(gate) -> None:
-    """Raise ``InvariantError`` if the WSS daemon has set a fatal error.
-
-    Called once per round in housekeeping. The WSS daemon sets
-    ``_fatal_error`` on unrecoverable conditions (boundary mismatch /
-    boundary unavailable after retry / first-push escalation / newest-
-    lagging 3-cycle escalation), AND signals ``_stop_event`` -- but the
-    main loop continues iterating and the gate happily returns
-    ``risk_kline_wss_failure`` skips for every subsequent round. Without
-    this check the bot looks healthy in normal logs while serving nothing.
-    Per Phase 2 spec item 17 part A (2026-04-27), poll here and crash so
-    the supervisor restarts and alerts fire.
-
-    No-op when *gate* is None (backtest / sync paths) or when the gate
-    wasn't constructed with a wss client (test fixtures).
-    """
-    if gate is None:
-        return
-    wss = getattr(gate, "_wss", None)
-    if wss is None or not hasattr(wss, "fatal_error"):
-        return
-    fatal = wss.fatal_error()
-    if fatal is not None:
-        raise InvariantError(f"okx_wss_fatal: {fatal}")
 
 
 def _refresh_clock_skew(gate) -> None:
@@ -516,10 +489,10 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     start_at=int(open_round.start_at),
                 )
 
-        # WSS migration: per-round REST kline fetch is REMOVED. Live
-        # candles arrive continuously via the OkxWssClient daemon thread
-        # subscribed at startup; gate.evaluate() reads the in-memory
-        # ring buffers (sub-ms). No per-round TLS warmup needed.
+        # Per-round REST kline fetch path: the gate fires its 4 parallel
+        # OKX GETs at decision time (Phase B below). Housekeeping here is
+        # purely the clock-skew refresh -- a fresh skew measurement keeps
+        # the wake-time math correctly anchored to OKX/UTC frame.
         gate = None
         if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, "_gate"):
             # noinspection PyProtectedMember
@@ -529,11 +502,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 # _utc_now() for skew-corrected scheduling. ~150-500ms;
                 # absorbed comfortably in the housekeeping window.
                 _refresh_clock_skew(gate)
-                # Fail loud if the WSS daemon has set a fatal error.
-                # Without this poll the bot would silently emit
-                # ``risk_kline_wss_failure`` skips forever (per Phase 2
-                # spec item 17 part A, 2026-04-27).
-                _check_wss_health(gate)
 
         # Pool data from WSS subscription (no RPC needed, ~0 ms).
         pool_bull_bnb = 0.0
@@ -579,15 +547,18 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                  endpoint=cfg.pool_watcher.current_endpoint,
                  last_ok=f"{cfg.pool_watcher.last_connected_at:.0f}")
 
-        # -- Phase B: Critical path (after cutoff) --
-        # Sleep until cutoff + small grace, then read WSS ring -> decide -> bet.
-        # WSS commits closed candles within ~50ms of the second boundary
-        # (confirm=="1"); a small grace ensures cutoff-1 is in the ring.
-        fetch_ts = cutoff_ts_t + _OKX_PUBLISH_DELAY_SECONDS
-        _sleep_until_ts(fetch_ts, reason="wait_for_okx_publish", epoch=current_epoch)
+        # -- Phase B: Critical path (pre-lock) --
+        # Sleep until ``lock_at - kline_fetch_offset_ms`` (skew-corrected),
+        # then run gate.evaluate() which fires 4 parallel /history-candles
+        # GETs and computes the signal off the returned arrays. The offset
+        # is sized so the fetch lands a configurable margin before lock_at;
+        # default 850ms accommodates OKX p99 staleness (~1.7s) plus the
+        # round-trip and signal compute. Tuned via [runtime] kline_fetch_offset_ms.
+        fetch_ts = lock_ts_t - cfg.kline_fetch_offset_ms / 1000.0
+        _sleep_until_ts(fetch_ts, reason="wait_for_kline_fetch", epoch=current_epoch)
 
-        # Step 8: Decide.  Gate reads WSS ring buffers (sub-ms in-memory
-        # lookup). No futures, no per-round REST fetch.
+        # Step 8: Decide. Gate fires 4 parallel REST fetches and computes
+        # signal off the returned 1s arrays.
         t_features_start_ms = _mono_ms()
         pred_p_final = 0.5
 

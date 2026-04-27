@@ -289,6 +289,7 @@ def run_fold(
         btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT",
         sol_symbol="SOL-USDT",
+        cutoff_seconds=spec.cutoff_seconds,
         mtf_lookbacks=strategy_cfg.gate.mtf_lookbacks,
         mtf_threshold=strategy_cfg.gate.mtf_threshold,
     )

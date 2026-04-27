@@ -28,8 +28,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from pancakebot.market_data.okx_client import OkxClient, RETRY_WSS  # noqa: E402
-from pancakebot.util import InvariantError  # noqa: E402
+from pancakebot.market_data.okx_client import OkxClient, RETRY_GATE  # noqa: E402
+from pancakebot.util import InvariantError, TransientOkxError  # noqa: E402
 
 
 def _make_client_with_session_that_raises(exc: BaseException) -> OkxClient:
@@ -39,7 +39,7 @@ def _make_client_with_session_that_raises(exc: BaseException) -> OkxClient:
     on each call (per-round connection-affinity break, design doc
     research/okx_kline_freshness_fix_design.md), so callers exercising
     warmup() should use ``_patch_session_factory`` instead -- this
-    helper is only useful for tests that exercise ``fetch_kline_window``
+    helper is only useful for tests that exercise ``kline_fetch_window``
     (which does NOT replace the session).
     """
     c = OkxClient(timeout_seconds=5.0)
@@ -147,33 +147,34 @@ def test_warmup_partial_failure_succeeds():
         )
 
 
-def test_fetch_kline_window_wraps_connection_error_into_invariant():
-    """``fetch_kline_window`` (the canonical primitive) classifies
-    ConnectionError as RETRYABLE and exhausts the policy → InvariantError.
-    Replaces the old ``fetch_1s_klines`` regression test (that method was
-    removed in the 2026-04-27 unification)."""
+def test_kline_fetch_window_wraps_connection_error_into_transient():
+    """``kline_fetch_window`` (the canonical primitive) classifies
+    ConnectionError as RETRYABLE and exhausts the policy → TransientOkxError.
+    The error type matters: callers on the live decision path catch
+    TransientOkxError to skip the round; InvariantError would crash the
+    bot (reserved for shape-violation conditions)."""
     c = _make_client_with_session_that_raises(
         requests.exceptions.ConnectionError("Connection aborted.")
     )
-    # Use RETRY_WSS (2 attempts) so the test runs in <3s instead of
+    # Use RETRY_GATE (2 attempts) so the test runs in <3s instead of
     # RETRY_SYNC's 30+ seconds of cumulative backoff.
     raised = False
     try:
-        c.fetch_kline_window(
+        c.kline_fetch_window(
             symbol="BTC-USDT",
             oldest_open_ms=1_000_000_000_000,
             newest_open_ms_inclusive=1_000_000_001_000,
-            retry_policy=RETRY_WSS,
+            retry_policy=RETRY_GATE,
         )
-    except InvariantError:
+    except TransientOkxError:
         raised = True
     assert raised, (
-        "fetch_kline_window should raise InvariantError after retry exhaustion"
+        "kline_fetch_window should raise TransientOkxError after retry exhaustion"
     )
 
 
 # ---------------------------------------------------------------------------
-# fetch_kline_window contiguity validation (Item A, 2026-04-27)
+# kline_fetch_window contiguity validation (Item A, 2026-04-27)
 # ---------------------------------------------------------------------------
 
 def _mock_okx_response(rows_newest_first):
@@ -203,23 +204,23 @@ def _client_with_canned_response(resp):
     return c
 
 
-def test_fetch_kline_window_accepts_contiguous_sequence():
+def test_kline_fetch_window_accepts_contiguous_sequence():
     """Happy path: 3 strictly-contiguous candles pass."""
     # OKX returns newest-first; we want internal oldest-first
     # [1000_000, 1001_000, 1002_000].
     rows = [_okx_row(1002_000), _okx_row(1001_000), _okx_row(1000_000)]
     resp = _mock_okx_response(rows)
     c = _client_with_canned_response(resp)
-    arrays = c.fetch_kline_window(
+    arrays = c.kline_fetch_window(
         symbol="BTC-USDT",
         oldest_open_ms=1000_000,
         newest_open_ms_inclusive=1002_000,
-        retry_policy=RETRY_WSS,
+        retry_policy=RETRY_GATE,
     )
     assert [a[0] for a in arrays] == [1000_000, 1001_000, 1002_000]
 
 
-def test_fetch_kline_window_rejects_gap_in_middle():
+def test_kline_fetch_window_rejects_gap_in_middle():
     """3 rows, correct length, correct first/last, but a 2s gap between
     rows 1 and 2 (1000_000 -> 1002_000 with 1001_000 missing). The
     boundary check passes; only the contiguity check catches it."""
@@ -266,19 +267,20 @@ def test_fetch_kline_window_rejects_gap_in_middle():
     c = _client_with_canned_response(resp)
     raised = False
     try:
-        c.fetch_kline_window(
+        c.kline_fetch_window(
             symbol="BTC-USDT",
             oldest_open_ms=1000_000,
             newest_open_ms_inclusive=1003_000,
-            retry_policy=RETRY_WSS,
+            retry_policy=RETRY_GATE,
         )
     except InvariantError as e:
-        assert "okx_kline_window_noncontiguous" in str(e), str(e)
+        assert "kline_fetch_integrity_violation" in str(e), str(e)
+        assert "noncontiguous" in str(e), str(e)
         raised = True
     assert raised, "expected InvariantError on mid-window non-contiguity"
 
 
-def test_fetch_kline_window_rejects_duplicate_timestamp():
+def test_kline_fetch_window_rejects_duplicate_timestamp():
     """Two adjacent rows at the same timestamp (duplicate) → contiguity
     delta == 0, fails."""
     # request [1000, 1003] count=4. Returned oldest-first: [1000, 1001, 1001, 1003]
@@ -292,19 +294,20 @@ def test_fetch_kline_window_rejects_duplicate_timestamp():
     c = _client_with_canned_response(resp)
     raised = False
     try:
-        c.fetch_kline_window(
+        c.kline_fetch_window(
             symbol="BTC-USDT",
             oldest_open_ms=1000_000,
             newest_open_ms_inclusive=1003_000,
-            retry_policy=RETRY_WSS,
+            retry_policy=RETRY_GATE,
         )
     except InvariantError as e:
-        assert "okx_kline_window_noncontiguous" in str(e), str(e)
+        assert "kline_fetch_integrity_violation" in str(e), str(e)
+        assert "noncontiguous" in str(e), str(e)
         raised = True
     assert raised, "expected InvariantError on duplicate timestamp"
 
 
-def test_fetch_kline_window_rejects_out_of_order_rows():
+def test_kline_fetch_window_rejects_out_of_order_rows():
     """Internal rows out of strictly-increasing order → contiguity delta
     is negative, fails."""
     # request [1000, 1003] count=4. Returned oldest-first: [1000, 1002, 1001, 1003]
@@ -318,14 +321,15 @@ def test_fetch_kline_window_rejects_out_of_order_rows():
     c = _client_with_canned_response(resp)
     raised = False
     try:
-        c.fetch_kline_window(
+        c.kline_fetch_window(
             symbol="BTC-USDT",
             oldest_open_ms=1000_000,
             newest_open_ms_inclusive=1003_000,
-            retry_policy=RETRY_WSS,
+            retry_policy=RETRY_GATE,
         )
     except InvariantError as e:
-        assert "okx_kline_window_noncontiguous" in str(e), str(e)
+        assert "kline_fetch_integrity_violation" in str(e), str(e)
+        assert "noncontiguous" in str(e), str(e)
         raised = True
     assert raised, "expected InvariantError on out-of-order rows"
 
@@ -339,11 +343,11 @@ def main() -> int:
         test_warmup_does_not_mask_non_network_errors,
         test_warmup_does_not_swallow_keyboard_interrupt,
         test_warmup_partial_failure_succeeds,
-        test_fetch_kline_window_wraps_connection_error_into_invariant,
-        test_fetch_kline_window_accepts_contiguous_sequence,
-        test_fetch_kline_window_rejects_gap_in_middle,
-        test_fetch_kline_window_rejects_duplicate_timestamp,
-        test_fetch_kline_window_rejects_out_of_order_rows,
+        test_kline_fetch_window_wraps_connection_error_into_transient,
+        test_kline_fetch_window_accepts_contiguous_sequence,
+        test_kline_fetch_window_rejects_gap_in_middle,
+        test_kline_fetch_window_rejects_duplicate_timestamp,
+        test_kline_fetch_window_rejects_out_of_order_rows,
     ]
     failures = []
     for t in tests:

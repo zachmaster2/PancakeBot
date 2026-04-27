@@ -32,6 +32,11 @@ class RuntimeConfig:
     # Prefetch offset: how many seconds before cutoff to wake for housekeeping
     prefetch_offset_seconds: int
 
+    # Per-round kline fetch offset: how many milliseconds before lock_at
+    # the gate wakes to fire its parallel 4-symbol REST fetch. Validated
+    # in [100..5000] at config load.
+    kline_fetch_offset_ms: int
+
     # Protocol constants (from chain via contract_constants.json)
     min_bet_amount_bnb: float
     treasury_fee_fraction: float

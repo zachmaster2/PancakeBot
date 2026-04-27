@@ -1,6 +1,6 @@
 """OKX public REST client with centralized retry + error classification.
 
-Single canonical fetch primitive: ``fetch_kline_window``. Always uses
+Single canonical fetch primitive: ``kline_fetch_window``. Always uses
 ``/history-candles`` (per memory ``project_pancakebot_okx_endpoint_divergence.md``,
 this endpoint has lower lag than ``/candles``). Caller passes the explicit
 ``[oldest_open_ms, newest_open_ms_inclusive]`` range; retry behaviour is
@@ -8,14 +8,26 @@ parameterised via ``RetryPolicy``:
 
 - ``RETRY_SYNC``: 5 attempts with exponential backoff (used by sync.py for
   bulk historical fetch — needs robustness over 38k+ rounds).
-- ``RETRY_WSS``: 2 attempts with one short retry (used by WSS bootstrap and
-  gap-fill — bounded fail-loud on the live decision path).
+- ``RETRY_GATE``: 2 attempts with one short retry (used by the per-round
+  live-decision gate — bounded fail-soft via ``TransientOkxError`` on the
+  decision path so a single OKX hiccup skips the round, not the bot).
 
 Returns oldest-first list of ``[ts_ms, open, high, low, close, volume]``
 arrays. Length is exactly ``(newest - oldest)/1000 + 1``. Boundary verified:
 the returned oldest/newest open_times must equal the requested values, else
 ``InvariantError`` (catches OKX data holes that ``len == expected_count``
 alone would miss).
+
+Error contract:
+- Contract violations (length mismatch, contiguity gap, boundary mismatch,
+  inverted/unaligned range, row malformed, OKX permanent-class response)
+  raise ``InvariantError``. These indicate OKX returned data that violates
+  our shape invariants, or the caller passed a malformed window.
+- Retry-exhausted transient failures (network exception, HTTP 429/5xx,
+  retryable OKX codes, repeated short/empty responses) raise
+  ``TransientOkxError``. Callers on the live decision path catch this to
+  skip the round; sync's bulk loader treats it as fail-loud (it shouldn't
+  happen with RETRY_SYNC's 5-attempt budget).
 """
 from __future__ import annotations
 
@@ -30,7 +42,7 @@ from typing import Callable
 import requests
 
 from pancakebot.log import error, info, warn
-from pancakebot.util import InvariantError
+from pancakebot.util import InvariantError, TransientOkxError
 
 
 _OKX_BASE_URL = "https://www.okx.com"
@@ -42,7 +54,7 @@ _JITTER_MAX = 1.5
 # ---------------------------------------------------------------------------
 # Shared OKX rate budget (single canonical source for all OKX REST callers).
 # OKX allows 20 req/2s per endpoint per IP = 10/s. Cap at 8/s to leave margin.
-# All in-process callers (sync.py bulk fetch, WSS bootstrap, WSS gap-fill)
+# All in-process callers (sync.py bulk fetch, per-round live-gate fetch)
 # use ``okx_rate_acquire`` so a single token bucket throttles total OKX
 # load across the live system.
 # ---------------------------------------------------------------------------
@@ -56,7 +68,7 @@ def okx_rate_acquire() -> None:
     """Block until we can make another OKX request without exceeding 8/s.
 
     Process-wide shared budget. Pass as ``rate_acquire_fn`` to
-    ``OkxClient.fetch_kline_window``.
+    ``OkxClient.kline_fetch_window``.
     """
     global _okx_rate_last_t
     min_interval = 1.0 / _OKX_RATE_LIMIT_PER_SEC
@@ -74,7 +86,7 @@ def okx_rate_acquire() -> None:
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """Retry config for ``fetch_kline_window``.
+    """Retry config for ``kline_fetch_window``.
 
     ``backoff_seconds[i]`` is the sleep BEFORE attempt i+1 (jittered by
     [0.5x, 1.5x]). Length must be ``max_attempts - 1``.
@@ -95,10 +107,11 @@ class RetryPolicy:
 # Sync.py iterates 38k+ rounds; needs robust retry over slow OKX backends.
 RETRY_SYNC = RetryPolicy(max_attempts=5, backoff_seconds=(2.0, 4.0, 8.0, 16.0))
 
-# WSS bootstrap and gap-fill on the live decision path; bounded retry then
-# fail-loud. The WSS layer adds its own boundary-unavailable retry on top
-# (one 2-3s delay then InvariantError) — see okx_wss_client.
-RETRY_WSS = RetryPolicy(max_attempts=2, backoff_seconds=(2.5,))
+# Per-round live-decision gate fetch; bounded retry then fail-soft via
+# ``TransientOkxError`` so a single OKX hiccup skips the round (the gate
+# handles consecutive-failure escalation). 2 attempts + 2.5s backoff fits
+# inside the gate's pre-lock budget alongside the parallel 4-symbol fetch.
+RETRY_GATE = RetryPolicy(max_attempts=2, backoff_seconds=(2.5,))
 
 # OKX API-level error codes that are transient and warrant retry.
 # See https://www.okx.com/docs-v5/en/#error-code
@@ -187,8 +200,8 @@ class OkxClient:
           the TLS-handshake latency itself; the round's signal logic still
           works.
         - If the underlying network is genuinely down, the next
-          ``fetch_kline_window`` call (sync bulk fetch or WSS bootstrap/
-          gap-fill REST repair) will raise ``InvariantError`` on its own
+          ``kline_fetch_window`` call (sync bulk fetch or live-gate
+          per-round fetch) will raise ``TransientOkxError`` on its own
           after retry exhaustion. No reason to kill the bot from a warmup
           hiccup.
 
@@ -197,6 +210,12 @@ class OkxClient:
         here killed the dry bot twice in 24h (2026-04-22 22:58 EDT and
         2026-04-22 23:59 EDT). Supervisor reported CRASHED correctly both
         times but the process was still dead until manual restart.
+
+        Note on error contract: a fully-failed network underneath warmup
+        does NOT raise here -- the next ``kline_fetch_window`` call will
+        surface a ``TransientOkxError`` (live gate path) or exhaust to
+        ``InvariantError`` via PERMANENT classification (rare; only on
+        explicit OKX rejection rather than network down).
         """
         # Step 1: close the stale session (breaks any backend affinity from
         # prior rounds). Best-effort -- a failed close just leaks a few
@@ -288,7 +307,7 @@ class OkxClient:
     # Canonical primitive: explicit-window /history-candles fetch.
     # ----------------------------------------------------------------
 
-    def fetch_kline_window(
+    def kline_fetch_window(
         self,
         *,
         symbol: str,
@@ -306,32 +325,35 @@ class OkxClient:
         any deviation raises ``InvariantError`` (catches OKX data holes that
         a length-only check would miss).
 
-        Network/transient errors retry per ``retry_policy``; permanent errors
-        raise ``InvariantError`` immediately. There is no separate transient-
-        error type — callers receive either the array or ``InvariantError``.
+        Error contract:
+        - Contract violations (length, contiguity, boundary, malformed input)
+          raise ``InvariantError`` — fail-loud; data shape is wrong.
+        - Retry-exhausted transient failures (network, HTTP 429/5xx,
+          retryable OKX codes, repeatedly empty/short responses) raise
+          ``TransientOkxError`` — fail-soft on the live decision path.
 
         ``rate_acquire_fn`` is invoked before EVERY attempt (including
         retries) so a shared rate budget can be threaded through. Pass None
-        to bypass rate limiting (used in WSS fast-path only when no other
-        OKX traffic is in flight).
+        to bypass rate limiting (rarely useful; almost every caller in this
+        codebase shares the global ``okx_rate_acquire`` budget).
         """
         if newest_open_ms_inclusive < oldest_open_ms:
             raise InvariantError(
-                f"fetch_kline_window_inverted_range: oldest={oldest_open_ms} "
+                f"kline_fetch_window_inverted_range: oldest={oldest_open_ms} "
                 f"newest={newest_open_ms_inclusive}"
             )
         if (newest_open_ms_inclusive - oldest_open_ms) % 1000 != 0:
             raise InvariantError(
-                f"fetch_kline_window_unaligned_ms: oldest={oldest_open_ms} "
+                f"kline_fetch_window_unaligned_ms: oldest={oldest_open_ms} "
                 f"newest={newest_open_ms_inclusive} (must be 1s-aligned)"
             )
         expected_count = (newest_open_ms_inclusive - oldest_open_ms) // 1000 + 1
         if expected_count > 300:
             # OKX /history-candles caps at 300 per request. Caller must
             # paginate (none of our current callers do; sync's per-round
-            # window is exactly 300, WSS's bootstrap window is at most 300).
+            # window is exactly 300, the live gate's window is exactly 300).
             raise InvariantError(
-                f"fetch_kline_window_exceeds_max: count={expected_count} max=300 "
+                f"kline_fetch_window_exceeds_max: count={expected_count} max=300 "
                 f"symbol={symbol}"
             )
         # OKX `after` is exclusive (returns rows with open_time < after).
@@ -368,7 +390,8 @@ class OkxClient:
                 for row in reversed(rows):
                     if not isinstance(row, list) or len(row) < 6:
                         raise InvariantError(
-                            f"okx_kline_window_row_invalid: symbol={symbol}"
+                            f"kline_fetch_integrity_violation: symbol={symbol} "
+                            f"detail=row_invalid"
                         )
                     arrays.append([
                         int(row[0]), float(row[1]), float(row[2]),
@@ -378,21 +401,22 @@ class OkxClient:
                 # _classify_response already ensured len == expected_count.
                 if arrays[0][0] != oldest_open_ms or arrays[-1][0] != newest_open_ms_inclusive:
                     raise InvariantError(
-                        f"okx_kline_window_boundary_mismatch: symbol={symbol} "
+                        f"kline_fetch_integrity_violation: symbol={symbol} "
+                        f"detail=boundary_mismatch "
                         f"requested=[{oldest_open_ms}..{newest_open_ms_inclusive}] "
                         f"got=[{arrays[0][0]}..{arrays[-1][0]}] count={len(arrays)}"
                     )
                 # Contiguity verification: every adjacent pair must be exactly
                 # 1000 ms apart. Catches mid-window holes / duplicates /
                 # out-of-order rows that the boundary check alone would miss.
-                # Required for the live decision path (bootstrap + gap-fill)
-                # AND for sync's on-disk records (downstream slice math
-                # assumes contiguity).
+                # Required for the live decision path AND for sync's on-disk
+                # records (downstream slice math assumes contiguity).
                 for i in range(1, len(arrays)):
                     delta = arrays[i][0] - arrays[i - 1][0]
                     if delta != 1000:
                         raise InvariantError(
-                            f"okx_kline_window_noncontiguous: symbol={symbol} "
+                            f"kline_fetch_integrity_violation: symbol={symbol} "
+                            f"detail=noncontiguous "
                             f"idx={i} prev_ts={arrays[i - 1][0]} cur_ts={arrays[i][0]} "
                             f"delta_ms={delta} (expected 1000)"
                         )
@@ -400,7 +424,7 @@ class OkxClient:
 
             if cls == _OkxErrorClass.PERMANENT:
                 raise InvariantError(
-                    f"okx_kline_window_permanent: symbol={symbol} detail={detail}"
+                    f"kline_fetch_permanent: symbol={symbol} detail={detail}"
                 )
 
             # RETRYABLE or INSUFFICIENT — retry per policy if attempts remain.
@@ -411,8 +435,8 @@ class OkxClient:
                 error("NET", "OKX", "EXHAUST",
                       attempts=attempt + 1, endpoint="history-candles",
                       symbol=symbol, error_class=cls.value, error_detail=detail)
-                raise InvariantError(
-                    f"okx_kline_window_exhausted: symbol={symbol} "
+                raise TransientOkxError(
+                    f"kline_fetch_exhausted: symbol={symbol} "
                     f"class={cls.value} detail={detail}"
                 )
             base_delay = retry_policy.backoff_seconds[attempt]
@@ -425,6 +449,6 @@ class OkxClient:
 
         # Defensive: loop above always returns or raises.
         raise InvariantError(
-            f"okx_kline_window_unreachable: symbol={symbol} "
+            f"kline_fetch_unreachable: symbol={symbol} "
             f"last_class={last_class} last_detail={last_detail}"
         )
