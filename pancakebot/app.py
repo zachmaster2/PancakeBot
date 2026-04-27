@@ -49,14 +49,16 @@ def run_from_config(
         raise InvariantError("run_modes_mutually_exclusive")
 
     # Inline MomentumGateConfig -- symbols are hardcoded project constants;
-    # mtf_lookbacks and mtf_threshold come from [strategy.gate] config
-    # (extracted from former module constants in 2026-04-26 refactor).
+    # mtf_lookbacks and mtf_threshold come from [strategy.gate] config.
+    # cutoff_seconds threads ``[runtime] kline_cutoff_seconds`` to the gate
+    # so the gate is the single source of truth for the data window.
     momentum_gate_cfg = MomentumGateConfig(
         enabled=True,
         bnb_symbol="BNB-USDT",
         btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT",
         sol_symbol="SOL-USDT",
+        cutoff_seconds=cfg.kline_cutoff_seconds,
         mtf_lookbacks=cfg.strategy.gate.mtf_lookbacks,
         mtf_threshold=cfg.strategy.gate.mtf_threshold,
     )
@@ -73,6 +75,7 @@ def run_from_config(
             wallet_address="",
             cutoff_seconds=cfg.kline_cutoff_seconds,
             prefetch_offset_seconds=cfg.prefetch_offset_seconds,
+            kline_fetch_offset_ms=cfg.kline_fetch_offset_ms,
             dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
             momentum_gate_config=momentum_gate_cfg,
             momentum_gate=None,
@@ -156,51 +159,18 @@ def run_from_config(
     okx_client = OkxClient(timeout_seconds=10.0)
     okx_client.warmup()
 
-    # WSS migration (Phase 2 spec 2026-04-27): subscribe-FIRST bootstrap.
-    # Daemon thread subscribes to ``candle1s`` for BTC/ETH/SOL/BNB, awaits
-    # the first confirm=1 push per symbol (T), waits 2s, then REST-fills
-    # ``[next_lock_at - 301_000, T]`` via ``OkxClient.fetch_kline_window``,
-    # boundary-verifies REST[T] == WSS[T], and atomically replaces the ring.
-    # Steady-state pushes append iff continuous; any gap triggers the same
-    # REST-repair flow. No fallback to REST polling in live mode.
-    #
-    # BNB is a FIRST-CLASS instrument (the bot bets on BNB/USD); it's
-    # subscribed and bootstrapped identically to BTC/ETH/SOL even though
-    # the current strategy gate doesn't read BNB klines from WSS. Future
-    # research that consumes BNB klines must work without re-plumbing.
-    from pancakebot.market_data.okx_wss_client import OkxWssClient
-    from pancakebot.market_data.okx_client import okx_rate_acquire
-
-    def _next_lock_at_ms() -> int:
-        """Return the lock_at (in MILLISECONDS) of the round whose betting
-        window currently includes wall-clock now, i.e. the round we're
-        about to evaluate. Anchors WSS bootstrap + gap-fill REST fetches
-        to the same window the on-disk rebuild uses
-        (``[lock-301000, lock-2000]``).
-        """
-        epoch = contract.current_epoch()
-        lock_ts = contract.lock_ts(int(epoch))
-        if lock_ts <= 0:
-            raise InvariantError(
-                f"next_lock_at_ms_unset: epoch={epoch} lock_ts={lock_ts}"
-            )
-        return int(lock_ts) * 1000
-
-    wss_client = OkxWssClient(
-        okx_client=okx_client,
-        instruments=("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT"),
-        next_lock_at_ms_provider=_next_lock_at_ms,
-        rate_acquire_fn=okx_rate_acquire,
-    )
-    wss_client.start()  # blocks until is_ready() or raises
-    import atexit as _atexit
-    _atexit.register(wss_client.stop)
-
+    # Per-round REST kline fetch path: the gate fires 4 parallel
+    # ``/history-candles`` GETs each round (BTC/ETH/SOL/BNB) anchored to
+    # ``lock_at_ms``. Wake-time offset configured via
+    # ``[runtime] kline_fetch_offset_ms``. BNB is FIRST-CLASS (the bot bets
+    # on BNB/USD); it's fetched alongside BTC/ETH/SOL even though the
+    # current strategy doesn't consume BNB closes for signal computation.
     momentum_gate = MomentumGate(
         config=momentum_gate_cfg,
         okx_client=okx_client,
-        wss_client=wss_client,
     )
+    import atexit as _atexit
+    _atexit.register(momentum_gate.shutdown)
 
     # Pool event watcher: subscribes to confirmed BetBull/BetBear events
     # via public WSS for accurate pool tracking (no signup required).
@@ -213,6 +183,7 @@ def run_from_config(
         wallet_address=contract.wallet_address,
         cutoff_seconds=cfg.kline_cutoff_seconds,
         prefetch_offset_seconds=cfg.prefetch_offset_seconds,
+        kline_fetch_offset_ms=cfg.kline_fetch_offset_ms,
         dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
         momentum_gate_config=momentum_gate_cfg,
         dry=dry,

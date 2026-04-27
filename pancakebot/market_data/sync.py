@@ -37,7 +37,7 @@ _HISTORY_NEWEST_OFFSET_MS = 2_000
 _FETCH_WORKERS = 4  # concurrent OKX fetches per batch
 
 # OKX REST rate budget moved to pancakebot.market_data.okx_client
-# (``okx_rate_acquire``). Sync's bulk fetch + WSS bootstrap + WSS gap-fill
+# (``okx_rate_acquire``). Sync's bulk fetch + per-round live-gate fetch
 # all share the same process-wide token bucket.
 
 _BNB_KLINES_PATH = Path(_proj_paths.BNB_SPOT_PRICES_PATH)
@@ -252,7 +252,9 @@ def _sync_1s_klines(
     total_synced = 0
 
     # --- Pass 1: Append (epochs after existing store) ---
-    # Raises InvariantError on unrecoverable OKX failure (caller's sync fails loud).
+    # Raises InvariantError on shape violations or TransientOkxError on
+    # retry-exhausted transients -- both surface to the caller (sync fails
+    # loud; it shouldn't skip rounds).
     if append_rounds:
         total_synced += _fetch_and_append(
             rounds_asc=append_rounds, inst_id=inst_id, store=store, label=label,
@@ -283,8 +285,10 @@ def _fetch_and_append(
 ) -> int:
     """Fetch epochs in ordered batches and append each to store immediately.
 
-    Raises InvariantError on unrecoverable OKX failure (any batch fetch that
-    exhausts retries inside OkxClient).
+    Raises ``InvariantError`` on shape violations (length, contiguity,
+    boundary, malformed input). Raises ``TransientOkxError`` if any batch
+    fetch exhausts retries inside ``OkxClient.kline_fetch_window`` (rare
+    with ``RETRY_SYNC``'s 5-attempt budget).
     """
     synced = 0
     prev_epoch = latest_on_disk if latest_on_disk is not None else 0
@@ -326,7 +330,8 @@ def _fetch_to_staging(
 ) -> int:
     """Fetch older epochs into a staging file (resumable append-only).
 
-    Raises InvariantError on unrecoverable OKX failure.
+    Raises ``InvariantError`` on shape violations or ``TransientOkxError``
+    on retry-exhausted transients (same contract as ``_fetch_and_append``).
     """
     # Load what's already in the staging file from a prior interrupted run.
     staged_epochs: set[int] = set()
@@ -398,7 +403,8 @@ def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient) -> list[dict]
     """Fetch a batch of rounds in parallel.
 
     Returns the list of kline records. Propagates any exception raised by
-    `_fetch_one_kline` (OkxClient's retry exhaustion surfaces as InvariantError).
+    ``_fetch_one_kline``: ``InvariantError`` on shape violations,
+    ``TransientOkxError`` on retry-exhausted transients.
     """
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
@@ -419,13 +425,15 @@ def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient) -> dict:
       oldest open_ts = lock_at_ms - 301_000
       300 candles, oldest-first
 
-    Raises InvariantError if the shared retry policy in
-    ``OkxClient.fetch_kline_window`` exhausts.
+    Raises InvariantError on shape violations. Raises TransientOkxError if
+    the shared retry policy in ``OkxClient.kline_fetch_window`` exhausts
+    (rare with RETRY_SYNC's 5-attempt budget; sync treats it as fail-loud
+    rather than skipping the round).
     """
     epoch = int(rnd.epoch)
     lock_at = int(rnd.lock_at)
     lock_at_ms = lock_at * 1000
-    klines = okx_client.fetch_kline_window(
+    klines = okx_client.kline_fetch_window(
         symbol=inst_id,
         oldest_open_ms=lock_at_ms - _HISTORY_OLDEST_OFFSET_MS,
         newest_open_ms_inclusive=lock_at_ms - _HISTORY_NEWEST_OFFSET_MS,

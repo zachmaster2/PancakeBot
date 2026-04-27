@@ -121,13 +121,6 @@ def build_snapshot(
     Called from the producer side (engine.py decision path), so this
     must be cheap. The only non-trivial work is array-flattening the
     klines, which is ~30-90 small list comprehensions and adds <1ms.
-
-    The legacy ``*_response_headers`` kwargs / ``response_headers`` JSONL
-    field were removed in Phase 2 spec item 17 part C (2026-04-27): the
-    fetch path that populated them (``OkxClient.fetch_1s_klines``) was
-    deleted in the WSS migration, so the field was always None. Existing
-    capture files that include ``response_headers`` remain readable --
-    the loader doesn't consume the field.
     """
     btc_arr = [_kline_dict_to_array(k) for k in (btc_klines_raw or [])]
     eth_arr = (

@@ -18,6 +18,10 @@ class TransientGraphError(Exception):
     pass
 
 
+class TransientOkxError(Exception):
+    pass
+
+
 # -- Paths ---------------------------------------------------------
 
 def ensure_parent_dir(path: str) -> None:

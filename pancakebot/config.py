@@ -313,6 +313,7 @@ class AppConfig:
 
     kline_cutoff_seconds: int
     prefetch_offset_seconds: int
+    kline_fetch_offset_ms: int
     dry_initial_bankroll_bnb: float
     live_min_bet_only: bool
     backtest_simulation_size: int
@@ -322,13 +323,6 @@ class AppConfig:
     backtest: BacktestConfig
     # Full StrategyConfig (defaults match pre-refactor module constants).
     strategy: StrategyConfig
-    # Note: ``okx_wss_stale_threshold_ms`` was removed (Phase 2 spec item 10,
-    # 2026-04-27). The wall-clock staleness check it gated is now redundant
-    # with ``wss_newest_lagging`` (item 9), which compares ring's newest
-    # against the cutoff-anchored expected timestamp -- catches everything
-    # the staleness threshold caught, plus the post-push-but-still-behind
-    # race condition. ``last_received_ms`` is preserved on the ring for
-    # diagnostics (``stats()``).
 
 
 # -- TOML parsing helpers -----------------------------------------------------
@@ -554,6 +548,17 @@ def load_app_config(path: str) -> AppConfig:
     prefetch_offset_seconds = _req_int(runtime, "prefetch_offset_seconds")
     if prefetch_offset_seconds <= 0:
         raise InvariantError("prefetch_offset_seconds_must_be_positive")
+    # ``kline_fetch_offset_ms`` controls how many milliseconds before lock_at
+    # the gate wakes to fire its parallel 4-symbol REST fetch. Default 850
+    # is sized for typical OKX p99 staleness (~1.7s) plus a margin for the
+    # round-trip. Below 100 we'd hit OKX before the lock-1 candle is
+    # published; above 5000 we'd burn most of the pre-lock budget waiting.
+    kline_fetch_offset_ms = _opt_int(runtime, "kline_fetch_offset_ms", 850)
+    if not (100 <= kline_fetch_offset_ms <= 5000):
+        raise InvariantError(
+            f"runtime_kline_fetch_offset_ms_out_of_range: "
+            f"got={kline_fetch_offset_ms} valid=[100..5000]"
+        )
 
     # [dry]
     dry_initial_bankroll_bnb = _opt_float(dry_sec, "initial_bankroll_bnb", 50.0)
@@ -585,14 +590,10 @@ def load_app_config(path: str) -> AppConfig:
 
     strategy_cfg = load_strategy_config(raw)
 
-    # ``[okx] wss_stale_threshold_ms`` removed (Phase 2 spec item 10,
-    # 2026-04-27). The check it gated is replaced by ``wss_newest_lagging``
-    # in ``OkxWssClient.get_window`` (item 9). If the TOML still contains
-    # the key, it is silently ignored -- callers don't need a migration.
-
     return AppConfig(
         kline_cutoff_seconds=kline_cutoff_seconds,
         prefetch_offset_seconds=prefetch_offset_seconds,
+        kline_fetch_offset_ms=kline_fetch_offset_ms,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_min_bet_only=live_min_bet_only,
         backtest_simulation_size=simulation_size,

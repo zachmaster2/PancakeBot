@@ -5,31 +5,45 @@ to all agree in direction and exceed ``GateConfig.mtf_threshold``, and emits
 independent ETH and SOL multi-TF directions plus confirmation strengths for
 use by the pipeline's sizing and regime-2 logic.
 
-Lookbacks and threshold live in ``pancakebot.config.GateConfig`` (TOML
-``[strategy.gate]``); previously module-level constants
-``_MTF_LOOKBACKS = (3, 7, 15)`` / ``_MTF_THRESH = 0.0001``. The candle
-count consumed by the gate is derived: ``candle_count = max(mtf_lookbacks) + 1``.
+Live data path: per-round parallel REST fetch of BTC/ETH/SOL/BNB
+``/history-candles`` windows, anchored to ``lock_at_ms`` (window =
+``[lock_at_ms - 301_000, lock_at_ms - 2_000]``, identical to sync.py and
+the on-disk rebuild). Empirical (2026-04-27) OKX REST staleness is
+median ~410ms / p99 ~1.7s, materially fresher than candle1s WSS push
+(median ~954ms / p99 ~1.5s+). The wake-time offset is configured via
+``RuntimeConfig.kline_fetch_offset_ms`` and applied by the engine; the
+gate itself just consumes ``lock_at_ms``.
 """
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from pancakebot.log import warn
-from pancakebot.market_data.okx_client import OkxClient
+from pancakebot.market_data.okx_client import (
+    OkxClient,
+    RETRY_GATE,
+    okx_rate_acquire,
+)
+from pancakebot.util import InvariantError, TransientOkxError
 
 
-# Single skip reason emitted for ANY WSS data-availability failure across
-# any of the four subscribed symbols (BTC/ETH/SOL/BNB). Per-failure detail
-# is logged via per-symbol ``warn()`` calls so the operator reconciles the
-# generic histogram entry with the warn-log cluster around it.
-#
-# Phase 2 spec item 16 (2026-04-27) -- supersedes the per-reason +
-# per-symbol-suffix variants from items 1B / 9 / 15. Rationale:
-#   - Histogram cardinality stays low (1 variant, not 5*4=20).
-#   - Multi-failure rounds aren't masked by a single arbitrary "first" reason.
-#   - All-4-failing rounds become very visible (4 clustered warns + 1 skip).
-_WSS_FAILURE_SKIP_REASON = "risk_kline_wss_failure"
+# Per-round fetch window. Anchored to ``lock_at_ms`` only — independent of
+# ``cutoff_seconds`` (a strategy/gate-only knob, not a fetch parameter).
+# Matches sync.py and the on-disk rebuild's record shape exactly.
+_HISTORY_OLDEST_OFFSET_MS = 301_000
+_HISTORY_NEWEST_OFFSET_MS = 2_000
+
+# Maximum consecutive rounds skipped on TransientOkxError before the gate
+# escalates to InvariantError. Three rounds at 5min each = ~15 min of
+# OKX REST unreachability before the bot fail-louds — long enough to ride
+# out an isolated network blip, short enough that the operator notices
+# before half a day's worth of opportunity is silently lost.
+_MAX_CONSECUTIVE_FETCH_FAILURES = 3
+
+_SYMBOLS_FETCHED = ("btc", "eth", "sol", "bnb")
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,12 +51,15 @@ class MomentumGateConfig:
     """Live/dry-mode gate configuration.
 
     The ``mtf_lookbacks`` / ``mtf_threshold`` carry the per-strategy
-    multi-TF parameters (formerly module constants). ``candle_count`` is
-    derived from ``mtf_lookbacks`` at gate-construction time.
+    multi-TF parameters. ``cutoff_seconds`` defines the data window the
+    gate consumes (cutoff_ts_ms = lock_at_ms - cutoff_seconds*1000) and
+    is the sole source of truth for the strategy-side cutoff. ``candle_count``
+    is derived from ``mtf_lookbacks`` at gate-construction time.
     """
     enabled: bool
     bnb_symbol: str          # "BNB-USDT"
     btc_symbol: str          # "BTC-USDT"
+    cutoff_seconds: int
     mtf_lookbacks: tuple[int, ...]
     mtf_threshold: float
     eth_symbol: str = "ETH-USDT"
@@ -65,17 +82,27 @@ class MomentumGateResult:
 
 
 class MomentumGate:
-    """Multi-asset momentum gate: reads BTC + ETH + SOL + BNB 1s klines
-    from OKX WSS in-memory ring buffers (live mode).
+    """Multi-asset momentum gate: fetches BTC + ETH + SOL + BNB 1s klines
+    in parallel via OKX ``/history-candles`` REST per round (live mode).
 
-    Per the WSS migration: live mode reads from ``OkxWssClient`` ring
-    buffers; the per-round REST fetch path is REMOVED. Bootstrap REST and
-    reconnect gap-fill REST survive inside ``OkxWssClient`` for
-    initialization-only purposes.
+    Decision-time work: 4 parallel HTTP GETs to OKX (median ~250ms,
+    p99 ~500ms, sharing the global 8/s rate budget). The wake-time offset
+    is set by the engine via ``RuntimeConfig.kline_fetch_offset_ms`` so
+    the fetch lands a configurable margin before ``lock_at``.
 
-    The OkxClient reference is preserved purely so the WSS client (which
-    holds the OKX HTTP session) is reachable from the gate for
-    diagnostics; the gate itself no longer issues OKX HTTP requests.
+    Error handling:
+    - Any ``InvariantError`` from any symbol → reraise (bot crashes →
+      supervisor restart). These indicate OKX returned a malformed window
+      (length/contiguity/boundary violation) and should never silently
+      skip.
+    - Any ``TransientOkxError`` (any subset of symbols) → emit one
+      ``warn("GATE", sym.upper(), "FETCH_FAIL", ...)`` per failed symbol
+      and skip the round with reason ``kline_fetch_transient_failure``.
+      Increments ``_consecutive_fetch_failures``; reset to 0 on a fully
+      successful 4-symbol fetch (regardless of whether downstream
+      signal-computation produces a BET or SKIP).
+    - Streak >= ``_MAX_CONSECUTIVE_FETCH_FAILURES`` → escalate to
+      ``InvariantError("kline_fetch_failure_streak_max_reached: ...")``.
     """
 
     def __init__(
@@ -83,41 +110,35 @@ class MomentumGate:
         *,
         config: MomentumGateConfig,
         okx_client: OkxClient,
-        wss_client=None,
     ) -> None:
         self._cfg = config
         self._client = okx_client
         # Derived: candle_count = max(mtf_lookbacks) + 1. Computed once at
-        # construction; used for OKX ring-window length, validation, and
-        # backtest pre-trim.
+        # construction; used for validation post-fetch and for the live
+        # signal computation slice.
         self._candle_count = max(config.mtf_lookbacks) + 1
-        # WSS client is REQUIRED for live runtime use (engine constructs
-        # it before instantiating the gate). It's accepted as Optional
-        # so backtest-side code paths can construct a "no-op" gate via
-        # MomentumOnlyPipeline(gate=None) without setting up WSS.
-        # If ``evaluate()`` is called with wss_client=None it raises --
-        # the live runtime should never reach that state.
-        self._wss = wss_client
         # Cached after each evaluate() so the pipeline can use data
         # for auxiliary signals and regime-adaptive sizing without re-fetching.
         self.last_btc_closes: list[float] | None = None
         # Per-pair fetch timing (ms) -- set each evaluate(), logged by caller
         # AFTER timing guard so file I/O doesn't delay bet submission.
-        # In WSS path, "fetch" is an in-memory dict lookup (sub-ms), so this
-        # field is set to {} per evaluate to keep the capture-format
-        # invariant. Pre-fix REST path tracked actual TLS+fetch latency.
         self.last_fetch_timing: dict[str, int] | None = None
-        # Raw kline arrays + computed returns from the most recent evaluate().
+        # Raw kline arrays (dict-shaped) from the most recent evaluate().
         # Consumed by pancakebot.runtime.kline_capture for off-critical-path
         # observability writes. Schema unchanged from REST-era: capture
         # serializes [ts, o, h, l, c, v] arrays as dicts via the existing
-        # _kline_dict_to_array path, but in WSS mode these are ALREADY
-        # arrays (the ring stores arrays). We materialize lightweight dict
-        # wrappers below to keep capture's reader contract stable.
+        # _kline_dict_to_array path.
         self.last_btc_klines_raw: list[dict] | None = None
         self.last_eth_klines_raw: list[dict] | None = None
         self.last_sol_klines_raw: list[dict] | None = None
         self.last_returns: dict[str, float | None] | None = None
+        # Consecutive-failure escalation state (TransientOkxError streak).
+        self._consecutive_fetch_failures: int = 0
+        # ThreadPoolExecutor lives for the gate's lifetime so we don't pay
+        # thread-spawn cost every round. max_workers=4 -- one per symbol.
+        self._executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="kline-fetch",
+        )
 
     @property
     def enabled(self) -> bool:
@@ -126,120 +147,176 @@ class MomentumGate:
     def evaluate(
         self,
         *,
-        cutoff_ts_ms: int,
+        lock_at_ms: int,
     ) -> MomentumGateResult:
-        """Compute signal from the WSS in-memory ring buffers.
+        """Fetch BTC/ETH/SOL/BNB 1s klines in parallel and compute the signal.
 
-        Live mode: reads ``self._wss.get_window(symbol, cutoff_ms, candle_count)``
-        for BTC, ETH, SOL, BNB. BTC drives the primary signal; ETH/SOL feed
-        regime-2 / BTC confirmation; BNB is the asset we bet on -- its window
-        is read for parity (data-availability check + ``needs_reconnect``
-        signal side effect) but the kline values are not consumed by signal
-        computation. Sub-millisecond decision-time read.
+        ``lock_at_ms`` is the round's lock_at in milliseconds (from
+        ``int(round_t.lock_at) * 1000``). The fetch window is
+        ``[lock_at_ms - 301_000, lock_at_ms - 2_000]`` for every symbol
+        regardless of ``cutoff_seconds``; the strategy-side cutoff is
+        applied to the fetched arrays before signal computation.
 
-        WSS failure handling (Phase 2 spec item 16, 2026-04-27): if ANY of
-        the four ``get_window`` calls returns ``None``, the round is
-        skipped with a SINGLE generic ``risk_kline_wss_failure`` reason
-        AND one ``warn()`` is emitted per failed symbol naming the specific
-        WSS reason (so the operator reconciles a histogram entry with the
-        warn-log cluster around it). All four calls fire upfront so
-        ``needs_reconnect`` side effects propagate even when an earlier
-        symbol fails.
+        Returns a MomentumGateResult with one of:
+        - ``signal`` set + ``skip_reason=None`` on a fired signal
+        - ``signal=None`` + ``skip_reason="gate_no_signal"`` on multi-TF miss
+        - ``signal=None`` + ``skip_reason="kline_fetch_transient_failure"``
+          on any subset of 4-symbol transient failures
+        - raises InvariantError on any contract violation OR on
+          ``_MAX_CONSECUTIVE_FETCH_FAILURES`` consecutive transient rounds
         """
         if not self._cfg.enabled:
             return MomentumGateResult(
                 signal=None, tier=None, skip_reason=None,
             )
 
-        if self._wss is None:
-            # Live runtime should always provide wss_client. This branch
-            # protects test paths that construct MomentumGate without WSS;
-            # they get a clean skip rather than a confusing AttributeError.
-            return self._skip("gate_no_wss_client")
+        cutoff_ts_ms = lock_at_ms - self._cfg.cutoff_seconds * 1000
+        oldest_open_ms = lock_at_ms - _HISTORY_OLDEST_OFFSET_MS
+        newest_open_ms = lock_at_ms - _HISTORY_NEWEST_OFFSET_MS
 
-        cc = self._candle_count
-        # ----- Read rings (all four upfront) -----
-        # Returns (klines, skip_reason). klines is list of
-        # [ts_ms, o, h, l, c, v] arrays oldest-first; None on any WSS skip.
-        # All four reads happen BEFORE any None-check so each call's side
-        # effect (notably ``needs_reconnect`` from item 13) fires regardless
-        # of which symbol(s) ultimately fail.
-        btc_arr, btc_reason = self._wss.get_window(self._cfg.btc_symbol, cutoff_ts_ms, cc)
-        eth_arr, eth_reason = self._wss.get_window(self._cfg.eth_symbol, cutoff_ts_ms, cc)
-        sol_arr, sol_reason = self._wss.get_window(self._cfg.sol_symbol, cutoff_ts_ms, cc)
-        bnb_arr, bnb_reason = self._wss.get_window(self._cfg.bnb_symbol, cutoff_ts_ms, cc)
+        # ----- Parallel REST fetch (4 symbols) -----
+        # Submit all four upfront so the network round-trips overlap.
+        # ThreadPoolExecutor + okx_rate_acquire share the global 8/s budget.
+        # ``as_completed`` reaps futures in finish-order so per-symbol
+        # ``durations`` reflect true individual latency (not iteration order).
+        symbols = {
+            "btc": self._cfg.btc_symbol,
+            "eth": self._cfg.eth_symbol,
+            "sol": self._cfg.sol_symbol,
+            "bnb": self._cfg.bnb_symbol,
+        }
+        submit_time = time.perf_counter()
+        futures = {
+            self._executor.submit(
+                self._client.kline_fetch_window,
+                symbol=symbols[sym_short],
+                oldest_open_ms=oldest_open_ms,
+                newest_open_ms_inclusive=newest_open_ms,
+                retry_policy=RETRY_GATE,
+                rate_acquire_fn=okx_rate_acquire,
+            ): sym_short
+            for sym_short in _SYMBOLS_FETCHED
+        }
 
-        # In-memory read; no fetch-timing meaningful (sub-ms).
-        self.last_fetch_timing = {"btc_ms": 0, "eth_ms": 0, "sol_ms": 0}
+        results: dict[str, list[list]] = {}
+        errors: dict[str, Exception] = {}
+        durations: dict[str, int] = {}
+        # Block until ALL futures complete (same wait-for-all behaviour as
+        # the prior submission-order loop) but timestamp each one at its
+        # actual completion, not when the iterator reaches it.
+        for fut in as_completed(futures):
+            sym_short = futures[fut]
+            durations[sym_short] = int((time.perf_counter() - submit_time) * 1000)
+            try:
+                results[sym_short] = fut.result()
+            except (InvariantError, TransientOkxError) as e:
+                errors[sym_short] = e
+        self.last_fetch_timing = {f"{sym}_ms": ms for sym, ms in durations.items()}
 
-        # ----- Capture snapshot (BEFORE validation early-return) -----
-        # Materialize dict-shaped wrappers for the capture module's
-        # _kline_dict_to_array reader. This preserves the existing
-        # captured.jsonl schema unchanged from the REST era.
-        def _arr_to_dicts(arrs: list[list] | None) -> list[dict] | None:
-            if arrs is None:
-                return None
-            return [
-                {"open_time_ms": int(k[0]), "open": float(k[1]), "high": float(k[2]),
-                 "low": float(k[3]), "close_price": float(k[4]),
-                 "volume": float(k[5]) if len(k) > 5 else 0.0}
-                for k in arrs
-            ]
+        invariant_errors = [
+            (s, e) for s, e in errors.items() if isinstance(e, InvariantError)
+        ]
+        transient_errors = [
+            (s, e) for s, e in errors.items() if isinstance(e, TransientOkxError)
+        ]
 
-        self.last_btc_klines_raw = _arr_to_dicts(btc_arr)
-        self.last_eth_klines_raw = _arr_to_dicts(eth_arr)
-        self.last_sol_klines_raw = _arr_to_dicts(sol_arr)
-        # Returns snapshot (uses available closes; partial data still produces
-        # something for capture, even on stale paths).
-        _btc_closes_snap = [float(k[4]) for k in btc_arr] if btc_arr else None
-        _eth_closes_snap = [float(k[4]) for k in eth_arr] if eth_arr else None
-        _sol_closes_snap = [float(k[4]) for k in sol_arr] if sol_arr else None
+        # ----- Error handling: InvariantError dominates -----
+        # Aggregate every InvariantError detail into a single raise so the
+        # operator sees the full picture (rather than only the first). The
+        # inner messages already begin with ``kline_fetch_integrity_violation:``
+        # so we don't re-prefix the aggregate -- per-symbol-tagged entries
+        # are self-explanatory.
+        if invariant_errors:
+            details = "; ".join(
+                f"{sym_short}={e}" for sym_short, e in invariant_errors
+            )
+            raise InvariantError(details)
+
+        # ----- Error handling: TransientOkxError (any subset) -----
+        if transient_errors:
+            for sym_short, e in transient_errors:
+                # Per-symbol detail goes into a warn log so the operator
+                # reconciles the generic skip with the warn-cluster around it.
+                warn(
+                    "GATE", sym_short.upper(), "FETCH_FAIL",
+                    msg=f"reason={e}",
+                )
+            self._consecutive_fetch_failures += 1
+            if self._consecutive_fetch_failures >= _MAX_CONSECUTIVE_FETCH_FAILURES:
+                # Capture the latest detail for the fail-loud message.
+                latest_sym, latest_err = transient_errors[-1]
+                raise InvariantError(
+                    f"kline_fetch_failure_streak_max_reached: "
+                    f"streak={self._consecutive_fetch_failures} "
+                    f"max={_MAX_CONSECUTIVE_FETCH_FAILURES} "
+                    f"latest={latest_sym}={latest_err}"
+                )
+            return self._skip("kline_fetch_transient_failure")
+
+        # ----- All 4 fetched cleanly -- reset streak -----
+        # Reset BEFORE signal computation so quiet-market `gate_no_signal`
+        # rounds don't falsely escalate the streak. The streak measures
+        # OKX-fetch health, not signal availability.
+        self._consecutive_fetch_failures = 0
+
+        btc_arr = results["btc"]
+        eth_arr = results["eth"]
+        sol_arr = results["sol"]
+        # ``bnb_arr`` is fetched for BNB-first-class parity (the bot bets on
+        # BNB/USD) but the BTC-driven signal does not consume BNB closes.
+        # Keeping the fetch in scope guarantees a future BNB-aware strategy
+        # works without re-plumbing the data path.
+        _bnb_arr = results["bnb"]
+
+        # Trim each array to the cutoff-aligned window (last
+        # candle_count candles ending at cutoff - 1000).
+        btc_window = _trim_to_window(btc_arr, cutoff_ts_ms, candle_count=self._candle_count)
+        eth_window = _trim_to_window(eth_arr, cutoff_ts_ms, candle_count=self._candle_count)
+        sol_window = _trim_to_window(sol_arr, cutoff_ts_ms, candle_count=self._candle_count)
+
+        # ----- Capture snapshot (BEFORE signal computation) -----
+        self.last_btc_klines_raw = _arr_to_dicts(btc_window)
+        self.last_eth_klines_raw = _arr_to_dicts(eth_window)
+        self.last_sol_klines_raw = _arr_to_dicts(sol_window)
+        btc_closes_snap = [float(k[4]) for k in btc_window] if btc_window else None
+        eth_closes_snap = [float(k[4]) for k in eth_window] if eth_window else None
+        sol_closes_snap = [float(k[4]) for k in sol_window] if sol_window else None
         self.last_returns = _snapshot_returns(
-            _btc_closes_snap, _eth_closes_snap, _sol_closes_snap,
+            btc_closes_snap, eth_closes_snap, sol_closes_snap,
             mtf_lookbacks=self._cfg.mtf_lookbacks,
         )
 
-        # ----- WSS failure handling (Phase 2 spec item 16) -----
-        # Collect every symbol that returned a skip reason from get_window.
-        # If ANY failed, log one warn() per failed symbol naming the
-        # specific reason, then skip the round with the single generic
-        # ``risk_kline_wss_failure`` reason.
-        failures: list[tuple[str, str]] = []
-        if btc_arr is None:
-            failures.append(("btc", btc_reason or "unknown"))
-        if eth_arr is None:
-            failures.append(("eth", eth_reason or "unknown"))
-        if sol_arr is None:
-            failures.append(("sol", sol_reason or "unknown"))
-        if bnb_arr is None:
-            failures.append(("bnb", bnb_reason or "unknown"))
-        if failures:
-            for sym, reason in failures:
-                # Note: event tag is "FAIL" (NOT "SKIP") -- the generic
-                # skip reason already conveys the round was skipped; this
-                # log row is the per-symbol detail for operator triage.
-                warn("WSS_GATE", sym.upper(), "FAIL", msg=f"reason={reason}")
-            return self._skip(_WSS_FAILURE_SKIP_REASON)
+        # ----- Validate windows are aligned (defense in depth) -----
+        # The fetch primitive guarantees length/contiguity for the FULL
+        # 300-candle window; trim should yield exactly candle_count rows
+        # ending at cutoff_ts_ms - 1000. Any drift here is a bug in the
+        # cutoff math, not OKX -- raise to surface it loudly.
+        for label, window in (("btc", btc_window), ("eth", eth_window), ("sol", sol_window)):
+            reason = _validate_klines_raw(
+                window, cutoff_ts_ms, label, candle_count=self._candle_count,
+            )
+            if reason is not None:
+                raise InvariantError(
+                    f"kline_fetch_window_validation_failed: {reason}"
+                )
 
         # ----- Compute signal -----
-        # Past the failures-collection block above, all four arrays are
-        # non-None and length-exactly-``cc`` (post-item-9+10 contract:
-        # ``get_window`` returns ``wss_insufficient`` when too few candles
-        # exist before cutoff, and ``wss_newest_lagging`` when the newest
-        # is behind expected -- both surface as failures-collection skips
-        # before we get here). All previously-defensive ``len(<x>_arr) < cc``
-        # / ``if x_arr and len(x_arr) >= cc else None`` branches were
-        # provably dead and removed in Phase 2 spec item 17 part D
-        # (2026-04-27).
-        btc_closes = [float(k[4]) for k in btc_arr]
-        eth_closes = [float(k[4]) for k in eth_arr]
-        sol_closes = [float(k[4]) for k in sol_arr]
+        btc_closes = [float(k[4]) for k in btc_window]
+        eth_closes = [float(k[4]) for k in eth_window]
+        sol_closes = [float(k[4]) for k in sol_window]
         self.last_btc_closes = btc_closes
         return _compute_signal(
             btc_closes, eth_closes, sol_closes,
             mtf_lookbacks=self._cfg.mtf_lookbacks,
             mtf_threshold=self._cfg.mtf_threshold,
         )
+
+    def shutdown(self) -> None:
+        """Shut down the per-gate executor. Best-effort; safe to call multiple times."""
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001 -- never block bot shutdown
+            pass
 
     @staticmethod
     def _skip(reason: str) -> MomentumGateResult:
@@ -248,10 +325,26 @@ class MomentumGate:
         )
 
 
+def _arr_to_dicts(arrs: list[list] | None) -> list[dict] | None:
+    """Convert kline arrays to the dict-shape the capture module expects.
+
+    The capture worker uses _kline_dict_to_array as its reader contract;
+    this is the writer side of the same schema.
+    """
+    if arrs is None:
+        return None
+    return [
+        {"open_time_ms": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+         "low": float(k[3]), "close_price": float(k[4]),
+         "volume": float(k[5]) if len(k) > 5 else 0.0}
+        for k in arrs
+    ]
+
+
 def _validate_klines_raw(
     klines: list[list] | None, cutoff_ms: int, label: str, *, candle_count: int,
 ) -> str | None:
-    """Validate raw kline arrays (backtest path, list-of-lists format)."""
+    """Validate raw kline arrays (live + backtest paths)."""
     if not klines or len(klines) < candle_count:
         n = 0 if not klines else len(klines)
         return f"gate_{label}_insufficient:got={n}"
