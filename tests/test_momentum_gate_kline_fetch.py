@@ -1,8 +1,8 @@
 """Tests for ``MomentumGate.evaluate`` per-round REST fetch path.
 
 Covers the post-WSS-revert data plane (2026-04-27): the gate fires 4 parallel
-``OkxClient.kline_fetch_window`` calls (BTC/ETH/SOL/BNB) anchored at
-``lock_at_ms`` and aggregates results by exception class.
+``OkxClient.kline_fetch_window`` calls (BTC/ETH/SOL/BNB) and aggregates
+results by exception class.
 
 Behavior under test:
 - Healthy path: all 4 symbols fetched, signal computed off the trimmed window.
@@ -11,8 +11,12 @@ Behavior under test:
   ``kline_fetch_transient_failure``, increments streak counter.
 - 3 consecutive transient rounds → escalates to ``InvariantError``.
 - Streak resets to 0 on any successful 4-symbol fetch (regardless of signal).
-- Fetch window is ``[lock_at_ms - 301_000, lock_at_ms - 2_000]`` for every
-  symbol, independent of ``cutoff_seconds``.
+- Fetch window is cutoff- and lookback-aware: newest = lock_at -
+  cutoff*1000 - 1000, oldest = newest - max(mtf_lookbacks)*1000, expected
+  count = max(mtf_lookbacks) + 1. Confirms the 2026-04-27 fix for
+  ``kline_fetch_integrity_violation`` crashes that used a hardcoded
+  300-candle, cutoff-blind window.
+- ``send_before_bound=True`` is set so OKX cannot slide the window.
 - ``last_fetch_timing`` populated with 4 entries (btc/eth/sol/bnb).
 
 Run:
@@ -62,34 +66,56 @@ def _make_gate(*, cutoff_seconds: int = _CUTOFF_SECONDS, mtf_lookbacks=(3, 7, 15
     return gate, fake_client
 
 
-def _flat_klines(*, lock_at_ms: int, count: int = 300, base_close: float = 100.0) -> list[list]:
-    """Build a 300-candle window with constant price (no signal)."""
-    oldest = lock_at_ms - 301_000
+def _flat_klines(
+    *,
+    lock_at_ms: int,
+    cutoff_seconds: int = _CUTOFF_SECONDS,
+    candle_count: int = 16,
+    base_close: float = 100.0,
+) -> list[list]:
+    """Build an exact-sized window with constant price (no signal).
+
+    Mimics what ``OkxClient.kline_fetch_window`` returns under the
+    cutoff-/lookback-aware live request:
+        newest = lock_at - cutoff*1000 - 1000
+        oldest = newest - (candle_count - 1) * 1000
+    """
+    newest = lock_at_ms - cutoff_seconds * 1000 - 1000
+    oldest = newest - (candle_count - 1) * 1000
     return [
         [oldest + i * 1000, base_close, base_close, base_close, base_close, 1.0]
-        for i in range(count)
+        for i in range(candle_count)
     ]
 
 
-def _trending_klines(*, lock_at_ms: int, slope: float = 0.0001) -> list[list]:
-    """Build a 300-candle window with monotonic upward price drift to fire BTC Bull."""
-    oldest = lock_at_ms - 301_000
+def _trending_klines(
+    *,
+    lock_at_ms: int,
+    cutoff_seconds: int = _CUTOFF_SECONDS,
+    candle_count: int = 16,
+    slope: float = 0.0001,
+) -> list[list]:
+    """Build an exact-sized window with monotonic upward price drift to fire BTC Bull."""
+    newest = lock_at_ms - cutoff_seconds * 1000 - 1000
+    oldest = newest - (candle_count - 1) * 1000
     base = 100.0
     return [
         [oldest + i * 1000,
          base + i * slope, base + i * slope, base + i * slope,
          base + i * slope, 1.0]
-        for i in range(300)
+        for i in range(candle_count)
     ]
 
 
 def _make_router(*, ok_klines: list[list], errors: dict[str, Exception] | None = None):
     """side_effect router for fake_client.kline_fetch_window. Symbols in
-    ``errors`` map to a raise; everything else returns ``ok_klines``."""
+    ``errors`` map to a raise; everything else returns ``ok_klines``.
+
+    Accepts arbitrary kwargs so the router doesn't have to track every
+    optional ``kline_fetch_window`` parameter (``send_before_bound`` etc.)."""
     errors = errors or {}
 
-    def _fetch(*, symbol, oldest_open_ms, newest_open_ms_inclusive,
-               retry_policy, rate_acquire_fn=None):
+    def _fetch(*, symbol, **_kwargs):
         if symbol in errors:
             raise errors[symbol]
         return ok_klines
@@ -128,23 +154,61 @@ def test_evaluate_fetches_all_four_symbols_in_parallel():
     assert called_symbols == ["BNB-USDT", "BTC-USDT", "ETH-USDT", "SOL-USDT"]
 
 
-def test_evaluate_uses_lock_at_anchored_window_independent_of_cutoff():
-    """Window is ``[lock_at-301s, lock_at-2s]`` regardless of cutoff_seconds.
-    The 300-candle window matches sync.py and the on-disk rebuild."""
+def test_evaluate_window_is_cutoff_and_lookback_aware():
+    """Window math: newest = lock - cutoff*1000 - 1000, oldest = newest -
+    max(lookbacks)*1000, count = max(lookbacks) + 1. Verifies the 2026-04-27
+    fix that prevents requesting candles OKX hasn't published yet."""
     for cs in (1, 2, 5, 30):
         gate, fake_client = _make_gate(cutoff_seconds=cs)
         fake_client.kline_fetch_window.side_effect = _make_router(
-            ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS),
+            ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS, cutoff_seconds=cs),
         )
         gate.evaluate(lock_at_ms=_LOCK_AT_MS)
-        # Every call should have the same window regardless of cutoff_seconds.
+        expected_newest = _LOCK_AT_MS - cs * 1000 - 1000
+        expected_oldest = expected_newest - 15 * 1000  # max((3,7,15)) = 15
         for c in fake_client.kline_fetch_window.call_args_list:
-            assert c.kwargs["oldest_open_ms"] == _LOCK_AT_MS - 301_000, (
-                f"cutoff_seconds={cs}: oldest must be lock-301s"
+            assert c.kwargs["oldest_open_ms"] == expected_oldest, (
+                f"cutoff={cs}: oldest got {c.kwargs['oldest_open_ms']}, "
+                f"expected {expected_oldest}"
             )
-            assert c.kwargs["newest_open_ms_inclusive"] == _LOCK_AT_MS - 2_000, (
-                f"cutoff_seconds={cs}: newest must be lock-2s"
+            assert c.kwargs["newest_open_ms_inclusive"] == expected_newest, (
+                f"cutoff={cs}: newest got {c.kwargs['newest_open_ms_inclusive']}, "
+                f"expected {expected_newest}"
             )
+            # Confirm the gate opts in to the both-bounds query so OKX
+            # cannot slide the window.
+            assert c.kwargs.get("send_before_bound") is True, (
+                f"cutoff={cs}: gate must send_before_bound=True; "
+                f"got {c.kwargs.get('send_before_bound')!r}"
+            )
+
+
+def test_evaluate_window_respects_non_default_lookbacks():
+    """Non-default mtf_lookbacks=(5, 20, 60) → expected_count = 61, oldest
+    bound = newest - 60_000. Confirms window math is keyed off the
+    configured lookbacks rather than hardcoded constants."""
+    lb = (5, 20, 60)
+    cs = 2
+    gate, fake_client = _make_gate(cutoff_seconds=cs, mtf_lookbacks=lb)
+    fake_client.kline_fetch_window.side_effect = _make_router(
+        ok_klines=_flat_klines(
+            lock_at_ms=_LOCK_AT_MS, cutoff_seconds=cs, candle_count=61,
+        ),
+    )
+    gate.evaluate(lock_at_ms=_LOCK_AT_MS)
+    expected_newest = _LOCK_AT_MS - cs * 1000 - 1000
+    expected_oldest = expected_newest - 60 * 1000
+    for c in fake_client.kline_fetch_window.call_args_list:
+        assert c.kwargs["oldest_open_ms"] == expected_oldest, (
+            f"non-default lookbacks: oldest got {c.kwargs['oldest_open_ms']}, "
+            f"expected {expected_oldest}"
+        )
+        assert c.kwargs["newest_open_ms_inclusive"] == expected_newest, (
+            f"non-default lookbacks: newest got "
+            f"{c.kwargs['newest_open_ms_inclusive']}, expected {expected_newest}"
+        )
+    # candle_count derives from max(lookbacks)+1.
+    assert gate._candle_count == 61
 
 
 def test_evaluate_populates_last_fetch_timing_with_four_entries():

@@ -6,13 +6,21 @@ independent ETH and SOL multi-TF directions plus confirmation strengths for
 use by the pipeline's sizing and regime-2 logic.
 
 Live data path: per-round parallel REST fetch of BTC/ETH/SOL/BNB
-``/history-candles`` windows, anchored to ``lock_at_ms`` (window =
-``[lock_at_ms - 301_000, lock_at_ms - 2_000]``, identical to sync.py and
-the on-disk rebuild). Empirical (2026-04-27) OKX REST staleness is
-median ~410ms / p99 ~1.7s, materially fresher than candle1s WSS push
-(median ~954ms / p99 ~1.5s+). The wake-time offset is configured via
-``RuntimeConfig.kline_fetch_offset_ms`` and applied by the engine; the
-gate itself just consumes ``lock_at_ms``.
+``/history-candles`` windows. The window is sized to exactly what the
+strategy consumes: cutoff-aware (newest = ``lock_at - cutoff_seconds*1000
+- 1000``) and lookback-aware (``max_lookback + 1`` candles), so a default
+cutoff=2 + lookbacks=(3,7,15) fetches the 16-candle window
+``[lock_at - 18_000, lock_at - 3_000]`` rather than the prior cutoff-blind
+300-candle window. Critically, this avoids requesting candles that
+OKX hasn't published yet at fetch time -- the older "request 300 ending
+at lock-2s" path crashed ~67% of rounds with
+``kline_fetch_integrity_violation`` because OKX's `after`-only filter
+slid the window when the newest candle was unavailable.
+
+Empirical (2026-04-27) OKX REST staleness is median ~410ms / p99 ~1.7s,
+materially fresher than candle1s WSS push (median ~954ms / p99 ~1.5s+).
+The wake-time offset is configured via ``RuntimeConfig.kline_fetch_offset_ms``
+and applied by the engine; the gate itself just consumes ``lock_at_ms``.
 """
 
 from __future__ import annotations
@@ -29,12 +37,6 @@ from pancakebot.market_data.okx_client import (
 )
 from pancakebot.util import InvariantError, TransientOkxError
 
-
-# Per-round fetch window. Anchored to ``lock_at_ms`` only — independent of
-# ``cutoff_seconds`` (a strategy/gate-only knob, not a fetch parameter).
-# Matches sync.py and the on-disk rebuild's record shape exactly.
-_HISTORY_OLDEST_OFFSET_MS = 301_000
-_HISTORY_NEWEST_OFFSET_MS = 2_000
 
 # Maximum consecutive rounds skipped on TransientOkxError before the gate
 # escalates to InvariantError. Three rounds at 5min each = ~15 min of
@@ -152,10 +154,18 @@ class MomentumGate:
         """Fetch BTC/ETH/SOL/BNB 1s klines in parallel and compute the signal.
 
         ``lock_at_ms`` is the round's lock_at in milliseconds (from
-        ``int(round_t.lock_at) * 1000``). The fetch window is
-        ``[lock_at_ms - 301_000, lock_at_ms - 2_000]`` for every symbol
-        regardless of ``cutoff_seconds``; the strategy-side cutoff is
-        applied to the fetched arrays before signal computation.
+        ``int(round_t.lock_at) * 1000``). The fetch window is sized to
+        exactly what the strategy consumes:
+            newest_open_ms = lock_at_ms - cutoff_seconds*1000 - 1000
+            oldest_open_ms = newest_open_ms - max(mtf_lookbacks) * 1000
+            expected_count = max(mtf_lookbacks) + 1
+        The newest candle (``open_ts == newest_open_ms``) closes at
+        ``lock_at - cutoff_seconds`` -- one second before the strategy's
+        cutoff filter at ``open_ts >= cutoff_ts_ms`` would drop it.
+        Requesting one less candle than the cutoff-blind window prevents
+        OKX from being asked for a candle it hasn't published yet at
+        fetch time, which was the root cause of the
+        ``kline_fetch_integrity_violation`` crash epidemic (2026-04-27).
 
         Returns a MomentumGateResult with one of:
         - ``signal`` set + ``skip_reason=None`` on a fired signal
@@ -171,8 +181,9 @@ class MomentumGate:
             )
 
         cutoff_ts_ms = lock_at_ms - self._cfg.cutoff_seconds * 1000
-        oldest_open_ms = lock_at_ms - _HISTORY_OLDEST_OFFSET_MS
-        newest_open_ms = lock_at_ms - _HISTORY_NEWEST_OFFSET_MS
+        max_lookback = max(self._cfg.mtf_lookbacks)
+        newest_open_ms = lock_at_ms - self._cfg.cutoff_seconds * 1000 - 1000
+        oldest_open_ms = newest_open_ms - max_lookback * 1000
 
         # ----- Parallel REST fetch (4 symbols) -----
         # Submit all four upfront so the network round-trips overlap.
@@ -194,6 +205,11 @@ class MomentumGate:
                 newest_open_ms_inclusive=newest_open_ms,
                 retry_policy=RETRY_GATE,
                 rate_acquire_fn=okx_rate_acquire,
+                # Pin both window bounds: prevents OKX from sliding the
+                # window when the newest candle isn't yet published, which
+                # would otherwise return expected_count older rows and
+                # trip the boundary check into a false InvariantError.
+                send_before_bound=True,
             ): sym_short
             for sym_short in _SYMBOLS_FETCHED
         }
@@ -268,32 +284,34 @@ class MomentumGate:
         # works without re-plumbing the data path.
         _bnb_arr = results["bnb"]
 
-        # Trim each array to the cutoff-aligned window (last
-        # candle_count candles ending at cutoff - 1000).
-        btc_window = _trim_to_window(btc_arr, cutoff_ts_ms, candle_count=self._candle_count)
-        eth_window = _trim_to_window(eth_arr, cutoff_ts_ms, candle_count=self._candle_count)
-        sol_window = _trim_to_window(sol_arr, cutoff_ts_ms, candle_count=self._candle_count)
+        # No trim needed: the cutoff+lookback-aware fetch returns exactly
+        # ``candle_count`` candles ending at ``cutoff_ts_ms - 1000`` per
+        # symbol, which is the same window the strategy consumes. The
+        # ``_validate_klines_raw`` checks below are now the sole shape
+        # gate on the live decision path. (Backtest's
+        # ``compute_signal_from_klines`` still uses ``_trim_to_window`` to
+        # absorb the wider ``candle_count=31`` history-fallback slack
+        # produced by the capture-mode merge.)
 
         # ----- Capture snapshot (BEFORE signal computation) -----
-        self.last_btc_klines_raw = _arr_to_dicts(btc_window)
-        self.last_eth_klines_raw = _arr_to_dicts(eth_window)
-        self.last_sol_klines_raw = _arr_to_dicts(sol_window)
-        btc_closes_snap = [float(k[4]) for k in btc_window] if btc_window else None
-        eth_closes_snap = [float(k[4]) for k in eth_window] if eth_window else None
-        sol_closes_snap = [float(k[4]) for k in sol_window] if sol_window else None
+        self.last_btc_klines_raw = _arr_to_dicts(btc_arr)
+        self.last_eth_klines_raw = _arr_to_dicts(eth_arr)
+        self.last_sol_klines_raw = _arr_to_dicts(sol_arr)
+        btc_closes_snap = [float(k[4]) for k in btc_arr] if btc_arr else None
+        eth_closes_snap = [float(k[4]) for k in eth_arr] if eth_arr else None
+        sol_closes_snap = [float(k[4]) for k in sol_arr] if sol_arr else None
         self.last_returns = _snapshot_returns(
             btc_closes_snap, eth_closes_snap, sol_closes_snap,
             mtf_lookbacks=self._cfg.mtf_lookbacks,
         )
 
-        # ----- Validate windows are aligned (defense in depth) -----
-        # The fetch primitive guarantees length/contiguity for the FULL
-        # 300-candle window; trim should yield exactly candle_count rows
-        # ending at cutoff_ts_ms - 1000. Any drift here is a bug in the
-        # cutoff math, not OKX -- raise to surface it loudly.
-        for label, window in (("btc", btc_window), ("eth", eth_window), ("sol", sol_window)):
+        # ----- Validate fetch shape (defense in depth) -----
+        # The fetch primitive guarantees length/contiguity for the
+        # exact-sized window; any drift here is a bug in the cutoff math,
+        # not OKX -- raise to surface it loudly.
+        for label, arr in (("btc", btc_arr), ("eth", eth_arr), ("sol", sol_arr)):
             reason = _validate_klines_raw(
-                window, cutoff_ts_ms, label, candle_count=self._candle_count,
+                arr, cutoff_ts_ms, label, candle_count=self._candle_count,
             )
             if reason is not None:
                 raise InvariantError(
@@ -301,9 +319,9 @@ class MomentumGate:
                 )
 
         # ----- Compute signal -----
-        btc_closes = [float(k[4]) for k in btc_window]
-        eth_closes = [float(k[4]) for k in eth_window]
-        sol_closes = [float(k[4]) for k in sol_window]
+        btc_closes = [float(k[4]) for k in btc_arr]
+        eth_closes = [float(k[4]) for k in eth_arr]
+        sol_closes = [float(k[4]) for k in sol_arr]
         self.last_btc_closes = btc_closes
         return _compute_signal(
             btc_closes, eth_closes, sol_closes,
