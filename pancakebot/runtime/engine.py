@@ -29,7 +29,6 @@ from pancakebot.runtime.dry import (
     _record_dry_cycle_audit,
 )
 from pancakebot.runtime.live import claim_scan_cursor
-from pancakebot.runtime.kline_capture import record_round_decision
 from pancakebot.runtime.process_health import write_heartbeat
 from pancakebot.strategy.momentum_pipeline import StrategyPipelineDecision
 from pancakebot.types import Round
@@ -198,13 +197,6 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
     if cfg.min_bet_amount_bnb <= 0.0:
         raise InvariantError("runtime_min_bet_amount_nonpositive")
     closed_state = _init_closed_state(cfg)
-
-    # Initialise the kline-capture background worker (decoupled JSONL writer).
-    # Producer side (record_round_decision) only enqueues; the worker thread
-    # owns all disk I/O. See pancakebot.runtime.kline_capture.
-    from pancakebot.runtime.kline_capture import init_capture_worker
-    capture_path = Path(paths.DRY_CAPTURE_PATH if cfg.dry else paths.LIVE_CAPTURE_PATH)
-    init_capture_worker(capture_path)
 
     # Bootstrap OKX clock-skew measurement BEFORE the first round starts.
     # The per-round refresh in housekeeping won't have fired yet; if local
@@ -606,23 +598,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             # SKIP path: no time pressure, safe to log timing here.
             if gate is not None and gate.last_fetch_timing is not None:
                 info("GATE", "FETCH", "TIMING", **gate.last_fetch_timing)
-            # Off-critical-path observability: enqueue this round's
-            # snapshot to the capture worker. Sub-ms producer call;
-            # disk I/O happens on the worker thread.
-            record_round_decision(
-                epoch=current_epoch,
-                lock_at_unix=lock_ts_t,
-                cutoff_ms=int(cutoff_ts_t * 1000),
-                mode="dry" if cfg.dry else "live",
-                gate=gate,
-                decision="SKIP",
-                skip_reason=reason,
-                selected_strategy=getattr(decision, "selected_strategy", None),
-                bet_side=None,
-                bet_size_bnb=None,
-                pool_bull_bnb=pool_bull_bnb,
-                pool_bear_bnb=pool_bear_bnb,
-            )
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
@@ -656,22 +631,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 "ACT",
                 "SKIP",
                 msg=f"Skip epoch {current_epoch}: too_close_to_lock_for_bet",
-            )
-            # Capture: gate fired but ran out of time. Record the
-            # would-have-bet snapshot for replay analysis.
-            record_round_decision(
-                epoch=current_epoch,
-                lock_at_unix=lock_ts_t,
-                cutoff_ms=int(cutoff_ts_t * 1000),
-                mode="dry" if cfg.dry else "live",
-                gate=gate,
-                decision="SKIP",
-                skip_reason="too_close_to_lock_for_bet",
-                selected_strategy=getattr(decision, "selected_strategy", None),
-                bet_side=decision.bet_side,
-                bet_size_bnb=decision.bet_size_bnb,
-                pool_bull_bnb=pool_bull_bnb,
-                pool_bear_bnb=pool_bear_bnb,
             )
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
@@ -821,23 +780,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             info("GATE", "FETCH", "TIMING", **gate.last_fetch_timing)
         # Log signal details for dry-run visibility.
         _log_deferred_gate_signal(decision)
-
-        # Capture: BET path. Snapshot enqueued sub-ms; worker thread
-        # owns the disk write.
-        record_round_decision(
-            epoch=current_epoch,
-            lock_at_unix=lock_ts_t,
-            cutoff_ms=int(cutoff_ts_t * 1000),
-            mode="dry" if cfg.dry else "live",
-            gate=gate,
-            decision="BET",
-            skip_reason=None,
-            selected_strategy=getattr(decision, "selected_strategy", None),
-            bet_side=bet_side,
-            bet_size_bnb=amount_bnb,
-            pool_bull_bnb=pool_bull_bnb,
-            pool_bear_bnb=pool_bear_bnb,
-        )
 
         # Step 15: Sleep until claim + claim scan.
         _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)

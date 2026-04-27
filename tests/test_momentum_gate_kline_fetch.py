@@ -223,28 +223,6 @@ def test_evaluate_populates_last_fetch_timing_with_four_entries():
     assert set(gate.last_fetch_timing.keys()) == {"btc_ms", "eth_ms", "sol_ms", "bnb_ms"}
 
 
-def test_evaluate_populates_capture_fields_on_healthy_path():
-    """``last_*_klines_raw`` and ``last_returns`` populated for capture."""
-    gate, fake_client = _make_gate()
-    fake_client.kline_fetch_window.side_effect = _make_router(
-        ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS),
-    )
-    gate.evaluate(lock_at_ms=_LOCK_AT_MS)
-    # Each capture field is a candle_count-length list of dicts.
-    cc = gate._candle_count
-    assert gate.last_btc_klines_raw is not None
-    assert len(gate.last_btc_klines_raw) == cc
-    assert gate.last_eth_klines_raw is not None
-    assert len(gate.last_eth_klines_raw) == cc
-    assert gate.last_sol_klines_raw is not None
-    assert len(gate.last_sol_klines_raw) == cc
-    assert gate.last_returns is not None
-    # returns dict has btc/eth/sol × each lookback.
-    assert "btc_r3" in gate.last_returns
-    assert "btc_r7" in gate.last_returns
-    assert "btc_r15" in gate.last_returns
-
-
 def test_evaluate_returns_no_signal_on_flat_market():
     """Flat prices → multi-TF returns are all 0 → gate_no_signal."""
     gate, fake_client = _make_gate()

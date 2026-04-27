@@ -26,13 +26,6 @@ DRY_HEARTBEAT_PATH = "var/dry/heartbeat.json"
 DRY_CRASH_PATH = "var/dry/crash.json"
 DRY_PID_PATH = "var/dry/bot.pid"
 
-# Per-round kline + signal capture (observability infrastructure for
-# live-vs-history divergence analysis). Append-only JSONL; one line per
-# round-decision. Written off the critical path AFTER the bet is submitted
-# (see engine.py "Step 14b" deferred-logging block). Capture errors are
-# swallowed so the bet path is never blocked. Gitignored.
-DRY_CAPTURE_PATH = "var/dry/captured_klines.jsonl"
-
 # -- Live mode --
 LIVE_BANKROLL_HISTORY_PATH = "var/live/bankroll_history.jsonl"
 LIVE_CLAIM_CURSOR_PATH = "var/live/claim_cursor.txt"
@@ -43,9 +36,6 @@ LIVE_TRADES_PATH = "var/live/trades.csv"
 LIVE_HEARTBEAT_PATH = "var/live/heartbeat.json"
 LIVE_CRASH_PATH = "var/live/crash.json"
 LIVE_PID_PATH = "var/live/bot.pid"
-
-# Live-mode mirror of DRY_CAPTURE_PATH (see above).
-LIVE_CAPTURE_PATH = "var/live/captured_klines.jsonl"
 
 # -- Backtest mode --
 BACKTEST_TRADES_PATH = "var/backtest/trades.csv"

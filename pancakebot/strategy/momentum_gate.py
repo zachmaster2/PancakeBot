@@ -119,21 +119,9 @@ class MomentumGate:
         # construction; used for validation post-fetch and for the live
         # signal computation slice.
         self._candle_count = max(config.mtf_lookbacks) + 1
-        # Cached after each evaluate() so the pipeline can use data
-        # for auxiliary signals and regime-adaptive sizing without re-fetching.
-        self.last_btc_closes: list[float] | None = None
         # Per-pair fetch timing (ms) -- set each evaluate(), logged by caller
         # AFTER timing guard so file I/O doesn't delay bet submission.
         self.last_fetch_timing: dict[str, int] | None = None
-        # Raw kline arrays (dict-shaped) from the most recent evaluate().
-        # Consumed by pancakebot.runtime.kline_capture for off-critical-path
-        # observability writes. Schema unchanged from REST-era: capture
-        # serializes [ts, o, h, l, c, v] arrays as dicts via the existing
-        # _kline_dict_to_array path.
-        self.last_btc_klines_raw: list[dict] | None = None
-        self.last_eth_klines_raw: list[dict] | None = None
-        self.last_sol_klines_raw: list[dict] | None = None
-        self.last_returns: dict[str, float | None] | None = None
         # Consecutive-failure escalation state (TransientOkxError streak).
         self._consecutive_fetch_failures: int = 0
         # ThreadPoolExecutor lives for the gate's lifetime so we don't pay
@@ -287,23 +275,8 @@ class MomentumGate:
         # No trim needed: the cutoff+lookback-aware fetch returns exactly
         # ``candle_count`` candles ending at ``cutoff_ts_ms - 1000`` per
         # symbol, which is the same window the strategy consumes. The
-        # ``_validate_klines_raw`` checks below are now the sole shape
-        # gate on the live decision path. (Backtest's
-        # ``compute_signal_from_klines`` still uses ``_trim_to_window`` to
-        # absorb the wider ``candle_count=31`` history-fallback slack
-        # produced by the capture-mode merge.)
-
-        # ----- Capture snapshot (BEFORE signal computation) -----
-        self.last_btc_klines_raw = _arr_to_dicts(btc_arr)
-        self.last_eth_klines_raw = _arr_to_dicts(eth_arr)
-        self.last_sol_klines_raw = _arr_to_dicts(sol_arr)
-        btc_closes_snap = [float(k[4]) for k in btc_arr] if btc_arr else None
-        eth_closes_snap = [float(k[4]) for k in eth_arr] if eth_arr else None
-        sol_closes_snap = [float(k[4]) for k in sol_arr] if sol_arr else None
-        self.last_returns = _snapshot_returns(
-            btc_closes_snap, eth_closes_snap, sol_closes_snap,
-            mtf_lookbacks=self._cfg.mtf_lookbacks,
-        )
+        # ``_validate_klines_raw`` checks below are the sole shape gate
+        # on the live decision path.
 
         # ----- Validate fetch shape (defense in depth) -----
         # The fetch primitive guarantees length/contiguity for the
@@ -322,7 +295,6 @@ class MomentumGate:
         btc_closes = [float(k[4]) for k in btc_arr]
         eth_closes = [float(k[4]) for k in eth_arr]
         sol_closes = [float(k[4]) for k in sol_arr]
-        self.last_btc_closes = btc_closes
         return _compute_signal(
             btc_closes, eth_closes, sol_closes,
             mtf_lookbacks=self._cfg.mtf_lookbacks,
@@ -343,22 +315,6 @@ class MomentumGate:
         )
 
 
-def _arr_to_dicts(arrs: list[list] | None) -> list[dict] | None:
-    """Convert kline arrays to the dict-shape the capture module expects.
-
-    The capture worker uses _kline_dict_to_array as its reader contract;
-    this is the writer side of the same schema.
-    """
-    if arrs is None:
-        return None
-    return [
-        {"open_time_ms": int(k[0]), "open": float(k[1]), "high": float(k[2]),
-         "low": float(k[3]), "close_price": float(k[4]),
-         "volume": float(k[5]) if len(k) > 5 else 0.0}
-        for k in arrs
-    ]
-
-
 def _validate_klines_raw(
     klines: list[list] | None, cutoff_ms: int, label: str, *, candle_count: int,
 ) -> str | None:
@@ -373,29 +329,6 @@ def _validate_klines_raw(
         return f"gate_{label}_unexpected_newest:got={newest_ts},expected={expected_ts}"
 
     return None
-
-
-def _snapshot_returns(
-    btc_closes: list[float] | None,
-    eth_closes: list[float] | None,
-    sol_closes: list[float] | None,
-    *,
-    mtf_lookbacks: tuple[int, ...],
-) -> dict[str, float | None]:
-    """Compute per-pair, per-lookback returns for capture.
-
-    Used only by ``pancakebot.runtime.kline_capture`` -- this is not on
-    the decision path. None values mean the closes list was missing or
-    too short for that lookback; the gate's own no-signal logic handles
-    those cases independently.
-    """
-    out: dict[str, float | None] = {}
-    pairs = (("btc", btc_closes), ("eth", eth_closes), ("sol", sol_closes))
-    for name, closes in pairs:
-        for lb in mtf_lookbacks:
-            key = f"{name}_r{lb}"
-            out[key] = _get_return(closes, lb) if closes is not None else None
-    return out
 
 
 def _get_return(closes: list[float], lookback: int) -> float | None:
@@ -425,22 +358,12 @@ def compute_signal_from_klines(
 ) -> MomentumGateResult:
     """Compute signal from raw kline arrays (backtest path).
 
-    Trims klines to the same window the live path fetches, validates
-    BTC (the signal source), then computes the signal.
-
-    In the post-2026-04-26 backtest pipeline, the loader pre-slices
-    each per-round record to exactly ``candle_count`` candles already
-    aligned with ``cutoff_ms``, so ``_trim_to_window`` here is a no-op
-    in practice. It's retained as defense-in-depth for any caller that
-    passes a wider window (e.g. live mode bridging a custom diagnostic).
+    Validates BTC (the signal source), then computes the signal.
+    All callers pre-slice each per-round record to exactly ``candle_count``
+    candles aligned with ``cutoff_ms`` (see
+    ``pancakebot.backtest.runner._load_klines_from`` and
+    ``research.in_process_runner._slice_per_entry``).
     """
-    if btc_klines is not None:
-        btc_klines = _trim_to_window(btc_klines, cutoff_ms, candle_count=candle_count)
-    if eth_klines is not None:
-        eth_klines = _trim_to_window(eth_klines, cutoff_ms, candle_count=candle_count)
-    if sol_klines is not None:
-        sol_klines = _trim_to_window(sol_klines, cutoff_ms, candle_count=candle_count)
-
     # Validate BTC klines (same gate as live path).
     btc_reason = _validate_klines_raw(btc_klines, cutoff_ms, "btc", candle_count=candle_count)
     if btc_reason is not None or btc_klines is None:
@@ -462,12 +385,6 @@ def compute_signal_from_klines(
         mtf_lookbacks=mtf_lookbacks,
         mtf_threshold=mtf_threshold,
     )
-
-
-def _trim_to_window(klines: list[list], cutoff_ms: int, *, candle_count: int) -> list[list]:
-    """Keep only the *candle_count* completed candles before cutoff_ms."""
-    before = [k for k in klines if int(k[0]) < cutoff_ms]
-    return before[-candle_count:] if len(before) > candle_count else before
 
 
 def _compute_pair_multi_tf(
