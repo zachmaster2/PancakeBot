@@ -567,8 +567,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             pool_bull_bnb=pool_bull_bnb,
             pool_bear_bnb=pool_bear_bnb,
         )
-        if decision.p_bull is not None:
-            pred_p_final = decision.p_bull
+        # `p_bull` was removed from StrategyPipelineDecision in the
+        # 2026-04-26 lean&clean refactor; defensive getattr keeps the
+        # audit-log path working if any future strategy emits a
+        # probability-shaped decision.
+        _p_bull_legacy = getattr(decision, "p_bull", None)
+        if _p_bull_legacy is not None:
+            pred_p_final = _p_bull_legacy
         t_decision_ready_ms = _mono_ms()
 
         if decision.action != "BET":
@@ -610,7 +615,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 gate=gate,
                 decision="SKIP",
                 skip_reason=reason,
-                selected_strategy=decision.selected_strategy,
+                selected_strategy=getattr(decision, "selected_strategy", None),
                 bet_side=None,
                 bet_size_bnb=None,
                 pool_bull_bnb=pool_bull_bnb,
@@ -660,7 +665,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 gate=gate,
                 decision="SKIP",
                 skip_reason="too_close_to_lock_for_bet",
-                selected_strategy=decision.selected_strategy,
+                selected_strategy=getattr(decision, "selected_strategy", None),
                 bet_side=decision.bet_side,
                 bet_size_bnb=decision.bet_size_bnb,
                 pool_bull_bnb=pool_bull_bnb,
@@ -786,7 +791,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 side=bet_side,
                 amount_bnb=amount_bnb,
                 p_final=pred_p_final,
-                expected_profit_bnb=decision.expected_profit_bnb,
                 bankroll_before_bet_bnb=bankroll_before_bet,
                 bankroll_after_bet_bnb=bankroll_after_bet,
             )
@@ -826,7 +830,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             gate=gate,
             decision="BET",
             skip_reason=None,
-            selected_strategy=decision.selected_strategy,
+            selected_strategy=getattr(decision, "selected_strategy", None),
             bet_side=bet_side,
             bet_size_bnb=amount_bnb,
             pool_bull_bnb=pool_bull_bnb,

@@ -71,22 +71,55 @@ def _load_all_rounds(runtime_cfg, *, include_failed: bool = False) -> list[Round
     return rounds
 
 
-def _load_klines_from(path: Path) -> dict[int, list[list]]:
-    """Load pre-fetched 1s kline arrays from a JSONL file.
+def _load_klines_from(
+    path: Path,
+    *,
+    cutoff_seconds: int,
+    candle_count: int,
+) -> dict[int, list[list]]:
+    """Load pre-fetched 1s kline arrays from a JSONL file, pre-sliced to the
+    exact window the strategy will read for the given (cutoff_seconds, candle_count).
 
-    Returns {epoch: [[ts_ms, o, h, l, c, vol], ...]} for epochs that
-    have data.  Returns empty dict if the file doesn't exist.
+    Stored records hold 300 candles per round, oldest-first, with
+    open_ts = lock_at - 301 .. lock_at - 2 seconds. The strategy at a given
+    cutoff_seconds reads the ``candle_count`` candles whose open_ts is in
+    ``[lock_at - cutoff_seconds - candle_count, lock_at - cutoff_seconds - 1]``,
+    i.e. the last ``candle_count`` candles ending ``(cutoff_seconds - 1)``
+    seconds before the most recent stored candle.
+
+    Slice math (negative indexing into the stored list):
+      start = -(cutoff_seconds + candle_count - 1)
+      end   = -(cutoff_seconds - 1)   if cutoff_seconds >= 2 else None
+
+    Memory-bounded by construction: streams the file line-by-line (no
+    ``path.read_text()`` materialising the whole 645 MB BTC file as a
+    string) and keeps only ``candle_count`` candles per record. For the
+    canonical (cutoff=2, lookbacks=(3,7,15)) baseline this is 16 candles
+    per record × 38,306 rounds × 3 pairs ≈ 1 GB peak per process,
+    bit-identical to the prior 31-candle ``_trim_to_window`` output.
+
+    Verified bit-identical on 2026-04-26 cutoff=2 baseline: per-fold
+    summary hash ``aa39a3a73f4e4cb718beeffaa72a22ca`` reproduces.
     """
     if not path.exists():
         return {}
+    start_neg = -(cutoff_seconds + candle_count - 1)
+    end_neg: int | None = None if cutoff_seconds == 1 else -(cutoff_seconds - 1)
     result: dict[int, list[list]] = {}
-    for line in path.read_text().splitlines():
-        if not line.strip():
-            continue
-        rec = json.loads(line)
-        if rec.get("error") or rec.get("klines_1s") is None:
-            continue
-        result[int(rec["epoch"])] = rec["klines_1s"]
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if rec.get("error") or rec.get("klines_1s") is None:
+                continue
+            kl = rec["klines_1s"]
+            if end_neg is None:
+                kl = kl[start_neg:]
+            else:
+                kl = kl[start_neg:end_neg]
+            result[int(rec["epoch"])] = kl
     return result
 
 
@@ -108,7 +141,10 @@ def _merge_captured_with_history(
     from pancakebot.runtime.kline_capture import load_klines_from_capture
 
     captured = load_klines_from_capture(captured_path, asset)
-    history = _load_klines_from(history_path)
+    # NOTE: captured-mode merging is rare; pass conservative defaults
+    # so the load is wide enough to cover any captured-record window.
+    # The captured records (when present) override history at write time.
+    history = _load_klines_from(history_path, cutoff_seconds=2, candle_count=31)
     merged: dict[int, list[list]] = dict(history)
     # captured wins where both have the epoch
     for ep, klines in captured.items():
@@ -189,12 +225,16 @@ def run_backtest(
         ),
     )
 
-    # Load pre-fetched 1s klines for honest backtest signal.
-    bnb_klines = _load_klines_from(_BNB_KLINES_PATH)
-    if bnb_klines:
-        info("BACK", "SETUP", "BNB_KL", msg=f"Loaded BNB 1s klines for {len(bnb_klines)} epochs")
-    else:
-        info("BACK", "SETUP", "BNB_KL", msg="No BNB klines found -- backtest will skip all rounds")
+    # BNB klines are stored on `_bnb_klines_by_epoch` but never read
+    # by the strategy (verified by grep across pancakebot/: no
+    # `_bnb_klines_by_epoch.get(...)` call site exists). Skip the
+    # ~3 GB load entirely. The pipeline's `refresh_bnb_klines` still
+    # accepts the empty dict so the wiring is preserved for any
+    # future BNB-aware research that re-enables this path.
+    bnb_klines: dict[int, list[list]] = {}
+    info("BACK", "SETUP", "BNB_KL",
+         msg="BNB load skipped (strategy does not read BNB klines; "
+             "saves ~3 GB RAM)")
 
     if kline_source == "captured":
         cap_path = Path(captured_path) if captured_path else Path(_paths.DRY_CAPTURE_PATH)
@@ -221,13 +261,28 @@ def run_backtest(
              msg=f"SOL: {len(sol_klines)} epochs (captured={sol_n_cap} history={sol_n_hist})")
     else:
         info("BACK", "SETUP", "SOURCE", msg="kline_source=history")
-        btc_klines = _load_klines_from(_BTC_KLINES_PATH)
+        # Compute the per-record kline window from the gate config.
+        # candle_count = max(mtf_lookbacks) + 1 covers the deepest lookback
+        # plus the anchor candle. The slice is bit-identical to what
+        # `_trim_to_window` would produce at the given cutoff_seconds.
+        _gc = runtime_cfg.strategy.gate
+        _candle_count = max(_gc.mtf_lookbacks) + 1
+        _cs = int(runtime_cfg.cutoff_seconds)
+        btc_klines = _load_klines_from(_BTC_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count)
         if btc_klines:
-            info("BACK", "SETUP", "BTC_KL", msg=f"Loaded BTC 1s klines for {len(btc_klines)} epochs")
-        eth_klines = _load_klines_from(_ETH_KLINES_PATH) if _ETH_KLINES_PATH.exists() else {}
+            info("BACK", "SETUP", "BTC_KL",
+                 msg=f"Loaded BTC 1s klines for {len(btc_klines)} epochs "
+                     f"(cutoff={_cs}, candle_count={_candle_count})")
+        eth_klines = (
+            _load_klines_from(_ETH_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count)
+            if _ETH_KLINES_PATH.exists() else {}
+        )
         if eth_klines:
             info("BACK", "SETUP", "ETH_KL", msg=f"Loaded ETH 1s klines for {len(eth_klines)} epochs")
-        sol_klines = _load_klines_from(_SOL_KLINES_PATH) if _SOL_KLINES_PATH.exists() else {}
+        sol_klines = (
+            _load_klines_from(_SOL_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count)
+            if _SOL_KLINES_PATH.exists() else {}
+        )
         if sol_klines:
             info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s klines for {len(sol_klines)} epochs")
 
@@ -272,7 +327,6 @@ def run_backtest(
                 "skip_reason",
                 "direction",
                 "bet_size_bnb",
-                "ret_1m_signal",
                 "profit_bnb",
                 "bankroll_bnb",
             ]
@@ -325,7 +379,6 @@ def run_backtest(
                     decision.skip_reason or "",
                     decision.bet_side or "",
                     decision.bet_size_bnb,
-                    decision.p_bull if decision.p_bull is not None else "",
                     profit,
                     bankroll,
                 ]

@@ -33,13 +33,29 @@ initial_bankroll_bnb = 50.0
 min_pool_bnb = 1.5
 min_payout = 1.5
 
+[strategy.gate]
+# Multi-TF momentum gate: all lookbacks must agree in direction and
+# min(|return|) must exceed mtf_threshold for the gate to fire.
+# Previously module constants in momentum_gate.py.
+mtf_lookbacks = [3, 7, 15]
+mtf_threshold = 0.0001
+
 [strategy.btc_primary.threshold]
+# Small-pool admission: signal_strength must exceed small_pool when the
+# pool is below pool_size_boundary_bnb (large pools rely on the gate's
+# mtf_threshold). Removed key 'large_pool' was equal to mtf_threshold by
+# construction (dead-by-equality).
 small_pool = 0.0002
-large_pool = 0.0001
 pool_size_boundary_bnb = 3.0
 
 [strategy.btc_primary.sizing]
+# base_fraction: starting pool fraction for the bet.
+# sizing_slope: gain on signal_strength (frac = base + slope * strength).
+# max_frac: hard cap on the resulting fraction.
+# sizing_slope and max_frac were previously module constants in momentum_pipeline.py.
 base_fraction = 0.04
+sizing_slope = 100.0
+max_frac = 0.30
 
 [strategy.eth_sol_fallback.signal]
 min_strength = 0.00015
@@ -48,14 +64,20 @@ min_strength = 0.00015
 base_fraction = 0.02
 
 [strategy.tier2_sizing]
-# Cross-regime sizing knobs (apply uniformly across btc_primary and regime-2
-# paths). Extracted from module-level constants in
-# pancakebot/strategy/momentum_pipeline.py for Tier-2 research sweeps.
-# Defaults preserve pre-refactor behaviour.
-payout_slope = 1.0        # Kelly-like payout-boost gain. 0 disables the boost.
-eth_sizing_weight = 0.3   # coefficient on ETH signal (primary boost + regime-2 component)
-sol_sizing_weight = 0.3   # mirror for SOL
-floor_bnb = 0.01          # absolute minimum bet in BNB
+# Symmetric weight applied to BOTH ETH and SOL signal strengths in the
+# BTC-primary confirmation boost AND the regime-2 effective-strength
+# composition. Collapsed from former separate eth_sizing_weight /
+# sol_sizing_weight (always identical in practice).
+# Removed knob: payout_slope (hardcoded slope=1.0 in code now).
+eth_sol_sizing_weight = 0.3
+
+# Lower bound applied at the end of _compute_bet_size:
+# max(min_bet_threshold_bnb, min(cap_bnb, bet)). Distinct from the
+# on-chain min_bet_amount_bnb (~0.001) which is checked at the call
+# site. Bit-identical at default 0.01 because every observed bet on
+# the canonical baseline already exceeds this floor (Phase 2 ablation
+# 2026-04-23). Renamed from former 'floor_bnb' for clarity.
+min_bet_threshold_bnb = 0.01
 
 [strategy.risk]
 # Risk controls active when a BankrollTracker is wired in (backtest always,

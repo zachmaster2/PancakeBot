@@ -19,6 +19,9 @@ def _ensure_parent_dir(path: str) -> None:
 # -- Trades audit CSV (per-bet settlement records) ---------------------------
 
 def ensure_audit_csv(path: str) -> list[str]:
+    # ``expected_profit_bnb`` removed 2026-04-26 (lean&clean refactor):
+    # the StrategyPipelineDecision field that fed it was removed, and the
+    # column was only ever written empty since 2025 anyway.
     header_cols = [
         "epoch",
         "placed_ts",
@@ -26,7 +29,6 @@ def ensure_audit_csv(path: str) -> list[str]:
         "bet_bnb",
         "pred_win_probability",
         "p_final",
-        "expected_profit_bnb",
         "cutoff_bull_bnb",
         "cutoff_bear_bnb",
         "final_bull_bnb",
@@ -86,10 +88,11 @@ def ensure_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         "decision_stage",
         "bet_side",
         "bet_size_bnb",
-        "p_bull",
-        "selected_side_probability",
-        "expected_profit_bnb",
-        "selector_score_bnb",
+        # Removed 2026-04-26 (lean&clean): the underlying
+        # StrategyPipelineDecision fields these columns sourced from
+        # were deleted (p_bull / expected_profit_bnb / selector_score_bnb /
+        # selected_strategy). selected_side_probability was a derived
+        # column over p_bull. All four columns are gone.
         "decision_latency_ms",
         "skip_reason",
     ]
@@ -155,17 +158,9 @@ def round_pool_snapshot(
     }
 
 
-def selected_side_probability(*, p_bull: float | None, bet_side: str | None) -> float | str:
-    if p_bull is None or bet_side is None:
-        return ""
-    if bet_side == "Bull":
-        return p_bull
-    if bet_side == "Bear":
-        return 1.0 - p_bull
-    return ""
-
-
 # -- Main cycle audit recorder ------------------------------------------------
+# (selected_side_probability helper removed 2026-04-26; it derived from
+# the now-removed p_bull column.)
 
 def record_cycle_audit(
     closed,
@@ -223,23 +218,11 @@ def record_cycle_audit(
 
     bet_side: str | object = ""
     bet_size_bnb: float | str = ""
-    p_bull: float | str = ""
-    expected_profit_bnb: float | str = ""
-    selector_score_bnb: float | str = ""
     if decision is not None:
         bet_side = getattr(decision, "bet_side", "") or ""
         bet_size_raw = getattr(decision, "bet_size_bnb", "")
         if isinstance(bet_size_raw, (int, float)):
             bet_size_bnb = float(bet_size_raw)
-        p_bull_raw = getattr(decision, "p_bull", None)
-        if isinstance(p_bull_raw, (int, float)):
-            p_bull = float(p_bull_raw)
-        expected_profit_raw = getattr(decision, "expected_profit_bnb", None)
-        if isinstance(expected_profit_raw, (int, float)):
-            expected_profit_bnb = float(expected_profit_raw)
-        selector_score_raw = getattr(decision, "selector_score_bnb", None)
-        if isinstance(selector_score_raw, (int, float)):
-            selector_score_bnb = float(selector_score_raw)
         if skip_reason is None:
             skip_reason = getattr(decision, "skip_reason", None)
 
@@ -282,13 +265,6 @@ def record_cycle_audit(
             "decision_stage": decision_stage,
             "bet_side": bet_side,
             "bet_size_bnb": bet_size_bnb,
-            "p_bull": p_bull,
-            "selected_side_probability": selected_side_probability(
-                p_bull=p_bull if isinstance(p_bull, float) else None,
-                bet_side=bet_side if isinstance(bet_side, str) and bet_side else None,
-            ),
-            "expected_profit_bnb": expected_profit_bnb,
-            "selector_score_bnb": selector_score_bnb,
             "decision_latency_ms": (
                 "" if decision_latency_ms is None else decision_latency_ms
             ),

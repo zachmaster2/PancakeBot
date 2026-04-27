@@ -3,6 +3,11 @@
 Drives bet/skip decisions from MomentumGate output (live/dry) or cached klines
 (backtest), applies pool-adaptive thresholds, a payout floor, and continuous
 sizing scaled by signal strength.
+
+All strategy parameters live in ``pancakebot.config.StrategyConfig``
+(TOML ``[strategy.*]``). Module-level constants here are intentionally
+NONE: the previous _SIZING_SLOPE / _MAX_FRAC / _REGIME2_ENABLED constants
+were extracted into config in the 2026-04-26 lean&clean refactor.
 """
 
 from __future__ import annotations
@@ -21,51 +26,22 @@ from pancakebot.strategy.momentum_gate import (
 )
 from pancakebot.types import Round
 
-# Continuous adaptive sizing with payout boost.
-# Signal strength sizing: frac = base_fraction + SIZING_SLOPE * signal_strength
-# Payout boost: frac *= max(0.5, 1.0 + payout_slope * (payout - 2.0))
-# Tier-2 sizing knobs (payout_slope, eth/sol_sizing_weight, floor_bnb) live
-# in StrategyConfig.tier2_sizing. Only shape-defining constants stay here:
-# multi-TF lookbacks, sizing slope (gain on signal_strength), max fractional
-# cap. Changes to these require a design discussion, not just a sweep.
-# Validated: 5-fold +2.21/2k (5/5 positive), nested CV +1.59/2k (4/5 positive).
-_SIZING_SLOPE = 100        # scales with min(|r3|, |r7|, |r15|)
-_MAX_FRAC = 0.30           # cap the pool fraction
-
-# Regime-2: ETH+SOL multi-TF agreement when BTC is silent.
-# Fills flat periods where primary BTC signal doesn't fire.
-# 5-fold: +2.83/2k (5/5) with separate sizing, 37% more bets.
-# Regime-2 bets have 58.6% WR -- lower than primary, so bet smaller.
-# Min-strength and sizing now live in StrategyConfig.eth_sol_fallback.
-_REGIME2_ENABLED = True
-
-# Strong-signal pool bypass was removed 2026-04-24 after Phase 2 ablation
-# (research/phase_strong_bypass_sweep.py, var/sweep/phase_strong_bypass/)
-# showed it contributed only +0.1226 BNB over 5 folds (50.6179 with bypass
-# vs 50.4953 without, SB-KILL=min_strength=0.01). Fold-5 actually IMPROVED
-# with bypass off (+1.5703 vs +1.3825 BNB). Historical threshold that lived
-# here for the record: min_strength=0.0004 required strong BTC signal;
-# min_pool_bnb=1.0 hard floor; base_fraction=0.03; max_bet_bnb=0.3 cap.
-
 
 @dataclass(frozen=True, slots=True)
 class StrategyPipelineDecision:
-    """Normalized open-round strategy pipeline decision (momentum-only variant)."""
+    """Normalized open-round strategy pipeline decision (momentum-only variant).
+
+    Slim post-2026-04-26 schema: removed dead fields ``selected_strategy``,
+    ``expected_profit_bnb``, ``selector_score_bnb``, ``p_bull``, and the
+    six ``controller_*`` carryovers from the prior multi-strategy
+    architecture. None of those were read in any decision path or written
+    to a meaningful CSV column.
+    """
 
     action: str
-    selected_strategy: str | None
     bet_side: str | None
     bet_size_bnb: float
-    expected_profit_bnb: float
-    selector_score_bnb: float | None
     skip_reason: str | None
-    p_bull: float | None
-    controller_mode: str | None = None
-    controller_estimator_mode: str | None = None
-    controller_window_index: int | None = None
-    controller_lookback_windows_used: int | None = None
-    controller_selected_profile: str | None = None
-    controller_selected_action: str | None = None
 
 
 def _compute_bet_size(
@@ -75,41 +51,52 @@ def _compute_bet_size(
     our_side_bnb: float,
     base_frac: float,
     cap_bnb: float,
-    payout_slope: float,
-    floor_bnb: float,
+    sizing_slope: float,
+    max_frac: float,
+    treasury_fee_fraction: float,
+    min_bet_threshold_bnb: float,
     current_bankroll: float | None = None,
     max_bet_frac_of_bankroll: float = 1.0,
 ) -> float:
     """Continuous adaptive sizing with payout-proportional boost + bankroll cap.
 
-    1. Signal-strength sizing: frac = base_frac + SIZING_SLOPE * signal_strength
-    2. Payout boost: when our side has high payout (fewer bettors on our side),
-       multiply frac by up to 2x. This is Kelly reasoning -- bet more when
-       the odds are favorable. ``payout_slope`` controls the gain; 0 disables.
+    1. Signal-strength sizing: frac = base_frac + sizing_slope * signal_strength
+    2. Payout boost (hardcoded slope=1.0 since 2026-04-26 lean&clean):
+       payout = pool * (1 - treasury_fee_fraction) / our_side
+       payout_mult = max(0.5, payout - 1.0)   # = max(0.5, 1.0 + (payout - 2.0))
+       frac = min(frac * payout_mult, max_frac)
     3. bet = pool_bnb * frac
     4. Bankroll cap (when current_bankroll is not None): bet <=
-       max_bet_frac_of_bankroll * current_bankroll. Prevents oversized bets
-       relative to the session bankroll.
-    5. Absolute BNB cap (cap_bnb) and floor (``floor_bnb``).
+       max_bet_frac_of_bankroll * current_bankroll.
+    5. Absolute BNB cap (cap_bnb), then floor by min_bet_threshold_bnb.
 
-    base_frac, cap_bnb, payout_slope, floor_bnb are supplied by the caller
-    (from StrategyConfig):
-      - base_frac / cap_bnb are per-regime (btc_primary and eth_sol_fallback
-        each have their own).
-      - payout_slope and floor_bnb are cross-regime, from
-        StrategyConfig.tier2_sizing (uniform for the whole pipeline).
-    current_bankroll defaults to None which disables the bankroll cap.
+    base_frac, cap_bnb are per-regime (btc_primary or eth_sol_fallback).
+    sizing_slope, max_frac come from BtcPrimarySizingConfig (apply uniformly
+    to both regimes). treasury_fee_fraction comes from on-chain contract
+    constants (matched to the settlement code path). min_bet_threshold_bnb
+    comes from Tier2SizingConfig. current_bankroll defaults to None
+    (no bankroll cap).
+
+    Removed parameters (2026-04-26):
+      - payout_slope (hardcoded to 1.0; was misleading because cutoff-time
+        payout != settlement-time payout).
+
+    Renamed (2026-04-26):
+      - floor_bnb -> min_bet_threshold_bnb (clearer semantics; the
+        on-chain ``min_bet_amount_bnb`` checked at the call site is a
+        separate concept).
     """
     if pool_bnb <= 0:
-        return floor_bnb
+        return 0.0
 
-    frac = min(base_frac + _SIZING_SLOPE * signal_strength, _MAX_FRAC)
+    frac = min(base_frac + sizing_slope * signal_strength, max_frac)
 
     # Payout-proportional boost: bet more when our side has high payout.
+    # Equivalent to the old payout_slope=1.0 default: max(0.5, 1.0 + (payout - 2.0)).
     if our_side_bnb > 0:
-        payout = pool_bnb * 0.97 / our_side_bnb  # 3% treasury fee
-        payout_mult = max(0.5, 1.0 + payout_slope * (payout - 2.0))
-        frac = min(frac * payout_mult, _MAX_FRAC)
+        payout = pool_bnb * (1.0 - treasury_fee_fraction) / our_side_bnb
+        payout_mult = max(0.5, payout - 1.0)
+        frac = min(frac * payout_mult, max_frac)
 
     bet = pool_bnb * frac
 
@@ -117,7 +104,7 @@ def _compute_bet_size(
     if current_bankroll is not None and current_bankroll > 0:
         bet = min(bet, max_bet_frac_of_bankroll * current_bankroll)
 
-    return max(floor_bnb, min(cap_bnb, bet))
+    return max(min_bet_threshold_bnb, min(cap_bnb, bet))
 
 
 class MomentumOnlyPipeline:
@@ -145,6 +132,8 @@ class MomentumOnlyPipeline:
         self._min_bet_amount_bnb = float(min_bet_amount_bnb)
         self._treasury_fee_fraction = float(treasury_fee_fraction)
         self._last_settled_epoch: int | None = None
+        # Derived candle count used for backtest validation.
+        self._candle_count = max(strategy_config.gate.mtf_lookbacks) + 1
         # Backtest: 1s klines per epoch {epoch: [[ts_ms, o, h, l, c, vol], ...]}
         self._bnb_klines_by_epoch: dict[int, list[list]] = {}
         self._btc_klines_by_epoch: dict[int, list[list]] = {}
@@ -278,34 +267,38 @@ class MomentumOnlyPipeline:
         signal_dir = None
         effective_strength = 0.0
         is_regime2 = False
+        t2_w = self._strategy.tier2_sizing.eth_sol_sizing_weight
 
         if result.signal is not None:
             # Primary: BTC multi-TF fires
-            # Pool-adaptive threshold
+            # Pool-adaptive admission: small-pool stricter threshold
+            # (large pools rely on the gate's mtf_threshold which already fired).
             bt = self._strategy.btc_primary.threshold
-            min_thresh = bt.large_pool if pool_total >= bt.pool_size_boundary_bnb \
-                else bt.small_pool
-            if result.signal_strength >= min_thresh:
+            small_pool_ok = (
+                pool_total >= bt.pool_size_boundary_bnb
+                or result.signal_strength >= bt.small_pool
+            )
+            if small_pool_ok:
                 signal_dir = result.signal
                 effective_strength = result.signal_strength
-                t2 = self._strategy.tier2_sizing
                 if result.eth_confirmation_strength > 0:
-                    effective_strength += result.eth_confirmation_strength * t2.eth_sizing_weight
+                    effective_strength += result.eth_confirmation_strength * t2_w
                 if result.sol_confirmation_strength > 0:
-                    effective_strength += result.sol_confirmation_strength * t2.sol_sizing_weight
+                    effective_strength += result.sol_confirmation_strength * t2_w
 
-        if signal_dir is None and _REGIME2_ENABLED:
-            # Regime-2: ETH+SOL both fire same direction, BTC silent
+        if signal_dir is None:
+            # Regime-2: ETH+SOL both fire same direction, BTC silent.
+            # (Always-on since 2026-04-26 lean&clean; previously gated by
+            # _REGIME2_ENABLED constant.)
             if (result.eth_signal is not None
                     and result.sol_signal is not None
                     and result.eth_signal == result.sol_signal):
                 r2_str = min(result.eth_signal_strength, result.sol_signal_strength)
                 if r2_str >= self._strategy.eth_sol_fallback.signal.min_strength:
                     signal_dir = result.eth_signal
-                    t2 = self._strategy.tier2_sizing
                     effective_strength = (
-                        result.eth_signal_strength * t2.eth_sizing_weight
-                        + result.sol_signal_strength * t2.sol_sizing_weight
+                        result.eth_signal_strength * t2_w
+                        + result.sol_signal_strength * t2_w
                     )
                     is_regime2 = True
 
@@ -330,6 +323,7 @@ class MomentumOnlyPipeline:
             if self._bankroll_tracker is not None else None
         )
         br_cap_frac = self._strategy.risk.max_bet_frac_of_bankroll
+        bt_sz = self._strategy.btc_primary.sizing
         t2 = self._strategy.tier2_sizing
 
         if is_regime2:
@@ -340,21 +334,24 @@ class MomentumOnlyPipeline:
                 our_side_bnb=our_side,
                 base_frac=es_sizing.base_fraction,
                 cap_bnb=self._strategy.risk.max_bet_bnb_eth_sol_fallback,
-                payout_slope=t2.payout_slope,
-                floor_bnb=t2.floor_bnb,
+                sizing_slope=bt_sz.sizing_slope,
+                max_frac=bt_sz.max_frac,
+                treasury_fee_fraction=self._treasury_fee_fraction,
+                min_bet_threshold_bnb=t2.min_bet_threshold_bnb,
                 current_bankroll=br_current,
                 max_bet_frac_of_bankroll=br_cap_frac,
             )
         else:
-            bt_sizing = self._strategy.btc_primary.sizing
             bet_size = _compute_bet_size(
                 signal_strength=effective_strength,
                 pool_bnb=pool_total,
                 our_side_bnb=our_side,
-                base_frac=bt_sizing.base_fraction,
+                base_frac=bt_sz.base_fraction,
                 cap_bnb=self._strategy.risk.max_bet_bnb_btc_primary,
-                payout_slope=t2.payout_slope,
-                floor_bnb=t2.floor_bnb,
+                sizing_slope=bt_sz.sizing_slope,
+                max_frac=bt_sz.max_frac,
+                treasury_fee_fraction=self._treasury_fee_fraction,
+                min_bet_threshold_bnb=t2.min_bet_threshold_bnb,
                 current_bankroll=br_current,
                 max_bet_frac_of_bankroll=br_cap_frac,
             )
@@ -378,13 +375,17 @@ class MomentumOnlyPipeline:
         btc_klines = self._btc_klines_by_epoch.get(epoch)
         if btc_klines is None or len(btc_klines) == 0:
             return MomentumGateResult(
-                signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
+                signal=None, tier=None,
                 skip_reason="gate_no_btc_klines",
             )
         eth_klines = self._eth_klines_by_epoch.get(epoch)
         sol_klines = self._sol_klines_by_epoch.get(epoch)
+        gate = self._strategy.gate
         return compute_signal_from_klines(
             btc_klines, cutoff_ts_ms,
+            mtf_lookbacks=gate.mtf_lookbacks,
+            mtf_threshold=gate.mtf_threshold,
+            candle_count=self._candle_count,
             eth_klines=eth_klines, sol_klines=sol_klines,
         )
 
@@ -392,13 +393,9 @@ class MomentumOnlyPipeline:
     def _skip(reason: str) -> StrategyPipelineDecision:
         return StrategyPipelineDecision(
             action="SKIP",
-            selected_strategy=None,
             bet_side=None,
             bet_size_bnb=0.0,
-            expected_profit_bnb=0.0,
-            selector_score_bnb=None,
             skip_reason=reason,
-            p_bull=None,
         )
 
     @staticmethod
@@ -407,14 +404,11 @@ class MomentumOnlyPipeline:
             raise InvariantError(f"momentum_pipeline_invalid_side: {side}")
         return StrategyPipelineDecision(
             action="BET",
-            selected_strategy="momentum_gate",
             bet_side=side,
             bet_size_bnb=float(size_bnb),
-            expected_profit_bnb=0.0,
-            selector_score_bnb=None,
             skip_reason=None,
-            p_bull=None,
         )
+
 
 def _pools_from_bets(round_t: Round, cutoff_ts: int) -> tuple[float, float]:
     """Compute bull/bear pool BNB from bets placed strictly before cutoff_ts.

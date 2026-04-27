@@ -27,7 +27,16 @@ from time import sleep as sleep_seconds
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 
-_KLINES_PER_ROUND = 31  # Must match momentum_gate._CANDLE_COUNT
+# Per-round 1s candle count fetched from OKX history. 300 is the
+# maximum the OKX /history-candles endpoint accepts in a single
+# request and matches the post-rebuild on-disk dataset shape
+# (2026-04-26 rebuild — see research/resync_300candle_cutoff1.py).
+# The strategy slices these to the actual ``max(mtf_lookbacks) + 1``
+# window at decision time (see ``[strategy.gate].mtf_lookbacks`` in
+# config.toml). Loading the full 300-candle window keeps the on-disk
+# store flexible for matrix experiments that vary cutoff and
+# lookbacks without re-fetching.
+_KLINES_PER_ROUND = 300
 _FETCH_WORKERS = 4      # concurrent OKX fetches per batch
 # Retry is now handled inside OkxClient.fetch_raw (centralized policy).
 
