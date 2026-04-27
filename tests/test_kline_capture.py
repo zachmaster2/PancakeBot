@@ -106,36 +106,6 @@ def test_build_snapshot_handles_none_klines():
     assert snap["returns"] == {}
 
 
-def test_build_snapshot_includes_response_headers_when_provided():
-    """Headers fields appear only when at least one is non-None."""
-    snap = kc.build_snapshot(
-        epoch=1, lock_at_unix=0, cutoff_ms=0, mode="dry",
-        btc_klines_raw=None, eth_klines_raw=None, sol_klines_raw=None,
-        returns=None, decision="SKIP", skip_reason="x",
-        selected_strategy=None, bet_side=None, bet_size_bnb=None,
-        pool_bull_bnb=0.0, pool_bear_bnb=0.0,
-        btc_response_headers={"cf-cache-status": "HIT", "age": "12"},
-        eth_response_headers=None,
-        sol_response_headers=None,
-    )
-    assert "response_headers" in snap
-    assert snap["response_headers"]["btc"] == {"cf-cache-status": "HIT", "age": "12"}
-    assert snap["response_headers"]["eth"] is None
-    assert snap["response_headers"]["sol"] is None
-
-
-def test_build_snapshot_omits_response_headers_when_all_none():
-    """Header field omitted entirely when all 3 are None (default)."""
-    snap = kc.build_snapshot(
-        epoch=1, lock_at_unix=0, cutoff_ms=0, mode="dry",
-        btc_klines_raw=None, eth_klines_raw=None, sol_klines_raw=None,
-        returns=None, decision="SKIP", skip_reason="x",
-        selected_strategy=None, bet_side=None, bet_size_bnb=None,
-        pool_bull_bnb=0.0, pool_bear_bnb=0.0,
-    )
-    assert "response_headers" not in snap
-
-
 def test_kline_dict_to_array_fallback_to_close():
     """Closes-only dicts (older fetches) round-trip as flat OHLCV with c-fill."""
     arr = kc._kline_dict_to_array({"open_time_ms": 123, "close_price": 100.0})

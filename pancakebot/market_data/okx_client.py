@@ -1,21 +1,29 @@
 """OKX public REST client with centralized retry + error classification.
 
-Two fetch modes:
+Single canonical fetch primitive: ``fetch_kline_window``. Always uses
+``/history-candles`` (per memory ``project_pancakebot_okx_endpoint_divergence.md``,
+this endpoint has lower lag than ``/candles``). Caller passes the explicit
+``[oldest_open_ms, newest_open_ms_inclusive]`` range; retry behaviour is
+parameterised via ``RetryPolicy``:
 
-- `fetch_raw` (sync mode): retries transient failures per-call with exponential
-  backoff + jitter. Raises `InvariantError` on permanent error or retry
-  exhaustion. Caller is expected to accept hard failure of the whole sync on
-  unrecoverable errors.
+- ``RETRY_SYNC``: 5 attempts with exponential backoff (used by sync.py for
+  bulk historical fetch — needs robustness over 38k+ rounds).
+- ``RETRY_WSS``: 2 attempts with one short retry (used by WSS bootstrap and
+  gap-fill — bounded fail-loud on the live decision path).
 
-- `fetch_1s_klines` (live mode): single attempt. Raises `OkxTransientError` on
-  transient failure (so caller can skip the round gracefully) and
-  `InvariantError` on permanent failure (hard stop).
+Returns oldest-first list of ``[ts_ms, open, high, low, close, volume]``
+arrays. Length is exactly ``(newest - oldest)/1000 + 1``. Boundary verified:
+the returned oldest/newest open_times must equal the requested values, else
+``InvariantError`` (catches OKX data holes that ``len == expected_count``
+alone would miss).
 """
 from __future__ import annotations
 
 import json
 import random
+import threading
 import time
+from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 
@@ -27,11 +35,70 @@ from pancakebot.util import InvariantError
 
 _OKX_BASE_URL = "https://www.okx.com"
 
-# Retry policy (sync mode only).
-_MAX_ATTEMPTS_SYNC = 5  # initial + 4 retries
-_BACKOFF_BASE_SYNC = [2.0, 4.0, 8.0, 16.0]  # 4 delays between 5 attempts
 _JITTER_MIN = 0.5
 _JITTER_MAX = 1.5
+
+
+# ---------------------------------------------------------------------------
+# Shared OKX rate budget (single canonical source for all OKX REST callers).
+# OKX allows 20 req/2s per endpoint per IP = 10/s. Cap at 8/s to leave margin.
+# All in-process callers (sync.py bulk fetch, WSS bootstrap, WSS gap-fill)
+# use ``okx_rate_acquire`` so a single token bucket throttles total OKX
+# load across the live system.
+# ---------------------------------------------------------------------------
+
+_OKX_RATE_LIMIT_PER_SEC = 8
+_okx_rate_lock = threading.Lock()
+_okx_rate_last_t: float = 0.0
+
+
+def okx_rate_acquire() -> None:
+    """Block until we can make another OKX request without exceeding 8/s.
+
+    Process-wide shared budget. Pass as ``rate_acquire_fn`` to
+    ``OkxClient.fetch_kline_window``.
+    """
+    global _okx_rate_last_t
+    min_interval = 1.0 / _OKX_RATE_LIMIT_PER_SEC
+    with _okx_rate_lock:
+        now = time.monotonic()
+        wait = _okx_rate_last_t + min_interval - now
+        if wait > 0:
+            time.sleep(wait)
+        _okx_rate_last_t = time.monotonic()
+
+# ---------------------------------------------------------------------------
+# Retry policy
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Retry config for ``fetch_kline_window``.
+
+    ``backoff_seconds[i]`` is the sleep BEFORE attempt i+1 (jittered by
+    [0.5x, 1.5x]). Length must be ``max_attempts - 1``.
+    """
+    max_attempts: int
+    backoff_seconds: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if len(self.backoff_seconds) != max(0, self.max_attempts - 1):
+            raise ValueError(
+                f"backoff_seconds len={len(self.backoff_seconds)} "
+                f"must equal max_attempts-1={self.max_attempts - 1}"
+            )
+
+
+# Sync.py iterates 38k+ rounds; needs robust retry over slow OKX backends.
+RETRY_SYNC = RetryPolicy(max_attempts=5, backoff_seconds=(2.0, 4.0, 8.0, 16.0))
+
+# WSS bootstrap and gap-fill on the live decision path; bounded retry then
+# fail-loud. The WSS layer adds its own boundary-unavailable retry on top
+# (one 2-3s delay then InvariantError) — see okx_wss_client.
+RETRY_WSS = RetryPolicy(max_attempts=2, backoff_seconds=(2.5,))
 
 # OKX API-level error codes that are transient and warrant retry.
 # See https://www.okx.com/docs-v5/en/#error-code
@@ -48,10 +115,6 @@ class _OkxErrorClass(Enum):
     RETRYABLE = "retryable"        # network/5xx/429/retryable-code — retry applies
     PERMANENT = "permanent"        # 4xx/permanent-code — don't retry
     INSUFFICIENT = "insufficient"  # code=0 but empty or short data — retry, then raise
-
-
-class OkxTransientError(Exception):
-    """Raised by live-mode fetchers on retryable errors. Caller skips the round."""
 
 
 def _classify_response(resp: requests.Response, expected_count: int) -> tuple[_OkxErrorClass, str]:
@@ -93,41 +156,9 @@ def _classify_exception(exc: Exception) -> tuple[_OkxErrorClass, str]:
 class OkxClient:
     """OKX Spot public REST client (unauthenticated) with retry and classification."""
 
-    # Headers to extract from each OKX response when header capture is enabled.
-    # These are the upstream-cache diagnostic fields: cache-control, age (CDN
-    # response age in seconds), x-cache (varnish-style HIT/MISS), cf-cache-status
-    # (CloudFlare HIT/MISS/EXPIRED), x-served-by (which edge node), via, server.
-    # We don't want to capture EVERY header (privacy + bloat), just the ones
-    # diagnostic for "is this a cached response" investigations.
-    _CAPTURED_HEADER_NAMES: tuple[str, ...] = (
-        "cache-control", "age", "x-cache", "cf-cache-status",
-        "x-served-by", "via", "server", "date", "x-amz-cf-id",
-        "x-amz-cf-pop", "expires", "etag",
-    )
-
     def __init__(self, *, timeout_seconds: float) -> None:
         self._timeout_seconds = timeout_seconds
         self._session = requests.Session()
-        # Per-symbol cache of the most-recent response headers, populated
-        # only when capture is enabled. Read by MomentumGate to forward
-        # into the kline_capture JSONL. Keyed by symbol (e.g. "BTC-USDT").
-        # Empty dict on each new request to that symbol.
-        self._last_response_headers: dict[str, dict[str, str]] = {}
-
-    def last_response_headers(self, symbol: str) -> dict[str, str] | None:
-        """Return the most-recent captured headers for *symbol*, or None.
-
-        Always returns None when ``OkxClient._capture_headers_enabled()``
-        was False at fetch time (i.e. the env var was unset). Otherwise
-        returns the diagnostic header subset.
-        """
-        return self._last_response_headers.get(symbol)
-
-    @staticmethod
-    def _capture_headers_enabled() -> bool:
-        """Opt-in via env var. Default OFF to avoid bloating capture file."""
-        import os
-        return os.environ.get("PANCAKEBOT_CAPTURE_OKX_HEADERS", "").lower() in ("1", "true", "yes")
 
     def warmup(self, connections: int = 3) -> None:
         """Fill the connection pool so parallel fetches hit warm connections.
@@ -156,9 +187,10 @@ class OkxClient:
           the TLS-handshake latency itself; the round's signal logic still
           works.
         - If the underlying network is genuinely down, the next
-          ``fetch_1s_klines`` call will raise ``OkxTransientError`` on its
-          own, which the pipeline handles with a ``gate_no_btc_klines``
-          skip. No reason to kill the bot from a warmup hiccup.
+          ``fetch_kline_window`` call (sync bulk fetch or WSS bootstrap/
+          gap-fill REST repair) will raise ``InvariantError`` on its own
+          after retry exhaustion. No reason to kill the bot from a warmup
+          hiccup.
 
         Pre-fix history: OKX sporadically resets established sockets
         (`WinError 10054 / ConnectionResetError`). The uncaught re-raise
@@ -175,8 +207,6 @@ class OkxClient:
             pass
         # Step 2: brand-new session for this round's pool.
         self._session = requests.Session()
-        # NOTE: per-symbol _last_response_headers dict is preserved across
-        # this swap (it's an OkxClient instance attr, not on Session).
         # Step 3: pre-warm the new pool with parallel GETs.
         from concurrent.futures import ThreadPoolExecutor
         url = f"{_OKX_BASE_URL}/api/v5/public/time"
@@ -255,32 +285,71 @@ class OkxClient:
         return float(statistics.median(skews_s))
 
     # ----------------------------------------------------------------
-    # Sync mode: retry-enabled fetch. Raises on permanent/exhaustion.
+    # Canonical primitive: explicit-window /history-candles fetch.
     # ----------------------------------------------------------------
 
-    def fetch_raw(
+    def fetch_kline_window(
         self,
         *,
-        endpoint: str,
-        params: dict[str, str],
-        expected_count: int,
+        symbol: str,
+        oldest_open_ms: int,
+        newest_open_ms_inclusive: int,
+        retry_policy: RetryPolicy = RETRY_SYNC,
         rate_acquire_fn: Callable[[], None] | None = None,
-    ) -> dict:
-        """GET a /market/<endpoint> URL with retry + classification.
+    ) -> list[list]:
+        """Fetch the inclusive 1s-candle window ``[oldest_open_ms, newest_open_ms_inclusive]``
+        from OKX ``/api/v5/market/history-candles``.
 
-        Returns the parsed JSON body on SUCCESS (code='0' with exactly
-        `expected_count` rows in `data`). Raises InvariantError on permanent
-        failure or exhausted retries.
+        Returns oldest-first list of ``[ts_ms, open, high, low, close, volume]``
+        arrays. Length is exactly ``(newest - oldest)/1000 + 1``. The returned
+        oldest/newest open_times are verified to equal the requested values;
+        any deviation raises ``InvariantError`` (catches OKX data holes that
+        a length-only check would miss).
 
-        *rate_acquire_fn* is called before every attempt (including retries)
-        so shared rate-limit policy holds across retries too.
+        Network/transient errors retry per ``retry_policy``; permanent errors
+        raise ``InvariantError`` immediately. There is no separate transient-
+        error type — callers receive either the array or ``InvariantError``.
+
+        ``rate_acquire_fn`` is invoked before EVERY attempt (including
+        retries) so a shared rate budget can be threaded through. Pass None
+        to bypass rate limiting (used in WSS fast-path only when no other
+        OKX traffic is in flight).
         """
-        url = f"{_OKX_BASE_URL}/api/v5/market/{endpoint}"
+        if newest_open_ms_inclusive < oldest_open_ms:
+            raise InvariantError(
+                f"fetch_kline_window_inverted_range: oldest={oldest_open_ms} "
+                f"newest={newest_open_ms_inclusive}"
+            )
+        if (newest_open_ms_inclusive - oldest_open_ms) % 1000 != 0:
+            raise InvariantError(
+                f"fetch_kline_window_unaligned_ms: oldest={oldest_open_ms} "
+                f"newest={newest_open_ms_inclusive} (must be 1s-aligned)"
+            )
+        expected_count = (newest_open_ms_inclusive - oldest_open_ms) // 1000 + 1
+        if expected_count > 300:
+            # OKX /history-candles caps at 300 per request. Caller must
+            # paginate (none of our current callers do; sync's per-round
+            # window is exactly 300, WSS's bootstrap window is at most 300).
+            raise InvariantError(
+                f"fetch_kline_window_exceeds_max: count={expected_count} max=300 "
+                f"symbol={symbol}"
+            )
+        # OKX `after` is exclusive (returns rows with open_time < after).
+        # To include newest_open_ms_inclusive, set after = newest + 1000.
+        after_ms = newest_open_ms_inclusive + 1000
+        url = f"{_OKX_BASE_URL}/api/v5/market/history-candles"
+        params: dict[str, str] = {
+            "instId": symbol,
+            "bar": "1s",
+            "limit": str(expected_count),
+            "after": str(after_ms),
+        }
 
-        for attempt in range(_MAX_ATTEMPTS_SYNC):
+        last_detail = ""
+        last_class: _OkxErrorClass | None = None
+        for attempt in range(retry_policy.max_attempts):
             if rate_acquire_fn is not None:
                 rate_acquire_fn()
-
             try:
                 resp = self._session.get(url, params=params, timeout=self._timeout_seconds)
             except requests.RequestException as e:
@@ -291,118 +360,71 @@ class OkxClient:
             if cls == _OkxErrorClass.SUCCESS:
                 if attempt > 0:
                     info("NET", "OKX", "RECOVER",
-                         attempts=attempt + 1, endpoint=endpoint)
-                return resp.json()
+                         attempts=attempt + 1, endpoint="history-candles",
+                         symbol=symbol)
+                body = resp.json()
+                rows = body["data"]  # OKX returns newest-first
+                arrays: list[list] = []
+                for row in reversed(rows):
+                    if not isinstance(row, list) or len(row) < 6:
+                        raise InvariantError(
+                            f"okx_kline_window_row_invalid: symbol={symbol}"
+                        )
+                    arrays.append([
+                        int(row[0]), float(row[1]), float(row[2]),
+                        float(row[3]), float(row[4]), float(row[5]),
+                    ])
+                # Boundary verification: requested oldest/newest must match.
+                # _classify_response already ensured len == expected_count.
+                if arrays[0][0] != oldest_open_ms or arrays[-1][0] != newest_open_ms_inclusive:
+                    raise InvariantError(
+                        f"okx_kline_window_boundary_mismatch: symbol={symbol} "
+                        f"requested=[{oldest_open_ms}..{newest_open_ms_inclusive}] "
+                        f"got=[{arrays[0][0]}..{arrays[-1][0]}] count={len(arrays)}"
+                    )
+                # Contiguity verification: every adjacent pair must be exactly
+                # 1000 ms apart. Catches mid-window holes / duplicates /
+                # out-of-order rows that the boundary check alone would miss.
+                # Required for the live decision path (bootstrap + gap-fill)
+                # AND for sync's on-disk records (downstream slice math
+                # assumes contiguity).
+                for i in range(1, len(arrays)):
+                    delta = arrays[i][0] - arrays[i - 1][0]
+                    if delta != 1000:
+                        raise InvariantError(
+                            f"okx_kline_window_noncontiguous: symbol={symbol} "
+                            f"idx={i} prev_ts={arrays[i - 1][0]} cur_ts={arrays[i][0]} "
+                            f"delta_ms={delta} (expected 1000)"
+                        )
+                return arrays
 
             if cls == _OkxErrorClass.PERMANENT:
                 raise InvariantError(
-                    f"okx_permanent: endpoint={endpoint} detail={detail}"
+                    f"okx_kline_window_permanent: symbol={symbol} detail={detail}"
                 )
 
-            # RETRYABLE or INSUFFICIENT — retry if attempts remain.
-            is_last = (attempt == _MAX_ATTEMPTS_SYNC - 1)
+            # RETRYABLE or INSUFFICIENT — retry per policy if attempts remain.
+            last_detail = detail
+            last_class = cls
+            is_last = (attempt == retry_policy.max_attempts - 1)
             if is_last:
                 error("NET", "OKX", "EXHAUST",
-                      attempts=attempt + 1, endpoint=endpoint,
-                      error_class=cls.value, error_detail=detail)
+                      attempts=attempt + 1, endpoint="history-candles",
+                      symbol=symbol, error_class=cls.value, error_detail=detail)
                 raise InvariantError(
-                    f"okx_retries_exhausted: endpoint={endpoint} "
+                    f"okx_kline_window_exhausted: symbol={symbol} "
                     f"class={cls.value} detail={detail}"
                 )
-
-            delay = _BACKOFF_BASE_SYNC[attempt] * random.uniform(_JITTER_MIN, _JITTER_MAX)
+            base_delay = retry_policy.backoff_seconds[attempt]
+            delay = base_delay * random.uniform(_JITTER_MIN, _JITTER_MAX)
             warn("NET", "OKX", "RETRY",
                  attempt=attempt + 1, delay_s=f"{delay:.2f}",
-                 endpoint=endpoint, error_class=cls.value, error_detail=detail)
+                 endpoint="history-candles", symbol=symbol,
+                 error_class=cls.value, error_detail=detail)
             time.sleep(delay)
 
-        # Unreachable — loop always returns or raises.
-        raise InvariantError(f"okx_unreachable_code_path: endpoint={endpoint}")
-
-    # ----------------------------------------------------------------
-    # Live mode: single-attempt. Transient → OkxTransientError.
-    # ----------------------------------------------------------------
-
-    def fetch_1s_klines(
-        self,
-        *,
-        symbol: str,
-        count: int = 25,
-        after_ms: int | None = None,
-    ) -> list[dict[str, float | int]]:
-        """Fetch the most recent `count` 1s klines from OKX (live-mode, no retry).
-
-        When *after_ms* is provided, only candles with open_time < after_ms
-        are returned (OKX ``after`` pagination parameter). This excludes
-        the in-progress bar whose open_time equals the current second, so
-        all returned candles are completed with final close prices.
-
-        Returns oldest-first list of dicts with keys:
-          open_time_ms, close_price
-
-        Raises:
-          OkxTransientError on retryable errors (caller skips the round).
-          InvariantError on permanent errors (hard stop).
-        """
-        url = f"{_OKX_BASE_URL}/api/v5/market/candles"
-        params: dict[str, str] = {
-            "instId": symbol,
-            "bar": "1s",
-            "limit": str(count),
-        }
-        if after_ms is not None:
-            params["after"] = str(after_ms)
-
-        resp = None
-        try:
-            resp = self._session.get(url, params=params, timeout=self._timeout_seconds)
-        except requests.RequestException as e:
-            cls, detail = _classify_exception(e)
-        else:
-            cls, detail = _classify_response(resp, count)
-
-        # Capture diagnostic headers if env-var-enabled. Always update the
-        # per-symbol slot (overwrite the previous response's headers) so
-        # the gate sees the headers from THIS request. When capture is
-        # disabled or no response was received, leave the slot untouched.
-        if resp is not None and self._capture_headers_enabled():
-            try:
-                hdrs = {
-                    name: resp.headers.get(name, "")
-                    for name in self._CAPTURED_HEADER_NAMES
-                    if resp.headers.get(name) is not None
-                }
-                self._last_response_headers[symbol] = hdrs
-            except Exception:  # noqa: BLE001 -- never fail the fetch on header capture
-                pass
-
-        if cls == _OkxErrorClass.SUCCESS:
-            body = resp.json()
-            rows = body["data"]  # newest first
-            result: list[dict[str, float | int]] = []
-            for row in reversed(rows):
-                if not isinstance(row, list) or len(row) < 6:
-                    raise InvariantError("okx_client_1s_row_invalid")
-                # Full OHLCV is captured for replay analysis (see
-                # pancakebot.runtime.kline_capture). Strategy code path
-                # only reads ``close_price`` so the extra fields are
-                # passive observability data.
-                result.append({
-                    "open_time_ms": int(row[0]),
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close_price": float(row[4]),
-                    "volume": float(row[5]),
-                })
-            return result
-
-        if cls == _OkxErrorClass.PERMANENT:
-            raise InvariantError(
-                f"okx_live_permanent: symbol={symbol} detail={detail}"
-            )
-
-        # RETRYABLE or INSUFFICIENT — live mode surfaces both as transient skip.
-        raise OkxTransientError(
-            f"okx_live_transient: symbol={symbol} class={cls.value} detail={detail}"
+        # Defensive: loop above always returns or raises.
+        raise InvariantError(
+            f"okx_kline_window_unreachable: symbol={symbol} "
+            f"last_class={last_class} last_detail={last_detail}"
         )

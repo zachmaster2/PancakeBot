@@ -322,14 +322,13 @@ class AppConfig:
     backtest: BacktestConfig
     # Full StrategyConfig (defaults match pre-refactor module constants).
     strategy: StrategyConfig
-
-    # OKX WSS subscription config (live mode only; ignored in backtest).
-    # Stale-data refusal threshold: if the WSS ring hasn't received a
-    # candle update within this many milliseconds, the gate refuses to
-    # bet (`risk_kline_wss_stale`). 5000ms = 5s = 5 missed pushes at 1s
-    # candle cadence -- clear outage signal. Configurable for tuning
-    # if soak data shows different optimal threshold.
-    okx_wss_stale_threshold_ms: int = 5000
+    # Note: ``okx_wss_stale_threshold_ms`` was removed (Phase 2 spec item 10,
+    # 2026-04-27). The wall-clock staleness check it gated is now redundant
+    # with ``wss_newest_lagging`` (item 9), which compares ring's newest
+    # against the cutoff-anchored expected timestamp -- catches everything
+    # the staleness threshold caught, plus the post-push-but-still-behind
+    # race condition. ``last_received_ms`` is preserved on the ring for
+    # diagnostics (``stats()``).
 
 
 # -- TOML parsing helpers -----------------------------------------------------
@@ -586,11 +585,10 @@ def load_app_config(path: str) -> AppConfig:
 
     strategy_cfg = load_strategy_config(raw)
 
-    # OKX WSS subscription config (optional [okx] TOML section).
-    okx_sec = _opt_section(raw, "okx")
-    wss_stale_ms = _opt_int(okx_sec, "wss_stale_threshold_ms", 5000)
-    if wss_stale_ms <= 0:
-        raise InvariantError("okx_wss_stale_threshold_ms_must_be_positive")
+    # ``[okx] wss_stale_threshold_ms`` removed (Phase 2 spec item 10,
+    # 2026-04-27). The check it gated is replaced by ``wss_newest_lagging``
+    # in ``OkxWssClient.get_window`` (item 9). If the TOML still contains
+    # the key, it is silently ignored -- callers don't need a migration.
 
     return AppConfig(
         kline_cutoff_seconds=kline_cutoff_seconds,
@@ -601,5 +599,4 @@ def load_app_config(path: str) -> AppConfig:
         backtest_initial_bankroll_bnb=bt_bankroll,
         backtest=backtest_cfg,
         strategy=strategy_cfg,
-        okx_wss_stale_threshold_ms=wss_stale_ms,
     )

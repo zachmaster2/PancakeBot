@@ -1,5 +1,26 @@
 # OKX WSS migration — design doc
 
+> **⚠️ SUPERSEDED** — this document represents the pre-Phase-2 design.
+> The implemented architecture differs significantly:
+> - Skip reasons collapsed to a single generic `risk_kline_wss_failure`
+>   (per Phase 2 item 16, 2026-04-27).
+> - Per-failure detail surfaces via `WSS_GATE` warn logs (one per failed
+>   symbol, naming the specific WSS skip reason).
+> - Stale-threshold and correlated-stale concepts removed (per items 10
+>   and 16). `wss_newest_lagging` subsumes the wall-clock staleness check.
+> - WSS bootstrap is subscribe-FIRST (not REST-first) with boundary
+>   verification, gap detection, and silent-WSS-death recovery via
+>   `needs_reconnect` (items 9, 11, 12, 13).
+> - BNB-USDT is a first-class instrument (per items 14, 15) -- subscribed,
+>   bootstrapped, gap-filled, gated by `is_ready()`, and queried at
+>   decision time identically to BTC/ETH/SOL.
+> - Engine housekeeping polls `OkxWssClient.fatal_error()` and crashes
+>   loudly on unrecoverable WSS failures (item 17 part A).
+>
+> See git log for the canonical Phase 2 commit and
+> `pancakebot/market_data/okx_wss_client.py` /
+> `pancakebot/strategy/momentum_gate.py` for current behavior.
+
 ## Context
 
 The dry bot's kline-fetch path is REST-based: every round, three parallel
