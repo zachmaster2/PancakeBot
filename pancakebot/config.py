@@ -72,16 +72,34 @@ class PoolFilterConfig:
 
 @dataclass(frozen=True, slots=True)
 class BtcPrimaryThresholdConfig:
-    """BTC primary signal thresholds, pool-size-adaptive."""
+    """BTC primary small-pool admission threshold (large pools use gate threshold).
+
+    For pools >= ``pool_size_boundary_bnb`` the gate's
+    ``GateConfig.mtf_threshold`` is the binding constraint (it already
+    fired). For pools below, signal_strength must additionally exceed
+    ``small_pool`` (a stricter cutoff that excludes weak signals on
+    small / dilution-prone pools).
+    """
     small_pool: float
-    large_pool: float
     pool_size_boundary_bnb: float
 
 
 @dataclass(frozen=True, slots=True)
 class BtcPrimarySizingConfig:
-    """BTC primary bet sizing. (max_bet_bnb moved to RiskConfig.)"""
+    """BTC primary bet sizing.
+
+    - base_fraction: starting fraction-of-pool stake.
+    - sizing_slope: gain on signal_strength; final frac =
+      base_fraction + sizing_slope * signal_strength, capped at max_frac.
+    - max_frac: hard cap on the computed pool fraction, applied
+      before per-bet absolute caps (in RiskConfig).
+
+    sizing_slope and max_frac were previously module-level constants
+    (_SIZING_SLOPE, _MAX_FRAC) in pancakebot/strategy/momentum_pipeline.py.
+    """
     base_fraction: float
+    sizing_slope: float
+    max_frac: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,49 +127,50 @@ class EthSolFallbackConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class Tier2SizingConfig:
-    """Cross-cutting sizing knobs used by every regime (BTC primary, regime-2).
-    These fields live inside ``_compute_bet_size`` and in the
-    effective-strength composition for BTC-primary ETH/SOL confirmation and
-    for regime-2's ETH+SOL-only weighting.
+class GateConfig:
+    """Multi-TF momentum gate parameters.
 
-    - payout_slope: Kelly-like payout-multiplier slope. Larger -> bet more
-      when our side's payout is high. 0.0 disables the boost.
-    - eth_sizing_weight: coefficient on ETH confirmation strength (BTC-
-      primary boost) AND on the ETH contribution to the regime-2 signal.
-      0.0 zeros out ETH's contribution in both paths.
-    - sol_sizing_weight: mirror of eth_sizing_weight for SOL.
-    - floor_bnb: computed-stake floor applied inside ``_compute_bet_size``
-      before final caps (``max(floor_bnb, min(cap_bnb, bet))``). Must be
-      strictly less than every per-bet BNB cap or it would silently beat
-      the caps at the ``max`` step -- ``StrategyConfig.validate`` enforces
-      this. The separate ``min_bet_amount_bnb`` pipeline guard at the end
-      of ``decide_open_round`` (``bet_size_below_min`` skip) handles the
-      on-chain contract minimum check; the two are intentionally distinct.
+    - mtf_lookbacks: tuple of integer-second lookbacks; all must agree
+      in direction for the gate to fire. Default (3, 7, 15) — 3-second,
+      7-second, 15-second returns.
+    - mtf_threshold: minimum min(|return|) across the lookbacks for
+      the gate to fire. The pipeline may apply a stricter pool-adaptive
+      threshold via BtcPrimaryThresholdConfig.
 
-      **Note (Phase 2 ablation finding, 2026-04-23):** a 5-value sweep
-      across {0.005, 0.010, 0.015, 0.020, 0.050} produced byte-identical
-      5-fold PnL (+50.6179 BNB) at the first four values -- the floor
-      **never bound** on observed data because (a) ``base_fraction ×
-      pool`` produces bets comfortably above 0.01 BNB for most rounds
-      and (b) the pipeline's own contract-minimum skip already filters
-      tiny bets before this floor matters. Only 0.050 (5x default) clipped
-      any bets, and only pennies. Retained as a configurable knob for
-      forward compatibility: if ``min_bet_amount_bnb`` drops (contract
-      change) or any ``base_fraction`` decreases into a regime where
-      sub-0.01-BNB computed bets become common, this floor starts to
-      matter and a sweep will surface that. Not worth deleting; not worth
-      sweeping again on the current dataset.
-
-    These were previously hardcoded module constants
-    (_PAYOUT_SLOPE / _ETH_SIZING_WEIGHT / _SOL_SIZING_WEIGHT / _FLOOR_BNB)
-    in ``pancakebot/strategy/momentum_pipeline.py``. Extracted for Tier-2
-    research sweeps; defaults preserve pre-refactor behaviour exactly.
+    Previously module constants (_MTF_LOOKBACKS, _MTF_THRESH) in
+    pancakebot/strategy/momentum_gate.py.
     """
-    payout_slope: float
-    eth_sizing_weight: float
-    sol_sizing_weight: float
-    floor_bnb: float
+    mtf_lookbacks: tuple[int, ...]
+    mtf_threshold: float
+
+
+@dataclass(frozen=True, slots=True)
+class Tier2SizingConfig:
+    """Cross-regime sizing knobs.
+
+    - eth_sol_sizing_weight: coefficient applied to BOTH ETH and SOL
+      signal strengths in the BTC-primary confirmation boost AND in the
+      regime-2 (ETH+SOL-only) effective-strength composition.
+      Symmetric by design (collapsed from former separate eth/sol
+      weights, which were always swept together at identical values).
+
+    - min_bet_threshold_bnb: lower bound applied at the end of
+      ``_compute_bet_size`` (``max(min_bet_threshold_bnb, min(cap_bnb, bet))``).
+      Default 0.01 BNB. Bit-identical with prior behaviour because every
+      observed computed bet on the canonical baseline already exceeds
+      0.01 (Phase-2 ablation 2026-04-23). Distinct from the on-chain
+      ``min_bet_amount_bnb`` (~0.001) which is the contract floor checked
+      at the call-site.
+
+    Removals (2026-04-26 lean&clean refactor):
+      - payout_slope: removed; payout-proportional boost is now
+        hardcoded with slope=1.0 (the default). The "payout at cutoff"
+        signal was misleading because settlement-time payout differs.
+      - eth_sizing_weight / sol_sizing_weight: collapsed into the single
+        symmetric eth_sol_sizing_weight above.
+    """
+    eth_sol_sizing_weight: float
+    min_bet_threshold_bnb: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +198,7 @@ class RiskConfig:
 @dataclass(frozen=True, slots=True)
 class StrategyConfig:
     pool_filter: PoolFilterConfig
+    gate: GateConfig
     btc_primary: BtcPrimaryConfig
     eth_sol_fallback: EthSolFallbackConfig
     tier2_sizing: Tier2SizingConfig
@@ -192,17 +212,27 @@ class StrategyConfig:
         if pf.min_payout < 1.0:
             raise InvariantError("strategy_pool_filter_min_payout_must_be_at_least_1")
 
+        g = self.gate
+        if not g.mtf_lookbacks:
+            raise InvariantError("strategy_gate_mtf_lookbacks_must_be_non_empty")
+        if any(not isinstance(lb, int) or lb <= 0 for lb in g.mtf_lookbacks):
+            raise InvariantError("strategy_gate_mtf_lookbacks_must_be_positive_ints")
+        if g.mtf_threshold <= 0.0:
+            raise InvariantError("strategy_gate_mtf_threshold_must_be_positive")
+
         bt = self.btc_primary.threshold
         if bt.small_pool <= 0.0:
             raise InvariantError("strategy_btc_primary_threshold_small_pool_must_be_positive")
-        if bt.large_pool <= 0.0:
-            raise InvariantError("strategy_btc_primary_threshold_large_pool_must_be_positive")
         if bt.pool_size_boundary_bnb <= 0.0:
             raise InvariantError("strategy_btc_primary_threshold_pool_size_boundary_bnb_must_be_positive")
 
         bs = self.btc_primary.sizing
         if not (0.0 < bs.base_fraction < 1.0):
             raise InvariantError("strategy_btc_primary_sizing_base_fraction_out_of_range")
+        if bs.sizing_slope < 0.0:
+            raise InvariantError("strategy_btc_primary_sizing_slope_must_be_non_negative")
+        if not (0.0 < bs.max_frac <= 1.0):
+            raise InvariantError("strategy_btc_primary_sizing_max_frac_out_of_range")
 
         es = self.eth_sol_fallback.signal
         if es.min_strength <= 0.0:
@@ -213,18 +243,10 @@ class StrategyConfig:
             raise InvariantError("strategy_eth_sol_fallback_sizing_base_fraction_out_of_range")
 
         t2 = self.tier2_sizing
-        # payout_slope = 0 disables the Kelly boost (valid sweep point);
-        # negative would silently invert -> forbid.
-        if t2.payout_slope < 0.0:
-            raise InvariantError("strategy_tier2_sizing_payout_slope_must_be_non_negative")
-        if t2.eth_sizing_weight < 0.0:
-            raise InvariantError("strategy_tier2_sizing_eth_sizing_weight_must_be_non_negative")
-        if t2.sol_sizing_weight < 0.0:
-            raise InvariantError("strategy_tier2_sizing_sol_sizing_weight_must_be_non_negative")
-        # floor_bnb is a live-side stake floor; zero would mean "no floor"
-        # which opens a class of sub-min-bet failures. Must be positive.
-        if t2.floor_bnb <= 0.0:
-            raise InvariantError("strategy_tier2_sizing_floor_bnb_must_be_positive")
+        if t2.eth_sol_sizing_weight < 0.0:
+            raise InvariantError("strategy_tier2_sizing_eth_sol_sizing_weight_must_be_non_negative")
+        if t2.min_bet_threshold_bnb < 0.0:
+            raise InvariantError("strategy_tier2_sizing_min_bet_threshold_bnb_must_be_non_negative")
 
         rk = self.risk
         if not (0.0 < rk.max_bet_frac_of_bankroll <= 1.0):
@@ -242,43 +264,34 @@ class StrategyConfig:
         if rk.max_bet_bnb_eth_sol_fallback <= 0.0:
             raise InvariantError("strategy_risk_max_bet_bnb_eth_sol_fallback_must_be_positive")
 
-        # Cross-field invariant: floor_bnb must be strictly less than every
-        # per-bet cap. Otherwise ``max(floor_bnb, min(cap_bnb, bet))`` in
-        # _compute_bet_size silently beats the cap -- a typo like
-        # floor_bnb=5.0 would blow past max_bet_bnb_btc_primary=2.0.
-        min_cap = min(
-            rk.max_bet_bnb_btc_primary,
-            rk.max_bet_bnb_eth_sol_fallback,
-        )
-        if t2.floor_bnb >= min_cap:
-            raise InvariantError(
-                f"strategy_tier2_sizing_floor_bnb_must_be_less_than_smallest_cap "
-                f"(floor_bnb={t2.floor_bnb}, smallest_cap={min_cap})"
-            )
-
 
 # Default strategy values — match the module-level constants they replaced in
 # pancakebot/strategy/momentum_pipeline.py, so a config.toml without any
 # [strategy.*] sections reproduces the pre-refactor behavior exactly.
 _DEFAULT_STRATEGY = StrategyConfig(
     pool_filter=PoolFilterConfig(min_pool_bnb=1.5, min_payout=1.5),
+    gate=GateConfig(
+        mtf_lookbacks=(3, 7, 15),
+        mtf_threshold=0.0001,
+    ),
     btc_primary=BtcPrimaryConfig(
         threshold=BtcPrimaryThresholdConfig(
             small_pool=0.0002,
-            large_pool=0.0001,
             pool_size_boundary_bnb=3.0,
         ),
-        sizing=BtcPrimarySizingConfig(base_fraction=0.04),
+        sizing=BtcPrimarySizingConfig(
+            base_fraction=0.04,
+            sizing_slope=100.0,
+            max_frac=0.30,
+        ),
     ),
     eth_sol_fallback=EthSolFallbackConfig(
         signal=EthSolFallbackSignalConfig(min_strength=0.00015),
         sizing=EthSolFallbackSizingConfig(base_fraction=0.02),
     ),
     tier2_sizing=Tier2SizingConfig(
-        payout_slope=1.0,
-        eth_sizing_weight=0.3,
-        sol_sizing_weight=0.3,
-        floor_bnb=0.01,
+        eth_sol_sizing_weight=0.3,
+        min_bet_threshold_bnb=0.01,
     ),
     risk=RiskConfig(
         max_bet_frac_of_bankroll=0.05,
@@ -381,14 +394,24 @@ def _opt_section(parent: dict[str, Any], key: str) -> dict[str, Any]:
     return v
 
 
+def _opt_int_tuple(obj: dict[str, Any], key: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    if key not in obj:
+        return default
+    v = obj[key]
+    if not isinstance(v, (list, tuple)) or not all(isinstance(x, int) for x in v):
+        raise InvariantError(f"config_key_not_int_list: {key}")
+    return tuple(int(x) for x in v)
+
+
 def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
     """Build StrategyConfig from the parsed TOML root dict.
 
     Missing [strategy.*] sections or missing keys fall back to the defaults
-    in _DEFAULT_STRATEGY (which match the pre-refactor module constants).
+    in _DEFAULT_STRATEGY.
     """
     strat_sec = _opt_section(cfg_toml, "strategy")
     pf_sec = _opt_section(strat_sec, "pool_filter")
+    gate_sec = _opt_section(strat_sec, "gate")
     btc_sec = _opt_section(strat_sec, "btc_primary")
     btc_thresh_sec = _opt_section(btc_sec, "threshold")
     btc_sizing_sec = _opt_section(btc_sec, "sizing")
@@ -404,10 +427,13 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
             min_pool_bnb=_opt_float(pf_sec, "min_pool_bnb", d.pool_filter.min_pool_bnb),
             min_payout=_opt_float(pf_sec, "min_payout", d.pool_filter.min_payout),
         ),
+        gate=GateConfig(
+            mtf_lookbacks=_opt_int_tuple(gate_sec, "mtf_lookbacks", d.gate.mtf_lookbacks),
+            mtf_threshold=_opt_float(gate_sec, "mtf_threshold", d.gate.mtf_threshold),
+        ),
         btc_primary=BtcPrimaryConfig(
             threshold=BtcPrimaryThresholdConfig(
                 small_pool=_opt_float(btc_thresh_sec, "small_pool", d.btc_primary.threshold.small_pool),
-                large_pool=_opt_float(btc_thresh_sec, "large_pool", d.btc_primary.threshold.large_pool),
                 pool_size_boundary_bnb=_opt_float(
                     btc_thresh_sec, "pool_size_boundary_bnb",
                     d.btc_primary.threshold.pool_size_boundary_bnb,
@@ -415,6 +441,8 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
             ),
             sizing=BtcPrimarySizingConfig(
                 base_fraction=_opt_float(btc_sizing_sec, "base_fraction", d.btc_primary.sizing.base_fraction),
+                sizing_slope=_opt_float(btc_sizing_sec, "sizing_slope", d.btc_primary.sizing.sizing_slope),
+                max_frac=_opt_float(btc_sizing_sec, "max_frac", d.btc_primary.sizing.max_frac),
             ),
         ),
         eth_sol_fallback=EthSolFallbackConfig(
@@ -432,17 +460,11 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
             ),
         ),
         tier2_sizing=Tier2SizingConfig(
-            payout_slope=_opt_float(
-                t2_sec, "payout_slope", d.tier2_sizing.payout_slope,
+            eth_sol_sizing_weight=_opt_float(
+                t2_sec, "eth_sol_sizing_weight", d.tier2_sizing.eth_sol_sizing_weight,
             ),
-            eth_sizing_weight=_opt_float(
-                t2_sec, "eth_sizing_weight", d.tier2_sizing.eth_sizing_weight,
-            ),
-            sol_sizing_weight=_opt_float(
-                t2_sec, "sol_sizing_weight", d.tier2_sizing.sol_sizing_weight,
-            ),
-            floor_bnb=_opt_float(
-                t2_sec, "floor_bnb", d.tier2_sizing.floor_bnb,
+            min_bet_threshold_bnb=_opt_float(
+                t2_sec, "min_bet_threshold_bnb", d.tier2_sizing.min_bet_threshold_bnb,
             ),
         ),
         risk=RiskConfig(
@@ -475,6 +497,26 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
     )
     cfg.validate()
     return cfg
+
+
+def load_strategy_config_from_dict(d: dict[str, Any]) -> StrategyConfig:
+    """Build StrategyConfig from a Python dict in [strategy.*] TOML shape.
+
+    Used by the in-process experiment driver to construct StrategyConfig
+    directly without round-tripping through a temp .toml file. The dict
+    has the same shape as the parsed TOML root (i.e. the top level is
+    expected to be a wrapper with a "strategy" key, or you can pass the
+    inner [strategy] dict directly via {"strategy": d}).
+
+    Missing keys/sections fall back to _DEFAULT_STRATEGY just like the
+    TOML loader.
+    """
+    if "strategy" in d:
+        wrapped = d
+    else:
+        # Caller passed the inner [strategy] dict directly.
+        wrapped = {"strategy": d}
+    return load_strategy_config(wrapped)
 
 
 # -- Main loader --------------------------------------------------------------

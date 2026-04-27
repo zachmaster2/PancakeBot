@@ -439,10 +439,12 @@ def _dry_record_bet(
     side: str,
     amount_bnb: float,
     p_final: float,
-    expected_profit_bnb: float,
     bankroll_before_bet_bnb: float,
     bankroll_after_bet_bnb: float,
 ) -> None:
+    # ``expected_profit_bnb`` parameter removed 2026-04-26: the source
+    # field on StrategyPipelineDecision was deleted, and the column had
+    # only ever been written empty in practice.
     if epoch in closed.dry_bets_by_epoch:
         raise InvariantError(f"dry_bet_duplicate_epoch: epoch={epoch}")
     placed_ts = int(time.time())
@@ -453,7 +455,6 @@ def _dry_record_bet(
         "bet_bnb": amount_bnb,
         "p_final": p_final,
         "pred_win_probability": p_final,
-        "expected_profit_bnb": expected_profit_bnb,
         "bankroll_before_bet_bnb": bankroll_before_bet_bnb,
         "bankroll_after_bet_bnb": bankroll_after_bet_bnb,
     }
@@ -631,7 +632,6 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
                 "bet_bnb": bet_bnb,
                 "pred_win_probability": bet.get("pred_win_probability", ""),
                 "p_final": bet.get("p_final", ""),
-                "expected_profit_bnb": bet.get("expected_profit_bnb", ""),
                 "cutoff_bull_bnb": bet.get("cutoff_bull_bnb", ""),
                 "cutoff_bear_bnb": bet.get("cutoff_bear_bnb", ""),
                 "final_bull_bnb": bet.get("final_bull_bnb", ""),

@@ -1,8 +1,14 @@
 """Multi-timeframe momentum gate over OKX 1s klines for BTC with independent ETH/SOL signals.
 
-Requires BTC 3s/7s/15s returns to all agree and exceed a strength threshold,
-and emits independent ETH and SOL multi-TF directions plus confirmation
-strengths for use by the pipeline's sizing and regime-2 logic.
+Requires BTC multi-TF returns (configured via ``GateConfig.mtf_lookbacks``)
+to all agree in direction and exceed ``GateConfig.mtf_threshold``, and emits
+independent ETH and SOL multi-TF directions plus confirmation strengths for
+use by the pipeline's sizing and regime-2 logic.
+
+Lookbacks and threshold live in ``pancakebot.config.GateConfig`` (TOML
+``[strategy.gate]``); previously module-level constants
+``_MTF_LOOKBACKS = (3, 7, 15)`` / ``_MTF_THRESH = 0.0001``. The candle
+count consumed by the gate is derived: ``candle_count = max(mtf_lookbacks) + 1``.
 """
 
 from __future__ import annotations
@@ -11,21 +17,20 @@ from dataclasses import dataclass
 
 from pancakebot.market_data.okx_client import OkxClient
 
-# Number of 1s candles fetched and used by all modes (live, sync, backtest).
-_CANDLE_COUNT = 31
-
-# Multi-TF BTC lookbacks -- all must agree in direction.
-_MTF_LOOKBACKS = (3, 7, 15)
-# Signal fires at this threshold; the pipeline may apply a stricter
-# threshold for small pools (pool-adaptive logic in momentum_pipeline.py).
-_MTF_THRESH = 0.0001
-
 
 @dataclass(frozen=True, slots=True)
 class MomentumGateConfig:
+    """Live/dry-mode gate configuration.
+
+    The ``mtf_lookbacks`` / ``mtf_threshold`` carry the per-strategy
+    multi-TF parameters (formerly module constants). ``candle_count`` is
+    derived from ``mtf_lookbacks`` at gate-construction time.
+    """
     enabled: bool
     bnb_symbol: str          # "BNB-USDT"
     btc_symbol: str          # "BTC-USDT"
+    mtf_lookbacks: tuple[int, ...]
+    mtf_threshold: float
     eth_symbol: str = "ETH-USDT"
     sol_symbol: str = "SOL-USDT"
 
@@ -34,10 +39,8 @@ class MomentumGateConfig:
 class MomentumGateResult:
     signal: str | None       # "Bull", "Bear", or None
     tier: str | None         # "multi_tf"
-    btc_agrees: bool         # kept for interface compat (always True for MTF)
-    btc_disagrees: bool      # kept for interface compat (always False for MTF)
     skip_reason: str | None
-    signal_strength: float = 0.0  # min(|r3|, |r7|, |r15|) for adaptive sizing
+    signal_strength: float = 0.0  # min(|r_lookback|) for adaptive sizing
     eth_confirmation_strength: float = 0.0  # ETH min(|r|) when confirming BTC direction
     sol_confirmation_strength: float = 0.0  # SOL min(|r|) when confirming BTC direction
     # Independent ETH/SOL multi-TF (for regime-2: fires when BTC is silent)
@@ -71,6 +74,10 @@ class MomentumGate:
     ) -> None:
         self._cfg = config
         self._client = okx_client
+        # Derived: candle_count = max(mtf_lookbacks) + 1. Computed once at
+        # construction; used for OKX ring-window length, validation, and
+        # backtest pre-trim.
+        self._candle_count = max(config.mtf_lookbacks) + 1
         # WSS client is REQUIRED for live runtime use (engine constructs
         # it before instantiating the gate). It's accepted as Optional
         # so backtest-side code paths can construct a "no-op" gate via
@@ -117,8 +124,8 @@ class MomentumGate:
     ) -> MomentumGateResult:
         """Compute signal from the WSS in-memory ring buffers.
 
-        Live mode: reads ``self._wss.get_window(symbol, cutoff_ms)`` for
-        BTC, ETH, SOL. ETH/SOL are independent feeds (regime-2 signal /
+        Live mode: reads ``self._wss.get_window(symbol, cutoff_ms, candle_count)``
+        for BTC, ETH, SOL. ETH/SOL are independent feeds (regime-2 signal /
         BTC-confirmation source). Sub-millisecond decision-time read.
 
         Multi-instrument independence (per design doc):
@@ -130,8 +137,7 @@ class MomentumGate:
         """
         if not self._cfg.enabled:
             return MomentumGateResult(
-                signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-                skip_reason=None,
+                signal=None, tier=None, skip_reason=None,
             )
 
         if self._wss is None:
@@ -140,13 +146,14 @@ class MomentumGate:
             # they get a clean skip rather than a confusing AttributeError.
             return self._skip("gate_no_wss_client")
 
+        cc = self._candle_count
         # ----- Read rings -----
         # Returns (klines, skip_reason). klines is list of
         # [ts_ms, o, h, l, c, v] arrays oldest-first; None on stale or
         # insufficient.
-        btc_arr, btc_reason = self._wss.get_window(self._cfg.btc_symbol, cutoff_ts_ms, _CANDLE_COUNT)
-        eth_arr, eth_reason = self._wss.get_window(self._cfg.eth_symbol, cutoff_ts_ms, _CANDLE_COUNT)
-        sol_arr, sol_reason = self._wss.get_window(self._cfg.sol_symbol, cutoff_ts_ms, _CANDLE_COUNT)
+        btc_arr, btc_reason = self._wss.get_window(self._cfg.btc_symbol, cutoff_ts_ms, cc)
+        eth_arr, eth_reason = self._wss.get_window(self._cfg.eth_symbol, cutoff_ts_ms, cc)
+        sol_arr, sol_reason = self._wss.get_window(self._cfg.sol_symbol, cutoff_ts_ms, cc)
 
         # In-memory read; no fetch-timing meaningful (sub-ms).
         self.last_fetch_timing = {"btc_ms": 0, "eth_ms": 0, "sol_ms": 0}
@@ -179,6 +186,7 @@ class MomentumGate:
         _sol_closes_snap = [float(k[4]) for k in sol_arr] if sol_arr else None
         self.last_returns = _snapshot_returns(
             _btc_closes_snap, _eth_closes_snap, _sol_closes_snap,
+            mtf_lookbacks=self._cfg.mtf_lookbacks,
         )
 
         # ----- Multi-instrument independence policy -----
@@ -195,13 +203,13 @@ class MomentumGate:
         # (No additional code needed; _compute_signal accepts None closes.)
 
         # ----- Validate (legacy-equivalent) -----
-        # Validation now amounts to: BTC has >= _CANDLE_COUNT candles AND
+        # Validation now amounts to: BTC has >= candle_count candles AND
         # the newest candle's open_time matches cutoff_ms - 1000. WSS commits
         # candles aligned to UTC seconds via the confirm=="1" gate, so the
         # newest-ts check is a sanity assertion rather than a reliability
         # gate (the ring won't include in-progress candles in the first
         # place).
-        if len(btc_arr) < _CANDLE_COUNT:
+        if len(btc_arr) < cc:
             return self._skip("gate_btc_wss_insufficient")
         if int(btc_arr[-1][0]) != cutoff_ts_ms - 1000:
             return self._skip(
@@ -211,27 +219,30 @@ class MomentumGate:
         # ----- Compute signal -----
         btc_closes = [float(k[4]) for k in btc_arr]
         eth_closes = (
-            [float(k[4]) for k in eth_arr] if eth_arr and len(eth_arr) >= _CANDLE_COUNT else None
+            [float(k[4]) for k in eth_arr] if eth_arr and len(eth_arr) >= cc else None
         )
         sol_closes = (
-            [float(k[4]) for k in sol_arr] if sol_arr and len(sol_arr) >= _CANDLE_COUNT else None
+            [float(k[4]) for k in sol_arr] if sol_arr and len(sol_arr) >= cc else None
         )
         self.last_btc_closes = btc_closes
-        return _compute_signal(btc_closes, eth_closes, sol_closes)
+        return _compute_signal(
+            btc_closes, eth_closes, sol_closes,
+            mtf_lookbacks=self._cfg.mtf_lookbacks,
+            mtf_threshold=self._cfg.mtf_threshold,
+        )
 
     @staticmethod
     def _skip(reason: str) -> MomentumGateResult:
         return MomentumGateResult(
-            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
-            skip_reason=reason,
+            signal=None, tier=None, skip_reason=reason,
         )
 
 
 def _validate_klines_raw(
-    klines: list[list] | None, cutoff_ms: int, label: str,
+    klines: list[list] | None, cutoff_ms: int, label: str, *, candle_count: int,
 ) -> str | None:
     """Validate raw kline arrays (backtest path, list-of-lists format)."""
-    if not klines or len(klines) < _CANDLE_COUNT:
+    if not klines or len(klines) < candle_count:
         n = 0 if not klines else len(klines)
         return f"gate_{label}_insufficient:got={n}"
 
@@ -247,6 +258,8 @@ def _snapshot_returns(
     btc_closes: list[float] | None,
     eth_closes: list[float] | None,
     sol_closes: list[float] | None,
+    *,
+    mtf_lookbacks: tuple[int, ...],
 ) -> dict[str, float | None]:
     """Compute per-pair, per-lookback returns for capture.
 
@@ -258,7 +271,7 @@ def _snapshot_returns(
     out: dict[str, float | None] = {}
     pairs = (("btc", btc_closes), ("eth", eth_closes), ("sol", sol_closes))
     for name, closes in pairs:
-        for lb in _MTF_LOOKBACKS:
+        for lb in mtf_lookbacks:
             key = f"{name}_r{lb}"
             out[key] = _get_return(closes, lb) if closes is not None else None
     return out
@@ -282,6 +295,10 @@ def _get_return(closes: list[float], lookback: int) -> float | None:
 def compute_signal_from_klines(
     btc_klines: list[list] | None,
     cutoff_ms: int,
+    *,
+    mtf_lookbacks: tuple[int, ...],
+    mtf_threshold: float,
+    candle_count: int,
     eth_klines: list[list] | None = None,
     sol_klines: list[list] | None = None,
 ) -> MomentumGateResult:
@@ -289,46 +306,58 @@ def compute_signal_from_klines(
 
     Trims klines to the same window the live path fetches, validates
     BTC (the signal source), then computes the signal.
+
+    In the post-2026-04-26 backtest pipeline, the loader pre-slices
+    each per-round record to exactly ``candle_count`` candles already
+    aligned with ``cutoff_ms``, so ``_trim_to_window`` here is a no-op
+    in practice. It's retained as defense-in-depth for any caller that
+    passes a wider window (e.g. live mode bridging a custom diagnostic).
     """
     if btc_klines is not None:
-        btc_klines = _trim_to_window(btc_klines, cutoff_ms)
+        btc_klines = _trim_to_window(btc_klines, cutoff_ms, candle_count=candle_count)
     if eth_klines is not None:
-        eth_klines = _trim_to_window(eth_klines, cutoff_ms)
+        eth_klines = _trim_to_window(eth_klines, cutoff_ms, candle_count=candle_count)
     if sol_klines is not None:
-        sol_klines = _trim_to_window(sol_klines, cutoff_ms)
+        sol_klines = _trim_to_window(sol_klines, cutoff_ms, candle_count=candle_count)
 
     # Validate BTC klines (same gate as live path).
-    btc_reason = _validate_klines_raw(btc_klines, cutoff_ms, "btc")
+    btc_reason = _validate_klines_raw(btc_klines, cutoff_ms, "btc", candle_count=candle_count)
     if btc_reason is not None or btc_klines is None:
         return MomentumGateResult(
-            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
+            signal=None, tier=None,
             skip_reason=btc_reason or "gate_no_btc_klines",
         )
 
     btc_closes = [k[4] for k in btc_klines]
     eth_closes = None
-    if eth_klines and len(eth_klines) >= _CANDLE_COUNT:
+    if eth_klines and len(eth_klines) >= candle_count:
         eth_closes = [k[4] for k in eth_klines]
     sol_closes = None
-    if sol_klines and len(sol_klines) >= _CANDLE_COUNT:
+    if sol_klines and len(sol_klines) >= candle_count:
         sol_closes = [k[4] for k in sol_klines]
 
-    return _compute_signal(btc_closes, eth_closes, sol_closes)
+    return _compute_signal(
+        btc_closes, eth_closes, sol_closes,
+        mtf_lookbacks=mtf_lookbacks,
+        mtf_threshold=mtf_threshold,
+    )
 
 
-def _trim_to_window(klines: list[list], cutoff_ms: int) -> list[list]:
-    """Keep only the *_CANDLE_COUNT* completed candles before cutoff_ms."""
+def _trim_to_window(klines: list[list], cutoff_ms: int, *, candle_count: int) -> list[list]:
+    """Keep only the *candle_count* completed candles before cutoff_ms."""
     before = [k for k in klines if int(k[0]) < cutoff_ms]
-    return before[-_CANDLE_COUNT:] if len(before) > _CANDLE_COUNT else before
+    return before[-candle_count:] if len(before) > candle_count else before
 
 
 def _compute_pair_multi_tf(
     closes: list[float] | None,
+    *,
+    mtf_lookbacks: tuple[int, ...],
 ) -> tuple[str | None, float]:
-    """Compute multi-TF(3,7,15) for a single pair. Returns (direction, min_abs)."""
+    """Compute multi-TF for a single pair. Returns (direction, min_abs)."""
     if closes is None:
         return None, 0.0
-    rets_opt = [_get_return(closes, lb) for lb in _MTF_LOOKBACKS]
+    rets_opt = [_get_return(closes, lb) for lb in mtf_lookbacks]
     if any(r is None for r in rets_opt):
         return None, 0.0
     rets: list[float] = [r for r in rets_opt if r is not None]
@@ -343,22 +372,25 @@ def _compute_signal(
     btc_closes: list[float] | None,
     eth_closes: list[float] | None = None,
     sol_closes: list[float] | None = None,
+    *,
+    mtf_lookbacks: tuple[int, ...],
+    mtf_threshold: float,
 ) -> MomentumGateResult:
     """Core signal logic shared by live and backtest paths.
 
-    Multi-TF BTC: all lookbacks (3, 7, 15) must agree in direction
-    and min(|return|) must exceed _MTF_THRESH.
+    Multi-TF BTC: all lookbacks must agree in direction and min(|return|)
+    must exceed *mtf_threshold*.
 
     ETH/SOL confirmation: if ETH or SOL multi-TF also fires in the same
     direction, their confirmation strengths are set for sizing boost.
     """
     # Always compute independent ETH/SOL multi-TF (used by regime-2).
-    eth_sig, eth_sig_str = _compute_pair_multi_tf(eth_closes)
-    sol_sig, sol_sig_str = _compute_pair_multi_tf(sol_closes)
+    eth_sig, eth_sig_str = _compute_pair_multi_tf(eth_closes, mtf_lookbacks=mtf_lookbacks)
+    sol_sig, sol_sig_str = _compute_pair_multi_tf(sol_closes, mtf_lookbacks=mtf_lookbacks)
 
     def _no_btc_result(skip_reason: str) -> MomentumGateResult:
         return MomentumGateResult(
-            signal=None, tier=None, btc_agrees=False, btc_disagrees=False,
+            signal=None, tier=None,
             skip_reason=skip_reason,
             eth_signal=eth_sig, eth_signal_strength=eth_sig_str,
             sol_signal=sol_sig, sol_signal_strength=sol_sig_str,
@@ -368,7 +400,7 @@ def _compute_signal(
         return _no_btc_result("gate_no_btc_klines")
 
     returns = []
-    for lb in _MTF_LOOKBACKS:
+    for lb in mtf_lookbacks:
         r = _get_return(btc_closes, lb)
         if r is None:
             return _no_btc_result("gate_no_signal")
@@ -379,7 +411,7 @@ def _compute_signal(
         return _no_btc_result("gate_no_signal")
 
     min_abs = min(abs(r) for r in returns)
-    if min_abs < _MTF_THRESH:
+    if min_abs < mtf_threshold:
         return _no_btc_result("gate_no_signal")
 
     direction = "Bull" if returns[0] > 0 else "Bear"
@@ -397,7 +429,6 @@ def _compute_signal(
 
     return MomentumGateResult(
         signal=direction, tier="multi_tf",
-        btc_agrees=True, btc_disagrees=False,
         skip_reason=None,
         signal_strength=min_abs,
         eth_confirmation_strength=eth_confirm,

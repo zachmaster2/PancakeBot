@@ -48,13 +48,17 @@ def run_from_config(
     if selected_modes > 1:
         raise InvariantError("run_modes_mutually_exclusive")
 
-    # Inline MomentumGateConfig -- symbols are hardcoded project constants.
+    # Inline MomentumGateConfig -- symbols are hardcoded project constants;
+    # mtf_lookbacks and mtf_threshold come from [strategy.gate] config
+    # (extracted from former module constants in 2026-04-26 refactor).
     momentum_gate_cfg = MomentumGateConfig(
         enabled=True,
         bnb_symbol="BNB-USDT",
         btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT",
         sol_symbol="SOL-USDT",
+        mtf_lookbacks=cfg.strategy.gate.mtf_lookbacks,
+        mtf_threshold=cfg.strategy.gate.mtf_threshold,
     )
 
     if backtest:
