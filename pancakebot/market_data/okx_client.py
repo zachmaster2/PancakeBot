@@ -13,21 +13,30 @@ parameterised via ``RetryPolicy``:
   decision path so a single OKX hiccup skips the round, not the bot).
 
 Returns oldest-first list of ``[ts_ms, open, high, low, close, volume]``
-arrays. Length is exactly ``(newest - oldest)/1000 + 1``. Boundary verified:
-the returned oldest/newest open_times must equal the requested values, else
-``InvariantError`` (catches OKX data holes that ``len == expected_count``
-alone would miss).
+arrays. Length is exactly ``(newest - oldest)/1000 + 1``. The query always
+sends ``after`` (exclusive upper). When ``send_before_bound=True`` the
+query also sends ``before`` (exclusive lower), pinning the window so OKX
+cannot slide it when the newest requested candle isn't yet published — in
+that case OKX returns fewer rows (classified ``INSUFFICIENT``, retried,
+surfaced as ``TransientOkxError``) rather than silently filling with older
+candles. The live decision-path gate uses ``send_before_bound=True``; sync
+keeps the default ``False`` to preserve canonical-baseline request shape
+(its historical data is fully published, so window-sliding cannot occur).
+Boundary is also verified: the returned oldest/newest open_times must
+equal the requested values, else ``InvariantError`` (catches OKX data
+holes that ``len == expected_count`` alone would miss).
 
 Error contract:
-- Contract violations (length mismatch, contiguity gap, boundary mismatch,
-  inverted/unaligned range, row malformed, OKX permanent-class response)
-  raise ``InvariantError``. These indicate OKX returned data that violates
-  our shape invariants, or the caller passed a malformed window.
+- Contract violations (contiguity gap, boundary mismatch, inverted/unaligned
+  range, row malformed, OKX permanent-class response) raise
+  ``InvariantError``. These indicate OKX returned data that violates our
+  shape invariants, or the caller passed a malformed window.
 - Retry-exhausted transient failures (network exception, HTTP 429/5xx,
-  retryable OKX codes, repeated short/empty responses) raise
+  retryable OKX codes, repeated short/empty responses including
+  ``len < expected_count`` when newest is unpublished) raise
   ``TransientOkxError``. Callers on the live decision path catch this to
   skip the round; sync's bulk loader treats it as fail-loud (it shouldn't
-  happen with RETRY_SYNC's 5-attempt budget).
+  happen with RETRY_SYNC's 5-attempt budget on already-published history).
 """
 from __future__ import annotations
 
@@ -315,21 +324,28 @@ class OkxClient:
         newest_open_ms_inclusive: int,
         retry_policy: RetryPolicy = RETRY_SYNC,
         rate_acquire_fn: Callable[[], None] | None = None,
+        send_before_bound: bool = False,
     ) -> list[list]:
         """Fetch the inclusive 1s-candle window ``[oldest_open_ms, newest_open_ms_inclusive]``
         from OKX ``/api/v5/market/history-candles``.
 
         Returns oldest-first list of ``[ts_ms, open, high, low, close, volume]``
-        arrays. Length is exactly ``(newest - oldest)/1000 + 1``. The returned
-        oldest/newest open_times are verified to equal the requested values;
-        any deviation raises ``InvariantError`` (catches OKX data holes that
-        a length-only check would miss).
+        arrays. Length is exactly ``(newest - oldest)/1000 + 1``. The query
+        always sends ``after = newest + 1000``; when ``send_before_bound=True``
+        it additionally sends ``before = oldest - 1000`` (both exclusive in
+        OKX semantics), pinning the window so OKX cannot slide it when the
+        newest candle is unpublished. The returned oldest/newest open_times
+        are verified to equal the requested values; any deviation raises
+        ``InvariantError`` (catches OKX data holes that a length-only check
+        would miss).
 
         Error contract:
-        - Contract violations (length, contiguity, boundary, malformed input)
+        - Contract violations (contiguity, boundary, malformed input)
           raise ``InvariantError`` — fail-loud; data shape is wrong.
         - Retry-exhausted transient failures (network, HTTP 429/5xx,
-          retryable OKX codes, repeatedly empty/short responses) raise
+          retryable OKX codes, repeatedly empty/short responses — the
+          short-response case fires when the newest requested candle
+          hasn't been published yet at fetch time) raise
           ``TransientOkxError`` — fail-soft on the live decision path.
 
         ``rate_acquire_fn`` is invoked before EVERY attempt (including
@@ -351,13 +367,30 @@ class OkxClient:
         if expected_count > 300:
             # OKX /history-candles caps at 300 per request. Caller must
             # paginate (none of our current callers do; sync's per-round
-            # window is exactly 300, the live gate's window is exactly 300).
+            # window is exactly 300, the live gate's is much smaller).
             raise InvariantError(
                 f"kline_fetch_window_exceeds_max: count={expected_count} max=300 "
                 f"symbol={symbol}"
             )
-        # OKX `after` is exclusive (returns rows with open_time < after).
-        # To include newest_open_ms_inclusive, set after = newest + 1000.
+        # Window bounds:
+        # - OKX `after` is exclusive (returns rows with open_time < after).
+        #   To include newest_open_ms_inclusive, set after = newest + 1000.
+        # - OKX `before` is also exclusive (returns rows with open_time >
+        #   before). To include oldest_open_ms, set before = oldest - 1000.
+        # Setting BOTH bounds (``send_before_bound=True``) prevents OKX
+        # from sliding the window when the newest requested candle hasn't
+        # been published yet -- in that case OKX returns FEWER than
+        # expected_count rows and the response is classified as
+        # INSUFFICIENT (retry, then TransientOkxError on exhaustion).
+        # Without ``before``, OKX would silently return expected_count
+        # older rows, tripping the boundary check below into a false
+        # InvariantError -- the root cause of the
+        # ``kline_fetch_integrity_violation`` epidemic that crashed the
+        # live bot ~67% of rounds (2026-04-27).
+        # Sync (bulk historical) leaves ``send_before_bound=False`` so its
+        # request shape is bit-identical to the canonical baseline; OKX
+        # historical data is fully published by sync time, so the
+        # window-sliding failure mode the bound prevents cannot fire there.
         after_ms = newest_open_ms_inclusive + 1000
         url = f"{_OKX_BASE_URL}/api/v5/market/history-candles"
         params: dict[str, str] = {
@@ -366,6 +399,8 @@ class OkxClient:
             "limit": str(expected_count),
             "after": str(after_ms),
         }
+        if send_before_bound:
+            params["before"] = str(oldest_open_ms - 1000)
 
         last_detail = ""
         last_class: _OkxErrorClass | None = None

@@ -542,9 +542,19 @@ def load_app_config(path: str) -> AppConfig:
         raise InvariantError("config_section_not_dict: backtest")
 
     # [runtime]
+    # ``kline_cutoff_seconds`` controls the strategy-side data window: the
+    # gate filters to candles with ``open_ts < lock_at - cutoff*1000``, and
+    # the live-fetch newest candle has open_ts ``lock_at - cutoff*1000 -
+    # 1000`` (closes at ``lock_at - cutoff_seconds``). Range [1..30]:
+    # below 1 the newest candle would close at/after lock_at (OKX hasn't
+    # published it); above 30 we'd erode the decision-window's predictive
+    # horizon for no reason.
     kline_cutoff_seconds = _req_int(runtime, "kline_cutoff_seconds")
-    if kline_cutoff_seconds <= 0:
-        raise InvariantError("kline_cutoff_seconds_must_be_positive")
+    if not (1 <= kline_cutoff_seconds <= 30):
+        raise InvariantError(
+            f"runtime_kline_cutoff_seconds_out_of_range: "
+            f"got={kline_cutoff_seconds} valid=[1..30]"
+        )
     prefetch_offset_seconds = _req_int(runtime, "prefetch_offset_seconds")
     if prefetch_offset_seconds <= 0:
         raise InvariantError("prefetch_offset_seconds_must_be_positive")
