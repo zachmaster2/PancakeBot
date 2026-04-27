@@ -156,18 +156,41 @@ def run_from_config(
     okx_client = OkxClient(timeout_seconds=10.0)
     okx_client.warmup()
 
-    # WSS migration (research/okx_wss_migration_design.md): live runtime
-    # subscribes to OKX `candle1s` for BTC/ETH/SOL once at startup; gate
-    # reads in-memory ring buffers at decision time. No per-round REST.
-    # Bootstrap: REST `/history-candles` initial fill blocks startup
-    # until all 3 rings have completed the 3-step bootstrap (REST done,
-    # subscribe ack, first strictly-newer confirm-1 push). Failure to
-    # bootstrap raises -- no fallback to REST in live mode.
+    # WSS migration (Phase 2 spec 2026-04-27): subscribe-FIRST bootstrap.
+    # Daemon thread subscribes to ``candle1s`` for BTC/ETH/SOL/BNB, awaits
+    # the first confirm=1 push per symbol (T), waits 2s, then REST-fills
+    # ``[next_lock_at - 301_000, T]`` via ``OkxClient.fetch_kline_window``,
+    # boundary-verifies REST[T] == WSS[T], and atomically replaces the ring.
+    # Steady-state pushes append iff continuous; any gap triggers the same
+    # REST-repair flow. No fallback to REST polling in live mode.
+    #
+    # BNB is a FIRST-CLASS instrument (the bot bets on BNB/USD); it's
+    # subscribed and bootstrapped identically to BTC/ETH/SOL even though
+    # the current strategy gate doesn't read BNB klines from WSS. Future
+    # research that consumes BNB klines must work without re-plumbing.
     from pancakebot.market_data.okx_wss_client import OkxWssClient
+    from pancakebot.market_data.okx_client import okx_rate_acquire
+
+    def _next_lock_at_ms() -> int:
+        """Return the lock_at (in MILLISECONDS) of the round whose betting
+        window currently includes wall-clock now, i.e. the round we're
+        about to evaluate. Anchors WSS bootstrap + gap-fill REST fetches
+        to the same window the on-disk rebuild uses
+        (``[lock-301000, lock-2000]``).
+        """
+        epoch = contract.current_epoch()
+        lock_ts = contract.lock_ts(int(epoch))
+        if lock_ts <= 0:
+            raise InvariantError(
+                f"next_lock_at_ms_unset: epoch={epoch} lock_ts={lock_ts}"
+            )
+        return int(lock_ts) * 1000
+
     wss_client = OkxWssClient(
         okx_client=okx_client,
-        instruments=("BTC-USDT", "ETH-USDT", "SOL-USDT"),
-        stale_threshold_ms=int(cfg.okx_wss_stale_threshold_ms),
+        instruments=("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT"),
+        next_lock_at_ms_provider=_next_lock_at_ms,
+        rate_acquire_fn=okx_rate_acquire,
     )
     wss_client.start()  # blocks until is_ready() or raises
     import atexit as _atexit

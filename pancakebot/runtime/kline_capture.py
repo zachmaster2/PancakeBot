@@ -115,9 +115,6 @@ def build_snapshot(
     bet_size_bnb: float | None,
     pool_bull_bnb: float,
     pool_bear_bnb: float,
-    btc_response_headers: dict[str, str] | None = None,
-    eth_response_headers: dict[str, str] | None = None,
-    sol_response_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Pure data shaping. No I/O. No exceptions on missing fields.
 
@@ -125,11 +122,12 @@ def build_snapshot(
     must be cheap. The only non-trivial work is array-flattening the
     klines, which is ~30-90 small list comprehensions and adds <1ms.
 
-    The optional ``*_response_headers`` kwargs carry diagnostic HTTP
-    headers from the OKX kline fetches (populated only when the
-    PANCAKEBOT_CAPTURE_OKX_HEADERS env var is set on the bot; None
-    otherwise). They're emitted in the JSONL only when non-None to
-    avoid bloating the file when capture is off.
+    The legacy ``*_response_headers`` kwargs / ``response_headers`` JSONL
+    field were removed in Phase 2 spec item 17 part C (2026-04-27): the
+    fetch path that populated them (``OkxClient.fetch_1s_klines``) was
+    deleted in the WSS migration, so the field was always None. Existing
+    capture files that include ``response_headers`` remain readable --
+    the loader doesn't consume the field.
     """
     btc_arr = [_kline_dict_to_array(k) for k in (btc_klines_raw or [])]
     eth_arr = (
@@ -161,15 +159,6 @@ def build_snapshot(
         "pool_bull_bnb": float(pool_bull_bnb),
         "pool_bear_bnb": float(pool_bear_bnb),
     }
-    # Only include header fields when at least one is present, to keep
-    # the JSONL compact when the env var isn't set.
-    if any(h is not None for h in
-           (btc_response_headers, eth_response_headers, sol_response_headers)):
-        out["response_headers"] = {
-            "btc": dict(btc_response_headers) if btc_response_headers else None,
-            "eth": dict(eth_response_headers) if eth_response_headers else None,
-            "sol": dict(sol_response_headers) if sol_response_headers else None,
-        }
     return out
 
 
@@ -435,9 +424,6 @@ def record_round_decision(
             bet_size_bnb=bet_size_bnb,
             pool_bull_bnb=pool_bull_bnb,
             pool_bear_bnb=pool_bear_bnb,
-            btc_response_headers=getattr(gate, "last_btc_response_headers", None),
-            eth_response_headers=getattr(gate, "last_eth_response_headers", None),
-            sol_response_headers=getattr(gate, "last_sol_response_headers", None),
         )
     except Exception as e:  # noqa: BLE001 -- never raise from capture
         warn("CAPTURE", "BUILD", "FAIL",

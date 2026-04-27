@@ -15,7 +15,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pancakebot.log import warn
 from pancakebot.market_data.okx_client import OkxClient
+
+
+# Single skip reason emitted for ANY WSS data-availability failure across
+# any of the four subscribed symbols (BTC/ETH/SOL/BNB). Per-failure detail
+# is logged via per-symbol ``warn()`` calls so the operator reconciles the
+# generic histogram entry with the warn-log cluster around it.
+#
+# Phase 2 spec item 16 (2026-04-27) -- supersedes the per-reason +
+# per-symbol-suffix variants from items 1B / 9 / 15. Rationale:
+#   - Histogram cardinality stays low (1 variant, not 5*4=20).
+#   - Multi-failure rounds aren't masked by a single arbitrary "first" reason.
+#   - All-4-failing rounds become very visible (4 clustered warns + 1 skip).
+_WSS_FAILURE_SKIP_REASON = "risk_kline_wss_failure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,18 +65,17 @@ class MomentumGateResult:
 
 
 class MomentumGate:
-    """Multi-asset momentum gate: reads BTC + ETH + SOL 1s klines from
-    OKX WSS in-memory ring buffers (live mode).
+    """Multi-asset momentum gate: reads BTC + ETH + SOL + BNB 1s klines
+    from OKX WSS in-memory ring buffers (live mode).
 
-    Per the WSS migration (research/okx_wss_migration_design.md): live
-    mode reads from ``OkxWssClient`` ring buffers; the per-round REST
-    fetch path is REMOVED. Bootstrap REST and reconnect gap-fill REST
-    survive inside ``OkxWssClient`` for initialization-only purposes.
+    Per the WSS migration: live mode reads from ``OkxWssClient`` ring
+    buffers; the per-round REST fetch path is REMOVED. Bootstrap REST and
+    reconnect gap-fill REST survive inside ``OkxWssClient`` for
+    initialization-only purposes.
 
-    The OkxClient reference is preserved for those bootstrap/gap-fill
-    calls and for the capture-time response_headers diagnostic
-    (which is no longer applicable in WSS path -- left for backwards
-    compat with the captured.jsonl schema; always None now).
+    The OkxClient reference is preserved purely so the WSS client (which
+    holds the OKX HTTP session) is reachable from the gate for
+    diagnostics; the gate itself no longer issues OKX HTTP requests.
     """
 
     def __init__(
@@ -105,13 +118,6 @@ class MomentumGate:
         self.last_eth_klines_raw: list[dict] | None = None
         self.last_sol_klines_raw: list[dict] | None = None
         self.last_returns: dict[str, float | None] | None = None
-        # Diagnostic HTTP response headers were used for the REST-era
-        # cache investigation (commit 1cb2b20). With WSS there are no
-        # per-round HTTP responses, so these are always None now.
-        # Kept for capture schema compatibility; readers tolerate None.
-        self.last_btc_response_headers: dict[str, str] | None = None
-        self.last_eth_response_headers: dict[str, str] | None = None
-        self.last_sol_response_headers: dict[str, str] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -125,15 +131,20 @@ class MomentumGate:
         """Compute signal from the WSS in-memory ring buffers.
 
         Live mode: reads ``self._wss.get_window(symbol, cutoff_ms, candle_count)``
-        for BTC, ETH, SOL. ETH/SOL are independent feeds (regime-2 signal /
-        BTC-confirmation source). Sub-millisecond decision-time read.
+        for BTC, ETH, SOL, BNB. BTC drives the primary signal; ETH/SOL feed
+        regime-2 / BTC confirmation; BNB is the asset we bet on -- its window
+        is read for parity (data-availability check + ``needs_reconnect``
+        signal side effect) but the kline values are not consumed by signal
+        computation. Sub-millisecond decision-time read.
 
-        Multi-instrument independence (per design doc):
-          - BTC stale -> _skip("risk_kline_wss_stale")
-          - ETH+SOL both stale -> _skip("risk_kline_wss_correlated_stale")
-          - One of ETH/SOL stale alone -> degraded BTC-primary
-            (no regime-2 signal that round)
-          - BNB never read here (capture-only, not in decision path)
+        WSS failure handling (Phase 2 spec item 16, 2026-04-27): if ANY of
+        the four ``get_window`` calls returns ``None``, the round is
+        skipped with a SINGLE generic ``risk_kline_wss_failure`` reason
+        AND one ``warn()`` is emitted per failed symbol naming the specific
+        WSS reason (so the operator reconciles a histogram entry with the
+        warn-log cluster around it). All four calls fire upfront so
+        ``needs_reconnect`` side effects propagate even when an earlier
+        symbol fails.
         """
         if not self._cfg.enabled:
             return MomentumGateResult(
@@ -147,13 +158,16 @@ class MomentumGate:
             return self._skip("gate_no_wss_client")
 
         cc = self._candle_count
-        # ----- Read rings -----
+        # ----- Read rings (all four upfront) -----
         # Returns (klines, skip_reason). klines is list of
-        # [ts_ms, o, h, l, c, v] arrays oldest-first; None on stale or
-        # insufficient.
+        # [ts_ms, o, h, l, c, v] arrays oldest-first; None on any WSS skip.
+        # All four reads happen BEFORE any None-check so each call's side
+        # effect (notably ``needs_reconnect`` from item 13) fires regardless
+        # of which symbol(s) ultimately fail.
         btc_arr, btc_reason = self._wss.get_window(self._cfg.btc_symbol, cutoff_ts_ms, cc)
         eth_arr, eth_reason = self._wss.get_window(self._cfg.eth_symbol, cutoff_ts_ms, cc)
         sol_arr, sol_reason = self._wss.get_window(self._cfg.sol_symbol, cutoff_ts_ms, cc)
+        bnb_arr, bnb_reason = self._wss.get_window(self._cfg.bnb_symbol, cutoff_ts_ms, cc)
 
         # In-memory read; no fetch-timing meaningful (sub-ms).
         self.last_fetch_timing = {"btc_ms": 0, "eth_ms": 0, "sol_ms": 0}
@@ -175,10 +189,6 @@ class MomentumGate:
         self.last_btc_klines_raw = _arr_to_dicts(btc_arr)
         self.last_eth_klines_raw = _arr_to_dicts(eth_arr)
         self.last_sol_klines_raw = _arr_to_dicts(sol_arr)
-        # response_headers no longer apply (no per-round HTTP). Always None.
-        self.last_btc_response_headers = None
-        self.last_eth_response_headers = None
-        self.last_sol_response_headers = None
         # Returns snapshot (uses available closes; partial data still produces
         # something for capture, even on stale paths).
         _btc_closes_snap = [float(k[4]) for k in btc_arr] if btc_arr else None
@@ -189,41 +199,41 @@ class MomentumGate:
             mtf_lookbacks=self._cfg.mtf_lookbacks,
         )
 
-        # ----- Multi-instrument independence policy -----
-        # BTC stale = hard block.
+        # ----- WSS failure handling (Phase 2 spec item 16) -----
+        # Collect every symbol that returned a skip reason from get_window.
+        # If ANY failed, log one warn() per failed symbol naming the
+        # specific reason, then skip the round with the single generic
+        # ``risk_kline_wss_failure`` reason.
+        failures: list[tuple[str, str]] = []
         if btc_arr is None:
-            return self._skip("risk_kline_wss_stale" if btc_reason == "wss_stale"
-                              else f"gate_btc_{btc_reason}")
-        # ETH+SOL both stale (correlated outage indicator) = block.
-        if eth_arr is None and sol_arr is None and eth_reason == "wss_stale" and sol_reason == "wss_stale":
-            return self._skip("risk_kline_wss_correlated_stale")
-        # Either ETH or SOL alone stale: degrade -- pass None so
-        # _compute_signal treats them as silent and we lose only the
-        # regime-2 / confirmation paths.
-        # (No additional code needed; _compute_signal accepts None closes.)
-
-        # ----- Validate (legacy-equivalent) -----
-        # Validation now amounts to: BTC has >= candle_count candles AND
-        # the newest candle's open_time matches cutoff_ms - 1000. WSS commits
-        # candles aligned to UTC seconds via the confirm=="1" gate, so the
-        # newest-ts check is a sanity assertion rather than a reliability
-        # gate (the ring won't include in-progress candles in the first
-        # place).
-        if len(btc_arr) < cc:
-            return self._skip("gate_btc_wss_insufficient")
-        if int(btc_arr[-1][0]) != cutoff_ts_ms - 1000:
-            return self._skip(
-                f"gate_btc_unexpected_newest:got={btc_arr[-1][0]},expected={cutoff_ts_ms - 1000}"
-            )
+            failures.append(("btc", btc_reason or "unknown"))
+        if eth_arr is None:
+            failures.append(("eth", eth_reason or "unknown"))
+        if sol_arr is None:
+            failures.append(("sol", sol_reason or "unknown"))
+        if bnb_arr is None:
+            failures.append(("bnb", bnb_reason or "unknown"))
+        if failures:
+            for sym, reason in failures:
+                # Note: event tag is "FAIL" (NOT "SKIP") -- the generic
+                # skip reason already conveys the round was skipped; this
+                # log row is the per-symbol detail for operator triage.
+                warn("WSS_GATE", sym.upper(), "FAIL", msg=f"reason={reason}")
+            return self._skip(_WSS_FAILURE_SKIP_REASON)
 
         # ----- Compute signal -----
+        # Past the failures-collection block above, all four arrays are
+        # non-None and length-exactly-``cc`` (post-item-9+10 contract:
+        # ``get_window`` returns ``wss_insufficient`` when too few candles
+        # exist before cutoff, and ``wss_newest_lagging`` when the newest
+        # is behind expected -- both surface as failures-collection skips
+        # before we get here). All previously-defensive ``len(<x>_arr) < cc``
+        # / ``if x_arr and len(x_arr) >= cc else None`` branches were
+        # provably dead and removed in Phase 2 spec item 17 part D
+        # (2026-04-27).
         btc_closes = [float(k[4]) for k in btc_arr]
-        eth_closes = (
-            [float(k[4]) for k in eth_arr] if eth_arr and len(eth_arr) >= cc else None
-        )
-        sol_closes = (
-            [float(k[4]) for k in sol_arr] if sol_arr and len(sol_arr) >= cc else None
-        )
+        eth_closes = [float(k[4]) for k in eth_arr]
+        sol_closes = [float(k[4]) for k in sol_arr]
         self.last_btc_closes = btc_closes
         return _compute_signal(
             btc_closes, eth_closes, sol_closes,

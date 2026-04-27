@@ -81,6 +81,32 @@ def _utc_now() -> float:
     return time.time() - _clock_skew_seconds
 
 
+def _check_wss_health(gate) -> None:
+    """Raise ``InvariantError`` if the WSS daemon has set a fatal error.
+
+    Called once per round in housekeeping. The WSS daemon sets
+    ``_fatal_error`` on unrecoverable conditions (boundary mismatch /
+    boundary unavailable after retry / first-push escalation / newest-
+    lagging 3-cycle escalation), AND signals ``_stop_event`` -- but the
+    main loop continues iterating and the gate happily returns
+    ``risk_kline_wss_failure`` skips for every subsequent round. Without
+    this check the bot looks healthy in normal logs while serving nothing.
+    Per Phase 2 spec item 17 part A (2026-04-27), poll here and crash so
+    the supervisor restarts and alerts fire.
+
+    No-op when *gate* is None (backtest / sync paths) or when the gate
+    wasn't constructed with a wss client (test fixtures).
+    """
+    if gate is None:
+        return
+    wss = getattr(gate, "_wss", None)
+    if wss is None or not hasattr(wss, "fatal_error"):
+        return
+    fatal = wss.fatal_error()
+    if fatal is not None:
+        raise InvariantError(f"okx_wss_fatal: {fatal}")
+
+
 def _refresh_clock_skew(gate) -> None:
     """Best-effort skew re-measurement via OKX /api/v5/public/time.
 
@@ -503,6 +529,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 # _utc_now() for skew-corrected scheduling. ~150-500ms;
                 # absorbed comfortably in the housekeeping window.
                 _refresh_clock_skew(gate)
+                # Fail loud if the WSS daemon has set a fatal error.
+                # Without this poll the bot would silently emit
+                # ``risk_kline_wss_failure`` skips forever (per Phase 2
+                # spec item 17 part A, 2026-04-27).
+                _check_wss_health(gate)
 
         # Pool data from WSS subscription (no RPC needed, ~0 ms).
         pool_bull_bnb = 0.0

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os as _os
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -21,42 +20,25 @@ from pancakebot.log import info
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.market_data.round_sync import sync_closed_rounds
 from pancakebot.market_data.graph_client import GraphClient
-from pancakebot.market_data.okx_client import OkxClient
+from pancakebot.market_data.okx_client import OkxClient, RETRY_SYNC, okx_rate_acquire
 from pancakebot.market_data.kline_store import KlineStore
 from time import sleep as sleep_seconds
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 
-# Per-round 1s candle count fetched from OKX history. 300 is the
-# maximum the OKX /history-candles endpoint accepts in a single
-# request and matches the post-rebuild on-disk dataset shape
-# (2026-04-26 rebuild — see research/resync_300candle_cutoff1.py).
-# The strategy slices these to the actual ``max(mtf_lookbacks) + 1``
-# window at decision time (see ``[strategy.gate].mtf_lookbacks`` in
-# config.toml). Loading the full 300-candle window keeps the on-disk
-# store flexible for matrix experiments that vary cutoff and
-# lookbacks without re-fetching.
-_KLINES_PER_ROUND = 300
-_FETCH_WORKERS = 4      # concurrent OKX fetches per batch
-# Retry is now handled inside OkxClient.fetch_raw (centralized policy).
+# Per-round 1s candle window. Anchored to ``lock_at`` only — independent of
+# ``kline_cutoff_seconds`` (which is a strategy/gate-only knob, not a fetch
+# parameter). Matches the 2026-04-26 rebuild's on-disk shape exactly:
+#   oldest open_ts = lock_at_ms - 301_000   (300 candles, oldest-first)
+#   newest open_ts = lock_at_ms - 2_000     (one extra past gate window)
+# 300 candles is the maximum OKX ``/history-candles`` accepts per request.
+_HISTORY_OLDEST_OFFSET_MS = 301_000
+_HISTORY_NEWEST_OFFSET_MS = 2_000
+_FETCH_WORKERS = 4  # concurrent OKX fetches per batch
 
-# Global rate limiter: OKX allows 20 req/2s per endpoint per IP = 10/s.
-# All sync threads share this to avoid 429 errors.
-_OKX_RATE_LIMIT_PER_SEC = 8  # safely under 10/s
-_rate_lock = threading.Lock()
-_rate_last = 0.0
-
-
-def _rate_acquire() -> None:
-    """Block until we can make another OKX request without exceeding rate limit."""
-    global _rate_last
-    min_interval = 1.0 / _OKX_RATE_LIMIT_PER_SEC
-    with _rate_lock:
-        now = time.monotonic()
-        wait = _rate_last + min_interval - now
-        if wait > 0:
-            time.sleep(wait)
-        _rate_last = time.monotonic()
+# OKX REST rate budget moved to pancakebot.market_data.okx_client
+# (``okx_rate_acquire``). Sync's bulk fetch + WSS bootstrap + WSS gap-fill
+# all share the same process-wide token bucket.
 
 _BNB_KLINES_PATH = Path(_proj_paths.BNB_SPOT_PRICES_PATH)
 _BTC_KLINES_PATH = Path(_proj_paths.BTC_SPOT_PRICES_PATH)
@@ -139,32 +121,33 @@ def sync_runtime_market_data(
     eth_store = KlineStore(str(_ETH_KLINES_PATH))
     sol_store = KlineStore(str(_SOL_KLINES_PATH))
 
-    cutoff_s = int(cfg.kline_cutoff_seconds)
     # All 4 pairs run in parallel -- the shared _rate_acquire() limiter
-    # throttles total OKX requests to 8/s across all threads.
+    # throttles total OKX requests to 8/s across all threads. Note: the
+    # per-round window is now derived from lock_at only; cfg.kline_cutoff_seconds
+    # is intentionally NOT used here (silent-corruption fix 2026-04-27).
     with ThreadPoolExecutor(max_workers=4) as pool:
         bnb_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="BNB-USDT",
-            store=bnb_store, label="BNB", cutoff_seconds=cutoff_s,
+            store=bnb_store, label="BNB",
             okx_client=okx_client,
         )
         btc_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="BTC-USDT",
-            store=btc_store, label="BTC", cutoff_seconds=cutoff_s,
+            store=btc_store, label="BTC",
             okx_client=okx_client,
         )
         eth_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="ETH-USDT",
-            store=eth_store, label="ETH", cutoff_seconds=cutoff_s,
+            store=eth_store, label="ETH",
             okx_client=okx_client,
         )
         sol_fut = pool.submit(
             _sync_1s_klines,
             rounds=tail_rounds, inst_id="SOL-USDT",
-            store=sol_store, label="SOL", cutoff_seconds=cutoff_s,
+            store=sol_store, label="SOL",
             okx_client=okx_client,
         )
         bnb_synced = bnb_fut.result()
@@ -225,7 +208,6 @@ def _sync_1s_klines(
     inst_id: str,
     store: KlineStore,
     label: str,
-    cutoff_seconds: int = 2,
     okx_client: OkxClient,
 ) -> int:
     """Fetch 1s OKX klines for rounds not yet in the store. Returns count synced.
@@ -275,7 +257,7 @@ def _sync_1s_klines(
         total_synced += _fetch_and_append(
             rounds_asc=append_rounds, inst_id=inst_id, store=store, label=label,
             latest_on_disk=latest_on_disk, done_count=len(done_epochs),
-            cutoff_seconds=cutoff_seconds, okx_client=okx_client,
+            okx_client=okx_client,
         )
 
     # --- Pass 2: Prepend (epochs before existing store) ---
@@ -284,7 +266,7 @@ def _sync_1s_klines(
         synced = _fetch_to_staging(
             rounds_asc=prepend_rounds, inst_id=inst_id,
             staging_path=staging_path, label=label,
-            cutoff_seconds=cutoff_seconds, okx_client=okx_client,
+            okx_client=okx_client,
         )
         if synced > 0:
             _prepend_staging_to_store(store=store, staging_path=staging_path, label=label)
@@ -296,7 +278,7 @@ def _sync_1s_klines(
 
 def _fetch_and_append(
     *, rounds_asc: list, inst_id: str, store: KlineStore, label: str,
-    latest_on_disk: int | None, done_count: int, cutoff_seconds: int = 2,
+    latest_on_disk: int | None, done_count: int,
     okx_client: OkxClient,
 ) -> int:
     """Fetch epochs in ordered batches and append each to store immediately.
@@ -312,7 +294,7 @@ def _fetch_and_append(
         if batch_start > 0:
             time.sleep(1.0)
 
-        results = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds, okx_client=okx_client)
+        results = _fetch_batch(batch, inst_id, okx_client=okx_client)
         if not results:
             continue
 
@@ -340,7 +322,7 @@ def _fetch_and_append(
 
 def _fetch_to_staging(
     *, rounds_asc: list, inst_id: str, staging_path: str, label: str,
-    cutoff_seconds: int = 2, okx_client: OkxClient,
+    okx_client: OkxClient,
 ) -> int:
     """Fetch older epochs into a staging file (resumable append-only).
 
@@ -370,7 +352,7 @@ def _fetch_to_staging(
             if batch_start > 0:
                 time.sleep(1.0)
 
-            results = _fetch_batch(batch, inst_id, cutoff_seconds=cutoff_seconds, okx_client=okx_client)
+            results = _fetch_batch(batch, inst_id, okx_client=okx_client)
 
             for rec in results:
                 staging_f.write(json.dumps(rec, separators=(",", ":")) + "\n")
@@ -412,7 +394,7 @@ def _prepend_staging_to_store(*, store: KlineStore, staging_path: str, label: st
          msg=f"  prepended {len(staging_records)} older epochs into store")
 
 
-def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient, cutoff_seconds: int = 2) -> list[dict]:
+def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient) -> list[dict]:
     """Fetch a batch of rounds in parallel.
 
     Returns the list of kline records. Propagates any exception raised by
@@ -420,61 +402,34 @@ def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient, cutoff_second
     """
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one_kline, rnd, inst_id, okx_client, cutoff_seconds): rnd for rnd in batch}
+        futures = {pool.submit(_fetch_one_kline, rnd, inst_id, okx_client): rnd for rnd in batch}
         for fut in as_completed(futures):
             rec = fut.result()  # propagates exception on failure
             results.append(rec)
     return results
 
 
-def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient, cutoff_seconds: int = 2) -> dict:
-    """Fetch 1s klines for a single round. Returns record dict.
+def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient) -> dict:
+    """Fetch 1s klines for a single round via the canonical primitive.
 
-    Raises InvariantError via _fetch_1s_klines if OkxClient's retry exhausts.
+    Window is anchored to ``lock_at`` only — strategy-side ``cutoff_seconds``
+    does NOT enter the fetch math. Produces records bit-identical to the
+    2026-04-26 rebuild's on-disk shape:
+      newest open_ts = lock_at_ms - 2_000
+      oldest open_ts = lock_at_ms - 301_000
+      300 candles, oldest-first
+
+    Raises InvariantError if the shared retry policy in
+    ``OkxClient.fetch_kline_window`` exhausts.
     """
     epoch = int(rnd.epoch)
     lock_at = int(rnd.lock_at)
-    cutoff_ms = lock_at * 1000 - cutoff_seconds * 1000
-    klines = _fetch_1s_klines(inst_id=inst_id, anchor_ms=cutoff_ms, okx_client=okx_client)
+    lock_at_ms = lock_at * 1000
+    klines = okx_client.fetch_kline_window(
+        symbol=inst_id,
+        oldest_open_ms=lock_at_ms - _HISTORY_OLDEST_OFFSET_MS,
+        newest_open_ms_inclusive=lock_at_ms - _HISTORY_NEWEST_OFFSET_MS,
+        retry_policy=RETRY_SYNC,
+        rate_acquire_fn=okx_rate_acquire,
+    )
     return {"epoch": epoch, "lock_at": lock_at, "klines_1s": klines}
-
-
-def _fetch_1s_klines(*, inst_id: str, anchor_ms: int, okx_client: OkxClient) -> list[list]:
-    """Fetch 1s klines ending just before anchor_ms from OKX (sync mode).
-
-    Tries history-candles first, falls back to the candles endpoint on
-    InvariantError from the primary. Retry is handled inside OkxClient.fetch_raw.
-
-    Returns list of [ts_ms, open, high, low, close, volume] sorted oldest-first.
-    Raises InvariantError if both endpoints exhaust retries.
-    """
-    params = {
-        "instId": inst_id,
-        "bar": "1s",
-        "limit": str(_KLINES_PER_ROUND),
-        "after": str(anchor_ms),
-    }
-    endpoints = ("history-candles", "candles")
-    for i, endpoint in enumerate(endpoints):
-        is_last = (i == len(endpoints) - 1)
-        try:
-            body = okx_client.fetch_raw(
-                endpoint=endpoint,
-                params=params,
-                expected_count=_KLINES_PER_ROUND,
-                rate_acquire_fn=_rate_acquire,
-            )
-        except InvariantError:
-            if is_last:
-                raise
-            continue  # try fallback endpoint
-
-        rows = body["data"]  # newest first; OkxClient guarantees len == _KLINES_PER_ROUND
-        return [
-            [int(row[0]), float(row[1]), float(row[2]), float(row[3]),
-             float(row[4]), float(row[5])]
-            for row in reversed(rows)
-        ]
-
-    # Unreachable: loop either returns or raises on the last iteration.
-    raise InvariantError(f"okx_sync_unreachable: inst={inst_id}")

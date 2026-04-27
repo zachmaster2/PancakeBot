@@ -83,28 +83,6 @@ def test_warmup_swallows_close_exception():
     assert c._session is new_sess
 
 
-def test_warmup_preserves_response_headers_dict():
-    """The OkxClient._last_response_headers dict (per-symbol cache for
-    diagnostic header capture) must survive the session swap.
-
-    It's an OkxClient attribute, not on Session, so this is a sanity
-    check that the fix doesn't inadvertently clear it.
-    """
-    c = OkxClient(timeout_seconds=5.0)
-    c._last_response_headers["BTC-USDT"] = {"cf-cache-status": "DYNAMIC", "age": "0"}
-
-    with mock.patch("pancakebot.market_data.okx_client.requests.Session") as mock_session_ctor:
-        new_sess = mock.MagicMock()
-        new_sess.get.return_value = mock.MagicMock(status_code=200)
-        mock_session_ctor.return_value = new_sess
-        c.warmup(connections=1)
-
-    # Headers from prior rounds should still be readable post-warmup.
-    assert c._last_response_headers["BTC-USDT"] == {
-        "cf-cache-status": "DYNAMIC", "age": "0",
-    }
-
-
 def test_warmup_handles_request_exception_gracefully():
     """If the warmup GET raises, warmup must not propagate the exception."""
     import requests
