@@ -205,19 +205,27 @@ def _client_with_canned_response(resp):
 
 
 def test_kline_fetch_window_accepts_contiguous_sequence():
-    """Happy path: 3 strictly-contiguous candles pass."""
+    """Happy path: 3 strictly-contiguous candles pass.
+
+    Return shape is ``(rows, rtt_ms)`` since the 2026-04-27 timing fix.
+    The mock response returns instantly so rtt_ms should be ~0 ms.
+    """
     # OKX returns newest-first; we want internal oldest-first
     # [1000_000, 1001_000, 1002_000].
     rows = [_okx_row(1002_000), _okx_row(1001_000), _okx_row(1000_000)]
     resp = _mock_okx_response(rows)
     c = _client_with_canned_response(resp)
-    arrays = c.kline_fetch_window(
+    arrays, rtt_ms = c.kline_fetch_window(
         symbol="BTC-USDT",
         oldest_open_ms=1000_000,
         newest_open_ms_inclusive=1002_000,
         retry_policy=RETRY_GATE,
     )
     assert [a[0] for a in arrays] == [1000_000, 1001_000, 1002_000]
+    # Mocked .get() returns instantly; rtt_ms should be a small non-negative int.
+    assert isinstance(rtt_ms, int)
+    assert rtt_ms >= 0
+    assert rtt_ms < 100, f"mocked .get() should be near-instant, got {rtt_ms}ms"
 
 
 def test_kline_fetch_window_rejects_gap_in_middle():

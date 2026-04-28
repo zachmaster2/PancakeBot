@@ -238,6 +238,73 @@ def test_noncontiguous_rows_raise_invariant_error():
 
 
 # ---------------------------------------------------------------------------
+# Return shape: (rows, rtt_ms)
+# ---------------------------------------------------------------------------
+
+
+def test_returns_rows_and_rtt_ms_tuple():
+    """Return shape is ``(rows, rtt_ms)`` since the 2026-04-27 timing fix.
+
+    ``rtt_ms`` is the wall-clock duration of the SUCCESSFUL
+    ``session.get(...)`` call only. With a mocked .get() that returns
+    instantly, rtt_ms should be a small non-negative int.
+    """
+    client = OkxClient(timeout_seconds=5.0)
+    oldest = 1_777_007_690_000
+    newest = oldest + 15 * 1000
+    rows = _flat_rows(oldest_open_ms=oldest, count=16)
+    with mock.patch.object(
+        client._session, "get", return_value=_make_kline_response(rows),
+    ):
+        result = client.kline_fetch_window(
+            symbol="BTC-USDT",
+            oldest_open_ms=oldest,
+            newest_open_ms_inclusive=newest,
+            retry_policy=_FAST_RETRY,
+            send_before_bound=True,
+        )
+    assert isinstance(result, tuple) and len(result) == 2, (
+        f"return type must be a 2-tuple (rows, rtt_ms); got {type(result).__name__}"
+    )
+    arrays, rtt_ms = result
+    assert len(arrays) == 16
+    assert isinstance(rtt_ms, int)
+    assert rtt_ms >= 0
+    assert rtt_ms < 100, f"mocked .get() should be near-instant, got {rtt_ms}ms"
+
+
+def test_rtt_ms_excludes_rate_limiter_wait():
+    """``rtt_ms`` is measured AROUND the ``session.get(...)`` call only.
+    A long ``rate_acquire_fn`` sleep before .get() must not inflate it."""
+    import time as _time
+    client = OkxClient(timeout_seconds=5.0)
+    oldest = 1_777_007_690_000
+    newest = oldest + 15 * 1000
+    rows = _flat_rows(oldest_open_ms=oldest, count=16)
+
+    def slow_rate_acquire():
+        # 200ms wait BEFORE .get() — should be excluded from rtt_ms.
+        _time.sleep(0.2)
+
+    with mock.patch.object(
+        client._session, "get", return_value=_make_kline_response(rows),
+    ):
+        _arrays, rtt_ms = client.kline_fetch_window(
+            symbol="BTC-USDT",
+            oldest_open_ms=oldest,
+            newest_open_ms_inclusive=newest,
+            retry_policy=_FAST_RETRY,
+            send_before_bound=True,
+            rate_acquire_fn=slow_rate_acquire,
+        )
+    # Rate-limiter sleep was 200ms; rtt_ms should be <50ms (mocked .get()).
+    assert rtt_ms < 50, (
+        f"rtt_ms must exclude rate-limiter wait; got {rtt_ms}ms "
+        f"after a 200ms rate_acquire_fn sleep"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Standalone runner
 # ---------------------------------------------------------------------------
 

@@ -107,9 +107,16 @@ def _trending_klines(
     ]
 
 
-def _make_router(*, ok_klines: list[list], errors: dict[str, Exception] | None = None):
+def _make_router(
+    *,
+    ok_klines: list[list],
+    errors: dict[str, Exception] | None = None,
+    rtt_ms: int = 100,
+):
     """side_effect router for fake_client.kline_fetch_window. Symbols in
-    ``errors`` map to a raise; everything else returns ``ok_klines``.
+    ``errors`` map to a raise; everything else returns the new
+    ``(rows, rtt_ms)`` tuple shape introduced 2026-04-27 alongside the
+    true-RTT-timing fix.
 
     Accepts arbitrary kwargs so the router doesn't have to track every
     optional ``kline_fetch_window`` parameter (``send_before_bound`` etc.)."""
@@ -118,7 +125,7 @@ def _make_router(*, ok_klines: list[list], errors: dict[str, Exception] | None =
     def _fetch(*, symbol, **_kwargs):
         if symbol in errors:
             raise errors[symbol]
-        return ok_klines
+        return ok_klines, rtt_ms
 
     return _fetch
 
@@ -221,6 +228,28 @@ def test_evaluate_populates_last_fetch_timing_with_four_entries():
     gate.evaluate(lock_at_ms=_LOCK_AT_MS)
     assert gate.last_fetch_timing is not None
     assert set(gate.last_fetch_timing.keys()) == {"btc_ms", "eth_ms", "sol_ms", "bnb_ms"}
+
+
+def test_evaluate_records_per_symbol_rtt_from_fetch_return():
+    """``last_fetch_timing`` records the rtt_ms returned by each
+    ``kline_fetch_window`` call (true per-symbol HTTP RTT), NOT
+    wall-clock since submit-loop start. This guarantees rate-limiter
+    wait does not bleed into the timing log."""
+    gate, fake_client = _make_gate()
+    # Router returns rtt_ms=42 for every symbol regardless of symbol or
+    # window args. The gate's reap loop should record this verbatim.
+    fake_client.kline_fetch_window.side_effect = _make_router(
+        ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS),
+        rtt_ms=42,
+    )
+    gate.evaluate(lock_at_ms=_LOCK_AT_MS)
+    assert gate.last_fetch_timing == {
+        "btc_ms": 42, "eth_ms": 42, "sol_ms": 42, "bnb_ms": 42,
+    }, (
+        f"last_fetch_timing must reflect per-symbol rtt_ms returned by "
+        f"kline_fetch_window, not wall-clock-since-submit; "
+        f"got {gate.last_fetch_timing}"
+    )
 
 
 def test_evaluate_returns_no_signal_on_flat_market():
