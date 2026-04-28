@@ -25,7 +25,6 @@ and applied by the engine; the gate itself just consumes ``lock_at_ms``.
 
 from __future__ import annotations
 
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -119,8 +118,12 @@ class MomentumGate:
         # construction; used for validation post-fetch and for the live
         # signal computation slice.
         self._candle_count = max(config.mtf_lookbacks) + 1
-        # Per-pair fetch timing (ms) -- set each evaluate(), logged by caller
-        # AFTER timing guard so file I/O doesn't delay bet submission.
+        # Per-pair true HTTP RTT (ms), keyed ``{btc,eth,sol,bnb}_ms`` --
+        # the duration of the successful ``session.get(...)`` call only
+        # (excludes rate-limiter wait, excludes thread-pool scheduling,
+        # excludes retry backoff). Set each evaluate(), logged by the
+        # caller AFTER the timing guard so file I/O doesn't delay bet
+        # submission.
         self.last_fetch_timing: dict[str, int] | None = None
         # Consecutive-failure escalation state (TransientOkxError streak).
         self._consecutive_fetch_failures: int = 0
@@ -175,16 +178,15 @@ class MomentumGate:
 
         # ----- Parallel REST fetch (4 symbols) -----
         # Submit all four upfront so the network round-trips overlap.
-        # ThreadPoolExecutor + okx_rate_acquire share the global 8/s budget.
-        # ``as_completed`` reaps futures in finish-order so per-symbol
-        # ``durations`` reflect true individual latency (not iteration order).
+        # ThreadPoolExecutor + okx_rate_acquire share the global token-bucket
+        # budget (capacity 8, refill 8/s) -- a 4-symbol burst once per round
+        # fits inside the bucket and fires with no FIFO stagger.
         symbols = {
             "btc": self._cfg.btc_symbol,
             "eth": self._cfg.eth_symbol,
             "sol": self._cfg.sol_symbol,
             "bnb": self._cfg.bnb_symbol,
         }
-        submit_time = time.perf_counter()
         futures = {
             self._executor.submit(
                 self._client.kline_fetch_window,
@@ -205,14 +207,18 @@ class MomentumGate:
         results: dict[str, list[list]] = {}
         errors: dict[str, Exception] = {}
         durations: dict[str, int] = {}
-        # Block until ALL futures complete (same wait-for-all behaviour as
-        # the prior submission-order loop) but timestamp each one at its
-        # actual completion, not when the iterator reaches it.
+        # Reap futures in finish-order. ``rtt_ms`` is the per-symbol HTTP
+        # RTT measured INSIDE ``kline_fetch_window`` around the
+        # ``session.get(...)`` call only -- excludes rate-limiter wait,
+        # retry-backoff sleeps, and thread-pool scheduling. So this
+        # reflects true network round-trip per symbol, not "wall-clock
+        # since submit-loop start" (which was the prior measurement).
         for fut in as_completed(futures):
             sym_short = futures[fut]
-            durations[sym_short] = int((time.perf_counter() - submit_time) * 1000)
             try:
-                results[sym_short] = fut.result()
+                rows, rtt_ms = fut.result()
+                results[sym_short] = rows
+                durations[sym_short] = rtt_ms
             except (InvariantError, TransientOkxError) as e:
                 errors[sym_short] = e
         self.last_fetch_timing = {f"{sym}_ms": ms for sym, ms in durations.items()}

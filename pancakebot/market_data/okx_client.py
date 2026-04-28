@@ -66,27 +66,79 @@ _JITTER_MAX = 1.5
 # All in-process callers (sync.py bulk fetch, per-round live-gate fetch)
 # use ``okx_rate_acquire`` so a single token bucket throttles total OKX
 # load across the live system.
+#
+# Token-bucket shape (capacity = refill_rate = 8): burst up to 8 requests
+# instantly, then 1 token / 125 ms refill. Live gate fires 4 symbols per
+# round (every 5 min) -- well within burst capacity, so all 4 acquire
+# immediately with zero stagger. Sync.py's bulk fetch sustains close to
+# 8 req/s long-run (refill-rate-limited, no burst gain after the first
+# 8 requests). The previous "leaky bucket with no burst" implementation
+# slept while holding the rate-limiter lock, which serialized concurrent
+# parallel-symbol acquires at FIFO 125 ms intervals; the token bucket
+# never sleeps under the lock, so concurrent acquires don't serialize
+# unless the bucket is genuinely empty.
 # ---------------------------------------------------------------------------
 
 _OKX_RATE_LIMIT_PER_SEC = 8
+_OKX_RATE_BUCKET_CAPACITY = 8
 _okx_rate_lock = threading.Lock()
-_okx_rate_last_t: float = 0.0
+# Bucket starts FULL so the first burst after process start fires
+# unconstrained (no synthetic startup penalty).
+_okx_rate_tokens: float = float(_OKX_RATE_BUCKET_CAPACITY)
+_okx_rate_last_refill_t: float = 0.0
+
+
+def _okx_rate_reset_for_tests() -> None:
+    """Reset the global rate-limiter state (test-only helper).
+
+    Tests need a clean bucket per case so behavior is deterministic.
+    Safe to call between tests; not thread-safe with concurrent acquires.
+    """
+    global _okx_rate_tokens, _okx_rate_last_refill_t
+    with _okx_rate_lock:
+        _okx_rate_tokens = float(_OKX_RATE_BUCKET_CAPACITY)
+        _okx_rate_last_refill_t = time.monotonic()
 
 
 def okx_rate_acquire() -> None:
-    """Block until we can make another OKX request without exceeding 8/s.
+    """Acquire one OKX-rate token. Blocks only when the bucket is empty.
+
+    Token bucket semantics:
+      - Capacity = ``_OKX_RATE_BUCKET_CAPACITY`` tokens (default 8).
+      - Refill = ``_OKX_RATE_LIMIT_PER_SEC`` tokens/sec (default 8/s),
+        i.e. one token every 125 ms.
+      - Lazy refill: each call computes ``elapsed * refill_rate`` new
+        tokens since the last refill timestamp, clamped to capacity.
+      - If a token is available, decrement and return immediately.
+      - If empty, sleep ``time-until-next-token`` OUTSIDE the lock,
+        re-enter, and retake. The lock is never held across ``time.sleep``.
 
     Process-wide shared budget. Pass as ``rate_acquire_fn`` to
     ``OkxClient.kline_fetch_window``.
     """
-    global _okx_rate_last_t
-    min_interval = 1.0 / _OKX_RATE_LIMIT_PER_SEC
-    with _okx_rate_lock:
-        now = time.monotonic()
-        wait = _okx_rate_last_t + min_interval - now
-        if wait > 0:
-            time.sleep(wait)
-        _okx_rate_last_t = time.monotonic()
+    global _okx_rate_tokens, _okx_rate_last_refill_t
+    refill_rate = float(_OKX_RATE_LIMIT_PER_SEC)
+    capacity = float(_OKX_RATE_BUCKET_CAPACITY)
+    while True:
+        with _okx_rate_lock:
+            now = time.monotonic()
+            elapsed = now - _okx_rate_last_refill_t
+            if elapsed > 0.0:
+                _okx_rate_tokens = min(
+                    capacity, _okx_rate_tokens + elapsed * refill_rate,
+                )
+                _okx_rate_last_refill_t = now
+            if _okx_rate_tokens >= 1.0:
+                _okx_rate_tokens -= 1.0
+                return
+            # Bucket empty: compute wait time for the next token.
+            tokens_short = 1.0 - _okx_rate_tokens
+            wait_s = tokens_short / refill_rate
+        # Sleep OUTSIDE the lock so other threads can refill/acquire
+        # in parallel if the bucket happens to refill from another
+        # source (e.g. test resets) or simply observe their own wait
+        # times concurrently.
+        time.sleep(wait_s)
 
 # ---------------------------------------------------------------------------
 # Retry policy
@@ -182,8 +234,14 @@ class OkxClient:
         self._timeout_seconds = timeout_seconds
         self._session = requests.Session()
 
-    def warmup(self, connections: int = 3) -> None:
+    def warmup(self, connections: int = 4) -> None:
         """Fill the connection pool so parallel fetches hit warm connections.
+
+        Default ``connections=4`` matches the live decision-path gate's
+        4-symbol concurrent fetch (BTC/ETH/SOL/BNB), so every parallel
+        request finds a pre-established TLS connection. With only 3 warm
+        sockets, the 4th symbol used to pay an ~80-150ms TLS handshake
+        on the critical path every cold round.
 
         Per-round freshness: BEFORE filling the pool, close the existing
         ``self._session`` and replace it with a brand-new
@@ -325,17 +383,29 @@ class OkxClient:
         retry_policy: RetryPolicy = RETRY_SYNC,
         rate_acquire_fn: Callable[[], None] | None = None,
         send_before_bound: bool = False,
-    ) -> list[list]:
+    ) -> tuple[list[list], int]:
         """Fetch the inclusive 1s-candle window ``[oldest_open_ms, newest_open_ms_inclusive]``
         from OKX ``/api/v5/market/history-candles``.
 
-        Returns oldest-first list of ``[ts_ms, open, high, low, close, volume]``
-        arrays. Length is exactly ``(newest - oldest)/1000 + 1``. The query
-        always sends ``after = newest + 1000``; when ``send_before_bound=True``
-        it additionally sends ``before = oldest - 1000`` (both exclusive in
-        OKX semantics), pinning the window so OKX cannot slide it when the
-        newest candle is unpublished. The returned oldest/newest open_times
-        are verified to equal the requested values; any deviation raises
+        Returns ``(rows, rtt_ms)`` where:
+          - ``rows`` is the oldest-first list of
+            ``[ts_ms, open, high, low, close, volume]`` arrays. Length
+            is exactly ``(newest - oldest)/1000 + 1``.
+          - ``rtt_ms`` is the wall-clock duration of the SUCCESSFUL
+            ``self._session.get(...)`` call only -- excludes rate-limiter
+            wait, retry backoff sleeps, JSON parse, and shape validation.
+            On a retry-then-success sequence, ``rtt_ms`` reports just the
+            successful attempt's network roundtrip (failed attempts are
+            reflected in the operator-facing ``RETRY``/``RECOVER`` log
+            lines rather than this metric). Callers that don't care about
+            timing can discard via ``rows, _ = client.kline_fetch_window(...)``.
+
+        The query always sends ``after = newest + 1000``; when
+        ``send_before_bound=True`` it additionally sends
+        ``before = oldest - 1000`` (both exclusive in OKX semantics),
+        pinning the window so OKX cannot slide it when the newest candle
+        is unpublished. The returned oldest/newest open_times are verified
+        to equal the requested values; any deviation raises
         ``InvariantError`` (catches OKX data holes that a length-only check
         would miss).
 
@@ -404,14 +474,22 @@ class OkxClient:
 
         last_detail = ""
         last_class: _OkxErrorClass | None = None
+        rtt_ms = 0
         for attempt in range(retry_policy.max_attempts):
             if rate_acquire_fn is not None:
                 rate_acquire_fn()
+            # Time only around the .get() call -- excludes rate wait and
+            # any prior retry backoff. On retry, this overwrites the
+            # previous attempt's measurement; on SUCCESS the value is the
+            # successful attempt's true HTTP RTT.
+            t_get_start = time.perf_counter()
             try:
                 resp = self._session.get(url, params=params, timeout=self._timeout_seconds)
             except requests.RequestException as e:
+                rtt_ms = int((time.perf_counter() - t_get_start) * 1000)
                 cls, detail = _classify_exception(e)
             else:
+                rtt_ms = int((time.perf_counter() - t_get_start) * 1000)
                 cls, detail = _classify_response(resp, expected_count)
 
             if cls == _OkxErrorClass.SUCCESS:
@@ -455,7 +533,7 @@ class OkxClient:
                             f"idx={i} prev_ts={arrays[i - 1][0]} cur_ts={arrays[i][0]} "
                             f"delta_ms={delta} (expected 1000)"
                         )
-                return arrays
+                return arrays, rtt_ms
 
             if cls == _OkxErrorClass.PERMANENT:
                 raise InvariantError(

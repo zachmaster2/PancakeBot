@@ -433,7 +433,9 @@ def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient) -> dict:
     epoch = int(rnd.epoch)
     lock_at = int(rnd.lock_at)
     lock_at_ms = lock_at * 1000
-    klines = okx_client.kline_fetch_window(
+    # Sync's bulk fetch doesn't consume the per-call RTT (no operator
+    # log line for it), so discard the second tuple element.
+    klines, _rtt_ms = okx_client.kline_fetch_window(
         symbol=inst_id,
         oldest_open_ms=lock_at_ms - _HISTORY_OLDEST_OFFSET_MS,
         newest_open_ms_inclusive=lock_at_ms - _HISTORY_NEWEST_OFFSET_MS,

@@ -1,7 +1,6 @@
 """Tests for OkxClient.warmup() session-reset behaviour.
 
-Verifies the per-round connection-affinity-break fix for OKX kline lag
-(see research/okx_kline_freshness_fix_design.md).
+Verifies the per-round connection-affinity-break fix for OKX kline lag.
 
 Run:
     python -m pytest tests/test_okx_client_warmup.py -v
@@ -9,6 +8,7 @@ Run:
 """
 from __future__ import annotations
 
+import inspect
 import sys
 from pathlib import Path
 from unittest import mock
@@ -18,6 +18,20 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from pancakebot.market_data.okx_client import OkxClient  # noqa: E402
+
+
+def test_warmup_default_connections_is_4():
+    """Default ``connections=4`` matches the live decision-path gate's
+    4-symbol concurrent fetch (BTC/ETH/SOL/BNB), so every parallel
+    request finds a pre-established TLS connection. Bumped from 3
+    after the 2026-04-27 audit found the 4th symbol was paying a
+    TLS handshake on every cold round."""
+    sig = inspect.signature(OkxClient.warmup)
+    default = sig.parameters["connections"].default
+    assert default == 4, (
+        f"OkxClient.warmup() default connections must be 4 to match "
+        f"the gate's 4-symbol concurrent fetch; got {default}"
+    )
 
 
 def test_warmup_replaces_session_with_fresh_instance():
