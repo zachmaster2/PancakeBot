@@ -125,17 +125,48 @@ class _FakeProc:
         }
 
 
-def _patch_process_iter(procs: list[_FakeProc]):
-    """Patch psutil.process_iter to yield the fake procs.
+def _patch_process_iter(procs: list[_FakeProc], *, parent_chain: list[int] | None = None):
+    """Patch psutil.process_iter + psutil.Process(self_pid).parent() chain.
 
     ``find_duplicate_bots`` does ``import psutil`` lazily inside the
     function body, so we have to inject the mock into ``sys.modules``
     rather than patching it as a module attribute (the import statement
-    binds the name in function scope, ignoring module attributes)."""
+    binds the name in function scope, ignoring module attributes).
+
+    ``parent_chain``: ordered list of ancestor PIDs, walking up from
+    self.  E.g. [99, 50, 1] means self.parent() -> 99, 99.parent() -> 50,
+    50.parent() -> 1, 1.parent() -> None.  Default empty (no parents).
+    """
+    NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+    AccessDenied = type("AccessDenied", (Exception,), {})
+    chain = list(parent_chain or [])
+
+    class _MockProcess:
+        def __init__(self, pid):
+            self.pid = pid
+            # Find this pid's index in the chain (-1 = self_pid)
+            try:
+                self._chain_idx = chain.index(pid)
+            except ValueError:
+                self._chain_idx = -2  # not in chain (e.g., self_pid)
+
+        def parent(self):
+            # If we're the self_pid (not in chain): return chain[0] if any
+            if self._chain_idx == -2:
+                if not chain:
+                    return None
+                return _MockProcess(chain[0])
+            # Otherwise walk one step up
+            next_idx = self._chain_idx + 1
+            if next_idx >= len(chain):
+                return None
+            return _MockProcess(chain[next_idx])
+
     fake_psutil = mock.MagicMock(
         process_iter=mock.MagicMock(return_value=iter(procs)),
-        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
-        AccessDenied=type("AccessDenied", (Exception,), {}),
+        Process=mock.MagicMock(side_effect=lambda pid: _MockProcess(pid)),
+        NoSuchProcess=NoSuchProcess,
+        AccessDenied=AccessDenied,
     )
     return mock.patch.dict(sys.modules, {"psutil": fake_psutil})
 
@@ -232,6 +263,81 @@ def test_find_duplicate_bots_returns_multiple_dupes():
         result = find_duplicate_bots()
     pids = sorted(r["pid"] for r in result)
     assert pids == [11, 22]
+
+
+def test_find_duplicate_bots_excludes_parent_with_matching_cmdline():
+    """The parent (e.g. py.exe launcher) carrying the same cmdline as the
+    self process (python.exe child) must NOT be flagged.
+
+    This is the production failure mode the ancestor-exclusion fix
+    addresses: ``Start-Process py run.py --dry`` spawns py.exe with
+    cmdline ``py run.py --dry``, which spawns python.exe with the same
+    cmdline.  Without ancestor exclusion, python.exe sees its own
+    py.exe parent as a "duplicate" and refuses to start.
+    """
+    self_pid = os.getpid()
+    parent_pid = 9999
+    procs = [
+        # Self
+        _FakeProc(pid=self_pid, create_time=10.0,
+                  cmdline=["python", "run.py", "--dry"]),
+        # py.exe launcher parent with same cmdline
+        _FakeProc(pid=parent_pid, create_time=9.0,
+                  cmdline=["py", "run.py", "--dry"]),
+    ]
+    with _patch_process_iter(procs, parent_chain=[parent_pid]):
+        result = find_duplicate_bots()
+    assert result == [], (
+        f"parent (pid={parent_pid}) should be excluded as ancestor; got {result}"
+    )
+
+
+def test_find_duplicate_bots_walks_ancestor_chain():
+    """Grandparent + parent + self all with bot cmdlines: none should fire.
+
+    Covers ``cmd.exe`` -> ``py.exe`` -> ``python.exe`` style chains.
+    """
+    self_pid = os.getpid()
+    parent_pid = 9999
+    grandparent_pid = 8888
+    procs = [
+        _FakeProc(pid=self_pid, create_time=10.0,
+                  cmdline=["python", "run.py", "--dry"]),
+        _FakeProc(pid=parent_pid, create_time=9.0,
+                  cmdline=["py", "run.py", "--dry"]),
+        _FakeProc(pid=grandparent_pid, create_time=8.0,
+                  cmdline=["cmd", "/c", "py", "run.py", "--dry"]),
+    ]
+    with _patch_process_iter(procs, parent_chain=[parent_pid, grandparent_pid]):
+        result = find_duplicate_bots()
+    assert result == [], (
+        f"all ancestors should be excluded; got {result}"
+    )
+
+
+def test_find_duplicate_bots_unrelated_parent_no_false_negative():
+    """Parent is NOT a bot (e.g. explorer.exe) and a TRUE duplicate exists
+    at a different PID: the duplicate must still be detected.
+
+    Guards against the fix being over-broad and excluding genuine duplicates.
+    """
+    self_pid = os.getpid()
+    explorer_pid = 1234
+    true_dup_pid = 200
+    procs = [
+        _FakeProc(pid=self_pid, create_time=10.0,
+                  cmdline=["python", "run.py", "--dry"]),
+        # Parent is explorer.exe (no bot cmdline)
+        _FakeProc(pid=explorer_pid, create_time=1.0,
+                  cmdline=["explorer.exe"]),
+        # True duplicate -- separate process running the bot
+        _FakeProc(pid=true_dup_pid, create_time=5.0,
+                  cmdline=["py", "run.py", "--config", "c.toml", "--dry"]),
+    ]
+    with _patch_process_iter(procs, parent_chain=[explorer_pid]):
+        result = find_duplicate_bots()
+    assert len(result) == 1, f"expected 1 dup; got {result}"
+    assert result[0]["pid"] == true_dup_pid
 
 
 def test_find_duplicate_bots_skips_empty_cmdline():
