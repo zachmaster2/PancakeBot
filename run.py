@@ -57,6 +57,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Archive existing dry state and start fresh (--dry only)")
     p.add_argument("--no-archive", action="store_true",
                    help="Delete (don't archive) existing state on --fresh (--dry only)")
+    p.add_argument("--use-extended-data", action="store_true",
+                   help="Backtest reads var/extended/ first then canonical var/ "
+                        "(default OFF preserves canonical bit-identical behavior)")
     args = p.parse_args(argv)
 
     selected = [args.sync, args.backtest, args.dry, args.live]
@@ -70,6 +73,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--fresh is only valid with --dry")
     if args.no_archive and not args.fresh:
         p.error("--no-archive requires --fresh")
+    if args.use_extended_data and not args.backtest:
+        p.error("--use-extended-data is only valid with --backtest")
 
     return args
 
@@ -117,6 +122,7 @@ def main() -> None:
             live=args.live,
             fresh=args.fresh,
             no_archive=args.no_archive,
+            use_extended_data=args.use_extended_data,
         )
     except KeyboardInterrupt:
         info("CORE", "RUN", "EXIT", msg="Caught KeyboardInterrupt: shutting down")

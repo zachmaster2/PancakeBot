@@ -11,6 +11,17 @@ BTC_SPOT_PRICES_PATH = "var/btc_spot_prices.jsonl"
 ETH_SPOT_PRICES_PATH = "var/eth_spot_prices.jsonl"
 SOL_SPOT_PRICES_PATH = "var/sol_spot_prices.jsonl"
 
+# Extended dataset (older epochs, lenient/with status; written by
+# research/backfill_okx_extended.py, consumed by --backtest --use-extended-data).
+# Files at the same paths under var/extended/ have epochs strictly older than
+# the canonical floor (epoch 437562); Phase B's lenient fetcher tolerates
+# partial/missing data and tags each record with a ``data_status`` field.
+EXTENDED_CLOSED_ROUNDS_PATH = "var/extended/closed_rounds.jsonl"
+EXTENDED_BNB_SPOT_PRICES_PATH = "var/extended/bnb_spot_prices.jsonl"
+EXTENDED_BTC_SPOT_PRICES_PATH = "var/extended/btc_spot_prices.jsonl"
+EXTENDED_ETH_SPOT_PRICES_PATH = "var/extended/eth_spot_prices.jsonl"
+EXTENDED_SOL_SPOT_PRICES_PATH = "var/extended/sol_spot_prices.jsonl"
+
 # -- Dry mode --
 DRY_BANKROLL_STATE_PATH = "var/dry/bankroll.json"
 DRY_BANKROLL_HISTORY_PATH = "var/dry/bankroll_history.jsonl"
