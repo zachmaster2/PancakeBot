@@ -25,6 +25,14 @@ _BTC_KLINES_PATH = Path(_paths.BTC_SPOT_PRICES_PATH)
 _ETH_KLINES_PATH = Path(_paths.ETH_SPOT_PRICES_PATH)
 _SOL_KLINES_PATH = Path(_paths.SOL_SPOT_PRICES_PATH)
 
+# Extended-data paths (consumed when --use-extended-data is on; the loader
+# accepts these as a sibling source of older epochs not in the canonical store.)
+_EXT_CLOSED_ROUNDS_PATH = Path(_paths.EXTENDED_CLOSED_ROUNDS_PATH)
+_EXT_BNB_KLINES_PATH = Path(_paths.EXTENDED_BNB_SPOT_PRICES_PATH)
+_EXT_BTC_KLINES_PATH = Path(_paths.EXTENDED_BTC_SPOT_PRICES_PATH)
+_EXT_ETH_KLINES_PATH = Path(_paths.EXTENDED_ETH_SPOT_PRICES_PATH)
+_EXT_SOL_KLINES_PATH = Path(_paths.EXTENDED_SOL_SPOT_PRICES_PATH)
+
 
 @dataclass(slots=True)
 class _BacktestStats:
@@ -76,6 +84,7 @@ def _load_klines_from(
     *,
     cutoff_seconds: int,
     candle_count: int,
+    extended_path: Path | None = None,
 ) -> dict[int, list[list]]:
     """Load pre-fetched 1s kline arrays from a JSONL file, pre-sliced to the
     exact window the strategy will read for the given (cutoff_seconds, candle_count).
@@ -100,25 +109,36 @@ def _load_klines_from(
     Verified bit-identical on 2026-04-26 cutoff=2 baseline: per-fold
     summary hash ``aa39a3a73f4e4cb718beeffaa72a22ca`` reproduces.
     """
-    if not path.exists():
+    if not path.exists() and (extended_path is None or not extended_path.exists()):
         return {}
     start_neg = -(cutoff_seconds + candle_count - 1)
     end_neg: int | None = None if cutoff_seconds == 1 else -(cutoff_seconds - 1)
     result: dict[int, list[list]] = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            if rec.get("error") or rec.get("klines_1s") is None:
-                continue
-            kl = rec["klines_1s"]
-            if end_neg is None:
-                kl = kl[start_neg:]
-            else:
-                kl = kl[start_neg:end_neg]
-            result[int(rec["epoch"])] = kl
+
+    def _ingest(p: Path) -> None:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if rec.get("error") or rec.get("klines_1s") is None:
+                    continue
+                kl = rec["klines_1s"]
+                if end_neg is None:
+                    kl = kl[start_neg:]
+                else:
+                    kl = kl[start_neg:end_neg]
+                ep = int(rec["epoch"])
+                # Canonical wins on collision (extended ingested second; first writer keeps).
+                if ep not in result:
+                    result[ep] = kl
+
+    # Canonical first so it wins any epoch collision (none expected).
+    if path.exists():
+        _ingest(path)
+    if extended_path is not None and extended_path.exists():
+        _ingest(extended_path)
     return result
 
 
@@ -127,11 +147,20 @@ def run_backtest(
     runtime_cfg,
     backtest_cfg: BacktestConfig,
     out_dir: Path,
+    use_extended_data: bool = False,
 ) -> None:
     """Replay historical rounds + klines and produce trades + summary.
 
     BTC/ETH/SOL klines come from the OKX history-candles cache files
     (var/{btc,eth,sol}_spot_prices.jsonl, populated by `--sync`).
+
+    When ``use_extended_data=True`` (default False), the loader also reads
+    rounds + klines from ``var/extended/`` (older-than-canonical-floor epochs
+    written by ``research/backfill_okx_extended.py``). Records flagged with
+    ``data_status`` other than ``OK_FULL`` may have empty or partial
+    ``klines_1s``; the strategy's existing ``_validate_klines_raw`` check
+    naturally skips such rounds via ``gate_<sym>_insufficient`` skip reasons.
+    Default OFF preserves canonical bit-identical behavior.
     """
     backtest_cfg.validate()
 
@@ -142,6 +171,16 @@ def run_backtest(
     t0 = time.perf_counter()
 
     all_rounds = _load_all_rounds(runtime_cfg)
+    if use_extended_data and _EXT_CLOSED_ROUNDS_PATH.exists():
+        from pancakebot.market_data.round_store import ClosedRoundsStore
+        ext_store = ClosedRoundsStore(str(_EXT_CLOSED_ROUNDS_PATH))
+        ext_rounds = [r for r in ext_store.iter_closed_rounds() if not r.failed]
+        existing = {int(r.epoch) for r in all_rounds}
+        ext_only = [r for r in ext_rounds if int(r.epoch) not in existing]
+        ext_only.sort(key=lambda r: int(r.epoch))
+        all_rounds = ext_only + all_rounds
+        info("BACK", "SETUP", "EXT_LOAD",
+             msg=f"loaded {len(ext_only)} extended rounds (older than canonical floor)")
     if not all_rounds:
         raise InvariantError("backtest_no_closed_rounds")
 
@@ -196,20 +235,32 @@ def run_backtest(
     _gc = runtime_cfg.strategy.gate
     _candle_count = max(_gc.mtf_lookbacks) + 1
     _cs = int(runtime_cfg.cutoff_seconds)
-    btc_klines = _load_klines_from(_BTC_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count)
+    _ext_btc = _EXT_BTC_KLINES_PATH if use_extended_data else None
+    _ext_eth = _EXT_ETH_KLINES_PATH if use_extended_data else None
+    _ext_sol = _EXT_SOL_KLINES_PATH if use_extended_data else None
+    btc_klines = _load_klines_from(
+        _BTC_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count,
+        extended_path=_ext_btc,
+    )
     if btc_klines:
         info("BACK", "SETUP", "BTC_KL",
              msg=f"Loaded BTC 1s klines for {len(btc_klines)} epochs "
                  f"(cutoff={_cs}, candle_count={_candle_count})")
     eth_klines = (
-        _load_klines_from(_ETH_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count)
-        if _ETH_KLINES_PATH.exists() else {}
+        _load_klines_from(
+            _ETH_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count,
+            extended_path=_ext_eth,
+        )
+        if _ETH_KLINES_PATH.exists() or (_ext_eth is not None and _ext_eth.exists()) else {}
     )
     if eth_klines:
         info("BACK", "SETUP", "ETH_KL", msg=f"Loaded ETH 1s klines for {len(eth_klines)} epochs")
     sol_klines = (
-        _load_klines_from(_SOL_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count)
-        if _SOL_KLINES_PATH.exists() else {}
+        _load_klines_from(
+            _SOL_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count,
+            extended_path=_ext_sol,
+        )
+        if _SOL_KLINES_PATH.exists() or (_ext_sol is not None and _ext_sol.exists()) else {}
     )
     if sol_klines:
         info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s klines for {len(sol_klines)} epochs")

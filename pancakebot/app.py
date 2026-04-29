@@ -39,6 +39,7 @@ def run_from_config(
     live: bool = False,
     fresh: bool = False,
     no_archive: bool = False,
+    use_extended_data: bool = False,
 ) -> None:
     cfg = load_app_config(config_path)
 
@@ -91,6 +92,7 @@ def run_from_config(
             runtime_cfg=runtime_cfg,
             backtest_cfg=backtest_cfg,
             out_dir=Path("var/backtest"),
+            use_extended_data=use_extended_data,
         )
         return
 

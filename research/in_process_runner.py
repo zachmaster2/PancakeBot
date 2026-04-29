@@ -72,6 +72,12 @@ _ETH_KLINES_PATH = REPO_ROOT / _paths.ETH_SPOT_PRICES_PATH
 _SOL_KLINES_PATH = REPO_ROOT / _paths.SOL_SPOT_PRICES_PATH
 _CLOSED_ROUNDS_PATH = REPO_ROOT / _paths.CLOSED_ROUNDS_PATH
 
+# Extended-data paths (consumed when use_extended_data=True, see run_experiment).
+_EXT_BTC_KLINES_PATH = REPO_ROOT / _paths.EXTENDED_BTC_SPOT_PRICES_PATH
+_EXT_ETH_KLINES_PATH = REPO_ROOT / _paths.EXTENDED_ETH_SPOT_PRICES_PATH
+_EXT_SOL_KLINES_PATH = REPO_ROOT / _paths.EXTENDED_SOL_SPOT_PRICES_PATH
+_EXT_CLOSED_ROUNDS_PATH = REPO_ROOT / _paths.EXTENDED_CLOSED_ROUNDS_PATH
+
 
 # ---------- spec dataclasses ----------
 
@@ -87,10 +93,19 @@ class FoldSpec:
 
 # ---------- one-time load ----------
 
-def _load_all_rounds() -> list[Round]:
+def _load_all_rounds(*, use_extended_data: bool = False) -> list[Round]:
     store = ClosedRoundsStore(str(_CLOSED_ROUNDS_PATH))
     rounds = list(store.iter_closed_rounds())
     rounds = [r for r in rounds if not r.failed]
+    if use_extended_data and _EXT_CLOSED_ROUNDS_PATH.exists():
+        ext_store = ClosedRoundsStore(str(_EXT_CLOSED_ROUNDS_PATH))
+        ext_rounds = [r for r in ext_store.iter_closed_rounds() if not r.failed]
+        # Extended rounds have epochs strictly older than canonical floor;
+        # by construction no overlap with canonical. Prepend (older first).
+        existing_epochs = {int(r.epoch) for r in rounds}
+        ext_only = [r for r in ext_rounds if int(r.epoch) not in existing_epochs]
+        ext_only.sort(key=lambda r: int(r.epoch))
+        rounds = ext_only + rounds
     return rounds
 
 
@@ -130,6 +145,7 @@ def _load_klines_unified(
     *,
     earliest_offset: int,
     latest_offset: int,
+    extended_path: Path | None = None,
 ) -> dict[int, list[list]]:
     """Load + slice each per-round record to the unified
     [open_ts: lock_at - earliest_offset, lock_at - latest_offset] window.
@@ -142,28 +158,47 @@ def _load_klines_unified(
       end_neg   = -(latest_offset - 2)   if latest_offset >= 3 else None
                   (latest_offset == 2 means we want through the newest stored
                    candle; Python slice end-of-array is None.)
+
+    If ``extended_path`` is provided and exists, also loads from that file.
+    Extended records may carry a ``data_status`` field (``OK_FULL``, ``OK_PARTIAL``,
+    ``MISSING``, etc.); records with empty or partial ``klines_1s`` are loaded
+    as-is and the strategy's ``_validate_klines_raw`` call naturally skips
+    rounds with insufficient data via ``gate_<sym>_insufficient`` skip reasons.
+    Canonical records take precedence on epoch collisions (none expected
+    by construction; extended fully precedes canonical's epoch range).
     """
-    if not path.exists():
+    if not path.exists() and (extended_path is None or not extended_path.exists()):
         return {}
     if latest_offset < 2:
         raise InvariantError(f"in_process_runner_latest_offset_must_be_ge_2: {latest_offset}")
     start_neg = -(earliest_offset - 1)
     end_neg: int | None = None if latest_offset == 2 else -(latest_offset - 2)
     result: dict[int, list[list]] = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            if rec.get("error") or rec.get("klines_1s") is None:
-                continue
-            kl = rec["klines_1s"]
-            if end_neg is None:
-                kl = kl[start_neg:]
-            else:
-                kl = kl[start_neg:end_neg]
-            result[int(rec["epoch"])] = kl
+
+    def _ingest(p: Path) -> None:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if rec.get("error") or rec.get("klines_1s") is None:
+                    continue
+                kl = rec["klines_1s"]
+                if end_neg is None:
+                    kl = kl[start_neg:]
+                else:
+                    kl = kl[start_neg:end_neg]
+                # Don't overwrite a previously-loaded record (canonical wins).
+                ep = int(rec["epoch"])
+                if ep not in result:
+                    result[ep] = kl
+
+    # Canonical first (so it wins on any epoch collision).
+    if path.exists():
+        _ingest(path)
+    if extended_path is not None and extended_path.exists():
+        _ingest(extended_path)
     return result
 
 
@@ -478,11 +513,20 @@ def run_experiment(
     initial_bankroll_bnb: float = 50.0,
     treasury_fee_fraction: float = 0.03,
     min_bet_amount_bnb: float | None = None,
+    use_extended_data: bool = False,
 ) -> list[dict[str, Any]]:
     """Run all folds in one process. Loads klines once.
 
     Returns a list of per-fold summary dicts. Output files land under
     ``output_base_dir/<spec.name>/{trades.csv,summary.json}``.
+
+    When ``use_extended_data=True`` (default False), the loader also reads
+    rounds + klines from ``var/extended/`` (older epochs not in the canonical
+    store; written by ``research/backfill_okx_extended.py`` with possibly
+    partial/missing data). Default OFF preserves canonical bit-identical
+    behavior. The strategy's per-symbol ``_validate_klines_raw`` check
+    naturally skips rounds whose extended klines are insufficient (empty,
+    too short, or boundary-misaligned).
     """
     if min_bet_amount_bnb is None:
         # Default to the on-chain contract minimum from cached constants.
@@ -495,9 +539,10 @@ def run_experiment(
         except Exception:  # noqa: BLE001 -- fall back for offline use
             min_bet_amount_bnb = 0.001
 
-    print(f"Loading closed_rounds + klines (one-time)...", flush=True)
+    print(f"Loading closed_rounds + klines (one-time)..."
+          f"{' (use_extended_data=True)' if use_extended_data else ''}", flush=True)
     t0 = time.perf_counter()
-    all_rounds = _load_all_rounds()
+    all_rounds = _load_all_rounds(use_extended_data=use_extended_data)
     # Resolve StrategyConfig once per spec (not per fold-iteration).
     resolved: list[tuple[FoldSpec, StrategyConfig]] = [
         (spec, _resolve_strategy_config(spec)) for spec in experiment_specs
@@ -507,16 +552,23 @@ def run_experiment(
           f"[{latest_offset}..{earliest_offset}] ({load_count} candles/record)",
           flush=True)
 
+    btc_ext = _EXT_BTC_KLINES_PATH if use_extended_data else None
+    eth_ext = _EXT_ETH_KLINES_PATH if use_extended_data else None
+    sol_ext = _EXT_SOL_KLINES_PATH if use_extended_data else None
+
     btc_unified = _load_klines_unified(
         _BTC_KLINES_PATH, earliest_offset=earliest_offset, latest_offset=latest_offset,
+        extended_path=btc_ext,
     )
     print(f"  BTC: {len(btc_unified)} epochs", flush=True)
     eth_unified = _load_klines_unified(
         _ETH_KLINES_PATH, earliest_offset=earliest_offset, latest_offset=latest_offset,
+        extended_path=eth_ext,
     )
     print(f"  ETH: {len(eth_unified)} epochs", flush=True)
     sol_unified = _load_klines_unified(
         _SOL_KLINES_PATH, earliest_offset=earliest_offset, latest_offset=latest_offset,
+        extended_path=sol_ext,
     )
     print(f"  SOL: {len(sol_unified)} epochs", flush=True)
     elapsed_load = time.perf_counter() - t0
@@ -570,6 +622,9 @@ def main() -> int:
                         help="Where per-fold output dirs land")
     parser.add_argument("--initial-bankroll-bnb", type=float, default=50.0)
     parser.add_argument("--treasury-fee-fraction", type=float, default=0.03)
+    parser.add_argument("--use-extended-data", action="store_true",
+                        help="Also load older epochs from var/extended/ "
+                             "(default OFF preserves canonical bit-identical behavior)")
     args = parser.parse_args()
 
     spec_path = Path(args.spec)
@@ -587,6 +642,7 @@ def main() -> int:
         output_base_dir=Path(args.output_base_dir),
         initial_bankroll_bnb=args.initial_bankroll_bnb,
         treasury_fee_fraction=args.treasury_fee_fraction,
+        use_extended_data=args.use_extended_data,
     )
 
     # Persist aggregated summary alongside the per-fold outputs.
