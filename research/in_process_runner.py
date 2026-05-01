@@ -331,6 +331,7 @@ def run_fold(
     bankroll_tracker = InMemoryBankrollTracker(
         initial_bankroll=initial_bankroll_bnb,
         window_days=strategy_cfg.risk.window_days,
+        peak_mode=strategy_cfg.risk.dd_peak_mode,
     )
     pipeline = MomentumOnlyPipeline(
         config=gate_config,

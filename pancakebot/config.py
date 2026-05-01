@@ -182,7 +182,13 @@ class RiskConfig:
     - max_drawdown_frac_from_peak: fire cooldown when (peak-current)/peak >= this.
       Set to 1.0 to disable the circuit breaker.
     - cooldown_rounds: number of rounds to pause after drawdown breaker fires.
-    - window_days: rolling window (days) for the drawdown-from-peak calculation.
+    - window_days: rolling window (days) for the drawdown-from-peak calculation
+      when ``dd_peak_mode == "rolling_7d"``.
+    - dd_peak_mode: peak-tracking semantics for the drawdown breaker.
+      ``"rolling_7d"`` (default, preserves canonical bit-identity) uses a
+      rolling window of ``window_days``. ``"absolute_ratchet"`` uses an
+      absolute-since-launch peak that monotonically only goes up — catches
+      slow drains the rolling window misses. (p2a workstream, backtest-only.)
     - max_bet_bnb_btc_primary: absolute BNB cap for BTC primary bets.
     - max_bet_bnb_eth_sol_fallback: absolute BNB cap for regime-2 ETH+SOL bets.
     """
@@ -193,6 +199,7 @@ class RiskConfig:
     window_days: int
     max_bet_bnb_btc_primary: float
     max_bet_bnb_eth_sol_fallback: float
+    dd_peak_mode: str = "rolling_7d"
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +266,11 @@ class StrategyConfig:
             raise InvariantError("strategy_risk_cooldown_rounds_must_be_non_negative")
         if rk.window_days <= 0:
             raise InvariantError("strategy_risk_window_days_must_be_positive")
+        if rk.dd_peak_mode not in ("rolling_7d", "absolute_ratchet"):
+            raise InvariantError(
+                f"strategy_risk_dd_peak_mode_invalid: {rk.dd_peak_mode!r} "
+                "(expected 'rolling_7d' or 'absolute_ratchet')"
+            )
         if rk.max_bet_bnb_btc_primary <= 0.0:
             raise InvariantError("strategy_risk_max_bet_bnb_btc_primary_must_be_positive")
         if rk.max_bet_bnb_eth_sol_fallback <= 0.0:
@@ -301,6 +313,7 @@ _DEFAULT_STRATEGY = StrategyConfig(
         window_days=7,
         max_bet_bnb_btc_primary=2.0,
         max_bet_bnb_eth_sol_fallback=0.5,
+        dd_peak_mode="rolling_7d",
     ),
 )
 
@@ -370,6 +383,15 @@ def _opt_bool(obj: dict[str, Any], key: str, default: bool) -> bool:
     v = obj[key]
     if not isinstance(v, bool):
         raise InvariantError(f"config_key_not_bool: {key}")
+    return v
+
+
+def _opt_str(obj: dict[str, Any], key: str, default: str) -> str:
+    if key not in obj:
+        return default
+    v = obj[key]
+    if not isinstance(v, str):
+        raise InvariantError(f"config_key_not_str: {key}")
     return v
 
 
@@ -485,6 +507,9 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
             max_bet_bnb_eth_sol_fallback=_opt_float(
                 risk_sec, "max_bet_bnb_eth_sol_fallback",
                 d.risk.max_bet_bnb_eth_sol_fallback,
+            ),
+            dd_peak_mode=_opt_str(
+                risk_sec, "dd_peak_mode", d.risk.dd_peak_mode,
             ),
         ),
     )

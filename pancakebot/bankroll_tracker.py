@@ -77,15 +77,40 @@ class BankrollTracker(ABC):
 
 
 class InMemoryBankrollTracker(BankrollTracker):
-    """Backtest-mode tracker. No disk I/O. Bootstraps with ``initial_bankroll``."""
+    """Backtest-mode tracker. No disk I/O. Bootstraps with ``initial_bankroll``.
 
-    __slots__ = ("_entries", "_window_days", "_cooldown", "_triggered_at", "_seeded")
+    ``peak_mode`` controls drawdown-from-peak semantics:
+      - ``"rolling_7d"`` (default, canonical-preserving): uses a rolling
+        ``window_days`` window. Entries older than the window are pruned;
+        peak is max over remaining entries plus the most-recent boundary.
+      - ``"absolute_ratchet"`` (p2a workstream): peak is monotonically
+        non-decreasing across the entire run, initialized to ``initial_bankroll``.
+        Catches slow drains the rolling window misses (extension-cohort regime).
+        ``window_days`` is ignored for peak calc but still controls entry pruning
+        of the underlying deque (entries are not used by peak under this mode).
+    """
 
-    def __init__(self, *, initial_bankroll: float, window_days: int) -> None:
+    __slots__ = (
+        "_entries", "_window_days", "_cooldown", "_triggered_at", "_seeded",
+        "_initial", "_peak_mode", "_absolute_peak",
+    )
+
+    def __init__(
+        self,
+        *,
+        initial_bankroll: float,
+        window_days: int,
+        peak_mode: str = "rolling_7d",
+    ) -> None:
         if initial_bankroll <= 0.0:
             raise InvariantError("bankroll_tracker_initial_bankroll_not_positive")
         if window_days <= 0:
             raise InvariantError("bankroll_tracker_window_days_not_positive")
+        if peak_mode not in ("rolling_7d", "absolute_ratchet"):
+            raise InvariantError(
+                f"bankroll_tracker_peak_mode_invalid: {peak_mode!r} "
+                "(expected 'rolling_7d' or 'absolute_ratchet')"
+            )
         self._entries: deque[_Entry] = deque()
         self._window_days = int(window_days)
         self._cooldown: int = 0
@@ -94,6 +119,10 @@ class InMemoryBankrollTracker(BankrollTracker):
         # prior to that, current_bankroll returns the initial value.
         self._seeded = False
         self._initial = float(initial_bankroll)
+        self._peak_mode = str(peak_mode)
+        # Absolute-since-launch peak: initialized to starting bankroll, only
+        # ever ratchets up. Used by ``peak_mode == "absolute_ratchet"``.
+        self._absolute_peak = float(initial_bankroll)
 
     def record_settlement(self, bankroll: float, start_at: int) -> None:
         if not self._seeded:
@@ -101,6 +130,10 @@ class InMemoryBankrollTracker(BankrollTracker):
                 start_at=int(start_at), bankroll=float(self._initial), event="init",
             ))
             self._seeded = True
+        # Update absolute peak unconditionally (used only by "absolute_ratchet"
+        # mode but kept current always so a runtime mode-switch is consistent).
+        if float(bankroll) > self._absolute_peak:
+            self._absolute_peak = float(bankroll)
         # Dedup: if the new value matches the most-recent recorded, skip.
         if self._entries and abs(self._entries[-1].bankroll - float(bankroll)) < 1e-12:
             return
@@ -143,6 +176,12 @@ class InMemoryBankrollTracker(BankrollTracker):
         return self._entries[-1].bankroll
 
     def peak_bankroll(self, as_of_start_at: int) -> float:
+        if self._peak_mode == "absolute_ratchet":
+            # Absolute-since-launch peak. Monotonically non-decreasing across
+            # the run; initialized to ``initial_bankroll`` and updated on every
+            # ``record_settlement`` via ``_absolute_peak`` field.
+            return self._absolute_peak
+        # rolling_7d (canonical default)
         if not self._entries:
             return self._initial if not self._seeded else 0.0
         window_start = int(as_of_start_at) - self._window_days * _SECONDS_PER_DAY
@@ -188,8 +227,19 @@ class PersistedBankrollTracker(InMemoryBankrollTracker):
 
     __slots__ = ("_history_path", "_pause_path")
 
-    def __init__(self, *, path: Path, initial_bankroll: float, window_days: int) -> None:
-        super().__init__(initial_bankroll=initial_bankroll, window_days=window_days)
+    def __init__(
+        self,
+        *,
+        path: Path,
+        initial_bankroll: float,
+        window_days: int,
+        peak_mode: str = "rolling_7d",
+    ) -> None:
+        super().__init__(
+            initial_bankroll=initial_bankroll,
+            window_days=window_days,
+            peak_mode=peak_mode,
+        )
         self._history_path = Path(path)
         self._pause_path = self._history_path.parent / "pause_state.json"
         self._history_path.parent.mkdir(parents=True, exist_ok=True)
