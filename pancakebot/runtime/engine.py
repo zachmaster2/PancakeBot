@@ -223,11 +223,10 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
             reason="live_wallet_bootstrap",
         )
         # Live mode: wire PersistedBankrollTracker now that wallet balance is known.
-        # TODO: live mode only seeds the tracker at startup; it does not yet
-        # update on per-round settlements. Claims are async (batched on-chain),
-        # so record_settlement needs to hook into claim-confirmation events.
-        # Until that's added, the risk checks run against the STARTUP bankroll
-        # only -- initial bounds still work, but drawdown-from-peak won't fire.
+        # Per-iteration settlements are forwarded to the tracker in
+        # _run_one_iteration (see record_settlement call near the end of the
+        # housekeeping phase, where bankroll_bnb is freshly RPC-fetched). The
+        # drawdown-from-peak gate reads from this tracker each iteration.
         # NOTE: Path is already imported at module level; do not re-import
         # locally or it shadows the module-level binding for the whole
         # function (Python locals-vs-globals scope rule).
@@ -475,6 +474,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             # Forward freshest bankroll to tracker (live only; dry records its
             # own settlements via dry.py after credit/debit). Risk gates read
             # from the tracker in decide_open_round below.
+            #
+            # On TransientRpcError above we SKIP this iteration and do NOT
+            # update the tracker, so multi-iteration RPC outages leave the
+            # tracker drifting on stale peak. Net effect is conservative: we
+            # also refuse to bet (risk_bankroll_stale), so the breaker can't
+            # mis-fire on stale data because we're not betting in the first
+            # place. Tracker re-syncs on the next successful RPC fetch.
             if closed.strategy_pipeline is not None:
                 closed.strategy_pipeline.record_settlement(
                     bankroll=bankroll_bnb,
