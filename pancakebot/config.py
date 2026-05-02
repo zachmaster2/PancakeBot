@@ -327,6 +327,7 @@ class AppConfig:
     kline_cutoff_seconds: int
     prefetch_offset_seconds: int
     kline_fetch_offset_ms: int
+    lock_safety_margin_ms: int
     dry_initial_bankroll_bnb: float
     live_min_bet_only: bool
     backtest_simulation_size: int
@@ -594,6 +595,29 @@ def load_app_config(path: str) -> AppConfig:
             f"runtime_kline_fetch_offset_ms_out_of_range: "
             f"got={kline_fetch_offset_ms} valid=[100..5000]"
         )
+    # ``lock_safety_margin_ms`` controls the pre-bet timing guard at engine.py:
+    # if wall-clock is within this margin of lock_at, abort the bet rather than
+    # submit a TX likely to land after lock. Must be smaller than
+    # ``kline_fetch_offset_ms`` minus typical fetch latency, otherwise the
+    # guard fires structurally on every BET decision (the p4c regression).
+    # Default 300ms = with 850ms wake and ~280ms median fetch, decision-ready
+    # at lock-520ms gives ~220ms TX-submit budget before guard. Range
+    # [50..2000]: below 50 we leave no buffer; above 2000 we'd be back in
+    # the broken regime.
+    lock_safety_margin_ms = _opt_int(runtime, "lock_safety_margin_ms", 300)
+    if not (50 <= lock_safety_margin_ms <= 2000):
+        raise InvariantError(
+            f"runtime_lock_safety_margin_ms_out_of_range: "
+            f"got={lock_safety_margin_ms} valid=[50..2000]"
+        )
+    # Cross-constraint: the safety margin MUST be strictly less than the
+    # kline-fetch wake offset, otherwise the bot wakes already inside the
+    # safety zone and aborts every bet (p4c regression). Enforce explicitly.
+    if lock_safety_margin_ms >= kline_fetch_offset_ms:
+        raise InvariantError(
+            f"runtime_lock_safety_margin_ms_must_be_less_than_kline_fetch_offset_ms: "
+            f"safety_margin={lock_safety_margin_ms} kline_fetch_offset={kline_fetch_offset_ms}"
+        )
 
     # [dry]
     dry_initial_bankroll_bnb = _opt_float(dry_sec, "initial_bankroll_bnb", 50.0)
@@ -629,6 +653,7 @@ def load_app_config(path: str) -> AppConfig:
         kline_cutoff_seconds=kline_cutoff_seconds,
         prefetch_offset_seconds=prefetch_offset_seconds,
         kline_fetch_offset_ms=kline_fetch_offset_ms,
+        lock_safety_margin_ms=lock_safety_margin_ms,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_min_bet_only=live_min_bet_only,
         backtest_simulation_size=simulation_size,

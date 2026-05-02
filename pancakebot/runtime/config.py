@@ -37,6 +37,13 @@ class RuntimeConfig:
     # in [100..5000] at config load.
     kline_fetch_offset_ms: int
 
+    # Pre-bet timing guard: if wall-clock is within this many milliseconds
+    # of lock_at, abort the bet rather than submit a TX likely to land
+    # after lock. Cross-validated at config load to be < kline_fetch_offset_ms
+    # so the wake doesn't fire inside the safety zone (the p4c regression).
+    # Validated in [50..2000] at config load.
+    lock_safety_margin_ms: int
+
     # Protocol constants (from chain via contract_constants.json)
     min_bet_amount_bnb: float
     treasury_fee_fraction: float
