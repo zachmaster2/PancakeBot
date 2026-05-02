@@ -585,26 +585,53 @@ def load_app_config(path: str) -> AppConfig:
     if prefetch_offset_seconds <= 0:
         raise InvariantError("prefetch_offset_seconds_must_be_positive")
     # ``kline_fetch_offset_ms`` controls how many milliseconds before lock_at
-    # the gate wakes to fire its parallel 4-symbol REST fetch. Default 850
-    # is sized for typical OKX p99 staleness (~1.7s) plus a margin for the
-    # round-trip. Below 100 we'd hit OKX before the lock-1 candle is
-    # published; above 5000 we'd burn most of the pre-lock budget waiting.
-    kline_fetch_offset_ms = _opt_int(runtime, "kline_fetch_offset_ms", 850)
+    # the gate wakes to fire its parallel 4-symbol REST fetch. The wake-time
+    # budget chain is:
+    #
+    #     wake -> fetch -> compute -> sign -> submit -> mempool -> block -> lock
+    #     |<--- kline_fetch_offset_ms (= 1200ms) -------------------------->|
+    #     |<--- fetch (p50 ~270ms) ->|
+    #                                |<--- compute (~50ms) ->|
+    #                                                        |<-- sign (~5ms)
+    #                                                        |<-- submit_RTT (~400ms) ->|
+    #                                                                                  |<-- block (~450ms) ->|
+    #
+    # Default 1200ms (post-p4c-revision) chosen so median-fetch rounds have
+    # decision-ready at lock-880ms, comfortably ahead of the 750ms safety
+    # margin, with median-block-landing before lock_ts (= block.timestamp =
+    # lock_ts - 1, satisfies PancakeSwap PredictionV2's strict
+    # block.timestamp < lockTimestamp check).
+    #
+    # Source: research/p4c_canonical_loop_probe.py (n=200 at wake=1200ms,
+    # 2026-05-02). Empirical first-try success: 88.0% rounds (96.9%
+    # per-symbol) at 800ms post-candle-close. Per-symbol p99 RTT ~558ms.
+    # See var/strategy_review/p4c_revision_implementer.md for the full data.
+    #
+    # Range [100..5000]: below 100 we'd hit OKX before the cutoff candle
+    # closes (impossible window); above 5000 we'd burn most of the pre-lock
+    # budget waiting and the gate would consume staler data. Re-derive
+    # via: py research/p4c_canonical_loop_probe.py 200 <new_offset>.
+    kline_fetch_offset_ms = _opt_int(runtime, "kline_fetch_offset_ms", 1200)
     if not (100 <= kline_fetch_offset_ms <= 5000):
         raise InvariantError(
             f"runtime_kline_fetch_offset_ms_out_of_range: "
             f"got={kline_fetch_offset_ms} valid=[100..5000]"
         )
-    # ``lock_safety_margin_ms`` controls the pre-bet timing guard at engine.py:
-    # if wall-clock is within this margin of lock_at, abort the bet rather than
-    # submit a TX likely to land after lock. Must be smaller than
-    # ``kline_fetch_offset_ms`` minus typical fetch latency, otherwise the
-    # guard fires structurally on every BET decision (the p4c regression).
-    # Default 300ms = with 850ms wake and ~280ms median fetch, decision-ready
-    # at lock-520ms gives ~220ms TX-submit budget before guard. Range
-    # [50..2000]: below 50 we leave no buffer; above 2000 we'd be back in
-    # the broken regime.
-    lock_safety_margin_ms = _opt_int(runtime, "lock_safety_margin_ms", 300)
+    # ``lock_safety_margin_ms`` controls the pre-bet timing guard at
+    # engine.py: abort the bet if wall-clock is within this margin of
+    # lock_at. Sized to ensure the TX has time to submit AND be included in
+    # a block whose timestamp is < lock_ts (PancakeSwap PredictionV2
+    # rejects late bets at the contract level).
+    #
+    # Default 750ms = block_time (~450ms, BSC post-Maxwell hardfork) +
+    # submit_RTT (~300ms typical to BSC RPC). At decision-ready = lock-880ms
+    # (median fetch), submit by lock-870ms, mempool by lock-470ms,
+    # next-block landing window [lock-470ms, lock-20ms] -> block.timestamp
+    # = lock_ts - 1 -> INCLUDED.
+    #
+    # Range [50..2000]: below 50 leaves no buffer; above 2000 returns to
+    # the broken regime where wake fires inside the safety zone (p4c).
+    lock_safety_margin_ms = _opt_int(runtime, "lock_safety_margin_ms", 750)
     if not (50 <= lock_safety_margin_ms <= 2000):
         raise InvariantError(
             f"runtime_lock_safety_margin_ms_out_of_range: "
@@ -612,19 +639,14 @@ def load_app_config(path: str) -> AppConfig:
         )
     # Cross-constraint: the safety margin MUST be strictly less than the
     # kline-fetch wake offset, otherwise the bot wakes already inside the
-    # safety zone and aborts every bet (p4c regression). Enforce explicitly.
+    # safety zone and aborts every bet (the p4c-regression failure mode
+    # the timing-architecture rewrite resolved).
     #
-    # NOTE: this constraint guarantees "wake outside safety zone" but does
-    # NOT guarantee a workable fetch budget. The DIFFERENCE
-    # ``kline_fetch_offset_ms - lock_safety_margin_ms`` is the per-round
-    # window the kline fetch + signal compute have to land in. For typical
-    # OKX REST p50 ~280ms / p99 ~850ms, this difference should be at LEAST
-    # ~200ms (otherwise the guard will fire on most p99 fetches even though
-    # the config technically validates). At default values (850-300=550ms)
-    # the budget is comfortable. A pathological config like
-    # ``kline_fetch_offset_ms=1000, lock_safety_margin_ms=950`` passes this
-    # check but leaves only 50ms of fetch budget -- nearly every fetch would
-    # abort. Keep the ratio sensible.
+    # The DIFFERENCE ``kline_fetch_offset_ms - lock_safety_margin_ms`` is
+    # the per-round budget for fetch + compute. At default values
+    # 1200 - 750 = 450ms; with median fetch+compute ~320ms, that leaves
+    # ~130ms of headroom. p99 fetch (~560ms) exceeds the budget and
+    # gracefully aborts at the timing guard (no wasted TX, conservative).
     if lock_safety_margin_ms >= kline_fetch_offset_ms:
         raise InvariantError(
             f"runtime_lock_safety_margin_ms_must_be_less_than_kline_fetch_offset_ms: "

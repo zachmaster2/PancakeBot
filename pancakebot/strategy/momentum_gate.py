@@ -17,8 +17,20 @@ at lock-2s" path crashed ~67% of rounds with
 ``kline_fetch_integrity_violation`` because OKX's `after`-only filter
 slid the window when the newest candle was unavailable.
 
-Empirical (2026-04-27) OKX REST staleness is median ~410ms / p99 ~1.7s,
-materially fresher than candle1s WSS push (median ~954ms / p99 ~1.5s+).
+Empirical (2026-05-02, n=200 each via research/p4c_canonical_loop_probe.py):
+per-symbol first-try success at 800ms post-candle-close = 96.9%; at
+1150ms post-close = 98.3%. Implied per-symbol p99 publishing staleness
+~1.0-1.3s (NOT the 1.7s asserted in earlier docstrings, which was an
+extrapolation from a 15-sample probe).
+
+Live decision path uses ``RETRY_NONE`` (max_attempts=1). A first-try
+fail on any symbol -> TransientOkxError -> gate skips with
+``kline_fetch_transient_failure``. Retries are reserved for sync (bulk
+historical) where there's no time pressure. The 2.5s retry backoff
+that RETRY_GATE used would have always pushed the live decision past
+lock_at, contributing zero bet-placement value; the engine's timing
+guard would skip the round anyway. Removed in p4c-revision.
+
 The wake-time offset is configured via ``RuntimeConfig.kline_fetch_offset_ms``
 and applied by the engine; the gate itself just consumes ``lock_at_ms``.
 """
@@ -31,18 +43,25 @@ from dataclasses import dataclass
 from pancakebot.log import warn
 from pancakebot.market_data.okx_client import (
     OkxClient,
-    RETRY_GATE,
+    RETRY_NONE,
     okx_rate_acquire,
 )
 from pancakebot.util import InvariantError, TransientOkxError
 
 
 # Maximum consecutive rounds skipped on TransientOkxError before the gate
-# escalates to InvariantError. Three rounds at 5min each = ~15 min of
-# OKX REST unreachability before the bot fail-louds — long enough to ride
-# out an isolated network blip, short enough that the operator notices
-# before half a day's worth of opportunity is silently lost.
-_MAX_CONSECUTIVE_FETCH_FAILURES = 3
+# escalates to InvariantError. Five rounds at 5min each = ~25 min of OKX
+# REST unreachability before the bot fail-louds. Long enough to ride out
+# multiple isolated network blips, short enough that the operator gets
+# alerted via supervisor-Discord before opportunity is lost for hours.
+#
+# Sized for the post-p4c-revision config (kline_fetch_offset_ms=1200, no
+# retry on the live decision path): per-round transient-failure rate is
+# ~12% empirically (research/p4c_canonical_loop_probe.py n=200 at 800ms
+# post-close). At _MAX=5: P(5 consecutive transient at 12% per-round) =
+# 0.12^5 = 2.5e-5 -> expected once per ~40,000 rounds = ~14 weeks at
+# 12 rounds/h. Acceptable alert cadence per operator preference.
+_MAX_CONSECUTIVE_FETCH_FAILURES = 5
 
 _SYMBOLS_FETCHED = ("btc", "eth", "sol", "bnb")
 
@@ -193,7 +212,7 @@ class MomentumGate:
                 symbol=symbols[sym_short],
                 oldest_open_ms=oldest_open_ms,
                 newest_open_ms_inclusive=newest_open_ms,
-                retry_policy=RETRY_GATE,
+                retry_policy=RETRY_NONE,
                 rate_acquire_fn=okx_rate_acquire,
                 # Pin both window bounds: prevents OKX from sliding the
                 # window when the newest candle isn't yet published, which
