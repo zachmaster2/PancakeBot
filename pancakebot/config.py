@@ -613,6 +613,18 @@ def load_app_config(path: str) -> AppConfig:
     # Cross-constraint: the safety margin MUST be strictly less than the
     # kline-fetch wake offset, otherwise the bot wakes already inside the
     # safety zone and aborts every bet (p4c regression). Enforce explicitly.
+    #
+    # NOTE: this constraint guarantees "wake outside safety zone" but does
+    # NOT guarantee a workable fetch budget. The DIFFERENCE
+    # ``kline_fetch_offset_ms - lock_safety_margin_ms`` is the per-round
+    # window the kline fetch + signal compute have to land in. For typical
+    # OKX REST p50 ~280ms / p99 ~850ms, this difference should be at LEAST
+    # ~200ms (otherwise the guard will fire on most p99 fetches even though
+    # the config technically validates). At default values (850-300=550ms)
+    # the budget is comfortable. A pathological config like
+    # ``kline_fetch_offset_ms=1000, lock_safety_margin_ms=950`` passes this
+    # check but leaves only 50ms of fetch budget -- nearly every fetch would
+    # abort. Keep the ratio sensible.
     if lock_safety_margin_ms >= kline_fetch_offset_ms:
         raise InvariantError(
             f"runtime_lock_safety_margin_ms_must_be_less_than_kline_fetch_offset_ms: "
