@@ -34,8 +34,6 @@ from pancakebot.strategy.momentum_pipeline import StrategyPipelineDecision
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
-_LOCK_SAFETY_MARGIN_SECONDS = 1  # abort bet if wall-clock is within this many seconds of lock_at
-
 # Extra cushion added to the claim-check wake time to avoid alignment retries near RPC boundaries.
 _CLAIM_CHECK_PADDING_SECONDS = 5
 
@@ -607,12 +605,29 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
-        # Step 11: Execution timing guard (float precision -- int truncation
-        # was randomly shaving 0-1 s off the budget). lock_ts_t is chain-
-        # anchored true UTC; compare via _utc_now() (skew-corrected). With
-        # local-only comparison + skew, the guard fires far too early in
-        # true UTC and the bot self-aborts almost every round.
-        if _utc_now() >= lock_ts_t - _LOCK_SAFETY_MARGIN_SECONDS:
+        # Step 11: Execution timing guard. Abort if wall-clock is within
+        # ``cfg.lock_safety_margin_ms`` of lock_at -- TX submitted that close
+        # to lock is unlikely to mine in time and would revert (gas burn).
+        # lock_ts_t is chain-anchored true UTC; compare via _utc_now()
+        # (skew-corrected). With local-only comparison + skew, the guard
+        # fires far too early in true UTC and the bot self-aborts almost
+        # every round.
+        #
+        # Pre-bet R1 telemetry: log submit-offset (ms remaining before lock)
+        # at this point so we can measure how much budget the post-fetch
+        # path leaves for TX submission. Negative values would indicate
+        # the fetch finished AFTER lock_at (definite revert in live).
+        bet_submit_offset_ms = (lock_ts_t - _utc_now()) * 1000.0
+        safety_margin_seconds = cfg.lock_safety_margin_ms / 1000.0
+        if _utc_now() >= lock_ts_t - safety_margin_seconds:
+            info(
+                "BET",
+                "TIMING",
+                "ABORT",
+                epoch=current_epoch,
+                submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
+                margin_ms=cfg.lock_safety_margin_ms,
+            )
             _record_dry_cycle_audit(
                 cfg,
                 closed,
@@ -640,6 +655,20 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             )
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
+
+        # Guard passed: log submit-offset for inclusion-rate observability.
+        # In dry mode this is a proxy ("if this were live, we'd submit with
+        # THIS many ms before lock"). In live mode this measures the actual
+        # TX-broadcast timing; the receipt status logged later (Step 13)
+        # tells us if the TX landed in time.
+        info(
+            "BET",
+            "TIMING",
+            "OFFSET",
+            epoch=current_epoch,
+            submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
+            margin_ms=cfg.lock_safety_margin_ms,
+        )
 
         # Step 12: Submit bet.
         if decision.bet_side is None:
@@ -732,6 +761,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 ),
             }
             _append_jsonl("var/live/latency.jsonl", latency_record)
+            # R1 inclusion-truth: was the bet TX mined before lock_at?
+            # PancakeSwap reverts late bets, so block-timestamp >= lock_ts
+            # means the TX wasted gas and the bet did NOT register.
+            if tx_submit.included_block_timestamp is not None:
+                included_late = (
+                    int(tx_submit.included_block_timestamp) >= int(lock_ts_t)
+                )
+                info(
+                    "BET",
+                    "INCLUSION",
+                    "LATE" if included_late else "OK",
+                    epoch=current_epoch,
+                    included_block_ts=int(tx_submit.included_block_timestamp),
+                    lock_ts=int(lock_ts_t),
+                    submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
+                )
         else:
             # Step 14: Dry bookkeeping (including gas proxy) + record.
             if closed.simulated_bankroll_bnb is None:
