@@ -547,9 +547,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Sleep until ``lock_at - kline_fetch_offset_ms`` (skew-corrected),
         # then run gate.evaluate() which fires 4 parallel /history-candles
         # GETs and computes the signal off the returned arrays. The offset
-        # is sized so the fetch lands a configurable margin before lock_at;
-        # default 850ms accommodates OKX p99 staleness (~1.7s) plus the
-        # round-trip and signal compute. Tuned via [runtime] kline_fetch_offset_ms.
+        # is sized so the round has time to fetch + compute + sign + submit
+        # + land in a block whose timestamp < lock_ts. With default 1200ms
+        # (post-p4c-revision): wake at lock-1200ms -> median fetch+compute
+        # ~320ms -> decision-ready at lock-880ms -> guard at lock-750ms ->
+        # PASS -> submit -> mempool by lock-470ms -> next-block landing
+        # within [lock-470ms, lock-20ms] -> block.timestamp = lock_ts - 1
+        # -> INCLUDED. Tuned via [runtime] kline_fetch_offset_ms.
         fetch_ts = lock_ts_t - cfg.kline_fetch_offset_ms / 1000.0
         _sleep_until_ts(fetch_ts, reason="wait_for_kline_fetch", epoch=current_epoch)
 

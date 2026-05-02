@@ -8,9 +8,11 @@ parameterised via ``RetryPolicy``:
 
 - ``RETRY_SYNC``: 5 attempts with exponential backoff (used by sync.py for
   bulk historical fetch — needs robustness over 38k+ rounds).
-- ``RETRY_GATE``: 2 attempts with one short retry (used by the per-round
-  live-decision gate — bounded fail-soft via ``TransientOkxError`` on the
-  decision path so a single OKX hiccup skips the round, not the bot).
+- ``RETRY_NONE``: single attempt, no retry (used by the per-round live-
+  decision gate post-p4c-revision). Retry on the live path adds 2.5s+
+  wall-clock that always pushes decision past lock_at, contributing zero
+  bet-placement value. The gate's ``_MAX_CONSECUTIVE_FETCH_FAILURES``
+  streak counter handles transient-failure escalation.
 
 Returns oldest-first list of ``[ts_ms, open, high, low, close, volume]``
 arrays. Length is exactly ``(newest - oldest)/1000 + 1``. The query always
@@ -168,10 +170,21 @@ class RetryPolicy:
 # Sync.py iterates 38k+ rounds; needs robust retry over slow OKX backends.
 RETRY_SYNC = RetryPolicy(max_attempts=5, backoff_seconds=(2.0, 4.0, 8.0, 16.0))
 
-# Per-round live-decision gate fetch; bounded retry then fail-soft via
-# ``TransientOkxError`` so a single OKX hiccup skips the round (the gate
-# handles consecutive-failure escalation). 2 attempts + 2.5s backoff fits
-# inside the gate's pre-lock budget alongside the parallel 4-symbol fetch.
+# Per-round live-decision gate fetch (post-p4c-revision, 2026-05-02): NO
+# retry. Single attempt; on insufficient/error -> TransientOkxError ->
+# gate skips the round with ``kline_fetch_transient_failure``. Retry has
+# zero bet-placement value on the live path because the 2.5s+ backoff
+# always pushes decision past lock_at, where the engine's timing guard
+# would skip anyway -- so retry just adds wall-clock + rate-budget cost
+# for no operational benefit. Streak counter
+# ``_MAX_CONSECUTIVE_FETCH_FAILURES`` in momentum_gate handles escalation:
+# 5 consecutive -> bot crashes with InvariantError -> supervisor restart
+# + Discord alert.
+RETRY_NONE = RetryPolicy(max_attempts=1, backoff_seconds=())
+
+# Retained for test fixture use (tests/test_okx_warmup_transient.py
+# exercises the retry path with this policy). Not used in production
+# post-p4c-revision; live decision path uses RETRY_NONE above.
 RETRY_GATE = RetryPolicy(max_attempts=2, backoff_seconds=(2.5,))
 
 # OKX API-level error codes that are transient and warrant retry.
