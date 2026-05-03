@@ -60,6 +60,7 @@ def run_from_config(
         cutoff_seconds=cfg.kline_cutoff_seconds,
         mtf_lookbacks=cfg.strategy.gate.mtf_lookbacks,
         mtf_threshold=cfg.strategy.gate.mtf_threshold,
+        max_consecutive_fetch_failures=cfg.max_consecutive_fetch_failures,
     )
 
     if backtest:
@@ -73,9 +74,12 @@ def run_from_config(
             contract=None,
             wallet_address="",
             cutoff_seconds=cfg.kline_cutoff_seconds,
-            prefetch_offset_seconds=cfg.prefetch_offset_seconds,
-            kline_fetch_offset_ms=cfg.kline_fetch_offset_ms,
+            skew_sync_wakeup_offset_ms=cfg.skew_sync_wakeup_offset_ms,
+            pool_wakeup_offset_ms=cfg.pool_wakeup_offset_ms,
+            kline_wakeup_offset_ms=cfg.kline_wakeup_offset_ms,
             lock_safety_margin_ms=cfg.lock_safety_margin_ms,
+            max_consecutive_fetch_failures=cfg.max_consecutive_fetch_failures,
+            pool_cutoff_seconds=cfg.pool_cutoff_seconds,
             dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
             momentum_gate_config=momentum_gate_cfg,
             momentum_gate=None,
@@ -161,7 +165,7 @@ def run_from_config(
     # Per-round REST kline fetch path: the gate fires 4 parallel
     # ``/history-candles`` GETs each round (BTC/ETH/SOL/BNB) anchored to
     # ``lock_at_ms``. Wake-time offset configured via
-    # ``[runtime] kline_fetch_offset_ms``. BNB is FIRST-CLASS (the bot bets
+    # ``RuntimeConfig.kline_wakeup_offset_ms``. BNB is FIRST-CLASS (the bot bets
     # on BNB/USD); it's fetched alongside BTC/ETH/SOL even though the
     # current strategy doesn't consume BNB closes for signal computation.
     momentum_gate = MomentumGate(
@@ -181,9 +185,12 @@ def run_from_config(
         contract=contract,
         wallet_address=contract.wallet_address,
         cutoff_seconds=cfg.kline_cutoff_seconds,
-        prefetch_offset_seconds=cfg.prefetch_offset_seconds,
-        kline_fetch_offset_ms=cfg.kline_fetch_offset_ms,
+        skew_sync_wakeup_offset_ms=cfg.skew_sync_wakeup_offset_ms,
+        pool_wakeup_offset_ms=cfg.pool_wakeup_offset_ms,
+        kline_wakeup_offset_ms=cfg.kline_wakeup_offset_ms,
         lock_safety_margin_ms=cfg.lock_safety_margin_ms,
+        max_consecutive_fetch_failures=cfg.max_consecutive_fetch_failures,
+        pool_cutoff_seconds=cfg.pool_cutoff_seconds,
         dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
         momentum_gate_config=momentum_gate_cfg,
         dry=dry,
