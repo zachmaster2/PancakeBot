@@ -322,12 +322,36 @@ _DEFAULT_STRATEGY = StrategyConfig(
 
 @dataclass(frozen=True, slots=True)
 class AppConfig:
-    """User-facing configuration loaded from config.toml."""
+    """User-facing configuration loaded from config.toml.
 
+    User-tunable knobs:
+    - ``kline_cutoff_seconds``: data horizon for the strategy (gate
+      consumes candles closing at-or-before lock_at - this).
+    - ``pool_cutoff_seconds``: data horizon for the pool aggregate (only
+      bets with block_ts < lock_at - this are counted).
+    - ``max_consecutive_fetch_failures``: streak counter before the bot
+      crashes with InvariantError + supervisor restart.
+
+    Derived (computed at config-load time from
+    ``pancakebot/timing_constants.py``; not user-tunable):
+    - ``lock_safety_margin_ms``
+    - ``kline_wakeup_offset_ms``
+    - ``pool_wakeup_offset_ms``
+    - ``skew_sync_wakeup_offset_ms``
+    """
+
+    # User-tunable
     kline_cutoff_seconds: int
-    prefetch_offset_seconds: int
-    kline_fetch_offset_ms: int
+    pool_cutoff_seconds: int
+    max_consecutive_fetch_failures: int
+
+    # Derived (from timing_constants.py at load time)
     lock_safety_margin_ms: int
+    kline_wakeup_offset_ms: int
+    pool_wakeup_offset_ms: int
+    skew_sync_wakeup_offset_ms: int
+
+    # Other
     dry_initial_bankroll_bnb: float
     live_min_bet_only: bool
     backtest_simulation_size: int
@@ -335,7 +359,7 @@ class AppConfig:
 
     # Full BacktestConfig with validation (kept as inner dataclass).
     backtest: BacktestConfig
-    # Full StrategyConfig (defaults match pre-refactor module constants).
+    # Full StrategyConfig.
     strategy: StrategyConfig
 
 
@@ -568,89 +592,91 @@ def load_app_config(path: str) -> AppConfig:
         raise InvariantError("config_section_not_dict: backtest")
 
     # [runtime]
-    # ``kline_cutoff_seconds`` controls the strategy-side data window: the
-    # gate filters to candles with ``open_ts < lock_at - cutoff*1000``, and
-    # the live-fetch newest candle has open_ts ``lock_at - cutoff*1000 -
-    # 1000`` (closes at ``lock_at - cutoff_seconds``). Range [1..30]:
-    # below 1 the newest candle would close at/after lock_at (OKX hasn't
-    # published it); above 30 we'd erode the decision-window's predictive
-    # horizon for no reason.
+    # ``kline_cutoff_seconds`` is the strategy's data horizon for OKX
+    # klines. The gate's newest candle CLOSES at ``lock_at - cutoff*1000``,
+    # one second before the strategy's ``open_ts >= cutoff_ts_ms`` filter
+    # would drop it. Cross-validated against ``OKX_PUBLISH_DELAY_P99_MS``
+    # below: cutoff*1000 must be >= the p99 publishing latency, otherwise
+    # the gate would routinely ask OKX for unpublished candles.
     kline_cutoff_seconds = _req_int(runtime, "kline_cutoff_seconds")
     if not (1 <= kline_cutoff_seconds <= 30):
         raise InvariantError(
             f"runtime_kline_cutoff_seconds_out_of_range: "
             f"got={kline_cutoff_seconds} valid=[1..30]"
         )
-    prefetch_offset_seconds = _req_int(runtime, "prefetch_offset_seconds")
-    if prefetch_offset_seconds <= 0:
-        raise InvariantError("prefetch_offset_seconds_must_be_positive")
-    # ``kline_fetch_offset_ms`` controls how many milliseconds before lock_at
-    # the gate wakes to fire its parallel 4-symbol REST fetch. The wake-time
-    # budget chain is:
-    #
-    #     wake -> fetch -> compute -> sign -> submit -> mempool -> block -> lock
-    #     |<--- kline_fetch_offset_ms (= 1200ms) -------------------------->|
-    #     |<--- fetch (p50 ~270ms) ->|
-    #                                |<--- compute (~50ms) ->|
-    #                                                        |<-- sign (~5ms)
-    #                                                        |<-- submit_RTT (~400ms) ->|
-    #                                                                                  |<-- block (~450ms) ->|
-    #
-    # Default 1200ms (post-p4c-revision) chosen so median-fetch rounds have
-    # decision-ready at lock-880ms, comfortably ahead of the 750ms safety
-    # margin, with median-block-landing before lock_ts (= block.timestamp =
-    # lock_ts - 1, satisfies PancakeSwap PredictionV2's strict
-    # block.timestamp < lockTimestamp check).
-    #
-    # Source: research/p4c_canonical_loop_probe.py (n=200 at wake=1200ms,
-    # 2026-05-02). Empirical first-try success: 88.0% rounds (96.9%
-    # per-symbol) at 800ms post-candle-close. Per-symbol p99 RTT ~558ms.
-    # See var/strategy_review/p4c_revision_implementer.md for the full data.
-    #
-    # Range [100..5000]: below 100 we'd hit OKX before the cutoff candle
-    # closes (impossible window); above 5000 we'd burn most of the pre-lock
-    # budget waiting and the gate would consume staler data. Re-derive
-    # via: py research/p4c_canonical_loop_probe.py 200 <new_offset>.
-    kline_fetch_offset_ms = _opt_int(runtime, "kline_fetch_offset_ms", 1200)
-    if not (100 <= kline_fetch_offset_ms <= 5000):
+
+    # ``pool_cutoff_seconds`` is the strategy's data horizon for BSC
+    # BetBull/BetBear events. Only bets with on-chain block_timestamp
+    # < lock_at - this are counted in the pool aggregate. Cross-validated
+    # against ``WSS_ARRIVAL_DELAY_P99_MS`` below: cutoff*1000 must be >=
+    # the p99 WSS arrival latency, otherwise the pool aggregate would
+    # routinely exclude bets still en route to our subscriber.
+    pool_cutoff_seconds = _opt_int(runtime, "pool_cutoff_seconds", 6)
+    if not (1 <= pool_cutoff_seconds <= 30):
         raise InvariantError(
-            f"runtime_kline_fetch_offset_ms_out_of_range: "
-            f"got={kline_fetch_offset_ms} valid=[100..5000]"
+            f"runtime_pool_cutoff_seconds_out_of_range: "
+            f"got={pool_cutoff_seconds} valid=[1..30]"
         )
-    # ``lock_safety_margin_ms`` controls the pre-bet timing guard at
-    # engine.py: abort the bet if wall-clock is within this margin of
-    # lock_at. Sized to ensure the TX has time to submit AND be included in
-    # a block whose timestamp is < lock_ts (PancakeSwap PredictionV2
-    # rejects late bets at the contract level).
-    #
-    # Default 750ms = block_time (~450ms, BSC post-Maxwell hardfork) +
-    # submit_RTT (~300ms typical to BSC RPC). At decision-ready = lock-880ms
-    # (median fetch), submit by lock-870ms, mempool by lock-470ms,
-    # next-block landing window [lock-470ms, lock-20ms] -> block.timestamp
-    # = lock_ts - 1 -> INCLUDED.
-    #
-    # Range [50..2000]: below 50 leaves no buffer; above 2000 returns to
-    # the broken regime where wake fires inside the safety zone (p4c).
-    lock_safety_margin_ms = _opt_int(runtime, "lock_safety_margin_ms", 750)
-    if not (50 <= lock_safety_margin_ms <= 2000):
+
+    # ``max_consecutive_fetch_failures``: streak counter for OKX
+    # transient failures on the live decision path. After this many in a
+    # row, the gate raises InvariantError -> bot crashes -> supervisor
+    # restart + Discord alert.
+    max_consecutive_fetch_failures = _opt_int(
+        runtime, "max_consecutive_fetch_failures", 5,
+    )
+    if not (1 <= max_consecutive_fetch_failures <= 100):
         raise InvariantError(
-            f"runtime_lock_safety_margin_ms_out_of_range: "
-            f"got={lock_safety_margin_ms} valid=[50..2000]"
+            f"runtime_max_consecutive_fetch_failures_out_of_range: "
+            f"got={max_consecutive_fetch_failures} valid=[1..100]"
         )
-    # Cross-constraint: the safety margin MUST be strictly less than the
-    # kline-fetch wake offset, otherwise the bot wakes already inside the
-    # safety zone and aborts every bet (the p4c-regression failure mode
-    # the timing-architecture rewrite resolved).
-    #
-    # The DIFFERENCE ``kline_fetch_offset_ms - lock_safety_margin_ms`` is
-    # the per-round budget for fetch + compute. At default values
-    # 1200 - 750 = 450ms; with median fetch+compute ~320ms, that leaves
-    # ~130ms of headroom. p99 fetch (~560ms) exceeds the budget and
-    # gracefully aborts at the timing guard (no wasted TX, conservative).
-    if lock_safety_margin_ms >= kline_fetch_offset_ms:
+    # --- Derived timing constants (NOT user-tunable) ---
+    # All four wake offsets and the safety margin are computed from
+    # empirical constants in pancakebot/timing_constants.py. To change
+    # any value, re-run the corresponding probe and update the constant
+    # there. See timing_constants.py for the derivation formulas.
+    from pancakebot import timing_constants as _tc
+
+    lock_safety_margin_ms = (
+        _tc.BSC_SUBMIT_RTT_P95_MS
+        + _tc.BSC_BLOCK_TIME_MS
+        + _tc.SAFETY_BUFFER_MS
+    )
+    kline_wakeup_offset_ms = (
+        lock_safety_margin_ms
+        + _tc.OKX_FETCH_RTT_P95_MS
+        + _tc.GATE_COMPUTE_MS
+    )
+    pool_wakeup_offset_ms = (
+        kline_wakeup_offset_ms
+        + _tc.POOL_READ_BUFFER_MS
+    )
+    skew_sync_wakeup_offset_ms = (
+        pool_wakeup_offset_ms
+        + _tc.SKEW_SYNC_TIME_P99_MS
+        + _tc.SKEW_SAFETY_BUFFER_MS
+    )
+
+    # Cross-validation: kline_cutoff must be at least OKX's p99
+    # publishing latency, otherwise the gate would ask for unpublished
+    # candles routinely.
+    if kline_cutoff_seconds * 1000 < _tc.OKX_PUBLISH_DELAY_P99_MS:
         raise InvariantError(
-            f"runtime_lock_safety_margin_ms_must_be_less_than_kline_fetch_offset_ms: "
-            f"safety_margin={lock_safety_margin_ms} kline_fetch_offset={kline_fetch_offset_ms}"
+            f"config_kline_cutoff_too_small_for_okx_publish_delay: "
+            f"kline_cutoff_seconds={kline_cutoff_seconds} "
+            f"({kline_cutoff_seconds * 1000}ms) "
+            f"< OKX_PUBLISH_DELAY_P99_MS={_tc.OKX_PUBLISH_DELAY_P99_MS}"
+        )
+
+    # Cross-validation: pool_cutoff must be at least WSS arrival p99,
+    # otherwise the pool aggregate would routinely miss bets still en
+    # route to our subscriber.
+    if pool_cutoff_seconds * 1000 < _tc.WSS_ARRIVAL_DELAY_P99_MS:
+        raise InvariantError(
+            f"config_pool_cutoff_too_small_for_wss_arrival_delay: "
+            f"pool_cutoff_seconds={pool_cutoff_seconds} "
+            f"({pool_cutoff_seconds * 1000}ms) "
+            f"< WSS_ARRIVAL_DELAY_P99_MS={_tc.WSS_ARRIVAL_DELAY_P99_MS}"
         )
 
     # [dry]
@@ -685,9 +711,12 @@ def load_app_config(path: str) -> AppConfig:
 
     return AppConfig(
         kline_cutoff_seconds=kline_cutoff_seconds,
-        prefetch_offset_seconds=prefetch_offset_seconds,
-        kline_fetch_offset_ms=kline_fetch_offset_ms,
+        pool_cutoff_seconds=pool_cutoff_seconds,
+        max_consecutive_fetch_failures=max_consecutive_fetch_failures,
         lock_safety_margin_ms=lock_safety_margin_ms,
+        kline_wakeup_offset_ms=kline_wakeup_offset_ms,
+        pool_wakeup_offset_ms=pool_wakeup_offset_ms,
+        skew_sync_wakeup_offset_ms=skew_sync_wakeup_offset_ms,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_min_bet_only=live_min_bet_only,
         backtest_simulation_size=simulation_size,

@@ -29,20 +29,29 @@ class RuntimeConfig:
     # Feature cutoff
     cutoff_seconds: int
 
-    # Prefetch offset: how many seconds before cutoff to wake for housekeeping
-    prefetch_offset_seconds: int
-
-    # Per-round kline fetch offset: how many milliseconds before lock_at
-    # the gate wakes to fire its parallel 4-symbol REST fetch. Validated
-    # in [100..5000] at config load.
-    kline_fetch_offset_ms: int
-
-    # Pre-bet timing guard: if wall-clock is within this many milliseconds
-    # of lock_at, abort the bet rather than submit a TX likely to land
-    # after lock. Cross-validated at config load to be < kline_fetch_offset_ms
-    # so the wake doesn't fire inside the safety zone (the p4c regression).
-    # Validated in [50..2000] at config load.
+    # Pre-lock wake schedule (all DERIVED from pancakebot/timing_constants.py
+    # at config load; not user-tunable). All in milliseconds before lock_at.
+    #
+    #   skew_sync_wakeup_offset_ms  >  pool_wakeup_offset_ms
+    #                               >  kline_wakeup_offset_ms
+    #                               >  lock_safety_margin_ms
+    #
+    # Engine fires three distinct _sleep_until_ts wakes per round:
+    # skew_sync -> pool -> kline. Timing guard at lock_safety_margin_ms.
+    skew_sync_wakeup_offset_ms: int
+    pool_wakeup_offset_ms: int
+    kline_wakeup_offset_ms: int
     lock_safety_margin_ms: int
+
+    # User-tunable. Streak counter for OKX transient failures; bot
+    # crashes (-> supervisor restart + Discord alert) after this many
+    # consecutive `kline_fetch_transient_failure` rounds.
+    max_consecutive_fetch_failures: int
+
+    # User-tunable. Pool cutoff: only bets with on-chain block_timestamp
+    # < lock_at - pool_cutoff_seconds are counted in the pool aggregate.
+    # Cross-validated at config load to be >= WSS_ARRIVAL_DELAY_P99.
+    pool_cutoff_seconds: int
 
     # Protocol constants (from chain via contract_constants.json)
     min_bet_amount_bnb: float

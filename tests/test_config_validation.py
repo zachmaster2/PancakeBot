@@ -48,9 +48,12 @@ def _write_cfg(tmp_path: Path, cutoff: int) -> Path:
     return p
 
 
-@pytest.mark.parametrize("cutoff", [1, 2, 15, 30])
+@pytest.mark.parametrize("cutoff", [2, 15, 30])
 def test_kline_cutoff_seconds_accepts_valid_range(tmp_path, cutoff):
-    """[1..30] inclusive: all accepted."""
+    """Range [1..30] PLUS cross-validation kline_cutoff*1000 >=
+    OKX_PUBLISH_DELAY_P99_MS. With OKX_PUBLISH_DELAY_P99_MS=1300, the
+    minimum valid cutoff is 2 (=2000ms).
+    """
     cfg = load_app_config(str(_write_cfg(tmp_path, cutoff)))
     assert cfg.kline_cutoff_seconds == cutoff
 

@@ -12,7 +12,6 @@ from pancakebot.constants import (
     GAS_LIMIT_BET,
     GAS_LIMIT_CLAIM,
     GAS_COST_BET_BNB,
-    POOL_CUTOFF_SECONDS,
 )
 from pancakebot.util import InvariantError, TransientRpcError
 from pancakebot.log import info, warn
@@ -378,12 +377,17 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
 
-        # -- Phase A: Housekeeping (before cutoff) --
-        # Wake early to do epoch check + TLS warmup while we're still
-        # waiting for the cutoff moment.  These run OUTSIDE the critical
-        # timing window so they don't eat into our bet-submission budget.
-        wake_ts = cutoff_ts_t - cfg.prefetch_offset_seconds
-        _sleep_until_ts(wake_ts, reason="wait_for_prefetch", epoch=current_epoch)
+        # -- Skew-sync wake --
+        # First of three pre-lock wakes. Fires at lock_at -
+        # skew_sync_wakeup_offset_ms (= ~3.65s before lock at canonical
+        # timing constants). Skew refresh + epoch quick-check + bankroll
+        # fetch run here, off the critical path.
+        skew_sync_wake_ts = lock_ts_t - cfg.skew_sync_wakeup_offset_ms / 1000.0
+        _sleep_until_ts(
+            skew_sync_wake_ts,
+            reason="wait_for_skew_sync",
+            epoch=current_epoch,
+        )
 
         # Epoch quick-check: verify current_epoch hasn't shifted during sleep.
         try:
@@ -499,6 +503,17 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 # absorbed comfortably in the housekeeping window.
                 _refresh_clock_skew(gate)
 
+        # -- Pool wake --
+        # Second of three pre-lock wakes. Fires at lock_at -
+        # pool_wakeup_offset_ms (= ~1.1s before lock). Pool data is
+        # in-memory (WSS subscriber) so this is mainly a synchronization
+        # point: we read the pool aggregate at the same OKX-time-anchored
+        # moment every round for reproducibility.
+        pool_wake_ts = lock_ts_t - cfg.pool_wakeup_offset_ms / 1000.0
+        _sleep_until_ts(
+            pool_wake_ts, reason="wait_for_pool", epoch=current_epoch,
+        )
+
         # Pool data from WSS subscription (no RPC needed, ~0 ms).
         pool_bull_bnb = 0.0
         pool_bear_bnb = 0.0
@@ -528,7 +543,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                      msg=f"Skip epoch {current_epoch}: backfill_incomplete")
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
-            pool_ts_cutoff = lock_ts_t - POOL_CUTOFF_SECONDS
+            pool_ts_cutoff = lock_ts_t - cfg.pool_cutoff_seconds
             pool_bull_bnb, pool_bear_bnb = cfg.pool_watcher.get_pool(
                 epoch=current_epoch, max_ts=pool_ts_cutoff,
             )
@@ -543,18 +558,15 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                  endpoint=cfg.pool_watcher.current_endpoint,
                  last_ok=f"{cfg.pool_watcher.last_connected_at:.0f}")
 
-        # -- Phase B: Critical path (pre-lock) --
-        # Sleep until ``lock_at - kline_fetch_offset_ms`` (skew-corrected),
-        # then run gate.evaluate() which fires 4 parallel /history-candles
-        # GETs and computes the signal off the returned arrays. The offset
-        # is sized so the round has time to fetch + compute + sign + submit
-        # + land in a block whose timestamp < lock_ts. With default 1200ms
-        # (post-p4c-revision): wake at lock-1200ms -> median fetch+compute
-        # ~320ms -> decision-ready at lock-880ms -> guard at lock-750ms ->
-        # PASS -> submit -> mempool by lock-470ms -> next-block landing
-        # within [lock-470ms, lock-20ms] -> block.timestamp = lock_ts - 1
-        # -> INCLUDED. Tuned via [runtime] kline_fetch_offset_ms.
-        fetch_ts = lock_ts_t - cfg.kline_fetch_offset_ms / 1000.0
+        # -- Kline-fetch wake (critical path) --
+        # Third of three pre-lock wakes. Fires at lock_at -
+        # kline_wakeup_offset_ms (= ~1.09s before lock at canonical
+        # timing constants). gate.evaluate() runs immediately after,
+        # firing 4 parallel /history-candles GETs and computing the
+        # signal. Sized so median-fetch rounds have decision-ready
+        # comfortably ahead of the timing guard at lock - lock_safety_margin_ms.
+        # See pancakebot/timing_constants.py for the empirical derivation.
+        fetch_ts = lock_ts_t - cfg.kline_wakeup_offset_ms / 1000.0
         _sleep_until_ts(fetch_ts, reason="wait_for_kline_fetch", epoch=current_epoch)
 
         # Step 8: Decide. Gate fires 4 parallel REST fetches and computes
