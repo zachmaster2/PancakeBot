@@ -17,11 +17,10 @@ at lock-2s" path crashed ~67% of rounds with
 ``kline_fetch_integrity_violation`` because OKX's `after`-only filter
 slid the window when the newest candle was unavailable.
 
-Empirical OKX REST behavior (research/p4c_canonical_loop_probe.py
-n=1000, 2026-05-03): per-symbol first-try success at 800ms post-close
-= 96.9%; at 1150ms = 98.3%. Implied per-symbol p99 publishing staleness
-~1.0-1.3s. Pooled fetch RTT p95=289ms, p99=363ms. See
-pancakebot/timing_constants.py for the empirical constants.
+Empirical OKX REST behavior (research/p4c_canonical_loop_probe.py): per-
+symbol first-try success ~96.9% at 800ms post-close, ~98.3% at 1150ms.
+Pooled fetch RTT p95=289ms, p99=363ms. Probe-derived empirical
+constants in pancakebot/timing_constants.py.
 
 Live decision path uses ``RETRY_NONE`` (max_attempts=1). A first-try
 fail on any symbol -> TransientOkxError -> gate skips with
@@ -53,11 +52,10 @@ from pancakebot.util import InvariantError, TransientOkxError
 # below is the canonical default + the value used by tests that don't
 # construct a custom MomentumGateConfig.
 #
-# Sized for the post-p4c-revision config: per-round transient-failure
-# rate is ~12% empirically (research/p4c_canonical_loop_probe.py n=1000
-# at 800ms post-close). At max=5: P(5 consecutive at 12%) = 0.12^5 =
-# 2.5e-5 -> expected once per ~40,000 rounds = ~14 weeks at 12 rounds/h.
-# Acceptable Discord-alert cadence per operator preference.
+# At default max=5 with empirical per-round transient-failure rate ~12%
+# (research/p4c_canonical_loop_probe.py n=1000 at 800ms post-close):
+# P(5 consecutive transient) = 0.12^5 = 2.5e-5 -> expected crash once
+# per ~40,000 rounds = ~14 weeks at 12 rounds/h.
 _MAX_CONSECUTIVE_FETCH_FAILURES = 5
 
 _SYMBOLS_FETCHED = ("btc", "eth", "sol", "bnb")

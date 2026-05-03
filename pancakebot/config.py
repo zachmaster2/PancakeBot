@@ -93,9 +93,6 @@ class BtcPrimarySizingConfig:
       base_fraction + sizing_slope * signal_strength, capped at max_frac.
     - max_frac: hard cap on the computed pool fraction, applied
       before per-bet absolute caps (in RiskConfig).
-
-    sizing_slope and max_frac were previously module-level constants
-    (_SIZING_SLOPE, _MAX_FRAC) in pancakebot/strategy/momentum_pipeline.py.
     """
     base_fraction: float
     sizing_slope: float
@@ -185,10 +182,10 @@ class RiskConfig:
     - window_days: rolling window (days) for the drawdown-from-peak calculation
       when ``dd_peak_mode == "rolling_7d"``.
     - dd_peak_mode: peak-tracking semantics for the drawdown breaker.
-      ``"rolling_7d"`` (default, preserves canonical bit-identity) uses a
-      rolling window of ``window_days``. ``"absolute_ratchet"`` uses an
-      absolute-since-launch peak that monotonically only goes up — catches
-      slow drains the rolling window misses. (p2a workstream, backtest-only.)
+      ``"rolling_7d"`` (default) uses a rolling window of ``window_days``.
+      ``"absolute_ratchet"`` uses an absolute-since-launch peak that
+      monotonically only goes up — catches slow drains the rolling
+      window misses.
     - max_bet_bnb_btc_primary: absolute BNB cap for BTC primary bets.
     - max_bet_bnb_eth_sol_fallback: absolute BNB cap for regime-2 ETH+SOL bets.
     """
