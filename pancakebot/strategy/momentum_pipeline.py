@@ -289,8 +289,6 @@ class MomentumOnlyPipeline:
 
         if signal_dir is None:
             # Regime-2: ETH+SOL both fire same direction, BTC silent.
-            # (Always-on since 2026-04-26 lean&clean; previously gated by
-            # _REGIME2_ENABLED constant.)
             if (result.eth_signal is not None
                     and result.sol_signal is not None
                     and result.eth_signal == result.sol_signal):

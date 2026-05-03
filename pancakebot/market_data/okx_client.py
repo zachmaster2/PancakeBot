@@ -181,9 +181,9 @@ RETRY_SYNC = RetryPolicy(max_attempts=5, backoff_seconds=(2.0, 4.0, 8.0, 16.0))
 # with InvariantError -> supervisor restart + Discord alert.
 RETRY_NONE = RetryPolicy(max_attempts=1, backoff_seconds=())
 
-# Retained for test fixture use (tests/test_okx_warmup_transient.py
-# exercises the retry path with this policy). Not used in production
-# post-p4c-revision; live decision path uses RETRY_NONE above.
+# Test fixture only (tests/test_okx_warmup_transient.py exercises the
+# retry path with this policy). Not used by the production live
+# decision path, which uses RETRY_NONE above.
 RETRY_GATE = RetryPolicy(max_attempts=2, backoff_seconds=(2.5,))
 
 # OKX API-level error codes that are transient and warrant retry.
