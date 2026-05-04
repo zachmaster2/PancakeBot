@@ -53,6 +53,15 @@ class RuntimeConfig:
     bet_tx_receipt_timeout_seconds: int
     claim_tx_receipt_timeout_seconds: int
 
+    # Selected publish-delay tier from the config-load tier ladder:
+    # ``"P99"`` (strict; full-inclusion guarantee that the cutoff candle
+    # is published at fetch time) or ``"P95"`` (operating budget; ~5%
+    # publish-delay tail absorbed by the streak counter). Surfaced for
+    # operator visibility -- logged at startup of the live/dry runtime
+    # loop. Set by ``pancakebot/config.py:load_app_config`` via the
+    # tier-ladder cross-validation (P99 first, P95 fallback).
+    kline_publish_tier: str
+
     # User-tunable. Streak counter for OKX transient failures; bot
     # crashes (-> supervisor restart + Discord alert) after this many
     # consecutive `kline_fetch_transient_failure` rounds.

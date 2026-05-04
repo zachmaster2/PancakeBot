@@ -118,11 +118,13 @@ def test_wake_chain_strictly_increasing(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_kline_fetch_wakeup_exceeds_cutoff_publish_budget_rejected(tmp_path):
-    """kline_fetch_wakeup > cutoff*1000 - OKX_KLINE_PUBLISH_DELAY_P95_MS must raise.
+    """kline_fetch_wakeup > cutoff*1000 - P95 (looser bound) must raise.
 
-    With cutoff=1 (=1000ms) and OKX_KLINE_PUBLISH_DELAY_P95_MS=700,
-    the budget is 1000 - 700 = 300ms but kline_fetch_wakeup_offset=1090ms.
-    1090 > 300 → fires.
+    Tier ladder: P99 first, P95 fallback, error if even P95 fails.
+    With cutoff=1 (=1000ms), P95=700, P99=1300:
+      P99 budget = 1000 - 1300 = -300ms (already negative).
+      P95 budget = 1000 - 700  =  300ms.
+      kline_fetch_wakeup_offset=1090ms > both -> InvariantError.
     """
     raised: Exception | None = None
     try:
@@ -133,17 +135,50 @@ def test_kline_fetch_wakeup_exceeds_cutoff_publish_budget_rejected(tmp_path):
     assert "config_kline_fetch_wakeup_exceeds_cutoff_publish_budget" in str(raised)
 
 
-def test_canonical_cutoff_2_passes_validation(tmp_path):
-    """Strategy-canonical cutoff=2 must pass the kline-fetch validation.
+def test_canonical_cutoff_2_falls_back_to_p95_tier(tmp_path):
+    """Strategy-canonical cutoff=2 lands in P95 tier (P99 budget too tight).
 
-    cutoff=2 (2000ms), kline_fetch_wakeup=1090ms, P95=700ms:
-    1090 > 2000 - 700 = 1300? NO. Passes.
+    cutoff=2 (2000ms), kline_fetch_wakeup=1090, P95=700, P99=1300:
+      P99 budget = 2000 - 1300 = 700ms;  1090 > 700 -> P99 fails.
+      P95 budget = 2000 - 700  = 1300ms; 1090 <= 1300 -> P95 passes.
+    Expected tier: "P95".
     """
     cfg = load_app_config(str(_write_cfg(tmp_path, cutoff=2)))
     assert cfg.kline_cutoff_seconds == 2
+    assert cfg.kline_publish_tier == "P95"
+    # Sanity: at this tier the wake offset fits the P95 budget.
     assert cfg.kline_fetch_wakeup_offset_ms <= (
         2 * 1000 - tc.OKX_KLINE_PUBLISH_DELAY_P95_MS
     )
+    # And it does NOT fit the strict P99 budget (else tier would be P99).
+    assert cfg.kline_fetch_wakeup_offset_ms > (
+        2 * 1000 - tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
+    )
+
+
+def test_cutoff_3_promotes_to_p99_tier(tmp_path):
+    """Larger cutoff auto-promotes to P99 tier without code change.
+
+    cutoff=3 (3000ms), kline_fetch_wakeup=1090, P99=1300:
+      P99 budget = 3000 - 1300 = 1700ms; 1090 <= 1700 -> P99 passes.
+    Expected tier: "P99".
+    """
+    cfg = load_app_config(str(_write_cfg(tmp_path, cutoff=3)))
+    assert cfg.kline_cutoff_seconds == 3
+    assert cfg.kline_publish_tier == "P99"
+    assert cfg.kline_fetch_wakeup_offset_ms <= (
+        3 * 1000 - tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
+    )
+
+
+def test_p95_le_p99_invariant_holds():
+    """Module-load assert in timing_constants.py: P95 must be <= P99.
+
+    If a future probe update accidentally inverts the percentile order,
+    the assert at module load fires immediately. This test re-asserts
+    the invariant for explicit regression coverage.
+    """
+    assert tc.OKX_KLINE_PUBLISH_DELAY_P95_MS <= tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
 
 
 def test_pool_read_wakeup_exceeds_cutoff_arrival_budget_rejected(tmp_path):

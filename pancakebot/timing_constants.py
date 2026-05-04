@@ -175,3 +175,14 @@ BET_SUBMIT_SAFETY_BUFFER_MS: int = 50
 # Source: engineering judgment.
 # Last measured: 2026-05-03
 SKEW_SYNC_SAFETY_BUFFER_MS: int = 50
+
+
+# --- Module-load sanity checks --------------------------------------------
+
+# Percentile order must hold: P95 <= P99 (probe noise that inverted them
+# would silently break the tier-fallback validation in config.py).
+assert OKX_KLINE_PUBLISH_DELAY_P95_MS <= OKX_KLINE_PUBLISH_DELAY_P99_MS, (
+    f"OKX_KLINE_PUBLISH_DELAY_P95_MS ({OKX_KLINE_PUBLISH_DELAY_P95_MS}) "
+    f"must be <= OKX_KLINE_PUBLISH_DELAY_P99_MS "
+    f"({OKX_KLINE_PUBLISH_DELAY_P99_MS}); probe ordering violated"
+)

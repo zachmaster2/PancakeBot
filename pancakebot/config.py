@@ -335,6 +335,9 @@ class AppConfig:
     - ``kline_fetch_wakeup_offset_ms``
     - ``pool_read_wakeup_offset_ms``
     - ``skew_sync_wakeup_offset_ms``
+    - ``kline_publish_tier``: ``"P99"`` (strict, full-inclusion guarantee)
+      or ``"P95"`` (operating budget; ~5% tail absorbed by streak counter).
+      Selected by tier-ladder cross-validation: P99 first, P95 fallback.
     """
 
     # User-tunable
@@ -347,6 +350,7 @@ class AppConfig:
     kline_fetch_wakeup_offset_ms: int
     pool_read_wakeup_offset_ms: int
     skew_sync_wakeup_offset_ms: int
+    kline_publish_tier: str
 
     # Other
     dry_initial_bankroll_bnb: float
@@ -652,31 +656,51 @@ def load_app_config(path: str) -> AppConfig:
         + _tc.SKEW_SYNC_SAFETY_BUFFER_MS
     )
 
-    # Cross-validation: the kline-fetch wake offset must fit inside the
-    # cutoff window minus typical publish delay. The cutoff is fixed by
-    # strategy; the wake offset adjusts around it. Validation uses
-    # OKX_KLINE_PUBLISH_DELAY_P95_MS (the engineered budget) rather than
-    # the strict P99 -- the strategy tolerates publish-delay tail misses
-    # (~5%) via the streak counter, and a strict-P99 validation would
-    # block the canonical operating point (cutoff=2, wakeup=1090ms,
-    # P99=1300ms; P99-strict would require wakeup <= 700ms which is
-    # below the inclusion-budget floor).
-    if kline_fetch_wakeup_offset_ms > (
+    # Tier-based publish-delay validation: prefer strict P99
+    # (full-inclusion guarantee that the cutoff candle is published at
+    # fetch time); fall back to P95 (operating budget; ~5% publish-delay
+    # tail absorbed by the streak counter). InvariantError fires only if
+    # even the looser P95 budget is exceeded.
+    #
+    # Behavior across cutoffs at the locked offsets:
+    #   - cutoff=2 (canonical): P99 budget=700ms < wake=1090ms. P95
+    #     budget=1300ms >= 1090ms -> tier="P95".
+    #   - cutoff=3+: P99 budget=1700ms+ >= 1090ms -> tier="P99".
+    #     Auto-strict; no code change needed when a future user opts
+    #     into a larger cutoff.
+    p99_budget_ms = (
+        kline_cutoff_seconds * 1000 - _tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
+    )
+    p95_budget_ms = (
         kline_cutoff_seconds * 1000 - _tc.OKX_KLINE_PUBLISH_DELAY_P95_MS
-    ):
+    )
+    if kline_fetch_wakeup_offset_ms <= p99_budget_ms:
+        kline_publish_tier = "P99"
+    elif kline_fetch_wakeup_offset_ms <= p95_budget_ms:
+        kline_publish_tier = "P95"
+    else:
         raise InvariantError(
             f"config_kline_fetch_wakeup_exceeds_cutoff_publish_budget: "
-            f"kline_fetch_wakeup_offset_ms={kline_fetch_wakeup_offset_ms} "
-            f"> kline_cutoff_seconds*1000={kline_cutoff_seconds * 1000} "
-            f"- OKX_KLINE_PUBLISH_DELAY_P95_MS"
-            f"={_tc.OKX_KLINE_PUBLISH_DELAY_P95_MS}"
+            f"kline_fetch_wakeup_offset_ms={kline_fetch_wakeup_offset_ms}ms "
+            f"exceeds P95 budget ({p95_budget_ms}ms) at "
+            f"kline_cutoff_seconds={kline_cutoff_seconds}s "
+            f"(P99 budget={p99_budget_ms}ms; "
+            f"P95={_tc.OKX_KLINE_PUBLISH_DELAY_P95_MS}ms; "
+            f"P99={_tc.OKX_KLINE_PUBLISH_DELAY_P99_MS}ms). "
+            f"Increase kline_cutoff_seconds or reduce wake offset."
         )
 
     # Cross-validation: the pool-read wake offset must fit inside the
     # pool-cutoff window minus WSS bet-event arrival delay (P99). Same
-    # framing: the cutoff is fixed; the wake offset adjusts around it.
-    # WSS uses P99 directly (no streak-counter analogue on this path,
-    # and WSS arrival is much more uniform than REST publishing).
+    # framing as klines: the cutoff is fixed; the wake offset adjusts
+    # around it.
+    #
+    # No tier fallback here -- WSS arrival is much more uniform than
+    # REST publishing (single subscriber stream vs. per-symbol
+    # publishing pipeline), so the P99 figure IS the operating budget;
+    # there's no looser percentile to fall back to. If a P95 WSS
+    # arrival probe constant is added later, this could be tier-ified
+    # symmetrically with klines. For now: P99-strict is the only check.
     if pool_read_wakeup_offset_ms > (
         pool_cutoff_seconds * 1000 - _tc.WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS
     ):
@@ -726,6 +750,7 @@ def load_app_config(path: str) -> AppConfig:
         kline_fetch_wakeup_offset_ms=kline_fetch_wakeup_offset_ms,
         pool_read_wakeup_offset_ms=pool_read_wakeup_offset_ms,
         skew_sync_wakeup_offset_ms=skew_sync_wakeup_offset_ms,
+        kline_publish_tier=kline_publish_tier,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_min_bet_only=live_min_bet_only,
         backtest_simulation_size=simulation_size,
