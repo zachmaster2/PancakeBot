@@ -1,10 +1,13 @@
 [runtime]
-# How many seconds before lock_at to sample kline data. Lower bound is
-# enforced at config load: kline_cutoff_seconds * 1000 must be >=
-# OKX_KLINE_PUBLISH_DELAY_P99_MS + kline_fetch_wakeup_offset_ms (so the
-# cutoff candle is already published by the time the gate fetches at
-# lock - kline_fetch_wakeup_offset_ms).
-kline_cutoff_seconds = 3
+# How many seconds before lock_at to sample kline data. The strategy
+# REQUIRES the kline closing at lock - kline_cutoff_seconds (cutoff=2
+# is the canonical baseline; without that kline the strategy falls
+# apart). The validation at config load checks the WAKE OFFSET fits
+# the cutoff window:
+#   kline_fetch_wakeup_offset_ms <= kline_cutoff_seconds * 1000
+#                                   - OKX_KLINE_PUBLISH_DELAY_P95_MS
+# (the cutoff is fixed by strategy; the offsets adjust around it).
+kline_cutoff_seconds = 2
 
 [dry]
 # Starting bankroll for fresh dry runs (ignored when continuing from existing state)

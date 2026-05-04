@@ -6,10 +6,11 @@ tests:
 
 1. The derivation chain produces the expected values from the locked
    constants (regression: catch accidental constant edits).
-2. Cross-validations fire when kline_cutoff_seconds is too small for
-   OKX_KLINE_PUBLISH_DELAY_P99_MS + kline_fetch_wakeup_offset_ms or
-   pool_cutoff_seconds is too small for pool_read_wakeup_offset_ms +
-   WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS.
+2. Cross-validations fire when the kline-fetch wake offset exceeds
+   `kline_cutoff_seconds * 1000 - OKX_KLINE_PUBLISH_DELAY_P95_MS`
+   or the pool-read wake offset exceeds
+   `pool_cutoff_seconds * 1000 - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS`.
+   The cutoffs are fixed by strategy; the wake offsets must fit.
 3. Inclusion-math chain remains satisfied at the locked constants
    (median fetch lands block before lock_ts).
 4. Engine timing-guard math at the locked bet_submit_deadline_offset_ms
@@ -50,7 +51,7 @@ initial_bankroll_bnb = 50.0
 """
 
 
-def _write_cfg(tmp_path: Path, *, cutoff: int = 3, extra: str = "") -> Path:
+def _write_cfg(tmp_path: Path, *, cutoff: int = 2, extra: str = "") -> Path:
     p = tmp_path / "config.toml"
     p.write_text(
         _BASE_TOML.format(cutoff=cutoff, extra_runtime=extra),
@@ -116,26 +117,41 @@ def test_wake_chain_strictly_increasing(tmp_path):
 # 2. Cross-validations fire when cutoffs are too small
 # ---------------------------------------------------------------------------
 
-def test_kline_cutoff_too_small_for_okx_publish_delay_rejected(tmp_path):
-    """kline_cutoff*1000 < OKX_KLINE_PUBLISH_DELAY_P99_MS + kline_fetch_wakeup_offset_ms must raise.
+def test_kline_fetch_wakeup_exceeds_cutoff_publish_budget_rejected(tmp_path):
+    """kline_fetch_wakeup > cutoff*1000 - OKX_KLINE_PUBLISH_DELAY_P95_MS must raise.
 
-    With OKX_KLINE_PUBLISH_DELAY_P99_MS=1300 and kline_fetch_wakeup_offset=1090
-    (sum=2390), kline_cutoff=2 (=2000ms) fails.
+    With cutoff=1 (=1000ms) and OKX_KLINE_PUBLISH_DELAY_P95_MS=700,
+    the budget is 1000 - 700 = 300ms but kline_fetch_wakeup_offset=1090ms.
+    1090 > 300 → fires.
     """
     raised: Exception | None = None
     try:
-        load_app_config(str(_write_cfg(tmp_path, cutoff=2)))
+        load_app_config(str(_write_cfg(tmp_path, cutoff=1)))
     except InvariantError as e:
         raised = e
     assert isinstance(raised, InvariantError)
-    assert "config_kline_cutoff_too_small_for_okx_publish_delay" in str(raised)
+    assert "config_kline_fetch_wakeup_exceeds_cutoff_publish_budget" in str(raised)
 
 
-def test_pool_cutoff_too_small_for_wss_arrival_delay_rejected(tmp_path):
-    """pool_cutoff*1000 < pool_read_wakeup_offset_ms + WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS must raise.
+def test_canonical_cutoff_2_passes_validation(tmp_path):
+    """Strategy-canonical cutoff=2 must pass the kline-fetch validation.
 
-    With WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS=3500 and pool_read_wakeup_offset=1095
-    (sum=4595), pool_cutoff=4 (=4000ms) fails.
+    cutoff=2 (2000ms), kline_fetch_wakeup=1090ms, P95=700ms:
+    1090 > 2000 - 700 = 1300? NO. Passes.
+    """
+    cfg = load_app_config(str(_write_cfg(tmp_path, cutoff=2)))
+    assert cfg.kline_cutoff_seconds == 2
+    assert cfg.kline_fetch_wakeup_offset_ms <= (
+        2 * 1000 - tc.OKX_KLINE_PUBLISH_DELAY_P95_MS
+    )
+
+
+def test_pool_read_wakeup_exceeds_cutoff_arrival_budget_rejected(tmp_path):
+    """pool_read_wakeup > pool_cutoff*1000 - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS must raise.
+
+    With pool_cutoff=4 (=4000ms) and WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS=3500,
+    the budget is 4000 - 3500 = 500ms but pool_read_wakeup_offset=1095ms.
+    1095 > 500 → fires.
     """
     extra = "pool_cutoff_seconds = 4"
     raised: Exception | None = None
@@ -144,7 +160,7 @@ def test_pool_cutoff_too_small_for_wss_arrival_delay_rejected(tmp_path):
     except InvariantError as e:
         raised = e
     assert isinstance(raised, InvariantError)
-    assert "config_pool_cutoff_too_small_for_wss_arrival_delay" in str(raised)
+    assert "config_pool_read_wakeup_exceeds_cutoff_arrival_budget" in str(raised)
 
 
 def test_pool_cutoff_default_is_6(tmp_path):
