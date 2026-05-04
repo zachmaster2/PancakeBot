@@ -101,12 +101,15 @@ constants in `pancakebot/timing_constants.py`.
 
 ### Configurable knobs (`config.toml [runtime]`)
 
-- `kline_cutoff_seconds = 3` — strategy data horizon for OKX klines.
-  Cross-validated at load: must be ≥
-  `(OKX_KLINE_PUBLISH_DELAY_P99_MS + kline_fetch_wakeup_offset_ms) / 1000`.
+- `kline_cutoff_seconds = 2` — strategy data horizon for OKX klines
+  (FIXED by strategy: the kline closing at `lock - cutoff` is required).
+  Cross-validated at load via the wake-offset framing:
+  `kline_fetch_wakeup_offset_ms <= kline_cutoff_seconds * 1000 -
+  OKX_KLINE_PUBLISH_DELAY_P95_MS`.
 - `pool_cutoff_seconds = 6` — pool-aggregate data horizon for BSC events.
-  Cross-validated at load: must be ≥
-  `(pool_read_wakeup_offset_ms + WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS) / 1000`.
+  Cross-validated at load:
+  `pool_read_wakeup_offset_ms <= pool_cutoff_seconds * 1000 -
+  WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS`.
 - `max_consecutive_fetch_failures = 5` — streak counter before bot
   crashes (supervisor restart + Discord alert).
 
