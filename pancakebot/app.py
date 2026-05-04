@@ -68,6 +68,13 @@ def run_from_config(
         round_store = ClosedRoundsStore(paths.CLOSED_ROUNDS_PATH)
         # noinspection PyTypeChecker
         backtest_cfg: BacktestConfig = cfg.backtest
+        # Receipt timeouts derived from chain-loaded buffer_seconds +
+        # _CLAIM_CHECK_PADDING_SECONDS (≈35s on canonical chain constants).
+        # Both bet and claim TX receipts share this timeout sizing.
+        from pancakebot.runtime.engine import _CLAIM_CHECK_PADDING_SECONDS
+        _bt_receipt_timeout = (
+            int(cc.buffer_seconds) + int(_CLAIM_CHECK_PADDING_SECONDS)
+        )
         # noinspection PyTypeChecker
         runtime_cfg = RuntimeConfig(
             round_store=round_store,
@@ -75,9 +82,11 @@ def run_from_config(
             wallet_address="",
             cutoff_seconds=cfg.kline_cutoff_seconds,
             skew_sync_wakeup_offset_ms=cfg.skew_sync_wakeup_offset_ms,
-            pool_wakeup_offset_ms=cfg.pool_wakeup_offset_ms,
-            kline_wakeup_offset_ms=cfg.kline_wakeup_offset_ms,
-            lock_safety_margin_ms=cfg.lock_safety_margin_ms,
+            pool_read_wakeup_offset_ms=cfg.pool_read_wakeup_offset_ms,
+            kline_fetch_wakeup_offset_ms=cfg.kline_fetch_wakeup_offset_ms,
+            bet_submit_deadline_offset_ms=cfg.bet_submit_deadline_offset_ms,
+            bet_tx_receipt_timeout_seconds=_bt_receipt_timeout,
+            claim_tx_receipt_timeout_seconds=_bt_receipt_timeout,
             max_consecutive_fetch_failures=cfg.max_consecutive_fetch_failures,
             pool_cutoff_seconds=cfg.pool_cutoff_seconds,
             dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
@@ -165,7 +174,7 @@ def run_from_config(
     # Per-round REST kline fetch path: the gate fires 4 parallel
     # ``/history-candles`` GETs each round (BTC/ETH/SOL/BNB) anchored to
     # ``lock_at_ms``. Wake-time offset configured via
-    # ``RuntimeConfig.kline_wakeup_offset_ms``. BNB is FIRST-CLASS (the bot bets
+    # ``RuntimeConfig.kline_fetch_wakeup_offset_ms``. BNB is FIRST-CLASS (the bot bets
     # on BNB/USD); it's fetched alongside BTC/ETH/SOL even though the
     # current strategy doesn't consume BNB closes for signal computation.
     momentum_gate = MomentumGate(
@@ -180,15 +189,25 @@ def run_from_config(
     pool_watcher = PoolEventWatcher(interval_seconds=interval_seconds)
     pool_watcher.start()
 
+    # Receipt timeouts derived from chain-loaded buffer_seconds +
+    # _CLAIM_CHECK_PADDING_SECONDS (≈35s on canonical chain constants).
+    # Both bet and claim TX receipts share this timeout sizing.
+    from pancakebot.runtime.engine import _CLAIM_CHECK_PADDING_SECONDS
+    _runtime_receipt_timeout = (
+        int(buffer_seconds) + int(_CLAIM_CHECK_PADDING_SECONDS)
+    )
+
     runtime_cfg = RuntimeConfig(
         round_store=None,
         contract=contract,
         wallet_address=contract.wallet_address,
         cutoff_seconds=cfg.kline_cutoff_seconds,
         skew_sync_wakeup_offset_ms=cfg.skew_sync_wakeup_offset_ms,
-        pool_wakeup_offset_ms=cfg.pool_wakeup_offset_ms,
-        kline_wakeup_offset_ms=cfg.kline_wakeup_offset_ms,
-        lock_safety_margin_ms=cfg.lock_safety_margin_ms,
+        pool_read_wakeup_offset_ms=cfg.pool_read_wakeup_offset_ms,
+        kline_fetch_wakeup_offset_ms=cfg.kline_fetch_wakeup_offset_ms,
+        bet_submit_deadline_offset_ms=cfg.bet_submit_deadline_offset_ms,
+        bet_tx_receipt_timeout_seconds=_runtime_receipt_timeout,
+        claim_tx_receipt_timeout_seconds=_runtime_receipt_timeout,
         max_consecutive_fetch_failures=cfg.max_consecutive_fetch_failures,
         pool_cutoff_seconds=cfg.pool_cutoff_seconds,
         dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,

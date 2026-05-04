@@ -5,6 +5,11 @@ that the live decision-path config derives from. Each constant cites its
 empirical provenance: the probe script that measured it, the date, the
 percentile, and the sample size.
 
+Naming convention: ``<subsystem>_<event>_<measurement>``. Constants are
+named for the subsystem they characterize (OKX, BSC, WSS), the specific
+event being measured (kline publish, bet submit, bet event arrival), and
+the statistic (P99/P95/TIME/SAFETY_BUFFER).
+
 Co-update discipline: if any environment-dependent constant changes
 (network latency, BSC behavior, OKX publishing characteristics), the
 corresponding probe script in ``research/`` must be re-run, and the
@@ -12,20 +17,26 @@ value here must be updated co-locked with a new measurement date.
 
 Derivation chain (computed at config-load time in ``pancakebot/config.py``):
 
-    lock_safety_margin_ms      = BSC_SUBMIT_RTT_P95_MS + BSC_BLOCK_TIME_MS
-                                 + SAFETY_BUFFER_MS
-    kline_wakeup_offset_ms     = lock_safety_margin_ms + OKX_FETCH_RTT_P95_MS
-                                 + GATE_COMPUTE_MS
-    pool_wakeup_offset_ms      = kline_wakeup_offset_ms + POOL_READ_BUFFER_MS
-    skew_sync_wakeup_offset_ms = pool_wakeup_offset_ms + SKEW_SYNC_TIME_P99_MS
-                                 + SKEW_SAFETY_BUFFER_MS
+    bet_submit_deadline_offset_ms = (BSC_BET_SUBMIT_RTT_P95_MS
+                                     + BSC_BLOCK_TIME_MS
+                                     + BET_SUBMIT_SAFETY_BUFFER_MS)
+    kline_fetch_wakeup_offset_ms  = (bet_submit_deadline_offset_ms
+                                     + OKX_KLINE_FETCH_RTT_P95_MS
+                                     + SIGNAL_COMPUTE_TIME_MS)
+    pool_read_wakeup_offset_ms    = (kline_fetch_wakeup_offset_ms
+                                     + POOL_READ_TIME_MS)
+    skew_sync_wakeup_offset_ms    = (pool_read_wakeup_offset_ms
+                                     + OKX_SKEW_SYNC_TIME_P99_MS
+                                     + SKEW_SYNC_SAFETY_BUFFER_MS)
 
 Cross-validations enforced at config load:
 
-    kline_cutoff_seconds * 1000 >= OKX_PUBLISH_DELAY_P99_MS
+    kline_cutoff_seconds * 1000 >= (OKX_KLINE_PUBLISH_DELAY_P99_MS
+                                    + kline_fetch_wakeup_offset_ms)
         (otherwise the gate asks OKX for a candle still being published)
 
-    pool_cutoff_seconds * 1000 >= WSS_ARRIVAL_DELAY_P99_MS
+    pool_cutoff_seconds * 1000 >= (pool_read_wakeup_offset_ms
+                                   + WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS)
         (otherwise the pool aggregate excludes bets still en route via WSS)
 """
 from __future__ import annotations
@@ -43,7 +54,7 @@ from __future__ import annotations
 #         first-try; probe @ wake=1200ms (800ms post-close) → 96.9%.
 #         Implied per-symbol p99 staleness ~1200-1300ms.
 # Last measured: 2026-05-03
-OKX_PUBLISH_DELAY_P99_MS: int = 1300
+OKX_KLINE_PUBLISH_DELAY_P99_MS: int = 1300
 
 # OKX REST round-trip time for /history-candles fetches. Pooled p95 over
 # the 4 symbols (BTC, ETH, SOL, BNB).
@@ -51,7 +62,7 @@ OKX_PUBLISH_DELAY_P99_MS: int = 1300
 # Source: research/p4c_canonical_loop_probe.py n=1000, 2026-05-03.
 # Pooled (n=4000 fetches): p50=258, p90=277, p95=289, p99=363, max=981.
 # Last measured: 2026-05-03
-OKX_FETCH_RTT_P95_MS: int = 290
+OKX_KLINE_FETCH_RTT_P95_MS: int = 290
 
 
 # --- Strategy compute ------------------------------------------------------
@@ -64,7 +75,7 @@ OKX_FETCH_RTT_P95_MS: int = 290
 #         pancakebot/strategy/momentum_gate.py:415-... (numpy diff/sum
 #         over 16-row arrays, no I/O).
 # Last measured: 2026-05-03 (engineering judgment, not empirical probe)
-GATE_COMPUTE_MS: int = 50
+SIGNAL_COMPUTE_TIME_MS: int = 50
 
 
 # --- BSC chain timing ------------------------------------------------------
@@ -79,7 +90,7 @@ GATE_COMPUTE_MS: int = 50
 # Last measured: 2026-05-03
 BSC_BLOCK_TIME_MS: int = 500
 
-# BSC RPC submit RTT (eth_sendRawTransaction). EMPIRICALLY MEASURED
+# BSC RPC bet-TX submit RTT (eth_sendRawTransaction). EMPIRICALLY MEASURED
 # AS A LOWER BOUND via eth_blockNumber proxy (p99=57ms in
 # research/p4c_bsc_rpc_probe.py n=200). Production sendRawTransaction
 # involves mempool insertion and may have higher RTT than a cached
@@ -90,7 +101,7 @@ BSC_BLOCK_TIME_MS: int = 500
 #         Production estimate: 200ms (no direct measurement; would
 #         require gas-spending probe to be precise).
 # Last measured: 2026-05-03 (proxy + estimate)
-BSC_SUBMIT_RTT_P95_MS: int = 200
+BSC_BET_SUBMIT_RTT_P95_MS: int = 200
 
 
 # --- WSS subscriber timing ------------------------------------------------
@@ -103,7 +114,7 @@ BSC_SUBMIT_RTT_P95_MS: int = 200
 #         2026-05-03. p50=1041ms, p90=1723, p95=1777, p99=3106,
 #         p99.9=3834.
 # Last measured: 2026-05-03
-WSS_ARRIVAL_DELAY_P99_MS: int = 3500  # p99=3106 + ~400ms buffer
+WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS: int = 3500  # p99=3106 + ~400ms buffer
 
 
 # --- Skew sync ------------------------------------------------------------
@@ -115,33 +126,33 @@ WSS_ARRIVAL_DELAY_P99_MS: int = 3500  # p99=3106 + ~400ms buffer
 # Source: research/p4c_skew_probe.py n=100, 2026-05-03.
 #         min=1635, p50=1890, p90=2236, p95=2294, p99=2409, max=2409.
 # Last measured: 2026-05-03
-SKEW_SYNC_TIME_P99_MS: int = 2500  # p99=2409 + ~100ms buffer
+OKX_SKEW_SYNC_TIME_P99_MS: int = 2500  # p99=2409 + ~100ms buffer
 
 
 # --- Static buffers --------------------------------------------------------
 
-# Small constant for the in-memory pool data read (engine.py:531-534).
-# The PoolEventWatcher's get_pool() is a dict + list filter under a
-# lock — sub-ms in practice. Buffer kept as a placeholder for the
-# wake-schedule arithmetic and any future GIL-contention budget.
+# Time for the in-memory pool data read (engine.py reads
+# PoolEventWatcher.get_pool, a dict + list filter under a lock).
+# Sub-ms in practice; held as a small placeholder for the wake-schedule
+# arithmetic and any future GIL-contention budget.
 #
 # Source: code inspection of pool_watcher.PoolEventWatcher.get_pool.
 # Last measured: 2026-05-03 (engineering judgment)
-POOL_READ_BUFFER_MS: int = 5
+POOL_READ_TIME_MS: int = 5
 
-# Headroom on the lock_safety_margin_ms derivation. Beyond
-# BSC_SUBMIT_RTT_P95 + BSC_BLOCK_TIME, this absorbs second-order
-# variance in TX submission (signing time, sign-to-send dispatch) and
-# any clock-jitter on the engine's timing-guard check.
+# Headroom on the bet_submit_deadline_offset_ms derivation. Beyond
+# BSC_BET_SUBMIT_RTT_P95 + BSC_BLOCK_TIME, this absorbs second-order
+# variance in bet-TX submission (signing time, sign-to-send dispatch)
+# and any clock-jitter on the engine's timing-guard check.
 #
 # Source: engineering judgment.
 # Last measured: 2026-05-03
-SAFETY_BUFFER_MS: int = 50
+BET_SUBMIT_SAFETY_BUFFER_MS: int = 50
 
 # Headroom on the skew_sync_wakeup_offset_ms derivation. Beyond
-# SKEW_SYNC_TIME_P99, this absorbs dispatch overhead between the
+# OKX_SKEW_SYNC_TIME_P99, this absorbs dispatch overhead between the
 # skew refresh completing and the next wake firing.
 #
 # Source: engineering judgment.
 # Last measured: 2026-05-03
-SKEW_SAFETY_BUFFER_MS: int = 50
+SKEW_SYNC_SAFETY_BUFFER_MS: int = 50

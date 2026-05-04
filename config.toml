@@ -1,8 +1,10 @@
 [runtime]
-# How many seconds before lock_at to sample kline data
-kline_cutoff_seconds = 2
-# How many seconds before kline cutoff to wake for housekeeping (epoch check, TLS warmup)
-prefetch_offset_seconds = 4
+# How many seconds before lock_at to sample kline data. Lower bound is
+# enforced at config load: kline_cutoff_seconds * 1000 must be >=
+# OKX_KLINE_PUBLISH_DELAY_P99_MS + kline_fetch_wakeup_offset_ms (so the
+# cutoff candle is already published by the time the gate fetches at
+# lock - kline_fetch_wakeup_offset_ms).
+kline_cutoff_seconds = 3
 
 [dry]
 # Starting bankroll for fresh dry runs (ignored when continuing from existing state)

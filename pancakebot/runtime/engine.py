@@ -335,6 +335,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     gas_limit=GAS_LIMIT_CLAIM,
                     claim_batch_size=_CLAIM_BATCH_SIZE,
                     min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
+                    claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
                 )
 
             _dry_settle_available_bets(cfg, closed)
@@ -505,11 +506,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         # -- Pool wake --
         # Second of three pre-lock wakes. Fires at lock_at -
-        # pool_wakeup_offset_ms (= ~1.1s before lock). Pool data is
+        # pool_read_wakeup_offset_ms (= ~1.1s before lock). Pool data is
         # in-memory (WSS subscriber) so this is mainly a synchronization
         # point: we read the pool aggregate at the same OKX-time-anchored
         # moment every round for reproducibility.
-        pool_wake_ts = lock_ts_t - cfg.pool_wakeup_offset_ms / 1000.0
+        pool_wake_ts = lock_ts_t - cfg.pool_read_wakeup_offset_ms / 1000.0
         _sleep_until_ts(
             pool_wake_ts, reason="wait_for_pool", epoch=current_epoch,
         )
@@ -560,13 +561,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         # -- Kline-fetch wake (critical path) --
         # Third of three pre-lock wakes. Fires at lock_at -
-        # kline_wakeup_offset_ms (= ~1.09s before lock at canonical
+        # kline_fetch_wakeup_offset_ms (= ~1.09s before lock at canonical
         # timing constants). gate.evaluate() runs immediately after,
         # firing 4 parallel /history-candles GETs and computing the
         # signal. Sized so median-fetch rounds have decision-ready
-        # comfortably ahead of the timing guard at lock - lock_safety_margin_ms.
+        # comfortably ahead of the timing guard at
+        # lock - bet_submit_deadline_offset_ms.
         # See pancakebot/timing_constants.py for the empirical derivation.
-        fetch_ts = lock_ts_t - cfg.kline_wakeup_offset_ms / 1000.0
+        fetch_ts = lock_ts_t - cfg.kline_fetch_wakeup_offset_ms / 1000.0
         _sleep_until_ts(fetch_ts, reason="wait_for_kline_fetch", epoch=current_epoch)
 
         # Step 8: Decide. Gate fires 4 parallel REST fetches and computes
@@ -622,19 +624,19 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             return
 
         # Step 11: Execution timing guard. Abort if wall-clock is within
-        # ``cfg.lock_safety_margin_ms`` of lock_at -- TX submitted that close
-        # to lock is unlikely to mine in time and would revert (gas burn).
-        # lock_ts_t is chain-anchored true UTC; compare via _utc_now()
-        # (skew-corrected). With local-only comparison + skew, the guard
-        # fires far too early in true UTC and the bot self-aborts almost
-        # every round.
+        # ``cfg.bet_submit_deadline_offset_ms`` of lock_at -- TX submitted
+        # that close to lock is unlikely to mine in time and would revert
+        # (gas burn). lock_ts_t is chain-anchored true UTC; compare via
+        # _utc_now() (skew-corrected). With local-only comparison + skew,
+        # the guard fires far too early in true UTC and the bot
+        # self-aborts almost every round.
         #
         # Pre-bet R1 telemetry: log submit-offset (ms remaining before lock)
         # at this point so we can measure how much budget the post-fetch
         # path leaves for TX submission. Negative values would indicate
         # the fetch finished AFTER lock_at (definite revert in live).
         bet_submit_offset_ms = (lock_ts_t - _utc_now()) * 1000.0
-        safety_margin_seconds = cfg.lock_safety_margin_ms / 1000.0
+        safety_margin_seconds = cfg.bet_submit_deadline_offset_ms / 1000.0
         if _utc_now() >= lock_ts_t - safety_margin_seconds:
             info(
                 "BET",
@@ -642,7 +644,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 "ABORT",
                 epoch=current_epoch,
                 submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
-                margin_ms=cfg.lock_safety_margin_ms,
+                margin_ms=cfg.bet_submit_deadline_offset_ms,
             )
             _record_dry_cycle_audit(
                 cfg,
@@ -683,7 +685,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             "OFFSET",
             epoch=current_epoch,
             submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
-            margin_ms=cfg.lock_safety_margin_ms,
+            margin_ms=cfg.bet_submit_deadline_offset_ms,
         )
 
         # Step 12: Submit bet.
@@ -714,7 +716,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     gas_limit=GAS_LIMIT_BET,
                     gas_price_wei=gas_price_wei,
                     wait_receipt=True,
-                    receipt_timeout_seconds=5,
+                    receipt_timeout_seconds=cfg.bet_tx_receipt_timeout_seconds,
                 )
             elif bet_side == "Bear":
                 tx_submit = cfg.contract.bet_bear_timed(
@@ -723,7 +725,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     gas_limit=GAS_LIMIT_BET,
                     gas_price_wei=gas_price_wei,
                     wait_receipt=True,
-                    receipt_timeout_seconds=5,
+                    receipt_timeout_seconds=cfg.bet_tx_receipt_timeout_seconds,
                 )
             else:
                 raise InvariantError(f"unexpected_bet_side: {bet_side}")
@@ -944,6 +946,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
             gas_limit=GAS_LIMIT_CLAIM,
             claim_batch_size=_CLAIM_BATCH_SIZE,
             min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
+            claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
         )
 
     # Dry: settle simulated bets against oracle price.

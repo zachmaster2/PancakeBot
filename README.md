@@ -97,14 +97,16 @@ constants in `pancakebot/timing_constants.py`.
 | `wait_for_pool` | `lock_at - 1095ms` | Read pool aggregate from WSS subscriber (`pool_cutoff_seconds = 6` data horizon) |
 | `wait_for_kline_fetch` | `lock_at - 1090ms` | 4 parallel OKX `/history-candles` GETs + signal compute |
 | Pre-bet timing guard | `lock_at - 750ms` | Abort if decision-ready past the safety margin (TX would mine after lock) |
-| `wait_for_claim` | `close_at(prev_locked) + 35s` | Sleep for previous round's settlement; claim winnings (live) |
+| `wait_for_claim` | `close_at(prev_locked) + 35s` | Sleep for previous round's settlement; claim winnings (live; receipt-waited with `claim_tx_receipt_timeout_seconds ≈ 35s`, revert/timeout fires Discord `CLAIM FAILED` alert) |
 
 ### Configurable knobs (`config.toml [runtime]`)
 
-- `kline_cutoff_seconds = 2` — strategy data horizon for OKX klines.
-  Cross-validated at load: must be ≥ `OKX_PUBLISH_DELAY_P99_MS / 1000`.
+- `kline_cutoff_seconds = 3` — strategy data horizon for OKX klines.
+  Cross-validated at load: must be ≥
+  `(OKX_KLINE_PUBLISH_DELAY_P99_MS + kline_fetch_wakeup_offset_ms) / 1000`.
 - `pool_cutoff_seconds = 6` — pool-aggregate data horizon for BSC events.
-  Cross-validated at load: must be ≥ `WSS_ARRIVAL_DELAY_P99_MS / 1000`.
+  Cross-validated at load: must be ≥
+  `(pool_read_wakeup_offset_ms + WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS) / 1000`.
 - `max_consecutive_fetch_failures = 5` — streak counter before bot
   crashes (supervisor restart + Discord alert).
 
