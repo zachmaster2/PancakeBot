@@ -12,7 +12,6 @@ from pancakebot.constants import (
     GAS_LIMIT_BET,
     GAS_LIMIT_CLAIM,
     GAS_COST_BET_BNB,
-    POOL_CUTOFF_SECONDS,
 )
 from pancakebot.util import InvariantError, TransientRpcError
 from pancakebot.log import info, warn
@@ -187,6 +186,39 @@ def _fetch_current_bnb_price_usd(cfg: RuntimeConfig) -> float:
         return 0.0
 
 
+def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
+    """Emit one INFO line summarizing the timing config in effect.
+
+    Operators read this at startup to confirm which publish-delay tier
+    the gate is running under (P99 = strict full-inclusion guarantee;
+    P95 = operating budget, ~5% publish-delay tail absorbed by the
+    streak counter) without having to derive the math from raw constants.
+    """
+    if cfg.kline_publish_tier == "P99":
+        tier_msg = "P99 (strict; full-inclusion guarantee)"
+    elif cfg.kline_publish_tier == "P95":
+        tier_msg = (
+            "P95 (operating budget; ~5% publish-delay tail absorbed by "
+            "streak counter)"
+        )
+    else:
+        tier_msg = f"{cfg.kline_publish_tier} (unrecognized tier)"
+    info(
+        "CORE", "RUN", "TIMING",
+        msg=(
+            f"timing config: kline_cutoff={cfg.cutoff_seconds}s "
+            f"pool_cutoff={cfg.pool_cutoff_seconds}s "
+            f"skew_sync_wakeup={cfg.skew_sync_wakeup_offset_ms}ms "
+            f"pool_read_wakeup={cfg.pool_read_wakeup_offset_ms}ms "
+            f"kline_fetch_wakeup={cfg.kline_fetch_wakeup_offset_ms}ms "
+            f"bet_submit_deadline={cfg.bet_submit_deadline_offset_ms}ms "
+            f"bet_tx_receipt_timeout={cfg.bet_tx_receipt_timeout_seconds}s "
+            f"claim_tx_receipt_timeout={cfg.claim_tx_receipt_timeout_seconds}s "
+            f"kline_publish_tier={tier_msg}"
+        ),
+    )
+
+
 def run_realtime_loop(cfg: RuntimeConfig) -> None:
     # Wallet address is only required for live mode (signing transactions).
     # Dry mode reads from chain via public RPC, no signing needed.
@@ -194,6 +226,9 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         raise InvariantError("wallet_address_required_for_live")
     if cfg.min_bet_amount_bnb <= 0.0:
         raise InvariantError("runtime_min_bet_amount_nonpositive")
+
+    _log_runtime_timing_summary(cfg)
+
     closed_state = _init_closed_state(cfg)
 
     # Bootstrap OKX clock-skew measurement BEFORE the first round starts.
@@ -336,6 +371,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     gas_limit=GAS_LIMIT_CLAIM,
                     claim_batch_size=_CLAIM_BATCH_SIZE,
                     min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
+                    claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
                 )
 
             _dry_settle_available_bets(cfg, closed)
@@ -378,12 +414,17 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
 
-        # -- Phase A: Housekeeping (before cutoff) --
-        # Wake early to do epoch check + TLS warmup while we're still
-        # waiting for the cutoff moment.  These run OUTSIDE the critical
-        # timing window so they don't eat into our bet-submission budget.
-        wake_ts = cutoff_ts_t - cfg.prefetch_offset_seconds
-        _sleep_until_ts(wake_ts, reason="wait_for_prefetch", epoch=current_epoch)
+        # -- Skew-sync wake --
+        # First of three pre-lock wakes. Fires at lock_at -
+        # skew_sync_wakeup_offset_ms (= ~3.65s before lock at canonical
+        # timing constants). Skew refresh + epoch quick-check + bankroll
+        # fetch run here, off the critical path.
+        skew_sync_wake_ts = lock_ts_t - cfg.skew_sync_wakeup_offset_ms / 1000.0
+        _sleep_until_ts(
+            skew_sync_wake_ts,
+            reason="wait_for_skew_sync",
+            epoch=current_epoch,
+        )
 
         # Epoch quick-check: verify current_epoch hasn't shifted during sleep.
         try:
@@ -499,6 +540,17 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 # absorbed comfortably in the housekeeping window.
                 _refresh_clock_skew(gate)
 
+        # -- Pool wake --
+        # Second of three pre-lock wakes. Fires at lock_at -
+        # pool_read_wakeup_offset_ms (= ~1.1s before lock). Pool data is
+        # in-memory (WSS subscriber) so this is mainly a synchronization
+        # point: we read the pool aggregate at the same OKX-time-anchored
+        # moment every round for reproducibility.
+        pool_wake_ts = lock_ts_t - cfg.pool_read_wakeup_offset_ms / 1000.0
+        _sleep_until_ts(
+            pool_wake_ts, reason="wait_for_pool", epoch=current_epoch,
+        )
+
         # Pool data from WSS subscription (no RPC needed, ~0 ms).
         pool_bull_bnb = 0.0
         pool_bear_bnb = 0.0
@@ -528,7 +580,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                      msg=f"Skip epoch {current_epoch}: backfill_incomplete")
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
-            pool_ts_cutoff = lock_ts_t - POOL_CUTOFF_SECONDS
+            pool_ts_cutoff = lock_ts_t - cfg.pool_cutoff_seconds
             pool_bull_bnb, pool_bear_bnb = cfg.pool_watcher.get_pool(
                 epoch=current_epoch, max_ts=pool_ts_cutoff,
             )
@@ -543,14 +595,16 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                  endpoint=cfg.pool_watcher.current_endpoint,
                  last_ok=f"{cfg.pool_watcher.last_connected_at:.0f}")
 
-        # -- Phase B: Critical path (pre-lock) --
-        # Sleep until ``lock_at - kline_fetch_offset_ms`` (skew-corrected),
-        # then run gate.evaluate() which fires 4 parallel /history-candles
-        # GETs and computes the signal off the returned arrays. The offset
-        # is sized so the fetch lands a configurable margin before lock_at;
-        # default 850ms accommodates OKX p99 staleness (~1.7s) plus the
-        # round-trip and signal compute. Tuned via [runtime] kline_fetch_offset_ms.
-        fetch_ts = lock_ts_t - cfg.kline_fetch_offset_ms / 1000.0
+        # -- Kline-fetch wake (critical path) --
+        # Third of three pre-lock wakes. Fires at lock_at -
+        # kline_fetch_wakeup_offset_ms (= ~1.09s before lock at canonical
+        # timing constants). gate.evaluate() runs immediately after,
+        # firing 4 parallel /history-candles GETs and computing the
+        # signal. Sized so median-fetch rounds have decision-ready
+        # comfortably ahead of the timing guard at
+        # lock - bet_submit_deadline_offset_ms.
+        # See pancakebot/timing_constants.py for the empirical derivation.
+        fetch_ts = lock_ts_t - cfg.kline_fetch_wakeup_offset_ms / 1000.0
         _sleep_until_ts(fetch_ts, reason="wait_for_kline_fetch", epoch=current_epoch)
 
         # Step 8: Decide. Gate fires 4 parallel REST fetches and computes
@@ -606,19 +660,19 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             return
 
         # Step 11: Execution timing guard. Abort if wall-clock is within
-        # ``cfg.lock_safety_margin_ms`` of lock_at -- TX submitted that close
-        # to lock is unlikely to mine in time and would revert (gas burn).
-        # lock_ts_t is chain-anchored true UTC; compare via _utc_now()
-        # (skew-corrected). With local-only comparison + skew, the guard
-        # fires far too early in true UTC and the bot self-aborts almost
-        # every round.
+        # ``cfg.bet_submit_deadline_offset_ms`` of lock_at -- TX submitted
+        # that close to lock is unlikely to mine in time and would revert
+        # (gas burn). lock_ts_t is chain-anchored true UTC; compare via
+        # _utc_now() (skew-corrected). With local-only comparison + skew,
+        # the guard fires far too early in true UTC and the bot
+        # self-aborts almost every round.
         #
         # Pre-bet R1 telemetry: log submit-offset (ms remaining before lock)
         # at this point so we can measure how much budget the post-fetch
         # path leaves for TX submission. Negative values would indicate
         # the fetch finished AFTER lock_at (definite revert in live).
         bet_submit_offset_ms = (lock_ts_t - _utc_now()) * 1000.0
-        safety_margin_seconds = cfg.lock_safety_margin_ms / 1000.0
+        safety_margin_seconds = cfg.bet_submit_deadline_offset_ms / 1000.0
         if _utc_now() >= lock_ts_t - safety_margin_seconds:
             info(
                 "BET",
@@ -626,7 +680,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 "ABORT",
                 epoch=current_epoch,
                 submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
-                margin_ms=cfg.lock_safety_margin_ms,
+                margin_ms=cfg.bet_submit_deadline_offset_ms,
             )
             _record_dry_cycle_audit(
                 cfg,
@@ -667,7 +721,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             "OFFSET",
             epoch=current_epoch,
             submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
-            margin_ms=cfg.lock_safety_margin_ms,
+            margin_ms=cfg.bet_submit_deadline_offset_ms,
         )
 
         # Step 12: Submit bet.
@@ -698,7 +752,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     gas_limit=GAS_LIMIT_BET,
                     gas_price_wei=gas_price_wei,
                     wait_receipt=True,
-                    receipt_timeout_seconds=5,
+                    receipt_timeout_seconds=cfg.bet_tx_receipt_timeout_seconds,
                 )
             elif bet_side == "Bear":
                 tx_submit = cfg.contract.bet_bear_timed(
@@ -707,7 +761,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     gas_limit=GAS_LIMIT_BET,
                     gas_price_wei=gas_price_wei,
                     wait_receipt=True,
-                    receipt_timeout_seconds=5,
+                    receipt_timeout_seconds=cfg.bet_tx_receipt_timeout_seconds,
                 )
             else:
                 raise InvariantError(f"unexpected_bet_side: {bet_side}")
@@ -928,6 +982,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
             gas_limit=GAS_LIMIT_CLAIM,
             claim_batch_size=_CLAIM_BATCH_SIZE,
             min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
+            claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
         )
 
     # Dry: settle simulated bets against oracle price.

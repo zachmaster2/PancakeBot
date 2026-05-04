@@ -17,10 +17,19 @@ at lock-2s" path crashed ~67% of rounds with
 ``kline_fetch_integrity_violation`` because OKX's `after`-only filter
 slid the window when the newest candle was unavailable.
 
-Empirical (2026-04-27) OKX REST staleness is median ~410ms / p99 ~1.7s,
-materially fresher than candle1s WSS push (median ~954ms / p99 ~1.5s+).
-The wake-time offset is configured via ``RuntimeConfig.kline_fetch_offset_ms``
-and applied by the engine; the gate itself just consumes ``lock_at_ms``.
+Empirical OKX REST behavior (research/p4c_canonical_loop_probe.py): per-
+symbol first-try success ~96.9% at 800ms post-close, ~98.3% at 1150ms.
+Pooled fetch RTT p95=289ms, p99=363ms. Probe-derived empirical
+constants in pancakebot/timing_constants.py.
+
+Live decision path uses ``RETRY_NONE`` (max_attempts=1). A first-try
+fail on any symbol -> TransientOkxError -> gate skips with
+``kline_fetch_transient_failure``. Retries are reserved for sync (bulk
+historical fetch via sync.py) where there's no time pressure.
+
+The wake-time offset is derived from timing_constants.py and applied
+by the engine via ``RuntimeConfig.kline_fetch_wakeup_offset_ms``; the
+gate itself just consumes ``lock_at_ms``.
 """
 
 from __future__ import annotations
@@ -31,18 +40,23 @@ from dataclasses import dataclass
 from pancakebot.log import warn
 from pancakebot.market_data.okx_client import (
     OkxClient,
-    RETRY_GATE,
+    RETRY_NONE,
     okx_rate_acquire,
 )
 from pancakebot.util import InvariantError, TransientOkxError
 
 
-# Maximum consecutive rounds skipped on TransientOkxError before the gate
-# escalates to InvariantError. Three rounds at 5min each = ~15 min of
-# OKX REST unreachability before the bot fail-louds — long enough to ride
-# out an isolated network blip, short enough that the operator notices
-# before half a day's worth of opportunity is silently lost.
-_MAX_CONSECUTIVE_FETCH_FAILURES = 3
+# Streak counter limit is configured per-instance via
+# ``MomentumGateConfig.max_consecutive_fetch_failures`` (threaded from
+# ``cfg.max_consecutive_fetch_failures`` at config load). The constant
+# below is the canonical default + the value used by tests that don't
+# construct a custom MomentumGateConfig.
+#
+# At default max=5 with empirical per-round transient-failure rate ~12%
+# (research/p4c_canonical_loop_probe.py n=1000 at 800ms post-close):
+# P(5 consecutive transient) = 0.12^5 = 2.5e-5 -> expected crash once
+# per ~40,000 rounds = ~14 weeks at 12 rounds/h.
+_MAX_CONSECUTIVE_FETCH_FAILURES = 5
 
 _SYMBOLS_FETCHED = ("btc", "eth", "sol", "bnb")
 
@@ -56,6 +70,11 @@ class MomentumGateConfig:
     gate consumes (cutoff_ts_ms = lock_at_ms - cutoff_seconds*1000) and
     is the sole source of truth for the strategy-side cutoff. ``candle_count``
     is derived from ``mtf_lookbacks`` at gate-construction time.
+
+    ``max_consecutive_fetch_failures`` is the streak counter: after this
+    many consecutive ``kline_fetch_transient_failure`` rounds, the gate
+    raises InvariantError -> bot crashes -> supervisor restart + Discord
+    alert. Threaded from ``cfg.max_consecutive_fetch_failures``.
     """
     enabled: bool
     bnb_symbol: str          # "BNB-USDT"
@@ -63,6 +82,7 @@ class MomentumGateConfig:
     cutoff_seconds: int
     mtf_lookbacks: tuple[int, ...]
     mtf_threshold: float
+    max_consecutive_fetch_failures: int = 5
     eth_symbol: str = "ETH-USDT"
     sol_symbol: str = "SOL-USDT"
 
@@ -86,10 +106,11 @@ class MomentumGate:
     """Multi-asset momentum gate: fetches BTC + ETH + SOL + BNB 1s klines
     in parallel via OKX ``/history-candles`` REST per round (live mode).
 
-    Decision-time work: 4 parallel HTTP GETs to OKX (median ~250ms,
-    p99 ~500ms, sharing the global 8/s rate budget). The wake-time offset
-    is set by the engine via ``RuntimeConfig.kline_fetch_offset_ms`` so
-    the fetch lands a configurable margin before ``lock_at``.
+    Decision-time work: 4 parallel HTTP GETs to OKX (pooled RTT
+    p50=258ms, p95=289ms, p99=363ms per probe n=1000 2026-05-03).
+    The wake-time offset is set by the engine via
+    ``RuntimeConfig.kline_fetch_wakeup_offset_ms``; the gate consumes
+    ``lock_at_ms``.
 
     Error handling:
     - Any ``InvariantError`` from any symbol → reraise (bot crashes →
@@ -100,10 +121,9 @@ class MomentumGate:
       ``warn("GATE", sym.upper(), "FETCH_FAIL", ...)`` per failed symbol
       and skip the round with reason ``kline_fetch_transient_failure``.
       Increments ``_consecutive_fetch_failures``; reset to 0 on a fully
-      successful 4-symbol fetch (regardless of whether downstream
-      signal-computation produces a BET or SKIP).
-    - Streak >= ``_MAX_CONSECUTIVE_FETCH_FAILURES`` → escalate to
-      ``InvariantError("kline_fetch_failure_streak_max_reached: ...")``.
+      successful 4-symbol fetch.
+    - Streak >= ``MomentumGateConfig.max_consecutive_fetch_failures`` →
+      escalate to ``InvariantError("kline_fetch_failure_streak_max_reached: ...")``.
     """
 
     def __init__(
@@ -164,7 +184,7 @@ class MomentumGate:
         - ``signal=None`` + ``skip_reason="kline_fetch_transient_failure"``
           on any subset of 4-symbol transient failures
         - raises InvariantError on any contract violation OR on
-          ``_MAX_CONSECUTIVE_FETCH_FAILURES`` consecutive transient rounds
+          ``max_consecutive_fetch_failures`` consecutive transient rounds
         """
         if not self._cfg.enabled:
             return MomentumGateResult(
@@ -193,7 +213,7 @@ class MomentumGate:
                 symbol=symbols[sym_short],
                 oldest_open_ms=oldest_open_ms,
                 newest_open_ms_inclusive=newest_open_ms,
-                retry_policy=RETRY_GATE,
+                retry_policy=RETRY_NONE,
                 rate_acquire_fn=okx_rate_acquire,
                 # Pin both window bounds: prevents OKX from sliding the
                 # window when the newest candle isn't yet published, which
@@ -252,13 +272,13 @@ class MomentumGate:
                     msg=f"reason={e}",
                 )
             self._consecutive_fetch_failures += 1
-            if self._consecutive_fetch_failures >= _MAX_CONSECUTIVE_FETCH_FAILURES:
+            if self._consecutive_fetch_failures >= self._cfg.max_consecutive_fetch_failures:
                 # Capture the latest detail for the fail-loud message.
                 latest_sym, latest_err = transient_errors[-1]
                 raise InvariantError(
                     f"kline_fetch_failure_streak_max_reached: "
                     f"streak={self._consecutive_fetch_failures} "
-                    f"max={_MAX_CONSECUTIVE_FETCH_FAILURES} "
+                    f"max={self._cfg.max_consecutive_fetch_failures} "
                     f"latest={latest_sym}={latest_err}"
                 )
             return self._skip("kline_fetch_transient_failure")

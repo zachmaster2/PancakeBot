@@ -85,7 +85,38 @@ var/
 
 See [docs/architecture.html](docs/architecture.html) for the visual diagram.
 
-**Two-phase runtime loop:**
-- Phase A (lock_at - 6s): Epoch check + OKX TLS warmup + pool data
-- Phase B (lock_at - 1.75s): Fetch klines (~285ms) + signal + bet
-- Safety margin: 1s before lock
+### Per-round runtime loop
+
+Three pre-lock wakes anchored at the chain-supplied `lock_at` timestamp,
+plus a post-lock claim wake. All ms offsets DERIVED from empirical
+constants in `pancakebot/timing_constants.py`.
+
+| Wake | Offset from `lock_at` | Activities |
+|---|---|---|
+| `wait_for_skew_sync` | `lock_at - 3645ms` | OKX clock-skew refresh, epoch check, bankroll fetch (live), settlement record (live) |
+| `wait_for_pool` | `lock_at - 1095ms` | Read pool aggregate from WSS subscriber (`pool_cutoff_seconds = 6` data horizon) |
+| `wait_for_kline_fetch` | `lock_at - 1090ms` | 4 parallel OKX `/history-candles` GETs + signal compute |
+| Pre-bet timing guard | `lock_at - 750ms` | Abort if decision-ready past the safety margin (TX would mine after lock) |
+| `wait_for_claim` | `close_at(prev_locked) + 35s` | Sleep for previous round's settlement; claim winnings (live; receipt-waited with `claim_tx_receipt_timeout_seconds ≈ 35s`, revert/timeout fires Discord `CLAIM FAILED` alert) |
+
+### Configurable knobs (`config.toml [runtime]`)
+
+- `kline_cutoff_seconds = 2` — strategy data horizon for OKX klines
+  (FIXED by strategy: the kline closing at `lock - cutoff` is required).
+  Cross-validated at load via the wake-offset framing:
+  `kline_fetch_wakeup_offset_ms <= kline_cutoff_seconds * 1000 -
+  OKX_KLINE_PUBLISH_DELAY_P95_MS`.
+- `pool_cutoff_seconds = 6` — pool-aggregate data horizon for BSC events.
+  Cross-validated at load:
+  `pool_read_wakeup_offset_ms <= pool_cutoff_seconds * 1000 -
+  WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS`.
+- `max_consecutive_fetch_failures = 5` — streak counter before bot
+  crashes (supervisor restart + Discord alert).
+
+### Empirical constants
+
+Maintained in `pancakebot/timing_constants.py` with per-constant
+provenance: probe script, measurement date, percentile, sample size.
+Re-deriving any value requires re-running the corresponding probe in
+`research/p4c_*_probe.py` and updating the constant co-locked with a
+new measurement date.

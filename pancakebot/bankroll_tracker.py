@@ -83,7 +83,7 @@ class InMemoryBankrollTracker(BankrollTracker):
       - ``"rolling_7d"`` (default, canonical-preserving): uses a rolling
         ``window_days`` window. Entries older than the window are pruned;
         peak is max over remaining entries plus the most-recent boundary.
-      - ``"absolute_ratchet"`` (p2a workstream): peak is monotonically
+      - ``"absolute_ratchet"``: peak is monotonically
         non-decreasing across the entire run, initialized to ``initial_bankroll``.
         Catches slow drains the rolling window misses (extension-cohort regime).
         ``window_days`` is ignored for peak calc but still controls entry pruning
