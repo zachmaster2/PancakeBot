@@ -81,6 +81,26 @@ class TxSubmitResult:
     included_block_timestamp: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class ClaimSubmitResult:
+    """Outcome of a ``claim()`` submission.
+
+    ``status`` is one of:
+      - ``"success"``: receipt arrived with status=1 (chain accepted the claim;
+        bankroll credit reflects on next ``wallet_balance_bnb`` read).
+      - ``"revert"``: receipt arrived with status=0 (chain rejected; gas was
+        burned, no bankroll credit). Caller logs + alerts; no retry.
+      - ``"timeout"``: ``wait_for_transaction_receipt`` exceeded its timeout
+        (TX may still mine later). Caller logs + alerts; no retry. Next
+        iteration's ``claim_scan_cursor`` will re-detect the still-claimable
+        epochs and try again.
+    """
+    tx_hash: str
+    status: Literal["success", "revert", "timeout"]
+    included_block_number: int | None
+    included_block_timestamp: int | None
+
+
 class Web3PredictionContract:
     """Thin Web3 wrapper for Pancake PredictionV2.
 
@@ -626,7 +646,23 @@ class Web3PredictionContract:
         )
         return str(out.tx_hash)
 
-    def claim(self, *, epochs: Sequence[int], gas_limit: int, gas_price_wei: int) -> str:
+    def claim(
+        self,
+        *,
+        epochs: Sequence[int],
+        gas_limit: int,
+        gas_price_wei: int,
+        wait_receipt: bool,
+        receipt_timeout_seconds: int,
+    ) -> ClaimSubmitResult:
+        """Submit a claim() TX and (optionally) wait for receipt.
+
+        Returns a ``ClaimSubmitResult`` whose ``status`` distinguishes
+        chain success / chain revert / receipt-poll timeout. When
+        ``wait_receipt`` is False the result has status="success" with
+        block fields None (used only by tests); production live code path
+        always passes ``wait_receipt=True``.
+        """
         fn = self._contract.functions.claim([int(e) for e in epochs])
         tx = fn.build_transaction(
             {
@@ -637,5 +673,45 @@ class Web3PredictionContract:
             }
         )
         signed = self._require_account().sign_transaction(tx)
-        txh = self._w3.eth.send_raw_transaction(signed.raw_transaction)
-        return str(txh.hex())
+        try:
+            txh = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+        except Exception as e:
+            raise TransientRpcError(f"claim_tx_send_failed: {e}") from e
+        tx_hash = str(txh.hex())
+
+        if not bool(wait_receipt):
+            return ClaimSubmitResult(
+                tx_hash=tx_hash,
+                status="success",
+                included_block_number=None,
+                included_block_timestamp=None,
+            )
+
+        if int(receipt_timeout_seconds) <= 0:
+            raise InvariantError("claim_receipt_timeout_seconds_nonpositive")
+
+        try:
+            receipt = self._w3.eth.wait_for_transaction_receipt(
+                txh,
+                timeout=float(receipt_timeout_seconds),
+                poll_latency=0.2,
+            )
+        except TimeExhausted:
+            return ClaimSubmitResult(
+                tx_hash=tx_hash,
+                status="timeout",
+                included_block_number=None,
+                included_block_timestamp=None,
+            )
+        except Exception as e:
+            raise TransientRpcError(f"claim_tx_receipt_wait_failed: {e}") from e
+
+        block_number = int(receipt["blockNumber"])
+        block_timestamp = int(self.block_timestamp(block_number))
+        chain_status = int(receipt.get("status", 0))
+        return ClaimSubmitResult(
+            tx_hash=tx_hash,
+            status="success" if chain_status == 1 else "revert",
+            included_block_number=block_number,
+            included_block_timestamp=block_timestamp,
+        )

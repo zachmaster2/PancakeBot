@@ -29,20 +29,49 @@ class RuntimeConfig:
     # Feature cutoff
     cutoff_seconds: int
 
-    # Prefetch offset: how many seconds before cutoff to wake for housekeeping
-    prefetch_offset_seconds: int
+    # Pre-lock wake schedule (all DERIVED from pancakebot/timing_constants.py
+    # at config load; not user-tunable). All in milliseconds before lock_at.
+    #
+    #   skew_sync_wakeup_offset_ms     >  pool_read_wakeup_offset_ms
+    #                                  >  kline_fetch_wakeup_offset_ms
+    #                                  >  bet_submit_deadline_offset_ms
+    #
+    # Engine fires three distinct _sleep_until_ts wakes per round:
+    # skew_sync -> pool -> kline. Timing guard fires at
+    # ``lock_at - bet_submit_deadline_offset_ms``.
+    skew_sync_wakeup_offset_ms: int
+    pool_read_wakeup_offset_ms: int
+    kline_fetch_wakeup_offset_ms: int
+    bet_submit_deadline_offset_ms: int
 
-    # Per-round kline fetch offset: how many milliseconds before lock_at
-    # the gate wakes to fire its parallel 4-symbol REST fetch. Validated
-    # in [100..5000] at config load.
-    kline_fetch_offset_ms: int
+    # Receipt timeouts for ``contract.bet_*_timed`` and ``contract.claim``
+    # (DERIVED at runtime from ``buffer_seconds + claim_check_padding_seconds``,
+    # ≈35s on canonical chain constants). Both share the same derivation:
+    # how long ``wait_for_transaction_receipt`` polls before raising
+    # TimeExhausted. Sized so a slow mempool inclusion is still caught
+    # before the next round's wake schedule needs the runtime back.
+    bet_tx_receipt_timeout_seconds: int
+    claim_tx_receipt_timeout_seconds: int
 
-    # Pre-bet timing guard: if wall-clock is within this many milliseconds
-    # of lock_at, abort the bet rather than submit a TX likely to land
-    # after lock. Cross-validated at config load to be < kline_fetch_offset_ms
-    # so the wake doesn't fire inside the safety zone (the p4c regression).
-    # Validated in [50..2000] at config load.
-    lock_safety_margin_ms: int
+    # Selected publish-delay tier from the config-load tier ladder:
+    # ``"P99"`` (strict; full-inclusion guarantee that the cutoff candle
+    # is published at fetch time) or ``"P95"`` (operating budget; ~5%
+    # publish-delay tail absorbed by the streak counter). Surfaced for
+    # operator visibility -- logged at startup of the live/dry runtime
+    # loop. Set by ``pancakebot/config.py:load_app_config`` via the
+    # tier-ladder cross-validation (P99 first, P95 fallback).
+    kline_publish_tier: str
+
+    # User-tunable. Streak counter for OKX transient failures; bot
+    # crashes (-> supervisor restart + Discord alert) after this many
+    # consecutive `kline_fetch_transient_failure` rounds.
+    max_consecutive_fetch_failures: int
+
+    # User-tunable. Pool cutoff: only bets with on-chain block_timestamp
+    # < lock_at - pool_cutoff_seconds are counted in the pool aggregate.
+    # Cross-validated at config load to be >= pool_read_wakeup_offset_ms
+    # + WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS.
+    pool_cutoff_seconds: int
 
     # Protocol constants (from chain via contract_constants.json)
     min_bet_amount_bnb: float

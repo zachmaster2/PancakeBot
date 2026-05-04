@@ -1,17 +1,22 @@
-"""p4c lock_safety_margin_ms config + guard-math regression tests.
+"""Derived-timing-config tests.
 
-Per p4c (`var/strategy_review/p4c_timing_guard_regression_*.md`): the prior
-`_LOCK_SAFETY_MARGIN_SECONDS = 1.0` constant exceeded the post-cf04f35
-`kline_fetch_offset_ms = 850` wake schedule, making the timing guard at
-engine.py:609 fire structurally on every BET decision. Fix: promote to
-`[runtime] lock_safety_margin_ms` config (default 300, range 50-2000) with
-a cross-constraint that `lock_safety_margin_ms < kline_fetch_offset_ms`.
+The timing wakes are NOT user-tunable. They derive from empirical
+constants in pancakebot/timing_constants.py at config load. This file
+tests:
 
-Tests cover:
-  - Config default + valid range + out-of-range rejection
-  - Cross-constraint: safety margin must be < kline_fetch_offset_ms
-  - Guard math at the new default: median fetch passes, slow fetch aborts
-  - Guard math regression: re-asserts the broken-old-default behavior
+1. The derivation chain produces the expected values from the locked
+   constants (regression: catch accidental constant edits).
+2. Cross-validations fire when the kline-fetch wake offset exceeds
+   `kline_cutoff_seconds * 1000 - OKX_KLINE_PUBLISH_DELAY_P95_MS`
+   or the pool-read wake offset exceeds
+   `pool_cutoff_seconds * 1000 - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS`.
+   The cutoffs are fixed by strategy; the wake offsets must fit.
+3. Inclusion-math chain remains satisfied at the locked constants
+   (median fetch lands block before lock_ts).
+4. Engine timing-guard math at the locked bet_submit_deadline_offset_ms
+   behaves correctly across the fetch-RTT distribution.
+5. User-tunable knobs ``pool_cutoff_seconds`` and
+   ``max_consecutive_fetch_failures`` accept their valid ranges.
 """
 from __future__ import annotations
 
@@ -25,13 +30,13 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from pancakebot.config import load_app_config  # noqa: E402
+from pancakebot import timing_constants as tc  # noqa: E402
 from pancakebot.util import InvariantError  # noqa: E402
 
 
 _BASE_TOML = """
 [runtime]
-kline_cutoff_seconds = 2
-prefetch_offset_seconds = 6
+kline_cutoff_seconds = {cutoff}
 {extra_runtime}
 
 [dry]
@@ -46,155 +51,277 @@ initial_bankroll_bnb = 50.0
 """
 
 
-def _write_cfg(tmp_path: Path, *, extra: str = "") -> Path:
+def _write_cfg(tmp_path: Path, *, cutoff: int = 2, extra: str = "") -> Path:
     p = tmp_path / "config.toml"
-    p.write_text(_BASE_TOML.format(extra_runtime=extra), encoding="utf-8")
+    p.write_text(
+        _BASE_TOML.format(cutoff=cutoff, extra_runtime=extra),
+        encoding="utf-8",
+    )
     return p
 
 
 # ---------------------------------------------------------------------------
-# Config: default + valid range
+# 1. Derivation chain produces expected values from locked constants
 # ---------------------------------------------------------------------------
 
-def test_lock_safety_margin_ms_default_is_300(tmp_path):
-    """Omitted -> default 300ms (the post-p4c safe default)."""
+def test_bet_submit_deadline_offset_derived_correctly(tmp_path):
     cfg = load_app_config(str(_write_cfg(tmp_path)))
-    assert cfg.lock_safety_margin_ms == 300
+    expected = (
+        tc.BSC_BET_SUBMIT_RTT_P95_MS
+        + tc.BSC_BLOCK_TIME_MS
+        + tc.BET_SUBMIT_SAFETY_BUFFER_MS
+    )
+    assert cfg.bet_submit_deadline_offset_ms == expected
+    assert cfg.bet_submit_deadline_offset_ms == 750  # locked snapshot
 
 
-@pytest.mark.parametrize("margin", [50, 100, 300, 700, 800])
-def test_lock_safety_margin_ms_accepts_valid_range(tmp_path, margin):
-    """[50..kline_fetch_offset_ms): all accepted at default kline_fetch_offset_ms=850."""
-    extra = f"lock_safety_margin_ms = {margin}"
+def test_kline_fetch_wakeup_offset_derived_correctly(tmp_path):
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
+    expected = (
+        cfg.bet_submit_deadline_offset_ms
+        + tc.OKX_KLINE_FETCH_RTT_P95_MS
+        + tc.SIGNAL_COMPUTE_TIME_MS
+    )
+    assert cfg.kline_fetch_wakeup_offset_ms == expected
+    assert cfg.kline_fetch_wakeup_offset_ms == 1090  # locked snapshot
+
+
+def test_pool_read_wakeup_offset_derived_correctly(tmp_path):
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
+    expected = cfg.kline_fetch_wakeup_offset_ms + tc.POOL_READ_TIME_MS
+    assert cfg.pool_read_wakeup_offset_ms == expected
+    assert cfg.pool_read_wakeup_offset_ms == 1095  # locked snapshot
+
+
+def test_skew_sync_wakeup_offset_derived_correctly(tmp_path):
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
+    expected = (
+        cfg.pool_read_wakeup_offset_ms
+        + tc.OKX_SKEW_SYNC_TIME_P99_MS
+        + tc.SKEW_SYNC_SAFETY_BUFFER_MS
+    )
+    assert cfg.skew_sync_wakeup_offset_ms == expected
+    assert cfg.skew_sync_wakeup_offset_ms == 3645  # locked snapshot
+
+
+def test_wake_chain_strictly_increasing(tmp_path):
+    """Wake offsets must be ordered:
+    skew_sync > pool_read > kline_fetch > bet_submit_deadline."""
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
+    assert cfg.skew_sync_wakeup_offset_ms > cfg.pool_read_wakeup_offset_ms
+    assert cfg.pool_read_wakeup_offset_ms > cfg.kline_fetch_wakeup_offset_ms
+    assert cfg.kline_fetch_wakeup_offset_ms > cfg.bet_submit_deadline_offset_ms
+
+
+# ---------------------------------------------------------------------------
+# 2. Cross-validations fire when cutoffs are too small
+# ---------------------------------------------------------------------------
+
+def test_kline_fetch_wakeup_exceeds_cutoff_publish_budget_rejected(tmp_path):
+    """kline_fetch_wakeup > cutoff*1000 - P95 (looser bound) must raise.
+
+    Tier ladder: P99 first, P95 fallback, error if even P95 fails.
+    With cutoff=1 (=1000ms), P95=700, P99=1300:
+      P99 budget = 1000 - 1300 = -300ms (already negative).
+      P95 budget = 1000 - 700  =  300ms.
+      kline_fetch_wakeup_offset=1090ms > both -> InvariantError.
+    """
+    raised: Exception | None = None
+    try:
+        load_app_config(str(_write_cfg(tmp_path, cutoff=1)))
+    except InvariantError as e:
+        raised = e
+    assert isinstance(raised, InvariantError)
+    assert "config_kline_fetch_wakeup_exceeds_cutoff_publish_budget" in str(raised)
+
+
+def test_canonical_cutoff_2_falls_back_to_p95_tier(tmp_path):
+    """Strategy-canonical cutoff=2 lands in P95 tier (P99 budget too tight).
+
+    cutoff=2 (2000ms), kline_fetch_wakeup=1090, P95=700, P99=1300:
+      P99 budget = 2000 - 1300 = 700ms;  1090 > 700 -> P99 fails.
+      P95 budget = 2000 - 700  = 1300ms; 1090 <= 1300 -> P95 passes.
+    Expected tier: "P95".
+    """
+    cfg = load_app_config(str(_write_cfg(tmp_path, cutoff=2)))
+    assert cfg.kline_cutoff_seconds == 2
+    assert cfg.kline_publish_tier == "P95"
+    # Sanity: at this tier the wake offset fits the P95 budget.
+    assert cfg.kline_fetch_wakeup_offset_ms <= (
+        2 * 1000 - tc.OKX_KLINE_PUBLISH_DELAY_P95_MS
+    )
+    # And it does NOT fit the strict P99 budget (else tier would be P99).
+    assert cfg.kline_fetch_wakeup_offset_ms > (
+        2 * 1000 - tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
+    )
+
+
+def test_cutoff_3_promotes_to_p99_tier(tmp_path):
+    """Larger cutoff auto-promotes to P99 tier without code change.
+
+    cutoff=3 (3000ms), kline_fetch_wakeup=1090, P99=1300:
+      P99 budget = 3000 - 1300 = 1700ms; 1090 <= 1700 -> P99 passes.
+    Expected tier: "P99".
+    """
+    cfg = load_app_config(str(_write_cfg(tmp_path, cutoff=3)))
+    assert cfg.kline_cutoff_seconds == 3
+    assert cfg.kline_publish_tier == "P99"
+    assert cfg.kline_fetch_wakeup_offset_ms <= (
+        3 * 1000 - tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
+    )
+
+
+def test_p95_le_p99_invariant_holds():
+    """Module-load assert in timing_constants.py: P95 must be <= P99.
+
+    If a future probe update accidentally inverts the percentile order,
+    the assert at module load fires immediately. This test re-asserts
+    the invariant for explicit regression coverage.
+    """
+    assert tc.OKX_KLINE_PUBLISH_DELAY_P95_MS <= tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
+
+
+def test_pool_read_wakeup_exceeds_cutoff_arrival_budget_rejected(tmp_path):
+    """pool_read_wakeup > pool_cutoff*1000 - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS must raise.
+
+    With pool_cutoff=4 (=4000ms) and WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS=3500,
+    the budget is 4000 - 3500 = 500ms but pool_read_wakeup_offset=1095ms.
+    1095 > 500 → fires.
+    """
+    extra = "pool_cutoff_seconds = 4"
+    raised: Exception | None = None
+    try:
+        load_app_config(str(_write_cfg(tmp_path, extra=extra)))
+    except InvariantError as e:
+        raised = e
+    assert isinstance(raised, InvariantError)
+    assert "config_pool_read_wakeup_exceeds_cutoff_arrival_budget" in str(raised)
+
+
+def test_pool_cutoff_default_is_6(tmp_path):
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
+    assert cfg.pool_cutoff_seconds == 6
+
+
+def test_max_consecutive_fetch_failures_default_is_5(tmp_path):
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
+    assert cfg.max_consecutive_fetch_failures == 5
+
+
+@pytest.mark.parametrize("n", [1, 5, 10, 100])
+def test_max_consecutive_fetch_failures_accepts_valid_range(tmp_path, n):
+    extra = f"max_consecutive_fetch_failures = {n}"
     cfg = load_app_config(str(_write_cfg(tmp_path, extra=extra)))
-    assert cfg.lock_safety_margin_ms == margin
+    assert cfg.max_consecutive_fetch_failures == n
 
 
-@pytest.mark.parametrize("margin", [-1, 0, 49, 2001, 5000])
-def test_lock_safety_margin_ms_rejects_out_of_range(tmp_path, margin):
-    """Below 50 or above 2000: must raise."""
-    extra = f"lock_safety_margin_ms = {margin}"
+@pytest.mark.parametrize("n", [-1, 0, 101, 500])
+def test_max_consecutive_fetch_failures_rejects_out_of_range(tmp_path, n):
+    extra = f"max_consecutive_fetch_failures = {n}"
     raised: Exception | None = None
     try:
         load_app_config(str(_write_cfg(tmp_path, extra=extra)))
     except InvariantError as e:
         raised = e
-    assert isinstance(raised, InvariantError), (
-        f"margin={margin} must raise InvariantError; got "
-        f"{type(raised).__name__}: {raised}"
+    assert isinstance(raised, InvariantError)
+    assert "max_consecutive_fetch_failures_out_of_range" in str(raised)
+
+
+# ---------------------------------------------------------------------------
+# 3. Inclusion-math chain
+# ---------------------------------------------------------------------------
+
+def _wake_to_block_landing_ms(*, kline_fetch_wakeup_offset_ms: int, fetch_rtt_ms: int) -> int:
+    """Worst-case ms past lock_at when a TX broadcast at wake+fetch+compute+sign
+    lands in the next BSC block. Uses canonical timing constants.
+
+    Returns NEGATIVE if block lands BEFORE lock_ts (= INCLUDED).
+    """
+    sign_overhead_ms = 5
+    decision_ready_ms_after_wake = (
+        fetch_rtt_ms + tc.SIGNAL_COMPUTE_TIME_MS + sign_overhead_ms
     )
-    assert "lock_safety_margin_ms_out_of_range" in str(raised)
+    mempool_ms_after_wake = decision_ready_ms_after_wake + tc.BSC_BET_SUBMIT_RTT_P95_MS
+    worst_case_block_landing_ms_after_wake = mempool_ms_after_wake + tc.BSC_BLOCK_TIME_MS
+    return worst_case_block_landing_ms_after_wake - kline_fetch_wakeup_offset_ms
 
 
-# ---------------------------------------------------------------------------
-# Cross-constraint: safety_margin < kline_fetch_offset_ms
-# ---------------------------------------------------------------------------
-
-def test_safety_margin_equal_to_kline_offset_rejected(tmp_path):
-    """The exact regression case: margin == kline_fetch_offset_ms must FAIL.
-
-    This is what the pre-p4c code path effectively had (margin=1000ms vs
-    wake=850ms). The cross-constraint ensures the wake is OUTSIDE the
-    safety zone.
-    """
-    extra = "kline_fetch_offset_ms = 850\nlock_safety_margin_ms = 850"
-    raised: Exception | None = None
-    try:
-        load_app_config(str(_write_cfg(tmp_path, extra=extra)))
-    except InvariantError as e:
-        raised = e
-    assert isinstance(raised, InvariantError), (
-        f"margin == kline_fetch_offset_ms must raise; got "
-        f"{type(raised).__name__}: {raised}"
+def test_inclusion_math_at_locked_constants_median_fetch(tmp_path):
+    """Median-fetch rounds at the locked constants land block BEFORE lock_ts."""
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
+    delta_ms = _wake_to_block_landing_ms(
+        kline_fetch_wakeup_offset_ms=cfg.kline_fetch_wakeup_offset_ms,
+        fetch_rtt_ms=tc.OKX_KLINE_FETCH_RTT_P95_MS - 50,  # ~median (slightly tighter than p95)
     )
-    assert "lock_safety_margin_ms_must_be_less_than_kline_fetch_offset_ms" in str(raised)
-
-
-def test_safety_margin_greater_than_kline_offset_rejected(tmp_path):
-    """The original regression: margin > wake offset means wake INSIDE safety zone."""
-    extra = "kline_fetch_offset_ms = 500\nlock_safety_margin_ms = 700"
-    raised: Exception | None = None
-    try:
-        load_app_config(str(_write_cfg(tmp_path, extra=extra)))
-    except InvariantError as e:
-        raised = e
-    assert isinstance(raised, InvariantError), (
-        f"margin > kline_fetch_offset_ms must raise; got "
-        f"{type(raised).__name__}: {raised}"
+    assert delta_ms < 0, (
+        f"At median fetch RTT and locked constants, worst-case block landing "
+        f"must precede lock_ts. delta_ms={delta_ms}."
     )
-    assert "lock_safety_margin_ms_must_be_less_than_kline_fetch_offset_ms" in str(raised)
 
 
-def test_safety_margin_less_than_kline_offset_accepted(tmp_path):
-    """The intended regime: margin strictly less than wake offset."""
-    extra = "kline_fetch_offset_ms = 850\nlock_safety_margin_ms = 300"
-    cfg = load_app_config(str(_write_cfg(tmp_path, extra=extra)))
-    assert cfg.kline_fetch_offset_ms == 850
-    assert cfg.lock_safety_margin_ms == 300
+def test_inclusion_math_at_locked_constants_p95_fetch_aborts_safely(tmp_path):
+    """At p95 fetch RTT, decision-ready hits the timing guard cleanly --
+    no submission, no gas burn.
+    """
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
+    # decision_ready_ms_after_wake at p95 fetch
+    p95_decision_ms_after_wake = (
+        tc.OKX_KLINE_FETCH_RTT_P95_MS + tc.SIGNAL_COMPUTE_TIME_MS
+    )
+    decision_ready_offset_ms = (
+        cfg.kline_fetch_wakeup_offset_ms - p95_decision_ms_after_wake
+    )
+    # Guard fires when remaining_to_lock <= safety_margin
+    guard_fires = decision_ready_offset_ms <= cfg.bet_submit_deadline_offset_ms
+    # Note: at the locked constants kline_fetch_wakeup=1090, p95_decision=340,
+    # so decision_ready_offset = 750 = exactly the bet-submit-deadline. The
+    # guard condition is `>=`, so equality fires the guard.
+    assert guard_fires, (
+        f"At p95 fetch RTT, decision-ready offset = {decision_ready_offset_ms}ms "
+        f"vs bet_submit_deadline_offset_ms = {cfg.bet_submit_deadline_offset_ms}ms. "
+        f"Guard must fire to abort the round before risk of late inclusion."
+    )
 
 
 # ---------------------------------------------------------------------------
-# Guard math: re-implement engine.py:609 logic with explicit time values
+# 4. Engine timing-guard math
 # ---------------------------------------------------------------------------
 
-def _guard_fires(*, now: float, lock_ts: float, safety_margin_ms: int) -> bool:
-    """Mirror engine.py:609:
-        if _utc_now() >= lock_ts_t - cfg.lock_safety_margin_ms / 1000.0: SKIP
-    Returns True iff the guard SKIPs the bet.
+def _guard_fires(*, now: float, lock_ts: float, deadline_ms: int) -> bool:
+    """Mirror engine.py timing guard:
+        if _utc_now() >= lock_ts - cfg.bet_submit_deadline_offset_ms / 1000.0: SKIP
     """
-    safety_seconds = safety_margin_ms / 1000.0
-    return now >= lock_ts - safety_seconds
+    deadline_seconds = deadline_ms / 1000.0
+    return now >= lock_ts - deadline_seconds
 
 
-def test_guard_at_p4c_default_passes_typical_fetch():
-    """Wake at lock-850ms, fetch 280ms median, decision-ready at lock-520ms.
+def test_guard_does_not_fire_at_wake_with_locked_constants():
+    """Wake fires at lock - kline_fetch_wakeup_offset_ms. Guard fires at
+    lock - bet_submit_deadline_offset_ms. Wake must be OUTSIDE the safety
+    zone (kline_fetch_wakeup > bet_submit_deadline).
 
-    With margin=300ms: lock - 520ms < lock - 300ms, so guard does NOT fire.
-    """
-    lock_ts = 1_000_000.0
-    decision_ready = lock_ts - 0.520  # 520 ms before lock
-    assert not _guard_fires(now=decision_ready, lock_ts=lock_ts, safety_margin_ms=300)
-
-
-def test_guard_at_p4c_default_aborts_slow_p99_fetch():
-    """Slow p99 fetch (~850ms) lands decision right at lock_ts.
-
-    With margin=300ms: now=lock_ts >= lock_ts - 300ms, so guard FIRES.
-    Correct conservative behavior.
+    With locked constants: wake at lock-1090ms, guard at lock-750ms.
+    -1090 < -750 -> wake is BEFORE guard threshold -> wake doesn't fire guard.
     """
     lock_ts = 1_000_000.0
-    decision_ready = lock_ts  # right at lock
-    assert _guard_fires(now=decision_ready, lock_ts=lock_ts, safety_margin_ms=300)
+    wake_at = lock_ts - 1090 / 1000.0
+    assert not _guard_fires(now=wake_at, lock_ts=lock_ts, deadline_ms=750)
 
 
-def test_guard_at_p4c_default_passes_fast_fetch():
-    """Fast 250ms fetch -> decision-ready at lock-600ms. Margin=300 -> PASS."""
-    lock_ts = 1_000_000.0
-    decision_ready = lock_ts - 0.600
-    assert not _guard_fires(now=decision_ready, lock_ts=lock_ts, safety_margin_ms=300)
-
-
-def test_guard_at_old_broken_margin_fires_at_wake_regression():
-    """Regression assertion: with the OLD margin (1000ms) and wake at lock-850ms,
-    the guard fires AT WAKE TIME -- before any fetch even runs.
-
-    This is the bug p4c fixes. The test is here so that anyone re-introducing
-    the old margin gets a clear pytest failure.
+def test_guard_fires_at_p99_fetch_decision_ready():
+    """At p99 fetch RTT, decision-ready is right at the safety margin
+    boundary; guard fires (skips the round).
     """
     lock_ts = 1_000_000.0
-    wake_time = lock_ts - 0.850  # the moment the bot wakes for kline fetch
-    # With the OLD margin = 1000ms, the guard would fire at wake.
-    assert _guard_fires(now=wake_time, lock_ts=lock_ts, safety_margin_ms=1000)
-    # With the NEW default 300ms, the guard does NOT fire at wake.
-    assert not _guard_fires(now=wake_time, lock_ts=lock_ts, safety_margin_ms=300)
+    # Decision-ready at p99 fetch = wake + fetch_p99 + compute = lock - 1090 + 363 + 50
+    decision_ready = lock_ts - (1090 - 363 - 50) / 1000.0  # = lock - 0.677s
+    # Guard at lock - 0.75. -0.677 >= -0.75 -> TRUE -> SKIP
+    assert _guard_fires(now=decision_ready, lock_ts=lock_ts, deadline_ms=750)
 
 
 def test_guard_negative_offset_always_fires():
-    """Edge case: if fetch finishes AFTER lock_at (now > lock_ts), guard MUST fire
-    regardless of margin."""
+    """If fetch finishes AFTER lock_ts (now > lock_ts), guard MUST fire."""
     lock_ts = 1_000_000.0
-    decision_ready = lock_ts + 0.050  # 50ms past lock
-    for margin in [50, 100, 300, 700, 2000]:
-        assert _guard_fires(now=decision_ready, lock_ts=lock_ts, safety_margin_ms=margin), (
-            f"with now > lock_ts, guard must fire at margin={margin}"
-        )
+    decision_ready = lock_ts + 0.050
+    for deadline in [50, 100, 300, 750, 2000]:
+        assert _guard_fires(now=decision_ready, lock_ts=lock_ts, deadline_ms=deadline)

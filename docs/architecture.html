@@ -593,26 +593,36 @@
     <div class="loop-timeline">
       <div class="loop-step">
         <div class="ls-title">Epoch Alignment</div>
-        <div class="ls-desc">Query BSC for current epoch and round timing.</div>
+        <div class="ls-desc">Query BSC for current epoch and round timing. Identifies the open round (currently accepting bets) and the just-locked round (awaiting settlement).</div>
       </div>
       <div class="loop-step">
-        <div class="ls-title">Phase A: Housekeeping</div>
-        <div class="ls-desc">Epoch recheck, 3-connection OKX TLS warmup, pool data from WSS. Runs outside critical path.</div>
-        <div class="ls-time">lock_at &minus; cutoff &minus; offset &rarr; cutoff and offset are configurable (kline_cutoff_seconds, prefetch_offset_seconds)</div>
+        <div class="ls-title">Skew-sync Wake</div>
+        <div class="ls-desc">Refresh OKX clock skew (~2s), epoch quick-check, bankroll fetch (live mode). Off the critical path.</div>
+        <div class="ls-time">lock_at &minus; skew_sync_wakeup_offset_ms &rarr; ~3.65s before lock</div>
       </div>
       <div class="loop-step data">
-        <div class="ls-title">Phase B: Critical Path</div>
-        <div class="ls-desc">Fetch BTC/ETH/SOL klines (&lt;500ms), compute signal + sizing (negligible).</div>
-        <div class="ls-time">lock_at &minus; cutoff + 0.25s &rarr; critical path begins</div>
+        <div class="ls-title">Pool Wake</div>
+        <div class="ls-desc">Read pool aggregate from WSS subscriber: BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds.</div>
+        <div class="ls-time">lock_at &minus; pool_read_wakeup_offset_ms &rarr; ~1.10s before lock</div>
+      </div>
+      <div class="loop-step data">
+        <div class="ls-title">Kline-fetch Wake (Critical Path)</div>
+        <div class="ls-desc">4 parallel OKX /history-candles GETs (BTC/ETH/SOL/BNB), compute multi-TF signal + sizing.</div>
+        <div class="ls-time">lock_at &minus; kline_fetch_wakeup_offset_ms &rarr; ~1.09s before lock</div>
       </div>
       <div class="loop-step action">
         <div class="ls-title">Timing Guard + Execute</div>
-        <div class="ls-desc">Safety margin 1s before lock. Submit bet or abort. Live mode: clamp to min bet when <code>min_bet_only=true</code>.</div>
+        <div class="ls-desc">Abort if decision-ready is within bet_submit_deadline_offset_ms of lock_at (TX submitted that close would land after lock and revert). Otherwise submit bet (receipt-waited with <code>bet_tx_receipt_timeout_seconds &asymp; 35s</code>). Live mode: clamp to min bet when <code>min_bet_only=true</code>.</div>
+        <div class="ls-time">lock_at &minus; bet_submit_deadline_offset_ms &rarr; ~750ms before lock</div>
       </div>
       <div class="loop-step settle">
-        <div class="ls-title">Claim / Settlement</div>
-        <div class="ls-desc">Sleep until close + 35s. Epoch handshake (both modes). Dry: settle simulated bets. Live: batched claim scan.</div>
+        <div class="ls-title">Claim Wake</div>
+        <div class="ls-desc">Sleep until previous round's close + buffer (35s post-close). Epoch handshake (both modes). Dry: settle simulated bets. Live: batched claim scan via getUserRounds; each claim TX is receipt-waited with <code>claim_tx_receipt_timeout_seconds &asymp; 35s</code>. Revert (status=0) and timeout outcomes log a WARN entry and POST a <code>PancakeBot-live CLAIM FAILED</code> alert to the live Discord webhook; no retry — next iteration's cursor walk re-detects any still-claimable epochs.</div>
+        <div class="ls-time">close_at(claim_epoch) + 35s</div>
       </div>
+    </div>
+    <div class="loop-note" style="margin-top: 12px; font-size: 0.9em;">
+      All wake offsets derive from empirical constants in <code>pancakebot/timing_constants.py</code>; not user-tunable. User-tunable knobs in <code>config.toml [runtime]</code>: <code>kline_cutoff_seconds</code>, <code>pool_cutoff_seconds</code>, <code>max_consecutive_fetch_failures</code>.
     </div>
   </div>
 
