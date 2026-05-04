@@ -331,9 +331,9 @@ class AppConfig:
 
     Derived (computed at config-load time from
     ``pancakebot/timing_constants.py``; not user-tunable):
-    - ``lock_safety_margin_ms``
-    - ``kline_wakeup_offset_ms``
-    - ``pool_wakeup_offset_ms``
+    - ``bet_submit_deadline_offset_ms``
+    - ``kline_fetch_wakeup_offset_ms``
+    - ``pool_read_wakeup_offset_ms``
     - ``skew_sync_wakeup_offset_ms``
     """
 
@@ -343,9 +343,9 @@ class AppConfig:
     max_consecutive_fetch_failures: int
 
     # Derived (from timing_constants.py at load time)
-    lock_safety_margin_ms: int
-    kline_wakeup_offset_ms: int
-    pool_wakeup_offset_ms: int
+    bet_submit_deadline_offset_ms: int
+    kline_fetch_wakeup_offset_ms: int
+    pool_read_wakeup_offset_ms: int
     skew_sync_wakeup_offset_ms: int
 
     # Other
@@ -592,9 +592,10 @@ def load_app_config(path: str) -> AppConfig:
     # ``kline_cutoff_seconds`` is the strategy's data horizon for OKX
     # klines. The gate's newest candle CLOSES at ``lock_at - cutoff*1000``,
     # one second before the strategy's ``open_ts >= cutoff_ts_ms`` filter
-    # would drop it. Cross-validated against ``OKX_PUBLISH_DELAY_P99_MS``
-    # below: cutoff*1000 must be >= the p99 publishing latency, otherwise
-    # the gate would routinely ask OKX for unpublished candles.
+    # would drop it. Cross-validated below: cutoff*1000 must be >=
+    # OKX_KLINE_PUBLISH_DELAY_P99_MS + kline_fetch_wakeup_offset_ms,
+    # otherwise the gate would wake before the cutoff candle has been
+    # published.
     kline_cutoff_seconds = _req_int(runtime, "kline_cutoff_seconds")
     if not (1 <= kline_cutoff_seconds <= 30):
         raise InvariantError(
@@ -605,9 +606,9 @@ def load_app_config(path: str) -> AppConfig:
     # ``pool_cutoff_seconds`` is the strategy's data horizon for BSC
     # BetBull/BetBear events. Only bets with on-chain block_timestamp
     # < lock_at - this are counted in the pool aggregate. Cross-validated
-    # against ``WSS_ARRIVAL_DELAY_P99_MS`` below: cutoff*1000 must be >=
-    # the p99 WSS arrival latency, otherwise the pool aggregate would
-    # routinely exclude bets still en route to our subscriber.
+    # below: cutoff*1000 must be >= pool_read_wakeup_offset_ms +
+    # WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS, otherwise the pool aggregate
+    # would wake before WSS-arriving bets have caught up to the cutoff.
     pool_cutoff_seconds = _opt_int(runtime, "pool_cutoff_seconds", 6)
     if not (1 <= pool_cutoff_seconds <= 30):
         raise InvariantError(
@@ -628,52 +629,60 @@ def load_app_config(path: str) -> AppConfig:
             f"got={max_consecutive_fetch_failures} valid=[1..100]"
         )
     # --- Derived timing constants (NOT user-tunable) ---
-    # All four wake offsets and the safety margin are computed from
-    # empirical constants in pancakebot/timing_constants.py. To change
+    # All four wake offsets and the bet-submit deadline offset are computed
+    # from empirical constants in pancakebot/timing_constants.py. To change
     # any value, re-run the corresponding probe and update the constant
     # there. See timing_constants.py for the derivation formulas.
     from pancakebot import timing_constants as _tc
 
-    lock_safety_margin_ms = (
-        _tc.BSC_SUBMIT_RTT_P95_MS
+    bet_submit_deadline_offset_ms = (
+        _tc.BSC_BET_SUBMIT_RTT_P95_MS
         + _tc.BSC_BLOCK_TIME_MS
-        + _tc.SAFETY_BUFFER_MS
+        + _tc.BET_SUBMIT_SAFETY_BUFFER_MS
     )
-    kline_wakeup_offset_ms = (
-        lock_safety_margin_ms
-        + _tc.OKX_FETCH_RTT_P95_MS
-        + _tc.GATE_COMPUTE_MS
+    kline_fetch_wakeup_offset_ms = (
+        bet_submit_deadline_offset_ms
+        + _tc.OKX_KLINE_FETCH_RTT_P95_MS
+        + _tc.SIGNAL_COMPUTE_TIME_MS
     )
-    pool_wakeup_offset_ms = (
-        kline_wakeup_offset_ms
-        + _tc.POOL_READ_BUFFER_MS
+    pool_read_wakeup_offset_ms = (
+        kline_fetch_wakeup_offset_ms
+        + _tc.POOL_READ_TIME_MS
     )
     skew_sync_wakeup_offset_ms = (
-        pool_wakeup_offset_ms
-        + _tc.SKEW_SYNC_TIME_P99_MS
-        + _tc.SKEW_SAFETY_BUFFER_MS
+        pool_read_wakeup_offset_ms
+        + _tc.OKX_SKEW_SYNC_TIME_P99_MS
+        + _tc.SKEW_SYNC_SAFETY_BUFFER_MS
     )
 
-    # Cross-validation: kline_cutoff must be at least OKX's p99
-    # publishing latency, otherwise the gate would ask for unpublished
-    # candles routinely.
-    if kline_cutoff_seconds * 1000 < _tc.OKX_PUBLISH_DELAY_P99_MS:
+    # Cross-validation: kline_cutoff must cover OKX's p99 publishing
+    # latency PLUS the kline-fetch wakeup offset, otherwise the gate
+    # would wake before publishing has caught up to the cutoff window.
+    if kline_cutoff_seconds * 1000 < (
+        _tc.OKX_KLINE_PUBLISH_DELAY_P99_MS + kline_fetch_wakeup_offset_ms
+    ):
         raise InvariantError(
             f"config_kline_cutoff_too_small_for_okx_publish_delay: "
             f"kline_cutoff_seconds={kline_cutoff_seconds} "
             f"({kline_cutoff_seconds * 1000}ms) "
-            f"< OKX_PUBLISH_DELAY_P99_MS={_tc.OKX_PUBLISH_DELAY_P99_MS}"
+            f"< OKX_KLINE_PUBLISH_DELAY_P99_MS"
+            f"={_tc.OKX_KLINE_PUBLISH_DELAY_P99_MS} "
+            f"+ kline_fetch_wakeup_offset_ms={kline_fetch_wakeup_offset_ms}"
         )
 
-    # Cross-validation: pool_cutoff must be at least WSS arrival p99,
-    # otherwise the pool aggregate would routinely miss bets still en
-    # route to our subscriber.
-    if pool_cutoff_seconds * 1000 < _tc.WSS_ARRIVAL_DELAY_P99_MS:
+    # Cross-validation: pool_cutoff must cover WSS arrival p99 PLUS the
+    # pool-read wakeup offset, otherwise the pool aggregate would wake
+    # before WSS has caught up to the cutoff window.
+    if pool_cutoff_seconds * 1000 < (
+        pool_read_wakeup_offset_ms + _tc.WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS
+    ):
         raise InvariantError(
             f"config_pool_cutoff_too_small_for_wss_arrival_delay: "
             f"pool_cutoff_seconds={pool_cutoff_seconds} "
             f"({pool_cutoff_seconds * 1000}ms) "
-            f"< WSS_ARRIVAL_DELAY_P99_MS={_tc.WSS_ARRIVAL_DELAY_P99_MS}"
+            f"< pool_read_wakeup_offset_ms={pool_read_wakeup_offset_ms} "
+            f"+ WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS"
+            f"={_tc.WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS}"
         )
 
     # [dry]
@@ -710,9 +719,9 @@ def load_app_config(path: str) -> AppConfig:
         kline_cutoff_seconds=kline_cutoff_seconds,
         pool_cutoff_seconds=pool_cutoff_seconds,
         max_consecutive_fetch_failures=max_consecutive_fetch_failures,
-        lock_safety_margin_ms=lock_safety_margin_ms,
-        kline_wakeup_offset_ms=kline_wakeup_offset_ms,
-        pool_wakeup_offset_ms=pool_wakeup_offset_ms,
+        bet_submit_deadline_offset_ms=bet_submit_deadline_offset_ms,
+        kline_fetch_wakeup_offset_ms=kline_fetch_wakeup_offset_ms,
+        pool_read_wakeup_offset_ms=pool_read_wakeup_offset_ms,
         skew_sync_wakeup_offset_ms=skew_sync_wakeup_offset_ms,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_min_bet_only=live_min_bet_only,

@@ -603,21 +603,21 @@
       <div class="loop-step data">
         <div class="ls-title">Pool Wake</div>
         <div class="ls-desc">Read pool aggregate from WSS subscriber: BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds.</div>
-        <div class="ls-time">lock_at &minus; pool_wakeup_offset_ms &rarr; ~1.10s before lock</div>
+        <div class="ls-time">lock_at &minus; pool_read_wakeup_offset_ms &rarr; ~1.10s before lock</div>
       </div>
       <div class="loop-step data">
         <div class="ls-title">Kline-fetch Wake (Critical Path)</div>
         <div class="ls-desc">4 parallel OKX /history-candles GETs (BTC/ETH/SOL/BNB), compute multi-TF signal + sizing.</div>
-        <div class="ls-time">lock_at &minus; kline_wakeup_offset_ms &rarr; ~1.09s before lock</div>
+        <div class="ls-time">lock_at &minus; kline_fetch_wakeup_offset_ms &rarr; ~1.09s before lock</div>
       </div>
       <div class="loop-step action">
         <div class="ls-title">Timing Guard + Execute</div>
-        <div class="ls-desc">Abort if decision-ready is within lock_safety_margin_ms of lock_at (TX submitted that close would land after lock and revert). Otherwise submit bet. Live mode: clamp to min bet when <code>min_bet_only=true</code>.</div>
-        <div class="ls-time">lock_at &minus; lock_safety_margin_ms &rarr; ~750ms before lock</div>
+        <div class="ls-desc">Abort if decision-ready is within bet_submit_deadline_offset_ms of lock_at (TX submitted that close would land after lock and revert). Otherwise submit bet (receipt-waited with <code>bet_tx_receipt_timeout_seconds &asymp; 35s</code>). Live mode: clamp to min bet when <code>min_bet_only=true</code>.</div>
+        <div class="ls-time">lock_at &minus; bet_submit_deadline_offset_ms &rarr; ~750ms before lock</div>
       </div>
       <div class="loop-step settle">
         <div class="ls-title">Claim Wake</div>
-        <div class="ls-desc">Sleep until previous round's close + buffer (35s post-close). Epoch handshake (both modes). Dry: settle simulated bets. Live: batched claim scan via getUserRounds.</div>
+        <div class="ls-desc">Sleep until previous round's close + buffer (35s post-close). Epoch handshake (both modes). Dry: settle simulated bets. Live: batched claim scan via getUserRounds; each claim TX is receipt-waited with <code>claim_tx_receipt_timeout_seconds &asymp; 35s</code>. Revert (status=0) and timeout outcomes log a WARN entry and POST a <code>PancakeBot-live CLAIM FAILED</code> alert to the live Discord webhook; no retry — next iteration's cursor walk re-detects any still-claimable epochs.</div>
         <div class="ls-time">close_at(claim_epoch) + 35s</div>
       </div>
     </div>

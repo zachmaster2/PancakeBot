@@ -32,16 +32,26 @@ class RuntimeConfig:
     # Pre-lock wake schedule (all DERIVED from pancakebot/timing_constants.py
     # at config load; not user-tunable). All in milliseconds before lock_at.
     #
-    #   skew_sync_wakeup_offset_ms  >  pool_wakeup_offset_ms
-    #                               >  kline_wakeup_offset_ms
-    #                               >  lock_safety_margin_ms
+    #   skew_sync_wakeup_offset_ms     >  pool_read_wakeup_offset_ms
+    #                                  >  kline_fetch_wakeup_offset_ms
+    #                                  >  bet_submit_deadline_offset_ms
     #
     # Engine fires three distinct _sleep_until_ts wakes per round:
-    # skew_sync -> pool -> kline. Timing guard at lock_safety_margin_ms.
+    # skew_sync -> pool -> kline. Timing guard fires at
+    # ``lock_at - bet_submit_deadline_offset_ms``.
     skew_sync_wakeup_offset_ms: int
-    pool_wakeup_offset_ms: int
-    kline_wakeup_offset_ms: int
-    lock_safety_margin_ms: int
+    pool_read_wakeup_offset_ms: int
+    kline_fetch_wakeup_offset_ms: int
+    bet_submit_deadline_offset_ms: int
+
+    # Receipt timeouts for ``contract.bet_*_timed`` and ``contract.claim``
+    # (DERIVED at runtime from ``buffer_seconds + claim_check_padding_seconds``,
+    # ≈35s on canonical chain constants). Both share the same derivation:
+    # how long ``wait_for_transaction_receipt`` polls before raising
+    # TimeExhausted. Sized so a slow mempool inclusion is still caught
+    # before the next round's wake schedule needs the runtime back.
+    bet_tx_receipt_timeout_seconds: int
+    claim_tx_receipt_timeout_seconds: int
 
     # User-tunable. Streak counter for OKX transient failures; bot
     # crashes (-> supervisor restart + Discord alert) after this many
@@ -50,7 +60,8 @@ class RuntimeConfig:
 
     # User-tunable. Pool cutoff: only bets with on-chain block_timestamp
     # < lock_at - pool_cutoff_seconds are counted in the pool aggregate.
-    # Cross-validated at config load to be >= WSS_ARRIVAL_DELAY_P99.
+    # Cross-validated at config load to be >= pool_read_wakeup_offset_ms
+    # + WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS.
     pool_cutoff_seconds: int
 
     # Protocol constants (from chain via contract_constants.json)

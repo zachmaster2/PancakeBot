@@ -28,8 +28,8 @@ fail on any symbol -> TransientOkxError -> gate skips with
 historical fetch via sync.py) where there's no time pressure.
 
 The wake-time offset is derived from timing_constants.py and applied
-by the engine via ``RuntimeConfig.kline_wakeup_offset_ms``; the gate
-itself just consumes ``lock_at_ms``.
+by the engine via ``RuntimeConfig.kline_fetch_wakeup_offset_ms``; the
+gate itself just consumes ``lock_at_ms``.
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ class MomentumGate:
     Decision-time work: 4 parallel HTTP GETs to OKX (pooled RTT
     p50=258ms, p95=289ms, p99=363ms per probe n=1000 2026-05-03).
     The wake-time offset is set by the engine via
-    ``RuntimeConfig.kline_wakeup_offset_ms``; the gate consumes
+    ``RuntimeConfig.kline_fetch_wakeup_offset_ms``; the gate consumes
     ``lock_at_ms``.
 
     Error handling:

@@ -1,10 +1,12 @@
 """Tests for ``load_app_config`` runtime-section validation.
 
-Covers ``kline_cutoff_seconds`` and ``kline_fetch_offset_ms`` range
-validation. The cutoff range bound was added 2026-04-27 alongside the
-gate-fetch math fix: ``cutoff < 1`` would request a candle past lock_at
-(which OKX hasn't published), and ``cutoff > 30`` erodes the gate's
-predictive horizon for no benefit.
+Covers ``kline_cutoff_seconds`` range validation: ``cutoff < 1`` would
+request a candle past lock_at (which OKX hasn't published), and
+``cutoff > 30`` erodes the gate's predictive horizon for no benefit.
+The lower-bound cross-validation is enforced separately via
+``kline_cutoff_seconds * 1000 >= OKX_KLINE_PUBLISH_DELAY_P99_MS +
+kline_fetch_wakeup_offset_ms``; see test_p4c_lock_safety_margin.py
+for that path.
 
 Run:
     python -m pytest tests/test_config_validation.py -v
@@ -28,7 +30,6 @@ from pancakebot.util import InvariantError  # noqa: E402
 _BASE_TOML = """
 [runtime]
 kline_cutoff_seconds = {cutoff}
-prefetch_offset_seconds = 6
 
 [dry]
 initial_bankroll_bnb = 50.0
@@ -48,11 +49,12 @@ def _write_cfg(tmp_path: Path, cutoff: int) -> Path:
     return p
 
 
-@pytest.mark.parametrize("cutoff", [2, 15, 30])
+@pytest.mark.parametrize("cutoff", [3, 15, 30])
 def test_kline_cutoff_seconds_accepts_valid_range(tmp_path, cutoff):
     """Range [1..30] PLUS cross-validation kline_cutoff*1000 >=
-    OKX_PUBLISH_DELAY_P99_MS. With OKX_PUBLISH_DELAY_P99_MS=1300, the
-    minimum valid cutoff is 2 (=2000ms).
+    OKX_KLINE_PUBLISH_DELAY_P99_MS + kline_fetch_wakeup_offset_ms.
+    With OKX_KLINE_PUBLISH_DELAY_P99_MS=1300 + kline_fetch_wakeup=1090
+    (sum=2390), the minimum valid cutoff is 3 (=3000ms).
     """
     cfg = load_app_config(str(_write_cfg(tmp_path, cutoff)))
     assert cfg.kline_cutoff_seconds == cutoff
@@ -77,7 +79,7 @@ def _run_all() -> int:
     """Standalone runner (parametrize unrolled manually)."""
     failed = 0
     import tempfile
-    for valid in [1, 2, 15, 30]:
+    for valid in [3, 15, 30]:
         with tempfile.TemporaryDirectory() as td:
             try:
                 test_kline_cutoff_seconds_accepts_valid_range(Path(td), valid)
@@ -101,7 +103,7 @@ def _run_all() -> int:
                 failed += 1
                 print(f"ERROR test_kline_cutoff_seconds_rejects_out_of_range[{invalid}]: "
                       f"{type(e).__name__}: {e}")
-    print(f"\n{8 - failed}/8 tests passed")
+    print(f"\n{7 - failed}/7 tests passed")
     return 0 if failed == 0 else 1
 
 
