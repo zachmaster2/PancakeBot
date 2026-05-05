@@ -48,6 +48,17 @@ _BET_BEAR_TOPIC = "0x0d8c1fe3e67ab767116a81f122b83c2557a8c2564019cb7c4f83de1aeb1
 _BACKOFF_STEPS = [5, 10, 20, 40, 80, 120]
 _BACKOFF_RESET_SECONDS = 60.0
 
+# Idle-event threshold (seconds) for forced reconnect. The watcher subscribes
+# to both BetBull/BetBear logs AND newHeads; on BSC (post-Maxwell ~0.45s
+# block time) newHeads should arrive every ~450ms even when bet traffic is
+# quiet. ``time.time() - _last_event_at >= _IDLE_RECONNECT_THRESHOLD_SECONDS``
+# means the endpoint has gone silent across 17+ expected blocks -- almost
+# certainly a server-side filter drop or a middlebox black-holing
+# eth_subscription messages. The library's ping_interval=30 / ping_timeout=10
+# only catches dead TCP, not silent-stall (Investigation B, 2026-05-05:
+# publicnode kept TCP up but stopped delivering messages for 4+ hours).
+_IDLE_RECONNECT_THRESHOLD_SECONDS = 8.0
+
 
 @dataclass
 class _Bet:
@@ -382,10 +393,33 @@ class PoolEventWatcher:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 except asyncio.TimeoutError:
-                    # Short timeout exists only so the _stop_event check fires.
-                    # Library-level ping_interval=30 / ping_timeout=10 handles
-                    # real liveness: a silent TCP drop raises ConnectionClosedError
-                    # out of ws.recv(), bubbling to _run_loop.
+                    # Short timeout exists only so the _stop_event check fires
+                    # AND the silent-stall idle check below runs. Library-level
+                    # ping_interval=30 / ping_timeout=10 handles dead-TCP case;
+                    # the idle check below handles silent-stall (TCP up but
+                    # no eth_subscription messages, e.g. server-side filter
+                    # drop or middlebox black-holing).
+                    idle_seconds = time.time() - self._last_event_at
+                    if idle_seconds >= _IDLE_RECONNECT_THRESHOLD_SECONDS:
+                        warn(
+                            "POOL_WSS", "ERR", "IDLE_STALL",
+                            msg=(
+                                f"No eth_subscription event received in "
+                                f"{idle_seconds:.1f}s on {url} "
+                                f"(threshold {_IDLE_RECONNECT_THRESHOLD_SECONDS:.1f}s); "
+                                f"forcing reconnect (silent-stall detection)"
+                            ),
+                        )
+                        # Raise to bubble out of _ws_listen and trigger the
+                        # round-robin failover in _run_loop. Use a bare
+                        # exception so we get a "RECONN" warn line at the
+                        # outer scope, mirroring how ConnectionClosedError
+                        # surfaces.
+                        raise ConnectionError(
+                            f"idle_stall_force_reconnect: "
+                            f"silent={idle_seconds:.1f}s threshold="
+                            f"{_IDLE_RECONNECT_THRESHOLD_SECONDS:.1f}s"
+                        )
                     continue
 
                 self._last_event_at = time.time()
