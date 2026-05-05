@@ -33,7 +33,12 @@ from pancakebot.strategy.momentum_pipeline import StrategyPipelineDecision
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
-# Extra cushion added to the claim-check wake time to avoid alignment retries near RPC boundaries.
+# Extra cushion added to the claim wake time, on top of the chain's
+# ``buffer_seconds`` settlement window. Total claim-wake time =
+# ``close_at(claim_epoch) + buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS``
+# (NOT relative to lock_at -- the bot only claims after the round closes
+# and the keeper has had ``buffer_seconds`` to call settleRound). The
+# padding absorbs alignment retries near RPC boundaries.
 _CLAIM_CHECK_PADDING_SECONDS = 5
 
 _CLAIM_BATCH_SIZE = 10
@@ -400,13 +405,19 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Step 5: cutoff_ts(t) = lock_ts(t) - cutoff_seconds.
         cutoff_ts_t = lock_ts_t - cfg.cutoff_seconds
 
-        # If we missed the previous epoch's cutoff and are now targeting a newer epoch, the
-        # just-closed locked epoch may become claimable before the next cutoff. In that case,
-        # we must wake for claim first (no approximation).
+        # If we missed the previous epoch's cutoff and are now targeting a
+        # newer epoch, the previously-locked epoch (which just closed) may
+        # become claimable before the next cutoff. In that case, we must
+        # wake for claim first (no approximation).
         prev_locked_epoch = locked_round.epoch - 1
         if locked_round.lock_at is None:
             raise InvariantError("locked_round_lock_at_missing")
-        claim_ts = locked_round.lock_at + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
+        # PredictionV2 rounds are tiled: each lock event closes the prior
+        # round AND opens the next. So ``locked_round.lock_at`` (epoch T-1's
+        # lock_at) IS the close_at of ``prev_locked_epoch`` (= epoch T-2).
+        # Claim wake fires at: close_at(prev) + buffer + padding.
+        prev_close_ts = locked_round.lock_at  # = close_at(prev_locked_epoch)
+        claim_ts = prev_close_ts + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
         # claim_ts and cutoff_ts_t are both chain-anchored true UTC; compare
         # against skew-corrected _utc_now() so a skewed local clock doesn't
         # make us miss the wake-for-claim window.
