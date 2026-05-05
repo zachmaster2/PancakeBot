@@ -239,12 +239,24 @@ class PoolEventWatcher:
         return bull_wei / BNB_WEI, bear_wei / BNB_WEI
 
     def set_round_phase(self, *, current_epoch: int, lock_at: int) -> None:
-        """Engine-driven state sync; called once per runtime iteration.
+        """Engine-driven state sync; called at the top of every runtime
+        iteration after epoch handshake.
 
-        Always strictly advances `current_epoch` after the first call
-        (enforced as an invariant — the engine loop structure guarantees
-        strictly increasing epochs between iterations that reach this
-        method). Calls `_try_trigger_backfill` after updating `_lock_at`:
+        ``current_epoch`` is normally strictly-advancing across iterations
+        (each round is 5 minutes; a normal iteration finishes within the
+        round). However the engine's catch-up ``_sleep_and_claim`` path
+        re-enters this method with the SAME epoch when a startup/restart
+        lands in the previous round's claim window: the bot sleeps
+        ~10-35s for the claim, loops back to the top, gets the same open
+        epoch from ``_epoch_handshake``, and calls this method again.
+
+        Same-epoch + same-lock_at is treated as a no-op resync. Same-epoch
+        + DIFFERENT lock_at is treated as an invariant violation (chain
+        state corruption: the same epoch should not retroactively change
+        its lock timestamp). Strictly-decreasing epochs are also a
+        violation.
+
+        Calls `_try_trigger_backfill` after updating `_lock_at`:
         actual backfill fires only when a first newHead has also arrived
         on the current WSS session.
         """
@@ -257,10 +269,21 @@ class PoolEventWatcher:
             prev_epoch = self._current_epoch
             is_first_call = (prev_epoch == -1)
 
-            if not is_first_call and current_epoch <= prev_epoch:
+            if not is_first_call and current_epoch < prev_epoch:
                 raise InvariantError(
-                    f"set_round_phase_non_advancing: prev={prev_epoch} new={current_epoch}"
+                    f"set_round_phase_decreasing: prev={prev_epoch} new={current_epoch}"
                 )
+            if not is_first_call and current_epoch == prev_epoch:
+                # Same-epoch resync (catch-up _sleep_and_claim path).
+                # Verify lock_at hasn't changed (chain state stable),
+                # then no-op the rest of the state-update logic.
+                if self._lock_at != lock_at:
+                    raise InvariantError(
+                        f"set_round_phase_same_epoch_lock_at_changed: "
+                        f"epoch={current_epoch} prev_lock_at={self._lock_at} "
+                        f"new_lock_at={lock_at}"
+                    )
+                return
 
             if is_first_call:
                 info("POOL_WSS", "EPOCH", "INIT",
