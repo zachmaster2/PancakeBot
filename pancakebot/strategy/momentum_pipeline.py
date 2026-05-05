@@ -302,7 +302,13 @@ class MomentumOnlyPipeline:
                     is_regime2 = True
 
         if signal_dir is None:
-            return self._skip("gate_no_signal")
+            # Propagate the gate's specific skip reason if it set one
+            # (e.g. ``kline_fetch_transient_failure`` when ETH/SOL fetch
+            # returned ``got_15_expected_16`` and the regime-2 fallback
+            # couldn't fire either). Falling through to ``gate_no_signal``
+            # silently rebrands transient kline failures and hides
+            # data-availability issues from the cycle_audit.
+            return self._skip(result.skip_reason or "gate_no_signal")
 
         # Pool filter: skip if visible pool is too small (dilution kills edge).
         if pool_total < self._strategy.pool_filter.min_pool_bnb:
