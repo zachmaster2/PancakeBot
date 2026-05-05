@@ -97,3 +97,78 @@ def test_run_loop_catches_connection_error_and_continues():
         "ConnectionError must be a generic Exception so _run_loop's "
         "blanket `except Exception` catches it"
     )
+
+
+# ---------------------------------------------------------------------------
+# set_round_phase idempotence (catch-up _sleep_and_claim race fix, 2026-05-05)
+# ---------------------------------------------------------------------------
+
+def test_set_round_phase_same_epoch_same_lock_at_is_noop():
+    """The engine's catch-up ``_sleep_and_claim`` path re-enters
+    ``_run_one_iteration`` with the same open-round epoch when a
+    startup/restart lands in the previous round's claim window. Calling
+    ``set_round_phase`` twice with the same epoch + same lock_at must
+    no-op (not raise) so the bot can complete the catch-up cycle and
+    transition to the next round normally.
+    """
+    from pancakebot.chain.pool_watcher import PoolEventWatcher
+
+    pw = PoolEventWatcher(interval_seconds=300)
+    # First call (initial set, after EPOCH INIT in real flow)
+    pw.set_round_phase(current_epoch=478574, lock_at=1777984304)
+    # Second call same epoch + same lock_at — must no-op, NOT raise
+    pw.set_round_phase(current_epoch=478574, lock_at=1777984304)
+    # Third call same again — still no-op
+    pw.set_round_phase(current_epoch=478574, lock_at=1777984304)
+    # Verify state is unchanged
+    assert pw._current_epoch == 478574
+    assert pw._lock_at == 1777984304
+
+
+def test_set_round_phase_same_epoch_different_lock_at_raises():
+    """Same epoch with a CHANGED lock_at indicates chain state corruption
+    (an epoch's lock timestamp should never retroactively change). Must
+    raise InvariantError, not no-op.
+    """
+    from pancakebot.chain.pool_watcher import PoolEventWatcher
+    from pancakebot.util import InvariantError
+
+    pw = PoolEventWatcher(interval_seconds=300)
+    pw.set_round_phase(current_epoch=478574, lock_at=1777984304)
+    raised: Exception | None = None
+    try:
+        pw.set_round_phase(current_epoch=478574, lock_at=1777984310)
+    except InvariantError as e:
+        raised = e
+    assert isinstance(raised, InvariantError)
+    assert "set_round_phase_same_epoch_lock_at_changed" in str(raised)
+
+
+def test_set_round_phase_decreasing_epoch_raises():
+    """A strictly-decreasing epoch is still a violation (chain shouldn't
+    rewind). The fix only relaxes equality, not the upper bound.
+    """
+    from pancakebot.chain.pool_watcher import PoolEventWatcher
+    from pancakebot.util import InvariantError
+
+    pw = PoolEventWatcher(interval_seconds=300)
+    pw.set_round_phase(current_epoch=478574, lock_at=1777984304)
+    raised: Exception | None = None
+    try:
+        pw.set_round_phase(current_epoch=478573, lock_at=1777984000)
+    except InvariantError as e:
+        raised = e
+    assert isinstance(raised, InvariantError)
+    assert "set_round_phase_decreasing" in str(raised)
+
+
+def test_set_round_phase_advancing_epoch_works():
+    """The canonical happy path: each iteration's epoch is +1 of the prior."""
+    from pancakebot.chain.pool_watcher import PoolEventWatcher
+
+    pw = PoolEventWatcher(interval_seconds=300)
+    pw.set_round_phase(current_epoch=478574, lock_at=1777984304)
+    pw.set_round_phase(current_epoch=478575, lock_at=1777984604)
+    pw.set_round_phase(current_epoch=478576, lock_at=1777984904)
+    assert pw._current_epoch == 478576
+    assert pw._lock_at == 1777984904
