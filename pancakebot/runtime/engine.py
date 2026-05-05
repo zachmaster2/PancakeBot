@@ -600,6 +600,58 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 info("POOL_WSS", "ROUND", "DATA",
                      epoch=current_epoch, pool_bnb=f"{pool_total:.4f}",
                      endpoint=cfg.pool_watcher.current_endpoint)
+            else:
+                # Data-integrity check (Investigation B fix, 2026-05-05).
+                # Pool=0 at lock-6s on a connected, backfill-done watcher
+                # is essentially always a WSS silent-stall: PancakeSwap
+                # rounds normally accumulate ~10-30 bets in the 5-minute
+                # bet window. If WSS observed nothing but the chain has
+                # the round open, the watcher is missing events.
+                #
+                # Skip with an EXPLICIT reason so the operator sees the
+                # data-availability issue in cycle_audit, not a misleading
+                # `gate_no_signal` or `pool_below_minimum`. Pair with the
+                # idle-stall reconnect in pool_watcher (~8s threshold);
+                # this invariant catches anything the idle check missed
+                # OR fires before the idle check has had time to
+                # reconnect-and-backfill.
+                #
+                # Future Option B: RPC fallback to chain truth via
+                # contract.round_data(). Deferred -- adds 50-200ms to
+                # critical path; the explicit skip is the minimum-change
+                # operator-visibility win.
+                warn(
+                    "POOL_WSS", "INTEG", "VIOLATION",
+                    msg=(
+                        f"Skip epoch {current_epoch}: "
+                        f"data_integrity_violation_pool_zero_chain_active "
+                        f"(WSS pool=0/0 at lock-{cfg.pool_cutoff_seconds}s; "
+                        f"connected=True backfill_done=True endpoint="
+                        f"{cfg.pool_watcher.current_endpoint})"
+                    ),
+                )
+                _record_dry_cycle_audit(
+                    cfg,
+                    closed,
+                    current_epoch=current_epoch,
+                    locked_epoch=locked_epoch,
+                    lock_ts=lock_ts_t,
+                    cutoff_ts=cutoff_ts_t,
+                    locked_price_bnbusd=bnbusd_price,
+                    action="SKIP",
+                    decision_stage="pipeline",
+                    open_round=open_round,
+                    bankroll_before_action_bnb=bankroll_bnb,
+                    bankroll_after_action_bnb=bankroll_bnb,
+                    skip_reason="data_integrity_violation_pool_zero_chain_active",
+                )
+                info("RUN", "ACT", "SKIP",
+                     msg=(
+                         f"Skip epoch {current_epoch}: "
+                         f"data_integrity_violation_pool_zero_chain_active"
+                     ))
+                _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
+                return
         elif cfg.pool_watcher is not None:
             info("POOL_WSS", "ROUND", "DISC",
                  epoch=current_epoch,
