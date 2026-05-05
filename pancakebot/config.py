@@ -366,40 +366,84 @@ class AppConfig:
 
 # -- TOML parsing helpers -----------------------------------------------------
 
+def _coerce_strict_int(v: Any, key: str) -> int:
+    """Return *v* as a Python int with strict type semantics.
+
+    Accepts integer literals (TOML ``int``) and integer-shaped strings
+    (e.g. for env-var-overridden config). Rejects floats (no silent
+    truncation -- ``2.5`` for an int field is a config error, not a 2),
+    bools (``bool`` is a subclass of ``int`` in Python; accepting
+    ``true``/``false`` for an int field is wrong), and everything else.
+
+    Raises ``InvariantError`` with the field name + received type/value.
+    """
+    if isinstance(v, str):
+        try:
+            return int(v)
+        except ValueError as e:
+            raise InvariantError(
+                f"config_key_not_int: {key}={v!r} (str parse failed: {e})"
+            ) from e
+    # Order matters: bool BEFORE int (bool is a subclass of int).
+    if isinstance(v, bool):
+        raise InvariantError(
+            f"config_key_not_int: {key}={v!r} "
+            f"(bool not allowed; expected integer literal)"
+        )
+    if isinstance(v, float):
+        raise InvariantError(
+            f"config_key_not_int: {key}={v!r} "
+            f"(float not allowed; use an integer literal in TOML)"
+        )
+    if isinstance(v, int):
+        return v
+    raise InvariantError(
+        f"config_key_not_int: {key}={v!r} "
+        f"(got {type(v).__name__}; expected int)"
+    )
+
+
 def _req_int(obj: dict[str, Any], key: str) -> int:
     if key not in obj:
         raise InvariantError(f"missing_config_key: {key}")
-    v = obj[key]
-    try:
-        i = int(v)
-    except (TypeError, ValueError) as e:
-        raise InvariantError(f"config_key_not_int: {key} err={e}") from e
-    return i
+    return _coerce_strict_int(obj[key], key)
 
 
 def _opt_int(obj: dict[str, Any], key: str, default: int) -> int:
     if key not in obj:
         return int(default)
-    v = obj[key]
-    try:
-        i = int(v)
-    except (TypeError, ValueError) as e:
-        raise InvariantError(f"config_key_not_int: {key} err={e}") from e
-    return i
+    return _coerce_strict_int(obj[key], key)
 
 
 def _opt_int_or_none(obj: dict[str, Any], key: str) -> int | None:
-    """Return an int if key exists and value is an int, otherwise None."""
+    """Return an int if key exists and value is an int, otherwise None.
+
+    Bools are explicitly rejected (``bool`` is a subclass of ``int`` in
+    Python; accepting ``true``/``false`` for an int field is wrong).
+    """
     v = obj.get(key)
+    if isinstance(v, bool):
+        return None
     return v if isinstance(v, int) else None
 
 
 def _opt_float(obj: dict[str, Any], key: str, default: float) -> float:
+    """Return *key* as a float, accepting int (no truncation risk) but
+    rejecting bool (``bool`` is a subclass of ``int`` in Python).
+    """
     if key not in obj:
         return float(default)
     v = obj[key]
+    if isinstance(v, bool):
+        raise InvariantError(
+            f"config_key_not_number: {key}={v!r} "
+            f"(bool not allowed; expected number)"
+        )
     if not isinstance(v, (int, float)):
-        raise InvariantError(f"config_key_not_number: {key}")
+        raise InvariantError(
+            f"config_key_not_number: {key}={v!r} "
+            f"(got {type(v).__name__}; expected number)"
+        )
     return float(v)
 
 
@@ -439,8 +483,16 @@ def _opt_int_tuple(obj: dict[str, Any], key: str, default: tuple[int, ...]) -> t
     if key not in obj:
         return default
     v = obj[key]
-    if not isinstance(v, (list, tuple)) or not all(isinstance(x, int) for x in v):
-        raise InvariantError(f"config_key_not_int_list: {key}")
+    if not isinstance(v, (list, tuple)):
+        raise InvariantError(f"config_key_not_int_list: {key} (not a list)")
+    # Reject bool elements (bool is a subclass of int in Python; accepting
+    # [true, false] in an int-list field would be wrong).
+    for i, x in enumerate(v):
+        if isinstance(x, bool) or not isinstance(x, int):
+            raise InvariantError(
+                f"config_key_not_int_list: {key}[{i}]={x!r} "
+                f"(got {type(x).__name__}; expected int)"
+            )
     return tuple(int(x) for x in v)
 
 
