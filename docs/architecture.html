@@ -596,19 +596,19 @@
         <div class="ls-desc">Query BSC for current epoch and round timing. Identifies the open round (currently accepting bets) and the just-locked round (awaiting settlement).</div>
       </div>
       <div class="loop-step">
-        <div class="ls-title">Skew-sync Wake</div>
-        <div class="ls-desc">Refresh OKX clock skew (~2s), epoch quick-check, bankroll fetch (live mode). Off the critical path.</div>
-        <div class="ls-time">lock_at &minus; skew_sync_wakeup_offset_ms &rarr; ~3.65s before lock</div>
+        <div class="ls-title">NTP-sync Wake</div>
+        <div class="ls-desc">Force a fresh NTP query against a public stratum-2 pool (cloudflare/google/pool.ntp.org, rotated round-to-round). Apply the (local &minus; ntp) offset for the rest of the round so critical-path scheduling uses freshly-corrected clock. 5s wake budget vs. ~125ms p99 query &mdash; deliberately generous for robustness against environmental drift.</div>
+        <div class="ls-time">lock_at &minus; ntp_sync_wakeup_offset_ms &rarr; ~11.10s before lock</div>
+      </div>
+      <div class="loop-step">
+        <div class="ls-title">Bankroll Wake</div>
+        <div class="ls-desc">Refresh wallet balance: live mode = BSC RPC call (~50-200ms p99); dry mode = in-memory simulated bankroll. Feeds the risk gates and decide_open_round with fresh-truth right before the bet decision. 5s wake budget covers any plausible RPC stall.</div>
+        <div class="ls-time">lock_at &minus; bankroll_wakeup_offset_ms &rarr; ~6.10s before lock</div>
       </div>
       <div class="loop-step data">
-        <div class="ls-title">Pool Wake</div>
-        <div class="ls-desc">Read pool aggregate from WSS subscriber: BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds.</div>
-        <div class="ls-time">lock_at &minus; pool_read_wakeup_offset_ms &rarr; ~1.10s before lock</div>
-      </div>
-      <div class="loop-step data">
-        <div class="ls-title">Kline-fetch Wake (Critical Path)</div>
-        <div class="ls-desc">4 parallel OKX /history-candles GETs (BTC/ETH/SOL/BNB), compute multi-TF signal + sizing.</div>
-        <div class="ls-time">lock_at &minus; kline_fetch_wakeup_offset_ms &rarr; ~1.09s before lock</div>
+        <div class="ls-title">Critical-path Wake</div>
+        <div class="ls-desc">Single critical-path entry. Sequentially: read pool aggregate from WSS subscriber (BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds, in-memory ~5ms) &rarr; fire 4 parallel OKX /history-candles GETs (BTC/ETH/SOL/BNB) &rarr; compute multi-TF signal + sizing. The bet-submit deadline gate at lock_at &minus; bet_submit_deadline_offset_ms gates the actual TX submission below.</div>
+        <div class="ls-time">lock_at &minus; critical_path_wakeup_offset_ms &rarr; ~1.10s before lock</div>
       </div>
       <div class="loop-step action">
         <div class="ls-title">Timing Guard + Execute</div>

@@ -81,9 +81,9 @@ def run_from_config(
             contract=None,
             wallet_address="",
             cutoff_seconds=cfg.kline_cutoff_seconds,
-            skew_sync_wakeup_offset_ms=cfg.skew_sync_wakeup_offset_ms,
-            pool_read_wakeup_offset_ms=cfg.pool_read_wakeup_offset_ms,
-            kline_fetch_wakeup_offset_ms=cfg.kline_fetch_wakeup_offset_ms,
+            ntp_sync_wakeup_offset_ms=cfg.ntp_sync_wakeup_offset_ms,
+            bankroll_wakeup_offset_ms=cfg.bankroll_wakeup_offset_ms,
+            critical_path_wakeup_offset_ms=cfg.critical_path_wakeup_offset_ms,
             bet_submit_deadline_offset_ms=cfg.bet_submit_deadline_offset_ms,
             bet_tx_receipt_timeout_seconds=_bt_receipt_timeout,
             claim_tx_receipt_timeout_seconds=_bt_receipt_timeout,
@@ -174,9 +174,10 @@ def run_from_config(
 
     # Per-round REST kline fetch path: the gate fires 4 parallel
     # ``/history-candles`` GETs each round (BTC/ETH/SOL/BNB) anchored to
-    # ``lock_at_ms``. Wake-time offset configured via
-    # ``RuntimeConfig.kline_fetch_wakeup_offset_ms``. BNB is FIRST-CLASS (the bot bets
-    # on BNB/USD); it's fetched alongside BTC/ETH/SOL even though the
+    # ``lock_at_ms``. Triggered inside the critical_path wake (configured
+    # via ``RuntimeConfig.critical_path_wakeup_offset_ms``) after the
+    # in-memory pool snapshot. BNB is FIRST-CLASS (the bot bets on
+    # BNB/USD); it's fetched alongside BTC/ETH/SOL even though the
     # current strategy doesn't consume BNB closes for signal computation.
     momentum_gate = MomentumGate(
         config=momentum_gate_cfg,
@@ -203,9 +204,9 @@ def run_from_config(
         contract=contract,
         wallet_address=contract.wallet_address,
         cutoff_seconds=cfg.kline_cutoff_seconds,
-        skew_sync_wakeup_offset_ms=cfg.skew_sync_wakeup_offset_ms,
-        pool_read_wakeup_offset_ms=cfg.pool_read_wakeup_offset_ms,
-        kline_fetch_wakeup_offset_ms=cfg.kline_fetch_wakeup_offset_ms,
+        ntp_sync_wakeup_offset_ms=cfg.ntp_sync_wakeup_offset_ms,
+        bankroll_wakeup_offset_ms=cfg.bankroll_wakeup_offset_ms,
+        critical_path_wakeup_offset_ms=cfg.critical_path_wakeup_offset_ms,
         bet_submit_deadline_offset_ms=cfg.bet_submit_deadline_offset_ms,
         bet_tx_receipt_timeout_seconds=_runtime_receipt_timeout,
         claim_tx_receipt_timeout_seconds=_runtime_receipt_timeout,

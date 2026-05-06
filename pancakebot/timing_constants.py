@@ -17,32 +17,55 @@ value here must be updated co-locked with a new measurement date.
 
 Derivation chain (computed at config-load time in ``pancakebot/config.py``):
 
-    bet_submit_deadline_offset_ms = (BSC_BET_SUBMIT_RTT_P95_MS
-                                     + BSC_BLOCK_TIME_MS
-                                     + BET_SUBMIT_SAFETY_BUFFER_MS)
-    kline_fetch_wakeup_offset_ms  = (bet_submit_deadline_offset_ms
-                                     + OKX_KLINE_FETCH_RTT_P95_MS
-                                     + SIGNAL_COMPUTE_TIME_MS)
-    pool_read_wakeup_offset_ms    = (kline_fetch_wakeup_offset_ms
-                                     + POOL_READ_TIME_MS)
-    skew_sync_wakeup_offset_ms    = (pool_read_wakeup_offset_ms
-                                     + OKX_SKEW_SYNC_TIME_P99_MS
-                                     + SKEW_SYNC_SAFETY_BUFFER_MS)
+    bet_submit_deadline_offset_ms  = (BSC_BET_SUBMIT_RTT_P95_MS
+                                      + BSC_BLOCK_TIME_MS
+                                      + BET_SUBMIT_SAFETY_BUFFER_MS)
+    critical_path_wakeup_offset_ms = (bet_submit_deadline_offset_ms
+                                      + OKX_KLINE_FETCH_RTT_P95_MS
+                                      + SIGNAL_COMPUTE_TIME_MS
+                                      + POOL_READ_TIME_MS)
+    bankroll_wakeup_offset_ms      = (critical_path_wakeup_offset_ms
+                                      + BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS)
+    ntp_sync_wakeup_offset_ms      = (bankroll_wakeup_offset_ms
+                                      + NTP_WAKE_OFFSET_PRE_BANKROLL_MS)
+
+Inside the critical-path wake the engine sequences pool snapshot ->
+kline fetch -> signal compute -> bet submit. The 5ms POOL_READ_TIME_MS
+is a cushion for the in-memory pool aggregate read; it does NOT need
+its own wake (the prior architecture used a separate pool_read_wake
+5ms ahead of kline_fetch_wake, which conceptually overstated as
+"two scheduled events" what is really sequential operation time).
+A single ``critical_path_wakeup_offset_ms`` keeps the wake schedule
+honest about what's a scheduled event vs what's intra-wake sequencing.
+
+The bankroll- and ntp-sync wake offsets above the critical path are
+deliberately LITERAL 5-second gaps rather than derived from tightly
+measured query budgets. Non-critical-path wakes are sized for
+robustness against environmental drift (network spikes, Windows
+update kicks, OKX RPC pauses) -- a 5s gap dwarfs every observed
+worst case (~125ms NTP roundtrip, ~50-200ms wallet RPC). See
+``BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS`` and
+``NTP_WAKE_OFFSET_PRE_BANKROLL_MS`` for the rationale.
+``NTP_QUERY_TIME_P99_MS`` is exposed for cross-validation
+(N_servers x P99 << 5000) but NOT in the derivation.
 
 Cross-validations enforced at config load. The CUTOFFS are fixed
 inputs (set by strategy / data-horizon requirements); the OFFSETS
 must fit within the cutoff windows.
 
-    kline_fetch_wakeup_offset_ms <= (kline_cutoff_seconds * 1000
-                                     - OKX_KLINE_PUBLISH_DELAY_P95_MS)
-        (the cutoff candle has typically been published by the time
-        the kline-fetch wake fires; rare publish-delay tail misses
-        are absorbed by the streak counter)
+    (critical_path_wakeup_offset_ms - POOL_READ_TIME_MS)
+        <= (kline_cutoff_seconds * 1000 - OKX_KLINE_PUBLISH_DELAY_P95_MS)
+        (the kline fetch fires inside the critical path AFTER the pool
+        snapshot, i.e. at lock - (critical_path_wakeup_offset_ms -
+        POOL_READ_TIME_MS); the cutoff candle has typically been
+        published by then; rare publish-delay tail misses are
+        absorbed by the streak counter)
 
-    pool_read_wakeup_offset_ms <= (pool_cutoff_seconds * 1000
-                                   - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS)
-        (the cutoff bet event has typically arrived via WSS by the
-        time the pool-read wake fires)
+    critical_path_wakeup_offset_ms <= (pool_cutoff_seconds * 1000
+                                       - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS)
+        (the pool snapshot fires at the START of the critical path,
+        i.e. at lock - critical_path_wakeup_offset_ms; the cutoff bet
+        event has typically arrived via WSS by then)
 """
 from __future__ import annotations
 
@@ -136,16 +159,58 @@ BSC_BET_SUBMIT_RTT_P95_MS: int = 200
 WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS: int = 3500  # p99=3106 + ~400ms buffer
 
 
-# --- Skew sync ------------------------------------------------------------
+# --- NTP clock sync -------------------------------------------------------
 
-# Wall-clock duration of one canonical clock-skew refresh
-# (OkxClient.measure_clock_skew(samples=3), which fires 3 sequential
-# GETs to OKX /api/v5/public/time). Per-call p99.
+# Wall-clock duration of one ``ntplib.NTPClient.request(...)`` call against
+# a public stratum-2 pool server (cloudflare/google/pool.ntp.org), end to
+# end including DNS + UDP roundtrip. Per-call worst-server p99 across the
+# rotation -- not the pooled p99, since the rotation visits each server
+# in turn so the slowest server's tail dominates the wake budget.
 #
-# Source: research/p4c_skew_probe.py n=100, 2026-05-03.
-#         min=1635, p50=1890, p90=2236, p95=2294, p99=2409, max=2409.
-# Last measured: 2026-05-03
-OKX_SKEW_SYNC_TIME_P99_MS: int = 2500  # p99=2409 + ~100ms buffer
+# This constant is INFORMATIONAL / cross-validation only -- the engine's
+# ntp_sync_wake budget is the literal NTP_WAKE_OFFSET_PRE_BANKROLL_MS
+# (5000 ms), which dwarfs even N_servers x P99 worst case
+# (3 x 102 = 306 ms per the 2026-05-06 probe). The cross-validation
+# assertion in pancakebot/config.py confirms the 5000ms budget covers
+# N_servers x p99 + a small dispatch buffer.
+#
+# Source: research/p4c_ntp_probe.py n=150, 2026-05-06.
+#         servers rotated across cloudflare/google/pool.ntp.org with
+#         200ms gap between calls.
+#         per-server p99: cloudflare=54.7, google=69.7, pool.ntp.org=102.0
+#         worst-server p99 = 102.0 ms.
+# Last measured: 2026-05-06
+NTP_QUERY_TIME_P99_MS: int = 125  # worst-server p99=102 + ~25ms buffer
+
+
+# --- Non-critical-path wake gaps ------------------------------------------
+
+# Gap between bankroll_wake and the critical_path entry. The bankroll
+# wake fires at critical_path_wakeup_offset_ms + this offset
+# (= ~lock-6.095s); the engine uses the budget to read live wallet
+# balance via BSC RPC (~50-200ms p99) or, in dry mode, the in-memory
+# simulated bankroll (sub-ms). 5s is deliberately generous: it covers
+# any plausible RPC stall (even a slow fallback to a backup endpoint),
+# and small RPC variance can't bleed into the critical path.
+#
+# Source: engineering judgment. Robustness > micro-optimization for
+# non-critical-path wakes; if RPC p99 ever drifts to 4s the bot still
+# bets on time. If it drifts to 6s the cross-validation gate in
+# config.py fires and the operator notices before production breaks.
+# Last measured: 2026-05-06
+BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS: int = 5000
+
+# Gap between ntp_sync_wake and bankroll_wake. The ntp_sync wake fires
+# at bankroll_wakeup_offset_ms + this offset (= ~lock-11.095s); the
+# engine uses the budget for one (or up to N_SERVERS rotated) NTP
+# query. 5s is deliberately generous: 3 x P99 worst case = ~306ms;
+# a 5000ms budget covers even a multi-second pool.ntp.org stall plus
+# the rotation fall-through.
+#
+# Source: engineering judgment. Same robustness rationale as
+# BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS.
+# Last measured: 2026-05-06
+NTP_WAKE_OFFSET_PRE_BANKROLL_MS: int = 5000
 
 
 # --- Static buffers --------------------------------------------------------
@@ -168,13 +233,6 @@ POOL_READ_TIME_MS: int = 5
 # Last measured: 2026-05-03
 BET_SUBMIT_SAFETY_BUFFER_MS: int = 50
 
-# Headroom on the skew_sync_wakeup_offset_ms derivation. Beyond
-# OKX_SKEW_SYNC_TIME_P99, this absorbs dispatch overhead between the
-# skew refresh completing and the next wake firing.
-#
-# Source: engineering judgment.
-# Last measured: 2026-05-03
-SKEW_SYNC_SAFETY_BUFFER_MS: int = 50
 
 
 # --- Module-load sanity checks --------------------------------------------
