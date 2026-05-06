@@ -48,16 +48,25 @@ _BET_BEAR_TOPIC = "0x0d8c1fe3e67ab767116a81f122b83c2557a8c2564019cb7c4f83de1aeb1
 _BACKOFF_STEPS = [5, 10, 20, 40, 80, 120]
 _BACKOFF_RESET_SECONDS = 60.0
 
-# Idle-event threshold (seconds) for forced reconnect. The watcher subscribes
-# to both BetBull/BetBear logs AND newHeads; on BSC (post-Maxwell ~0.45s
-# block time) newHeads should arrive every ~450ms even when bet traffic is
-# quiet. ``time.time() - _last_event_at >= _IDLE_RECONNECT_THRESHOLD_SECONDS``
-# means the endpoint has gone silent across 17+ expected blocks -- almost
-# certainly a server-side filter drop or a middlebox black-holing
-# eth_subscription messages. The library's ping_interval=30 / ping_timeout=10
-# only catches dead TCP, not silent-stall (Investigation B, 2026-05-05:
-# publicnode kept TCP up but stopped delivering messages for 4+ hours).
-_IDLE_RECONNECT_THRESHOLD_SECONDS = 8.0
+# Per-subscription idle thresholds (seconds) for forced reconnect. The
+# watcher subscribes to TWO independent channels per session: BetBull/
+# BetBear logs and newHeads. Each can stall independently on the upstream
+# (publicnode-class endpoints have been observed to silently drop the
+# logs subscription while keeping newHeads alive for hours -- see
+# var/incident_reports/2026_05_06_wss_silent_stall_root_cause.md).
+#
+# - ``_NEWHEAD_IDLE_THRESHOLD_SECONDS = 8.0``: BSC produces ~2 blocks/s
+#   post-Maxwell. 17+ missed blocks = certain stall. The library's
+#   ping_interval=30/ping_timeout=10 catches dead-TCP separately; this
+#   threshold catches the case where TCP is up but the newHead stream
+#   has gone silent.
+# - ``_LOGS_IDLE_THRESHOLD_SECONDS = 600.0``: bet events are sparse
+#   compared to newHeads. PancakeSwap rounds last 5 minutes; quiet
+#   rounds may have zero bets above the watcher's filter. 10 minutes
+#   covers two full rounds without false-positive reconnects on
+#   genuinely-quiet markets but bounds the worst-case logs-only stall.
+_NEWHEAD_IDLE_THRESHOLD_SECONDS = 8.0
+_LOGS_IDLE_THRESHOLD_SECONDS = 600.0
 
 
 @dataclass
@@ -105,8 +114,20 @@ class PoolEventWatcher:
         self._connected = False
         self._current_endpoint: str = ""
         self._last_connected_at: float = 0.0
-        self._last_event_at: float = 0.0
+        self._last_event_at: float = 0.0  # any event (logs OR newHead); kept for stats
+        self._last_logs_event_at: float = 0.0     # bet log events specifically
+        self._last_newhead_event_at: float = 0.0  # newHead events specifically
         self._total_events = 0
+        self._session_logs_events = 0     # reset per session
+        self._session_newhead_events = 0  # reset per session
+
+        # Engine sets this via request_reconnect() to force the recv loop
+        # to bubble out and trigger the round-robin failover. Used when
+        # the engine's data-integrity check (pool=0 + connected +
+        # backfill_done) fires -- catches the silent-stall scenario one
+        # round earlier than the per-subscription idle thresholds would.
+        self._reconnect_requested: bool = False
+        self._reconnect_reason: str = ""
 
         # Failure streak counter (incremented per unhealthy session, reset on healthy one).
         self._failure_streak: int = 0
@@ -162,6 +183,28 @@ class PoolEventWatcher:
     def is_backfill_done(self) -> bool:
         """True when no backfill is currently in flight (initial state is True)."""
         return self._backfill_done_event.is_set()
+
+    def request_reconnect(self, reason: str) -> None:
+        """Engine-driven reconnect trigger. The current recv-loop iteration
+        sees the flag on its next 2-second timeout tick and bubbles out
+        with a ConnectionError; the outer ``_run_loop`` then performs
+        round-robin failover to the next endpoint and starts a fresh
+        subscription pair.
+
+        Used by the engine when the data-integrity check at the
+        critical_path wake fires (pool=0 + connected + backfill_done):
+        that's a strong signal the logs subscription has silently
+        stalled, and we want to recover within ONE skipped round
+        rather than wait for the per-subscription idle threshold
+        (10 min for logs) to trip on its own.
+
+        Idempotent: subsequent calls before the recv loop processes
+        the prior request just overwrite the reason; nothing else
+        accumulates.
+        """
+        with self._lock:
+            self._reconnect_requested = True
+            self._reconnect_reason = reason
 
     def _try_trigger_backfill(self) -> None:
         """Called under self._lock. Fires backfill in a daemon thread when both
@@ -405,9 +448,22 @@ class PoolEventWatcher:
             now = time.time()
             self._connected = True
             self._last_connected_at = now
+            # Initialize per-subscription liveness clocks at session start.
+            # Both subscriptions are considered "fresh as of now" until the
+            # first message lands; this prevents bogus idle-stall trips on
+            # the very first 2s timeout tick of a brand-new session.
             self._last_event_at = now
+            self._last_logs_event_at = now
+            self._last_newhead_event_at = now
+            self._session_logs_events = 0
+            self._session_newhead_events = 0
             session_start_at = now
             session_events = 0
+            # Clear any stale reconnect request that lingered from a
+            # prior session (the engine writes the flag asynchronously).
+            with self._lock:
+                self._reconnect_requested = False
+                self._reconnect_reason = ""
             info("POOL_WSS", "SUB", "OK",
                  msg=f"Subscribed on {url}")
 
@@ -416,32 +472,66 @@ class PoolEventWatcher:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 except asyncio.TimeoutError:
-                    # Short timeout exists only so the _stop_event check fires
-                    # AND the silent-stall idle check below runs. Library-level
-                    # ping_interval=30 / ping_timeout=10 handles dead-TCP case;
-                    # the idle check below handles silent-stall (TCP up but
-                    # no eth_subscription messages, e.g. server-side filter
-                    # drop or middlebox black-holing).
-                    idle_seconds = time.time() - self._last_event_at
-                    if idle_seconds >= _IDLE_RECONNECT_THRESHOLD_SECONDS:
+                    # Short timeout exists so the _stop_event check fires AND
+                    # the silent-stall idle checks below run AND the engine-
+                    # driven request_reconnect flag is observed.
+                    #
+                    # Library-level ping_interval=30 / ping_timeout=10 handles
+                    # dead-TCP case (raises ConnectionClosedError); the idle
+                    # checks below handle silent-stall (TCP up + library
+                    # ping/pong working but eth_subscription messages have
+                    # stopped flowing for one or both channels).
+                    if self._reconnect_requested:
+                        # Engine has detected a data-integrity violation
+                        # (pool=0 + connected + backfill_done) and asked
+                        # us to reconnect. Take the hint -- this catches
+                        # silent-stall one round earlier than waiting for
+                        # _LOGS_IDLE_THRESHOLD_SECONDS to trip.
+                        with self._lock:
+                            reason = self._reconnect_reason or "engine_request"
+                            self._reconnect_requested = False
+                            self._reconnect_reason = ""
                         warn(
-                            "POOL_WSS", "ERR", "IDLE_STALL",
+                            "POOL_WSS", "ERR", "ENGINE_RECONN",
                             msg=(
-                                f"No eth_subscription event received in "
-                                f"{idle_seconds:.1f}s on {url} "
-                                f"(threshold {_IDLE_RECONNECT_THRESHOLD_SECONDS:.1f}s); "
-                                f"forcing reconnect (silent-stall detection)"
+                                f"Reconnect requested by engine on {url}: "
+                                f"reason={reason}; cycling endpoint."
                             ),
                         )
-                        # Raise to bubble out of _ws_listen and trigger the
-                        # round-robin failover in _run_loop. Use a bare
-                        # exception so we get a "RECONN" warn line at the
-                        # outer scope, mirroring how ConnectionClosedError
-                        # surfaces.
                         raise ConnectionError(
-                            f"idle_stall_force_reconnect: "
-                            f"silent={idle_seconds:.1f}s threshold="
-                            f"{_IDLE_RECONNECT_THRESHOLD_SECONDS:.1f}s"
+                            f"engine_request_reconnect: reason={reason}"
+                        )
+                    newhead_idle = time.time() - self._last_newhead_event_at
+                    logs_idle = time.time() - self._last_logs_event_at
+                    if newhead_idle >= _NEWHEAD_IDLE_THRESHOLD_SECONDS:
+                        warn(
+                            "POOL_WSS", "ERR", "NEWHEAD_STALL",
+                            msg=(
+                                f"newHeads channel silent {newhead_idle:.1f}s "
+                                f"on {url} (threshold "
+                                f"{_NEWHEAD_IDLE_THRESHOLD_SECONDS:.1f}s); "
+                                f"forcing reconnect (TCP-up silent-stall on "
+                                f"newHeads subscription)."
+                            ),
+                        )
+                        raise ConnectionError(
+                            f"newhead_idle_stall: silent={newhead_idle:.1f}s "
+                            f"threshold={_NEWHEAD_IDLE_THRESHOLD_SECONDS:.1f}s"
+                        )
+                    if logs_idle >= _LOGS_IDLE_THRESHOLD_SECONDS:
+                        warn(
+                            "POOL_WSS", "ERR", "LOGS_STALL",
+                            msg=(
+                                f"logs channel silent {logs_idle:.1f}s on "
+                                f"{url} (threshold "
+                                f"{_LOGS_IDLE_THRESHOLD_SECONDS:.1f}s); "
+                                f"forcing reconnect (newHeads still flowing "
+                                f"but bet-event subscription dropped)."
+                            ),
+                        )
+                        raise ConnectionError(
+                            f"logs_idle_stall: silent={logs_idle:.1f}s "
+                            f"threshold={_LOGS_IDLE_THRESHOLD_SECONDS:.1f}s"
                         )
                     continue
 
@@ -456,16 +546,27 @@ class PoolEventWatcher:
                     continue
 
                 if sub_id == logs_sub_id:
+                    self._last_logs_event_at = time.time()
+                    self._session_logs_events += 1
                     self._process_bet_event(result)
                 elif sub_id == heads_sub_id:
+                    self._last_newhead_event_at = time.time()
+                    self._session_newhead_events += 1
                     self._process_new_head(result)
 
-        # Log session summary before marking disconnected.
+        # Log session summary before marking disconnected. Per-subscription
+        # event counts make it trivial to spot post-mortem the silent-stall
+        # signature: logs_events==0 over a non-trivial duration while
+        # newhead_events>>0 means the logs subscription dropped silently.
         duration = time.time() - session_start_at
         if duration > 0:
             warn("POOL_WSS", "WS", "CLOSED",
-                 msg=f"Session ended on {url}: reason={disconnect_reason} "
-                     f"duration={duration:.0f}s events={session_events}")
+                 msg=(
+                     f"Session ended on {url}: reason={disconnect_reason} "
+                     f"duration={duration:.0f}s events={session_events} "
+                     f"logs_events={self._session_logs_events} "
+                     f"newhead_events={self._session_newhead_events}"
+                 ))
         self._connected = False
 
     # ------------------------------------------------------------------
