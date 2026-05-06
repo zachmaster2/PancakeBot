@@ -117,7 +117,13 @@ def run_from_config(
         graph = GraphClient(endpoint=PREDICTION_V2_GRAPH_ENDPOINT, api_key=graph_api_key)
         round_store = ClosedRoundsStore(paths.CLOSED_ROUNDS_PATH)
         okx_client = OkxClient(timeout_seconds=10.0)
-        okx_client.warmup()
+        # Sync mode fetches all 4 symbols (BNB/BTC/ETH/SOL) in parallel even
+        # though the live/dry hot-path gate only consumes 3 (BTC/ETH/SOL).
+        # BNB klines are kept synced to disk so future strategies that want
+        # BNB closes have the historical data already on hand. Pass
+        # connections=4 explicitly so all 4 sockets are pre-warmed; the
+        # default (3) tracks the live/dry gate's symbol count.
+        okx_client.warmup(connections=4)
         summary = sync_runtime_market_data(
             cfg=cfg,
             graph=graph,
