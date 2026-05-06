@@ -620,6 +620,15 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                         f"{cfg.pool_watcher.current_endpoint})"
                     ),
                 )
+                # Tell the watcher to cycle endpoints next session-loop
+                # iteration. This catches publicnode-style silent logs-
+                # subscription drops one round earlier than the watcher's
+                # own _LOGS_IDLE_THRESHOLD_SECONDS (10 min) would. See
+                # var/incident_reports/2026_05_06_wss_silent_stall_root_cause.md
+                # for the smoking-gun trace.
+                cfg.pool_watcher.request_reconnect(
+                    "pool_zero_chain_active"
+                )
                 _record_dry_cycle_audit(
                     cfg,
                     closed,
