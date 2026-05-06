@@ -58,7 +58,14 @@ from pancakebot.util import InvariantError, TransientOkxError
 # per ~40,000 rounds = ~14 weeks at 12 rounds/h.
 _MAX_CONSECUTIVE_FETCH_FAILURES = 5
 
-_SYMBOLS_FETCHED = ("btc", "eth", "sol", "bnb")
+# BNB temporarily removed from the live fetch -- the strategy doesn't
+# consume BNB closes for signal computation, and the bot already has
+# BNB price-via-chain (lock_price on the locked round) for any
+# downstream needs. See var/design/phase_2_robustness_design.md sec 2.1.
+# To re-enable: add "bnb" back to this tuple, restore the "bnb" entry
+# in the symbols dict in evaluate(), bump _executor max_workers to 4,
+# and reinstate the _bnb_arr extraction below the validation block.
+_SYMBOLS_FETCHED = ("btc", "eth", "sol")
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,14 +110,15 @@ class MomentumGateResult:
 
 
 class MomentumGate:
-    """Multi-asset momentum gate: fetches BTC + ETH + SOL + BNB 1s klines
+    """Multi-asset momentum gate: fetches BTC + ETH + SOL 1s klines
     in parallel via OKX ``/history-candles`` REST per round (live mode).
 
-    Decision-time work: 4 parallel HTTP GETs to OKX (pooled RTT
+    Decision-time work: 3 parallel HTTP GETs to OKX (pooled RTT
     p50=258ms, p95=289ms, p99=363ms per probe n=1000 2026-05-03).
     The wake-time offset is set by the engine via
     ``RuntimeConfig.kline_fetch_wakeup_offset_ms``; the gate consumes
-    ``lock_at_ms``.
+    ``lock_at_ms``. BNB fetch is currently disabled (see
+    ``_SYMBOLS_FETCHED`` for re-enable instructions).
 
     Error handling:
     - Any ``InvariantError`` from any symbol → reraise (bot crashes →
@@ -121,7 +129,7 @@ class MomentumGate:
       ``warn("GATE", sym.upper(), "FETCH_FAIL", ...)`` per failed symbol
       and skip the round with reason ``kline_fetch_transient_failure``.
       Increments ``_consecutive_fetch_failures``; reset to 0 on a fully
-      successful 4-symbol fetch.
+      successful 3-symbol fetch.
     - Streak >= ``MomentumGateConfig.max_consecutive_fetch_failures`` →
       escalate to ``InvariantError("kline_fetch_failure_streak_max_reached: ...")``.
     """
@@ -148,9 +156,11 @@ class MomentumGate:
         # Consecutive-failure escalation state (TransientOkxError streak).
         self._consecutive_fetch_failures: int = 0
         # ThreadPoolExecutor lives for the gate's lifetime so we don't pay
-        # thread-spawn cost every round. max_workers=4 -- one per symbol.
+        # thread-spawn cost every round. max_workers=3 -- one per symbol
+        # (BTC + ETH + SOL). Bump to 4 if BNB is re-enabled in
+        # _SYMBOLS_FETCHED.
         self._executor = ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="kline-fetch",
+            max_workers=3, thread_name_prefix="kline-fetch",
         )
 
     @property
@@ -162,7 +172,7 @@ class MomentumGate:
         *,
         lock_at_ms: int,
     ) -> MomentumGateResult:
-        """Fetch BTC/ETH/SOL/BNB 1s klines in parallel and compute the signal.
+        """Fetch BTC/ETH/SOL 1s klines in parallel and compute the signal.
 
         ``lock_at_ms`` is the round's lock_at in milliseconds (from
         ``int(round_t.lock_at) * 1000``). The fetch window is sized to
@@ -182,7 +192,7 @@ class MomentumGate:
         - ``signal`` set + ``skip_reason=None`` on a fired signal
         - ``signal=None`` + ``skip_reason="gate_no_signal"`` on multi-TF miss
         - ``signal=None`` + ``skip_reason="kline_fetch_transient_failure"``
-          on any subset of 4-symbol transient failures
+          on any subset of 3-symbol transient failures
         - raises InvariantError on any contract violation OR on
           ``max_consecutive_fetch_failures`` consecutive transient rounds
         """
@@ -196,16 +206,17 @@ class MomentumGate:
         newest_open_ms = lock_at_ms - self._cfg.cutoff_seconds * 1000 - 1000
         oldest_open_ms = newest_open_ms - max_lookback * 1000
 
-        # ----- Parallel REST fetch (4 symbols) -----
-        # Submit all four upfront so the network round-trips overlap.
+        # ----- Parallel REST fetch (3 symbols) -----
+        # Submit all three upfront so the network round-trips overlap.
         # ThreadPoolExecutor + okx_rate_acquire share the global token-bucket
-        # budget (capacity 8, refill 8/s) -- a 4-symbol burst once per round
-        # fits inside the bucket and fires with no FIFO stagger.
+        # budget (capacity 8, refill 8/s) -- a 3-symbol burst once per round
+        # fits inside the bucket and fires with no FIFO stagger. BNB is
+        # currently disabled (see _SYMBOLS_FETCHED for re-enable steps).
         symbols = {
             "btc": self._cfg.btc_symbol,
             "eth": self._cfg.eth_symbol,
             "sol": self._cfg.sol_symbol,
-            "bnb": self._cfg.bnb_symbol,
+            # "bnb": self._cfg.bnb_symbol,  # disabled; see _SYMBOLS_FETCHED.
         }
         futures = {
             self._executor.submit(
@@ -292,11 +303,10 @@ class MomentumGate:
         btc_arr = results["btc"]
         eth_arr = results["eth"]
         sol_arr = results["sol"]
-        # ``bnb_arr`` is fetched for BNB-first-class parity (the bot bets on
-        # BNB/USD) but the BTC-driven signal does not consume BNB closes.
-        # Keeping the fetch in scope guarantees a future BNB-aware strategy
-        # works without re-plumbing the data path.
-        _bnb_arr = results["bnb"]
+        # BNB fetch disabled; see _SYMBOLS_FETCHED at module top for the
+        # rationale + re-enable steps. To re-enable, uncomment the bnb
+        # entry in the symbols dict above and add `_bnb_arr = results["bnb"]`
+        # back here.
 
         # No trim needed: the cutoff+lookback-aware fetch returns exactly
         # ``candle_count`` candles ending at ``cutoff_ts_ms - 1000`` per

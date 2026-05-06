@@ -246,14 +246,14 @@ class OkxClient:
         self._timeout_seconds = timeout_seconds
         self._session = requests.Session()
 
-    def warmup(self, connections: int = 4) -> None:
+    def warmup(self, connections: int = 3) -> None:
         """Fill the connection pool so parallel fetches hit warm connections.
 
-        Default ``connections=4`` matches the live decision-path gate's
-        4-symbol concurrent fetch (BTC/ETH/SOL/BNB), so every parallel
-        request finds a pre-established TLS connection. With only 3 warm
-        sockets, the 4th symbol used to pay an ~80-150ms TLS handshake
-        on the critical path every cold round.
+        Default ``connections=3`` matches the live decision-path gate's
+        3-symbol concurrent fetch (BTC/ETH/SOL), so every parallel
+        request finds a pre-established TLS connection. If BNB fetch is
+        re-enabled in ``MomentumGate._SYMBOLS_FETCHED``, bump this default
+        back to 4 in the same change.
 
         Per-round freshness: BEFORE filling the pool, close the existing
         ``self._session`` and replace it with a brand-new

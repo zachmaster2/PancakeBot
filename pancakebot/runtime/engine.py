@@ -648,12 +648,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                  endpoint=cfg.pool_watcher.current_endpoint,
                  last_ok=f"{cfg.pool_watcher.last_connected_at:.0f}")
 
-        # Step 8: Decide. Gate fires 4 parallel OKX /history-candles
-        # GETs + computes signal off the returned 1s arrays. Runs
-        # sequentially after the in-memory pool snapshot above; both
-        # share the single critical_path_wake. The kline fetch
-        # effectively starts at lock_at - (critical_path_wakeup_offset_ms
-        # - POOL_READ_TIME_MS) ~= lock - 1090ms.
+        # Step 8: Decide. Gate fires 3 parallel OKX /history-candles
+        # GETs (BTC/ETH/SOL; BNB disabled, see MomentumGate._SYMBOLS_FETCHED)
+        # + computes signal off the returned 1s arrays. Runs sequentially
+        # after the in-memory pool snapshot above; both share the single
+        # critical_path_wake. The kline fetch effectively starts at
+        # lock_at - (critical_path_wakeup_offset_ms - POOL_READ_TIME_MS)
+        # ~= lock - 1090ms.
         t_features_start_ms = _mono_ms()
         pred_p_final = 0.5
 
