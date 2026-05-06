@@ -32,16 +32,30 @@ class RuntimeConfig:
     # Pre-lock wake schedule (all DERIVED from pancakebot/timing_constants.py
     # at config load; not user-tunable). All in milliseconds before lock_at.
     #
-    #   skew_sync_wakeup_offset_ms     >  pool_read_wakeup_offset_ms
-    #                                  >  kline_fetch_wakeup_offset_ms
-    #                                  >  bet_submit_deadline_offset_ms
+    #   ntp_sync_wakeup_offset_ms       >  bankroll_wakeup_offset_ms
+    #                                   >  critical_path_wakeup_offset_ms
+    #                                   >  bet_submit_deadline_offset_ms
     #
     # Engine fires three distinct _sleep_until_ts wakes per round:
-    # skew_sync -> pool -> kline. Timing guard fires at
+    # ntp_sync -> bankroll -> critical_path. Timing guard fires at
     # ``lock_at - bet_submit_deadline_offset_ms``.
-    skew_sync_wakeup_offset_ms: int
-    pool_read_wakeup_offset_ms: int
-    kline_fetch_wakeup_offset_ms: int
+    #
+    # The ntp_sync_wake forces a fresh NTP query; the bankroll_wake
+    # refreshes wallet balance (live: BSC RPC; dry: in-memory). Both
+    # land WELL before the critical path -- 5 second gaps deliberately
+    # generous against environmental drift.
+    #
+    # The critical_path_wake is the SINGLE entry point for the
+    # bet-decision sequence. Inside the wake the engine sequences:
+    # pool snapshot (~5ms in-memory) -> kline gate.evaluate() (~340ms
+    # parallel REST + signal compute) -> bet submit (~700ms BSC RTT
+    # + block budget). Prior architecture used a separate pool_read
+    # wake 5ms ahead of kline_fetch wake; that 5ms gap was sequential
+    # operation time, not a scheduled event, and is now correctly
+    # absorbed inside the critical_path wake.
+    ntp_sync_wakeup_offset_ms: int
+    bankroll_wakeup_offset_ms: int
+    critical_path_wakeup_offset_ms: int
     bet_submit_deadline_offset_ms: int
 
     # Receipt timeouts for ``contract.bet_*_timed`` and ``contract.claim``

@@ -28,6 +28,7 @@ from pancakebot.runtime.dry import (
     _record_dry_cycle_audit,
 )
 from pancakebot.runtime.live import claim_scan_cursor
+from pancakebot.runtime.ntp_sync import NtpSync
 from pancakebot.runtime.process_health import write_heartbeat
 from pancakebot.strategy.momentum_pipeline import StrategyPipelineDecision
 from pancakebot.types import Round
@@ -48,75 +49,53 @@ _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 _ONE_MINUTE_MS = 60_000
 
 
-# -- Clock skew compensation -------------------------------------------------
+# -- NTP clock sync ----------------------------------------------------------
 # The bot's scheduling uses chain-anchored timestamps (lock_at from BSC, in
-# true UTC) but wakes/compares against ``time.time()`` (local clock). On
-# Windows with stale/unsynced w32tm, local can drift seconds ahead of UTC,
-# which makes the bot fire OKX kline fetches BEFORE OKX has had time to
-# publish the requested candle window. Result: 75%+ of fetches return a
-# lagged window, validation rejects them as ``gate_btc_unexpected_newest``,
-# bot skips the round.
+# true UTC) but wakes/compares against ``time.time()`` (local clock).
+# Local clocks drift between OS-NTP polls -- Windows Time Service refreshes
+# at ~1h intervals by default, and at 50 minutes since the last poll the
+# local clock is materially off from true UTC. Critical-path timing margins
+# are tight enough (sub-100ms) that the accumulated drift can flip a round's
+# bet decision (e.g. epoch 478372 in the 2026-05-04 soak was 40ms inside
+# the timing-guard margin).
 #
-# Fix: measure (local - okx) skew via ``OkxClient.measure_clock_skew()`` once
-# per round in housekeeping, cache it, and use ``_utc_now()`` everywhere we
-# compare local time to a chain-anchored value. This converts all scheduling
-# decisions from "wait until LOCAL time hits X" to "wait until OKX-frame time
-# hits X" without changing any request CONTENT.
+# Fix: query NTP directly each round at a pre-critical-path wake
+# (``ntp_sync_wake`` at lock - ~11.095s), cache the freshest measured
+# offset, and use ``_utc_now()`` everywhere we compare local time to a
+# chain-anchored value. Per-round freshness eliminates accumulated
+# OS-NTP-poll-interval drift; the wake's 5000ms budget dwarfs the
+# empirical NTP roundtrip worst case.
 #
-# Documented diagnosis: research/okx_lag_root_cause_clock_skew.md.
-# Mechanism verification: research/okx_artificial_delay_probe.py (lag goes to
-# 0ms when fired at correct true-UTC anchor).
-_clock_skew_seconds: float = 0.0
+# Documented diagnosis: research/okx_lag_root_cause_clock_skew.md (the
+# original 2026-04-26 fix used OKX /public/time as the truth source via
+# Cristian's algorithm; that approach conflated network latency with clock
+# offset and was retired 2026-05-05 in favor of direct NTP).
+# Empirical NTP query cost: research/p4c_ntp_probe.py.
+_ntp_sync: NtpSync | None = None
+
+
+def _get_ntp_sync() -> NtpSync:
+    """Lazy singleton for the NTP sync manager. Construction is deferred
+    until first use so test harnesses that monkey-patch the module's
+    network primitives can swap in a fake before the singleton lands."""
+    global _ntp_sync
+    if _ntp_sync is None:
+        _ntp_sync = NtpSync()
+    return _ntp_sync
 
 
 def _utc_now() -> float:
-    """Best-effort estimate of the current OKX/UTC second.
+    """Best-effort estimate of the current NTP/UTC second.
 
-    Returns ``time.time() - _clock_skew_seconds``. Falls back to local time
-    when ``_clock_skew_seconds`` is 0.0 (initial value, or every refresh
-    failed). Caller code that compares local time against a chain-anchored
-    value (lock_at, cutoff_ts, claim_ts) MUST use this instead of
-    ``time.time()`` so the comparison is in OKX/UTC frame.
+    Returns ``time.time() - ntp_offset`` where ``ntp_offset`` is the most
+    recent successful NTP measurement of (local - ntp). Falls back to
+    local ``time.time()`` when no NTP query has succeeded yet (initial
+    state, or pre-bootstrap). Caller code that compares local time
+    against a chain-anchored value (lock_at, cutoff_ts, claim_ts) MUST
+    use this instead of ``time.time()`` so the comparison is in
+    NTP/UTC frame.
     """
-    return time.time() - _clock_skew_seconds
-
-
-def _refresh_clock_skew(gate) -> None:
-    """Best-effort skew re-measurement via OKX /api/v5/public/time.
-
-    Called once per round in the housekeeping phase (off the critical path).
-    Updates the module-level ``_clock_skew_seconds`` if measurement
-    succeeds. On failure, keeps the prior cached value.
-
-    No-op when *gate* is None (backtest mode, sync mode) -- those paths
-    don't care about skew.
-    """
-    global _clock_skew_seconds
-    if gate is None:
-        return
-    try:
-        client = getattr(gate, "_client", None)
-        if client is None or not hasattr(client, "measure_clock_skew"):
-            return
-        new_skew = client.measure_clock_skew(samples=3)
-    except Exception:  # noqa: BLE001 -- never crash the round on skew refresh
-        return
-    if new_skew is None:
-        warn("CLOCK", "SKEW", "REFRESH",
-             msg="OKX /public/time unreachable; using prior cached skew",
-             cached_skew_s=f"{_clock_skew_seconds:.3f}")
-        return
-    delta = abs(new_skew - _clock_skew_seconds)
-    prev = _clock_skew_seconds
-    _clock_skew_seconds = float(new_skew)
-    if delta >= 0.1 or prev == 0.0:
-        # Log meaningful changes (>100ms drift) and the initial measurement.
-        info("CLOCK", "SKEW", "UPDATE",
-             msg=f"clock skew (local - okx) refreshed: {prev:.3f}s -> {new_skew:.3f}s")
-    if abs(new_skew) >= 5.0:
-        warn("CLOCK", "SKEW", "LARGE",
-             msg=f"large clock skew detected: {new_skew:.3f}s. Consider running w32tm /resync.",
-             skew_s=f"{new_skew:.3f}")
+    return time.time() - _get_ntp_sync().current_offset()
 
 
 # -- Heartbeat context -------------------------------------------------------
@@ -213,9 +192,9 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
         msg=(
             f"timing config: kline_cutoff={cfg.cutoff_seconds}s "
             f"pool_cutoff={cfg.pool_cutoff_seconds}s "
-            f"skew_sync_wakeup={cfg.skew_sync_wakeup_offset_ms}ms "
-            f"pool_read_wakeup={cfg.pool_read_wakeup_offset_ms}ms "
-            f"kline_fetch_wakeup={cfg.kline_fetch_wakeup_offset_ms}ms "
+            f"ntp_sync_wakeup={cfg.ntp_sync_wakeup_offset_ms}ms "
+            f"bankroll_wakeup={cfg.bankroll_wakeup_offset_ms}ms "
+            f"critical_path_wakeup={cfg.critical_path_wakeup_offset_ms}ms "
             f"bet_submit_deadline={cfg.bet_submit_deadline_offset_ms}ms "
             f"bet_tx_receipt_timeout={cfg.bet_tx_receipt_timeout_seconds}s "
             f"claim_tx_receipt_timeout={cfg.claim_tx_receipt_timeout_seconds}s "
@@ -236,17 +215,25 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
 
     closed_state = _init_closed_state(cfg)
 
-    # Bootstrap OKX clock-skew measurement BEFORE the first round starts.
-    # The per-round refresh in housekeeping won't have fired yet; if local
-    # clock is significantly skewed and we don't bootstrap, the first
-    # round's _sleep_until_ts will fire too early in OKX frame and the
-    # initial fetch will rejected by validation. See _refresh_clock_skew.
-    if closed_state.strategy_pipeline is not None and hasattr(closed_state.strategy_pipeline, "_gate"):
-        # noinspection PyProtectedMember
-        _bootstrap_gate = closed_state.strategy_pipeline._gate
-        if _bootstrap_gate is not None:
-            info("CLOCK", "SKEW", "BOOT", msg="bootstrapping OKX clock skew measurement...")
-            _refresh_clock_skew(_bootstrap_gate)
+    # Bootstrap NTP clock sync BEFORE the first round starts. The per-round
+    # ntp_sync_wake won't have fired yet; without bootstrap, the first
+    # iteration's _sleep_until_ts compares against an uncorrected local
+    # clock. Refuse to start if every server fails or the initial offset
+    # is unreasonably large -- broken NTP at startup is a clear operator-
+    # actionable failure (run w32tm /resync, check firewall, etc.).
+    info("CLOCK", "NTP", "BOOT", msg="bootstrapping NTP clock sync...")
+    _ntp = _get_ntp_sync()
+    if not _ntp.bootstrap():
+        raise InvariantError(
+            "ntp_bootstrap_failed: no NTP servers reachable at startup; "
+            "check network / firewall / w32tm /resync before retrying"
+        )
+    if abs(_ntp.current_offset()) > 1.0:
+        raise InvariantError(
+            f"ntp_bootstrap_offset_too_large: "
+            f"{_ntp.current_offset():+.3f}s exceeds 1.0s sanity bound; "
+            f"run w32tm /resync on host before retrying"
+        )
 
     bnbusd_price = _fetch_current_bnb_price_usd(cfg)
     if cfg.dry:
@@ -405,6 +392,17 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Step 5: cutoff_ts(t) = lock_ts(t) - cutoff_seconds.
         cutoff_ts_t = lock_ts_t - cfg.cutoff_seconds
 
+        # Open-round handle. Iteration-stable since _open_round comes from
+        # the handshake at the top of this iteration; epoch state is not
+        # re-checked on the critical path.
+        open_round = _open_round
+
+        # Gate handle (used downstream for last_fetch_timing logging on SKIP).
+        gate = None
+        if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, "_gate"):
+            # noinspection PyProtectedMember
+            gate = closed.strategy_pipeline._gate
+
         # If we missed the previous epoch's cutoff and are now targeting a
         # newer epoch, the previously-locked epoch (which just closed) may
         # become claimable before the next cutoff. In that case, we must
@@ -419,31 +417,37 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         prev_close_ts = locked_round.lock_at  # = close_at(prev_locked_epoch)
         claim_ts = prev_close_ts + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
         # claim_ts and cutoff_ts_t are both chain-anchored true UTC; compare
-        # against skew-corrected _utc_now() so a skewed local clock doesn't
+        # against NTP-corrected _utc_now() so a drifted local clock doesn't
         # make us miss the wake-for-claim window.
         if _utc_now() < claim_ts < cutoff_ts_t:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
 
-        # -- Skew-sync wake --
+        # -- NTP sync wake --
         # First of three pre-lock wakes. Fires at lock_at -
-        # skew_sync_wakeup_offset_ms (= ~3.65s before lock at canonical
-        # timing constants). Skew refresh + epoch quick-check + bankroll
-        # fetch run here, off the critical path.
-        skew_sync_wake_ts = lock_ts_t - cfg.skew_sync_wakeup_offset_ms / 1000.0
+        # ntp_sync_wakeup_offset_ms (= ~11.095s before lock at canonical
+        # timing constants). Forces a fresh NTP query so the freshest
+        # measured (local - ntp) offset is applied for the rest of the
+        # round's critical-path scheduling. Generously off the critical
+        # path: 5000ms wake budget vs. ~125ms NTP p99 query, so even a
+        # 3-server rotation fall-through (~306ms worst case) is fine.
+        ntp_sync_wake_ts = lock_ts_t - cfg.ntp_sync_wakeup_offset_ms / 1000.0
         _sleep_until_ts(
-            skew_sync_wake_ts,
-            reason="wait_for_skew_sync",
+            ntp_sync_wake_ts,
+            reason="wait_for_ntp_sync",
             epoch=current_epoch,
         )
-
-        # Epoch quick-check: verify current_epoch hasn't shifted during sleep.
-        try:
-            current_epoch2 = int(cfg.contract.current_epoch())
-        except TransientRpcError:
-            current_epoch2 = None
-
-        if current_epoch2 is not None and current_epoch2 != current_epoch:
+        ntp = _get_ntp_sync()
+        ntp.force_resync()
+        if not ntp.is_healthy():
+            # NTP state stale: consecutive failures over the threshold OR
+            # last-good offset is too old. Skip rather than bet on a
+            # potentially-drifted clock; the next round's wake re-queries
+            # and may recover.
+            warn("RUN", "NTP", "UNHEALTHY",
+                 msg=(f"Skip epoch {current_epoch}: ntp_state_unhealthy "
+                      f"(consecutive_failures={ntp.consecutive_failures()}, "
+                      f"last_query_age={ntp.last_query_age_seconds():.0f}s)"))
             _record_dry_cycle_audit(
                 cfg,
                 closed,
@@ -453,38 +457,32 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 cutoff_ts=cutoff_ts_t,
                 locked_price_bnbusd=bnbusd_price,
                 action="SKIP",
-                decision_stage="reanchor",
-                open_round=None,
-                bankroll_before_action_bnb=closed.simulated_bankroll_bnb,
-                bankroll_after_action_bnb=closed.simulated_bankroll_bnb,
-                skip_reason=f"epoch_shift_before_decision:new_epoch={current_epoch2}",
+                decision_stage="pipeline",
+                open_round=open_round,
+                bankroll_before_action_bnb=closed.simulated_bankroll_bnb or 0.0,
+                bankroll_after_action_bnb=closed.simulated_bankroll_bnb or 0.0,
+                skip_reason="ntp_state_unhealthy",
             )
-            info(
-                "RUN",
-                "ACT",
-                "SKIP",
-                msg=(
-                    f"Skip epoch {current_epoch}: "
-                    f"epoch_shift_before_decision:new_epoch={current_epoch2}"
-                ),
-            )
-            continue
+            info("RUN", "ACT", "SKIP",
+                 msg=f"Skip epoch {current_epoch}: ntp_state_unhealthy")
+            _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
+            return
 
-        if current_epoch2 is None:
-            locked_round, open_round, current_epoch, _ = _epoch_handshake(cfg)
-            locked_epoch = locked_round.epoch
-            if open_round.lock_at is None:
-                raise InvariantError("open_round_lock_at_missing")
-            lock_ts_t = int(open_round.lock_at)
-        else:
-            open_round = _open_round
-
-        # -- Housekeeping bankroll resolution (moved from critical path) --
-        # Live mode fetches wallet balance from RPC BEFORE the cutoff so the
-        # post-cutoff critical path doesn't pay that 50-500ms latency. The
-        # tracker is fed the freshest value so risk gates + decide_open_round
-        # see it. On TransientRpcError we refuse to bet on stale bankroll and
-        # SKIP the iteration. Dry mode reads from in-memory state (no latency).
+        # -- Bankroll wake --
+        # Second of three pre-lock wakes. Fires at lock_at -
+        # bankroll_wakeup_offset_ms (= ~6.095s before lock). Refreshes
+        # wallet balance so risk gates + decide_open_round see fresh
+        # truth. Live mode does a BSC RPC call (~50-200ms p99); dry
+        # mode reads in-memory simulated bankroll (sub-ms). Generously
+        # off the critical path: 5000ms wake budget. On live RPC error,
+        # SKIP the iteration with risk_bankroll_stale rather than betting
+        # on stale value.
+        bankroll_wake_ts = lock_ts_t - cfg.bankroll_wakeup_offset_ms / 1000.0
+        _sleep_until_ts(
+            bankroll_wake_ts,
+            reason="wait_for_bankroll",
+            epoch=current_epoch,
+        )
         if cfg.dry:
             if closed.simulated_bankroll_bnb is None:
                 raise InvariantError("dry_bankroll_uninitialized")
@@ -521,45 +519,37 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                      msg=f"Skip epoch {current_epoch}: risk_bankroll_stale")
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
-            # Forward freshest bankroll to tracker (live only; dry records its
-            # own settlements via dry.py after credit/debit). Risk gates read
-            # from the tracker in decide_open_round below.
+            # Forward freshest bankroll to tracker (live only; dry records
+            # its own settlements via dry.py after credit/debit). Risk
+            # gates read from the tracker in decide_open_round below.
             #
-            # On TransientRpcError above we SKIP this iteration and do NOT
-            # update the tracker, so multi-iteration RPC outages leave the
-            # tracker drifting on stale peak. Net effect is conservative: we
-            # also refuse to bet (risk_bankroll_stale), so the breaker can't
-            # mis-fire on stale data because we're not betting in the first
-            # place. Tracker re-syncs on the next successful RPC fetch.
+            # On TransientRpcError above we SKIP and do NOT update the
+            # tracker, so multi-iteration RPC outages leave it on stale
+            # peak. Net effect is conservative: we also refuse to bet
+            # (risk_bankroll_stale), so the breaker can't mis-fire on
+            # stale data because we're not betting in the first place.
+            # Tracker re-syncs on the next successful RPC fetch.
             if closed.strategy_pipeline is not None:
                 closed.strategy_pipeline.record_settlement(
                     bankroll=bankroll_bnb,
                     start_at=int(open_round.start_at),
                 )
 
-        # Per-round REST kline fetch path: the gate fires its 4 parallel
-        # OKX GETs at decision time (Phase B below). Housekeeping here is
-        # purely the clock-skew refresh -- a fresh skew measurement keeps
-        # the wake-time math correctly anchored to OKX/UTC frame.
-        gate = None
-        if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, "_gate"):
-            # noinspection PyProtectedMember
-            gate = closed.strategy_pipeline._gate
-            if gate is not None:
-                # Refresh OKX clock skew off the critical path. Used by
-                # _utc_now() for skew-corrected scheduling. ~150-500ms;
-                # absorbed comfortably in the housekeeping window.
-                _refresh_clock_skew(gate)
-
-        # -- Pool wake --
-        # Second of three pre-lock wakes. Fires at lock_at -
-        # pool_read_wakeup_offset_ms (= ~1.1s before lock). Pool data is
-        # in-memory (WSS subscriber) so this is mainly a synchronization
-        # point: we read the pool aggregate at the same OKX-time-anchored
-        # moment every round for reproducibility.
-        pool_wake_ts = lock_ts_t - cfg.pool_read_wakeup_offset_ms / 1000.0
+        # -- Critical-path wake --
+        # Third (and final) pre-lock scheduled wake. Fires at lock_at -
+        # critical_path_wakeup_offset_ms (= ~1.095s before lock at
+        # canonical timing constants). Inside the wake the engine
+        # sequences: pool snapshot (in-memory, ~5ms) -> kline fetch +
+        # signal compute (~340ms via gate.evaluate()) -> bet submit
+        # (~700ms BSC RTT + block budget). The bet-submit-deadline
+        # timing guard at lock_at - bet_submit_deadline_offset_ms
+        # gates the actual submission to abort late rounds.
+        critical_path_wake_ts = (
+            lock_ts_t - cfg.critical_path_wakeup_offset_ms / 1000.0
+        )
         _sleep_until_ts(
-            pool_wake_ts, reason="wait_for_pool", epoch=current_epoch,
+            critical_path_wake_ts, reason="wait_for_critical_path",
+            epoch=current_epoch,
         )
 
         # Pool data from WSS subscription (no RPC needed, ~0 ms).
@@ -568,7 +558,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if cfg.pool_watcher is not None and cfg.pool_watcher.connected:
             # Gate: if backfill is still running, our pool data is incomplete.
             # Skip rather than decide on partial data. bankroll_bnb was already
-            # resolved in the housekeeping block above -- reuse it for audit.
+            # resolved at the bankroll wake -- reuse it for audit.
             if not cfg.pool_watcher.is_backfill_done():
                 warn("POOL_WSS", "BKFILL", "INCOMPL",
                      msg=f"Skip epoch {current_epoch}: backfill_incomplete")
@@ -658,20 +648,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                  endpoint=cfg.pool_watcher.current_endpoint,
                  last_ok=f"{cfg.pool_watcher.last_connected_at:.0f}")
 
-        # -- Kline-fetch wake (critical path) --
-        # Third of three pre-lock wakes. Fires at lock_at -
-        # kline_fetch_wakeup_offset_ms (= ~1.09s before lock at canonical
-        # timing constants). gate.evaluate() runs immediately after,
-        # firing 4 parallel /history-candles GETs and computing the
-        # signal. Sized so median-fetch rounds have decision-ready
-        # comfortably ahead of the timing guard at
-        # lock - bet_submit_deadline_offset_ms.
-        # See pancakebot/timing_constants.py for the empirical derivation.
-        fetch_ts = lock_ts_t - cfg.kline_fetch_wakeup_offset_ms / 1000.0
-        _sleep_until_ts(fetch_ts, reason="wait_for_kline_fetch", epoch=current_epoch)
-
-        # Step 8: Decide. Gate fires 4 parallel REST fetches and computes
-        # signal off the returned 1s arrays.
+        # Step 8: Decide. Gate fires 4 parallel OKX /history-candles
+        # GETs + computes signal off the returned 1s arrays. Runs
+        # sequentially after the in-memory pool snapshot above; both
+        # share the single critical_path_wake. The kline fetch
+        # effectively starts at lock_at - (critical_path_wakeup_offset_ms
+        # - POOL_READ_TIME_MS) ~= lock - 1090ms.
         t_features_start_ms = _mono_ms()
         pred_p_final = 0.5
 

@@ -75,42 +75,49 @@ def test_bet_submit_deadline_offset_derived_correctly(tmp_path):
     assert cfg.bet_submit_deadline_offset_ms == 750  # locked snapshot
 
 
-def test_kline_fetch_wakeup_offset_derived_correctly(tmp_path):
+def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
+    """critical_path_wakeup_offset_ms is the SINGLE entry point for the
+    bet-decision sequence. Inside the wake the engine sequences pool
+    snapshot -> kline fetch -> signal compute -> bet submit; all the
+    operation-time constants roll up into the one wake offset."""
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     expected = (
         cfg.bet_submit_deadline_offset_ms
         + tc.OKX_KLINE_FETCH_RTT_P95_MS
         + tc.SIGNAL_COMPUTE_TIME_MS
+        + tc.POOL_READ_TIME_MS
     )
-    assert cfg.kline_fetch_wakeup_offset_ms == expected
-    assert cfg.kline_fetch_wakeup_offset_ms == 1090  # locked snapshot
+    assert cfg.critical_path_wakeup_offset_ms == expected
+    assert cfg.critical_path_wakeup_offset_ms == 1095  # locked snapshot
 
 
-def test_pool_read_wakeup_offset_derived_correctly(tmp_path):
-    cfg = load_app_config(str(_write_cfg(tmp_path)))
-    expected = cfg.kline_fetch_wakeup_offset_ms + tc.POOL_READ_TIME_MS
-    assert cfg.pool_read_wakeup_offset_ms == expected
-    assert cfg.pool_read_wakeup_offset_ms == 1095  # locked snapshot
-
-
-def test_skew_sync_wakeup_offset_derived_correctly(tmp_path):
+def test_bankroll_wakeup_offset_derived_correctly(tmp_path):
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     expected = (
-        cfg.pool_read_wakeup_offset_ms
-        + tc.OKX_SKEW_SYNC_TIME_P99_MS
-        + tc.SKEW_SYNC_SAFETY_BUFFER_MS
+        cfg.critical_path_wakeup_offset_ms
+        + tc.BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS
     )
-    assert cfg.skew_sync_wakeup_offset_ms == expected
-    assert cfg.skew_sync_wakeup_offset_ms == 3645  # locked snapshot
+    assert cfg.bankroll_wakeup_offset_ms == expected
+    assert cfg.bankroll_wakeup_offset_ms == 6095  # locked snapshot
+
+
+def test_ntp_sync_wakeup_offset_derived_correctly(tmp_path):
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
+    expected = (
+        cfg.bankroll_wakeup_offset_ms
+        + tc.NTP_WAKE_OFFSET_PRE_BANKROLL_MS
+    )
+    assert cfg.ntp_sync_wakeup_offset_ms == expected
+    assert cfg.ntp_sync_wakeup_offset_ms == 11095  # locked snapshot
 
 
 def test_wake_chain_strictly_increasing(tmp_path):
     """Wake offsets must be ordered:
-    skew_sync > pool_read > kline_fetch > bet_submit_deadline."""
+    ntp_sync > bankroll > critical_path > bet_submit_deadline."""
     cfg = load_app_config(str(_write_cfg(tmp_path)))
-    assert cfg.skew_sync_wakeup_offset_ms > cfg.pool_read_wakeup_offset_ms
-    assert cfg.pool_read_wakeup_offset_ms > cfg.kline_fetch_wakeup_offset_ms
-    assert cfg.kline_fetch_wakeup_offset_ms > cfg.bet_submit_deadline_offset_ms
+    assert cfg.ntp_sync_wakeup_offset_ms > cfg.bankroll_wakeup_offset_ms
+    assert cfg.bankroll_wakeup_offset_ms > cfg.critical_path_wakeup_offset_ms
+    assert cfg.critical_path_wakeup_offset_ms > cfg.bet_submit_deadline_offset_ms
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +145,8 @@ def test_kline_fetch_wakeup_exceeds_cutoff_publish_budget_rejected(tmp_path):
 def test_canonical_cutoff_2_falls_back_to_p95_tier(tmp_path):
     """Strategy-canonical cutoff=2 lands in P95 tier (P99 budget too tight).
 
-    cutoff=2 (2000ms), kline_fetch_wakeup=1090, P95=700, P99=1300:
+    cutoff=2 (2000ms), kline_fetch fires at lock-1090ms (= critical_path
+    wake at lock-1095ms minus the 5ms pool snapshot), P95=700, P99=1300:
       P99 budget = 2000 - 1300 = 700ms;  1090 > 700 -> P99 fails.
       P95 budget = 2000 - 700  = 1300ms; 1090 <= 1300 -> P95 passes.
     Expected tier: "P95".
@@ -146,12 +154,13 @@ def test_canonical_cutoff_2_falls_back_to_p95_tier(tmp_path):
     cfg = load_app_config(str(_write_cfg(tmp_path, cutoff=2)))
     assert cfg.kline_cutoff_seconds == 2
     assert cfg.kline_publish_tier == "P95"
+    kline_fetch_offset = cfg.critical_path_wakeup_offset_ms - tc.POOL_READ_TIME_MS
     # Sanity: at this tier the wake offset fits the P95 budget.
-    assert cfg.kline_fetch_wakeup_offset_ms <= (
+    assert kline_fetch_offset <= (
         2 * 1000 - tc.OKX_KLINE_PUBLISH_DELAY_P95_MS
     )
     # And it does NOT fit the strict P99 budget (else tier would be P99).
-    assert cfg.kline_fetch_wakeup_offset_ms > (
+    assert kline_fetch_offset > (
         2 * 1000 - tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
     )
 
@@ -159,14 +168,15 @@ def test_canonical_cutoff_2_falls_back_to_p95_tier(tmp_path):
 def test_cutoff_3_promotes_to_p99_tier(tmp_path):
     """Larger cutoff auto-promotes to P99 tier without code change.
 
-    cutoff=3 (3000ms), kline_fetch_wakeup=1090, P99=1300:
+    cutoff=3 (3000ms), kline_fetch fires at lock-1090ms, P99=1300:
       P99 budget = 3000 - 1300 = 1700ms; 1090 <= 1700 -> P99 passes.
     Expected tier: "P99".
     """
     cfg = load_app_config(str(_write_cfg(tmp_path, cutoff=3)))
     assert cfg.kline_cutoff_seconds == 3
     assert cfg.kline_publish_tier == "P99"
-    assert cfg.kline_fetch_wakeup_offset_ms <= (
+    kline_fetch_offset = cfg.critical_path_wakeup_offset_ms - tc.POOL_READ_TIME_MS
+    assert kline_fetch_offset <= (
         3 * 1000 - tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
     )
 
@@ -182,11 +192,13 @@ def test_p95_le_p99_invariant_holds():
 
 
 def test_pool_read_wakeup_exceeds_cutoff_arrival_budget_rejected(tmp_path):
-    """pool_read_wakeup > pool_cutoff*1000 - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS must raise.
+    """critical_path_wakeup > pool_cutoff*1000 - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS must raise.
 
-    With pool_cutoff=4 (=4000ms) and WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS=3500,
-    the budget is 4000 - 3500 = 500ms but pool_read_wakeup_offset=1095ms.
-    1095 > 500 → fires.
+    The pool snapshot fires at the START of the critical path
+    (lock - critical_path_wakeup_offset_ms). With pool_cutoff=4
+    (=4000ms) and WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS=3500, the budget
+    is 4000 - 3500 = 500ms but critical_path_wakeup_offset=1095ms.
+    1095 > 500 -> fires.
     """
     extra = "pool_cutoff_seconds = 4"
     raised: Exception | None = None
@@ -249,8 +261,10 @@ def _wake_to_block_landing_ms(*, kline_fetch_wakeup_offset_ms: int, fetch_rtt_ms
 def test_inclusion_math_at_locked_constants_median_fetch(tmp_path):
     """Median-fetch rounds at the locked constants land block BEFORE lock_ts."""
     cfg = load_app_config(str(_write_cfg(tmp_path)))
+    # kline fetch fires at lock - (critical_path_wakeup - POOL_READ_TIME)
+    kline_fetch_offset = cfg.critical_path_wakeup_offset_ms - tc.POOL_READ_TIME_MS
     delta_ms = _wake_to_block_landing_ms(
-        kline_fetch_wakeup_offset_ms=cfg.kline_fetch_wakeup_offset_ms,
+        kline_fetch_wakeup_offset_ms=kline_fetch_offset,
         fetch_rtt_ms=tc.OKX_KLINE_FETCH_RTT_P95_MS - 50,  # ~median (slightly tighter than p95)
     )
     assert delta_ms < 0, (
@@ -268,12 +282,11 @@ def test_inclusion_math_at_locked_constants_p95_fetch_aborts_safely(tmp_path):
     p95_decision_ms_after_wake = (
         tc.OKX_KLINE_FETCH_RTT_P95_MS + tc.SIGNAL_COMPUTE_TIME_MS
     )
-    decision_ready_offset_ms = (
-        cfg.kline_fetch_wakeup_offset_ms - p95_decision_ms_after_wake
-    )
+    kline_fetch_offset = cfg.critical_path_wakeup_offset_ms - tc.POOL_READ_TIME_MS
+    decision_ready_offset_ms = kline_fetch_offset - p95_decision_ms_after_wake
     # Guard fires when remaining_to_lock <= safety_margin
     guard_fires = decision_ready_offset_ms <= cfg.bet_submit_deadline_offset_ms
-    # Note: at the locked constants kline_fetch_wakeup=1090, p95_decision=340,
+    # Note: at the locked constants kline_fetch_offset=1090, p95_decision=340,
     # so decision_ready_offset = 750 = exactly the bet-submit-deadline. The
     # guard condition is `>=`, so equality fires the guard.
     assert guard_fires, (
@@ -296,15 +309,15 @@ def _guard_fires(*, now: float, lock_ts: float, deadline_ms: int) -> bool:
 
 
 def test_guard_does_not_fire_at_wake_with_locked_constants():
-    """Wake fires at lock - kline_fetch_wakeup_offset_ms. Guard fires at
-    lock - bet_submit_deadline_offset_ms. Wake must be OUTSIDE the safety
-    zone (kline_fetch_wakeup > bet_submit_deadline).
+    """Critical-path wake fires at lock - critical_path_wakeup_offset_ms.
+    Guard fires at lock - bet_submit_deadline_offset_ms. Wake must be
+    OUTSIDE the safety zone (critical_path_wakeup > bet_submit_deadline).
 
-    With locked constants: wake at lock-1090ms, guard at lock-750ms.
-    -1090 < -750 -> wake is BEFORE guard threshold -> wake doesn't fire guard.
+    With locked constants: wake at lock-1095ms, guard at lock-750ms.
+    -1095 < -750 -> wake is BEFORE guard threshold -> wake doesn't fire guard.
     """
     lock_ts = 1_000_000.0
-    wake_at = lock_ts - 1090 / 1000.0
+    wake_at = lock_ts - 1095 / 1000.0
     assert not _guard_fires(now=wake_at, lock_ts=lock_ts, deadline_ms=750)
 
 

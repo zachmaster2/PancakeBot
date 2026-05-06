@@ -89,14 +89,18 @@ See [docs/architecture.html](docs/architecture.html) for the visual diagram.
 
 Three pre-lock wakes anchored at the chain-supplied `lock_at` timestamp,
 plus a post-close claim wake anchored at `close_at(prev_locked_epoch)`.
-All ms offsets DERIVED from empirical constants in
-`pancakebot/timing_constants.py`.
+The ntp-sync and bankroll wakes use deliberately generous (5 s) gaps
+above the critical path — robustness over micro-optimization for
+non-critical-path operations. The critical path wake is a single
+scheduled event whose budget covers a sequential pool snapshot →
+kline fetch → signal compute → bet submit. All ms offsets DERIVED
+from constants in `pancakebot/timing_constants.py`.
 
 | Wake | Anchor + offset | Activities |
 |---|---|---|
-| `wait_for_skew_sync` | `lock_at - 3645ms` | OKX clock-skew refresh, epoch check, bankroll fetch (live), settlement record (live) |
-| `wait_for_pool` | `lock_at - 1095ms` | Read pool aggregate from WSS subscriber (`pool_cutoff_seconds = 6` data horizon) |
-| `wait_for_kline_fetch` | `lock_at - 1090ms` | 4 parallel OKX `/history-candles` GETs + signal compute |
+| `wait_for_ntp_sync` | `lock_at - 11095ms` | Force a fresh NTP query; apply (local − ntp) offset to `_utc_now()` for the rest of the round so critical-path scheduling uses freshly-corrected clock |
+| `wait_for_bankroll` | `lock_at - 6095ms` | Refresh wallet balance: live mode = BSC RPC; dry mode = in-memory simulated bankroll. Feeds the risk gates and `decide_open_round` with fresh-truth |
+| `wait_for_critical_path` | `lock_at - 1095ms` | Single critical-path entry. Sequentially: pool snapshot from WSS (`pool_cutoff_seconds = 6` data horizon) → 4 parallel OKX `/history-candles` GETs (kline fetch) → signal compute → bet submit |
 | Pre-bet timing guard | `lock_at - 750ms` | Abort if decision-ready past the safety margin (TX would mine after lock) |
 | `wait_for_claim` | `close_at(prev_locked) + buffer_seconds + 5s` (≈ 35s post-close) | Sleep for previous round's settlement; claim winnings (live; receipt-waited with `claim_tx_receipt_timeout_seconds ≈ 35s`, revert/timeout fires Discord `CLAIM FAILED` alert) |
 

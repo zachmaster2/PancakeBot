@@ -332,9 +332,9 @@ class AppConfig:
     Derived (computed at config-load time from
     ``pancakebot/timing_constants.py``; not user-tunable):
     - ``bet_submit_deadline_offset_ms``
-    - ``kline_fetch_wakeup_offset_ms``
-    - ``pool_read_wakeup_offset_ms``
-    - ``skew_sync_wakeup_offset_ms``
+    - ``critical_path_wakeup_offset_ms``
+    - ``bankroll_wakeup_offset_ms``
+    - ``ntp_sync_wakeup_offset_ms``
     - ``kline_publish_tier``: ``"P99"`` (strict, full-inclusion guarantee)
       or ``"P95"`` (operating budget; ~5% tail absorbed by streak counter).
       Selected by tier-ladder cross-validation: P99 first, P95 fallback.
@@ -347,9 +347,9 @@ class AppConfig:
 
     # Derived (from timing_constants.py at load time)
     bet_submit_deadline_offset_ms: int
-    kline_fetch_wakeup_offset_ms: int
-    pool_read_wakeup_offset_ms: int
-    skew_sync_wakeup_offset_ms: int
+    critical_path_wakeup_offset_ms: int
+    bankroll_wakeup_offset_ms: int
+    ntp_sync_wakeup_offset_ms: int
     kline_publish_tier: str
 
     # Other
@@ -693,19 +693,27 @@ def load_app_config(path: str) -> AppConfig:
         + _tc.BSC_BLOCK_TIME_MS
         + _tc.BET_SUBMIT_SAFETY_BUFFER_MS
     )
-    kline_fetch_wakeup_offset_ms = (
+    critical_path_wakeup_offset_ms = (
         bet_submit_deadline_offset_ms
         + _tc.OKX_KLINE_FETCH_RTT_P95_MS
         + _tc.SIGNAL_COMPUTE_TIME_MS
-    )
-    pool_read_wakeup_offset_ms = (
-        kline_fetch_wakeup_offset_ms
         + _tc.POOL_READ_TIME_MS
     )
-    skew_sync_wakeup_offset_ms = (
-        pool_read_wakeup_offset_ms
-        + _tc.OKX_SKEW_SYNC_TIME_P99_MS
-        + _tc.SKEW_SYNC_SAFETY_BUFFER_MS
+    bankroll_wakeup_offset_ms = (
+        critical_path_wakeup_offset_ms
+        + _tc.BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS
+    )
+    ntp_sync_wakeup_offset_ms = (
+        bankroll_wakeup_offset_ms
+        + _tc.NTP_WAKE_OFFSET_PRE_BANKROLL_MS
+    )
+
+    # The kline fetch fires INSIDE the critical-path wake, after the
+    # ~5ms pool snapshot. So the kline-fetch effective offset (= time
+    # until lock when the GETs go out) is the critical-path wake offset
+    # minus POOL_READ_TIME_MS.
+    kline_fetch_offset_within_critical_ms = (
+        critical_path_wakeup_offset_ms - _tc.POOL_READ_TIME_MS
     )
 
     # Tier-based publish-delay validation: prefer strict P99
@@ -715,8 +723,8 @@ def load_app_config(path: str) -> AppConfig:
     # even the looser P95 budget is exceeded.
     #
     # Behavior across cutoffs at the locked offsets:
-    #   - cutoff=2 (canonical): P99 budget=700ms < wake=1090ms. P95
-    #     budget=1300ms >= 1090ms -> tier="P95".
+    #   - cutoff=2 (canonical): P99 budget=700ms < kline-fetch=1090ms.
+    #     P95 budget=1300ms >= 1090ms -> tier="P95".
     #   - cutoff=3+: P99 budget=1700ms+ >= 1090ms -> tier="P99".
     #     Auto-strict; no code change needed when a future user opts
     #     into a larger cutoff.
@@ -726,14 +734,15 @@ def load_app_config(path: str) -> AppConfig:
     p95_budget_ms = (
         kline_cutoff_seconds * 1000 - _tc.OKX_KLINE_PUBLISH_DELAY_P95_MS
     )
-    if kline_fetch_wakeup_offset_ms <= p99_budget_ms:
+    if kline_fetch_offset_within_critical_ms <= p99_budget_ms:
         kline_publish_tier = "P99"
-    elif kline_fetch_wakeup_offset_ms <= p95_budget_ms:
+    elif kline_fetch_offset_within_critical_ms <= p95_budget_ms:
         kline_publish_tier = "P95"
     else:
         raise InvariantError(
             f"config_kline_fetch_wakeup_exceeds_cutoff_publish_budget: "
-            f"kline_fetch_wakeup_offset_ms={kline_fetch_wakeup_offset_ms}ms "
+            f"kline_fetch_offset_within_critical_ms="
+            f"{kline_fetch_offset_within_critical_ms}ms "
             f"exceeds P95 budget ({p95_budget_ms}ms) at "
             f"kline_cutoff_seconds={kline_cutoff_seconds}s "
             f"(P99 budget={p99_budget_ms}ms; "
@@ -742,10 +751,10 @@ def load_app_config(path: str) -> AppConfig:
             f"Increase kline_cutoff_seconds or reduce wake offset."
         )
 
-    # Cross-validation: the pool-read wake offset must fit inside the
-    # pool-cutoff window minus WSS bet-event arrival delay (P99). Same
-    # framing as klines: the cutoff is fixed; the wake offset adjusts
-    # around it.
+    # Cross-validation: the critical-path wake offset (= the pool-snapshot
+    # time inside the wake) must fit inside the pool-cutoff window minus
+    # WSS bet-event arrival delay (P99). Same framing as klines: the
+    # cutoff is fixed; the wake offset adjusts around it.
     #
     # No tier fallback here -- WSS arrival is much more uniform than
     # REST publishing (single subscriber stream vs. per-symbol
@@ -753,15 +762,41 @@ def load_app_config(path: str) -> AppConfig:
     # there's no looser percentile to fall back to. If a P95 WSS
     # arrival probe constant is added later, this could be tier-ified
     # symmetrically with klines. For now: P99-strict is the only check.
-    if pool_read_wakeup_offset_ms > (
+    if critical_path_wakeup_offset_ms > (
         pool_cutoff_seconds * 1000 - _tc.WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS
     ):
         raise InvariantError(
             f"config_pool_read_wakeup_exceeds_cutoff_arrival_budget: "
-            f"pool_read_wakeup_offset_ms={pool_read_wakeup_offset_ms} "
+            f"critical_path_wakeup_offset_ms={critical_path_wakeup_offset_ms} "
             f"> pool_cutoff_seconds*1000={pool_cutoff_seconds * 1000} "
             f"- WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS"
             f"={_tc.WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS}"
+        )
+
+    # Cross-validation: the NTP wake budget must comfortably exceed
+    # ``N_servers x NTP_QUERY_TIME_P99_MS + dispatch buffer`` so even a
+    # full rotation fall-through (every server's first query times out
+    # below the libntp timeout) lands before the bankroll wake fires.
+    # This is informational/defensive -- the literal 5000ms gap dwarfs
+    # the empirical worst case (3 x 102 = 306 ms 2026-05-06 probe), so
+    # the assertion would only fire if a future probe revision drove
+    # NTP_QUERY_TIME_P99_MS into the 1.5s+ range, which itself signals
+    # something has gone badly wrong with the public NTP pool. Keep the
+    # check as a tripwire for that scenario.
+    _N_SERVERS_DEFAULT = 3
+    _DISPATCH_BUFFER_MS = 200
+    _ntp_rotation_worst_case_ms = (
+        _N_SERVERS_DEFAULT * _tc.NTP_QUERY_TIME_P99_MS + _DISPATCH_BUFFER_MS
+    )
+    if _tc.NTP_WAKE_OFFSET_PRE_BANKROLL_MS < _ntp_rotation_worst_case_ms:
+        raise InvariantError(
+            f"config_ntp_wake_budget_below_rotation_worst_case: "
+            f"NTP_WAKE_OFFSET_PRE_BANKROLL_MS="
+            f"{_tc.NTP_WAKE_OFFSET_PRE_BANKROLL_MS}ms is below "
+            f"N_servers={_N_SERVERS_DEFAULT} x "
+            f"NTP_QUERY_TIME_P99_MS={_tc.NTP_QUERY_TIME_P99_MS}ms "
+            f"+ dispatch_buffer={_DISPATCH_BUFFER_MS}ms = "
+            f"{_ntp_rotation_worst_case_ms}ms"
         )
 
     # [dry]
@@ -799,9 +834,9 @@ def load_app_config(path: str) -> AppConfig:
         pool_cutoff_seconds=pool_cutoff_seconds,
         max_consecutive_fetch_failures=max_consecutive_fetch_failures,
         bet_submit_deadline_offset_ms=bet_submit_deadline_offset_ms,
-        kline_fetch_wakeup_offset_ms=kline_fetch_wakeup_offset_ms,
-        pool_read_wakeup_offset_ms=pool_read_wakeup_offset_ms,
-        skew_sync_wakeup_offset_ms=skew_sync_wakeup_offset_ms,
+        critical_path_wakeup_offset_ms=critical_path_wakeup_offset_ms,
+        bankroll_wakeup_offset_ms=bankroll_wakeup_offset_ms,
+        ntp_sync_wakeup_offset_ms=ntp_sync_wakeup_offset_ms,
         kline_publish_tier=kline_publish_tier,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_min_bet_only=live_min_bet_only,
