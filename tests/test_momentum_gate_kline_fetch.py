@@ -1,23 +1,24 @@
 """Tests for ``MomentumGate.evaluate`` per-round REST fetch path.
 
-Covers the post-WSS-revert data plane (2026-04-27): the gate fires 4 parallel
-``OkxClient.kline_fetch_window`` calls (BTC/ETH/SOL/BNB) and aggregates
-results by exception class.
+The gate fires 3 parallel ``OkxClient.kline_fetch_window`` calls
+(BTC/ETH/SOL) and aggregates results by exception class. BNB fetch
+is currently disabled (see ``MomentumGate._SYMBOLS_FETCHED`` for
+re-enable steps).
 
 Behavior under test:
-- Healthy path: all 4 symbols fetched, signal computed off the trimmed window.
+- Healthy path: all 3 symbols fetched, signal computed off the trimmed window.
 - ``InvariantError`` from any symbol → reraised (bot crashes).
 - ``TransientOkxError`` (any subset) → per-symbol warn + skip with
   ``kline_fetch_transient_failure``, increments streak counter.
 - 3 consecutive transient rounds → escalates to ``InvariantError``.
-- Streak resets to 0 on any successful 4-symbol fetch (regardless of signal).
+- Streak resets to 0 on any successful 3-symbol fetch (regardless of signal).
 - Fetch window is cutoff- and lookback-aware: newest = lock_at -
   cutoff*1000 - 1000, oldest = newest - max(mtf_lookbacks)*1000, expected
   count = max(mtf_lookbacks) + 1. Confirms the 2026-04-27 fix for
   ``kline_fetch_integrity_violation`` crashes that used a hardcoded
   300-candle, cutoff-blind window.
 - ``send_before_bound=True`` is set so OKX cannot slide the window.
-- ``last_fetch_timing`` populated with 4 entries (btc/eth/sol/bnb).
+- ``last_fetch_timing`` populated with 3 entries (btc/eth/sol).
 
 Run:
     python -m pytest tests/test_momentum_gate_kline_fetch.py -v
@@ -148,8 +149,9 @@ def _capture_warns():
 # Healthy path
 # ---------------------------------------------------------------------------
 
-def test_evaluate_fetches_all_four_symbols_in_parallel():
-    """All 4 symbols (BTC/ETH/SOL/BNB) hit OKX in a single round."""
+def test_evaluate_fetches_three_symbols_in_parallel():
+    """All 3 symbols (BTC/ETH/SOL) hit OKX in a single round. BNB is
+    currently disabled in MomentumGate._SYMBOLS_FETCHED."""
     gate, fake_client = _make_gate()
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS),
@@ -158,7 +160,7 @@ def test_evaluate_fetches_all_four_symbols_in_parallel():
     called_symbols = sorted(
         c.kwargs["symbol"] for c in fake_client.kline_fetch_window.call_args_list
     )
-    assert called_symbols == ["BNB-USDT", "BTC-USDT", "ETH-USDT", "SOL-USDT"]
+    assert called_symbols == ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
 
 
 def test_evaluate_window_is_cutoff_and_lookback_aware():
@@ -218,16 +220,16 @@ def test_evaluate_window_respects_non_default_lookbacks():
     assert gate._candle_count == 61
 
 
-def test_evaluate_populates_last_fetch_timing_with_four_entries():
-    """``last_fetch_timing`` has bnb_ms entry post-revert (matching the
-    actual fetched symbols, not the 3-entry WSS-era shape)."""
+def test_evaluate_populates_last_fetch_timing_with_three_entries():
+    """``last_fetch_timing`` has one entry per fetched symbol. With BNB
+    disabled, that's btc/eth/sol — three entries."""
     gate, fake_client = _make_gate()
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS),
     )
     gate.evaluate(lock_at_ms=_LOCK_AT_MS)
     assert gate.last_fetch_timing is not None
-    assert set(gate.last_fetch_timing.keys()) == {"btc_ms", "eth_ms", "sol_ms", "bnb_ms"}
+    assert set(gate.last_fetch_timing.keys()) == {"btc_ms", "eth_ms", "sol_ms"}
 
 
 def test_evaluate_records_per_symbol_rtt_from_fetch_return():
@@ -244,7 +246,7 @@ def test_evaluate_records_per_symbol_rtt_from_fetch_return():
     )
     gate.evaluate(lock_at_ms=_LOCK_AT_MS)
     assert gate.last_fetch_timing == {
-        "btc_ms": 42, "eth_ms": 42, "sol_ms": 42, "bnb_ms": 42,
+        "btc_ms": 42, "eth_ms": 42, "sol_ms": 42,
     }, (
         f"last_fetch_timing must reflect per-symbol rtt_ms returned by "
         f"kline_fetch_window, not wall-clock-since-submit; "
@@ -282,7 +284,7 @@ def test_evaluate_returns_signal_on_trending_market():
 def test_evaluate_skips_with_kline_fetch_transient_failure_on_any_transient():
     """A single TransientOkxError on any symbol skips with the canonical
     ``kline_fetch_transient_failure`` reason."""
-    for failing_symbol in ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT"):
+    for failing_symbol in ("BTC-USDT", "ETH-USDT", "SOL-USDT"):
         gate, fake_client = _make_gate()
         fake_client.kline_fetch_window.side_effect = _make_router(
             ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS),
@@ -305,25 +307,25 @@ def test_evaluate_emits_one_warn_per_failed_symbol_on_transient():
         ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS),
         errors={
             "ETH-USDT": TransientOkxError("kline_fetch_exhausted: net_error"),
-            "BNB-USDT": TransientOkxError("kline_fetch_exhausted: net_error"),
+            "SOL-USDT": TransientOkxError("kline_fetch_exhausted: net_error"),
         },
     )
     patcher, warn_calls = _capture_warns()
     with patcher:
         gate.evaluate(lock_at_ms=_LOCK_AT_MS)
     assert len(warn_calls) == 2, (
-        f"expected 2 warns (ETH+BNB), got {len(warn_calls)}: {warn_calls}"
+        f"expected 2 warns (ETH+SOL), got {len(warn_calls)}: {warn_calls}"
     )
     sub_tags = sorted(args[1] for args, _ in warn_calls)
-    assert sub_tags == ["BNB", "ETH"]
+    assert sub_tags == ["ETH", "SOL"]
     for args, kwargs in warn_calls:
         assert args[0] == "GATE"
         assert args[2] == "FETCH_FAIL"
         assert "kline_fetch_exhausted" in kwargs.get("msg", "")
 
 
-def test_evaluate_all_four_transient_produces_four_warns_and_one_skip():
-    """All-4-down round: 4 warns + 1 generic skip + streak += 1."""
+def test_evaluate_all_three_transient_produces_three_warns_and_one_skip():
+    """All-3-down round: 3 warns + 1 generic skip + streak += 1."""
     gate, fake_client = _make_gate()
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=[],
@@ -331,15 +333,14 @@ def test_evaluate_all_four_transient_produces_four_warns_and_one_skip():
             "BTC-USDT": TransientOkxError("kline_fetch_exhausted: net_down"),
             "ETH-USDT": TransientOkxError("kline_fetch_exhausted: net_down"),
             "SOL-USDT": TransientOkxError("kline_fetch_exhausted: net_down"),
-            "BNB-USDT": TransientOkxError("kline_fetch_exhausted: net_down"),
         },
     )
     patcher, warn_calls = _capture_warns()
     with patcher:
         result = gate.evaluate(lock_at_ms=_LOCK_AT_MS)
     assert result.skip_reason == "kline_fetch_transient_failure"
-    assert len(warn_calls) == 4
-    assert sorted(args[1] for args, _ in warn_calls) == ["BNB", "BTC", "ETH", "SOL"]
+    assert len(warn_calls) == 3
+    assert sorted(args[1] for args, _ in warn_calls) == ["BTC", "ETH", "SOL"]
     assert gate._consecutive_fetch_failures == 1
 
 
@@ -348,15 +349,15 @@ def test_evaluate_all_four_transient_produces_four_warns_and_one_skip():
 # ---------------------------------------------------------------------------
 
 def test_streak_resets_on_successful_fetch_regardless_of_signal():
-    """Streak counter resets on a clean 4-symbol fetch even when the
+    """Streak counter resets on a clean 3-symbol fetch even when the
     downstream signal is gate_no_signal. The streak measures fetch
     health, not signal availability -- a quiet market shouldn't escalate."""
     gate, fake_client = _make_gate()
-    # Round 1: all 4 transient.
+    # Round 1: all 3 transient.
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=[],
         errors={s: TransientOkxError("net_down") for s in
-                ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT")},
+                ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
     patcher, _calls = _capture_warns()
     with patcher:
@@ -380,7 +381,7 @@ def test_streak_escalates_to_invariant_error_at_three_consecutive_failures():
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=[],
         errors={s: TransientOkxError("net_down") for s in
-                ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT")},
+                ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
     patcher, _calls = _capture_warns()
     raised = None
@@ -413,7 +414,7 @@ def test_streak_does_not_escalate_when_a_clean_round_intervenes():
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=[],
         errors={s: TransientOkxError("net_down") for s in
-                ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT")},
+                ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
     with patcher:
         for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
@@ -431,7 +432,7 @@ def test_streak_does_not_escalate_when_a_clean_round_intervenes():
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=[],
         errors={s: TransientOkxError("net_down") for s in
-                ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT")},
+                ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
     with patcher:
         for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
@@ -449,7 +450,7 @@ def test_evaluate_reraises_invariant_error_from_any_symbol():
     """Any InvariantError from any symbol surfaces as InvariantError --
     the bot crashes. These indicate OKX returned a malformed window;
     silently skipping would mask shape violations."""
-    for failing_symbol in ("BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT"):
+    for failing_symbol in ("BTC-USDT", "ETH-USDT", "SOL-USDT"):
         gate, fake_client = _make_gate()
         fake_client.kline_fetch_window.side_effect = _make_router(
             ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS),

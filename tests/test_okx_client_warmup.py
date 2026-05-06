@@ -20,17 +20,19 @@ if str(_REPO_ROOT) not in sys.path:
 from pancakebot.market_data.okx_client import OkxClient  # noqa: E402
 
 
-def test_warmup_default_connections_is_4():
-    """Default ``connections=4`` matches the live decision-path gate's
-    4-symbol concurrent fetch (BTC/ETH/SOL/BNB), so every parallel
-    request finds a pre-established TLS connection. Bumped from 3
-    after the 2026-04-27 audit found the 4th symbol was paying a
-    TLS handshake on every cold round."""
+def test_warmup_default_connections_matches_gate_symbol_count():
+    """Default ``connections`` matches the live decision-path gate's
+    concurrent-fetch symbol count, so every parallel request finds a
+    pre-established TLS connection. With BNB currently disabled in
+    ``MomentumGate._SYMBOLS_FETCHED``, the gate fetches 3 symbols
+    (BTC/ETH/SOL) and the warmup default is 3."""
+    from pancakebot.strategy.momentum_gate import _SYMBOLS_FETCHED
     sig = inspect.signature(OkxClient.warmup)
     default = sig.parameters["connections"].default
-    assert default == 4, (
-        f"OkxClient.warmup() default connections must be 4 to match "
-        f"the gate's 4-symbol concurrent fetch; got {default}"
+    expected = len(_SYMBOLS_FETCHED)
+    assert default == expected, (
+        f"OkxClient.warmup() default connections must equal the gate's "
+        f"_SYMBOLS_FETCHED count ({expected}); got {default}"
     )
 
 

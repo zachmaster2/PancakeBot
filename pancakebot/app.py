@@ -172,13 +172,15 @@ def run_from_config(
     okx_client = OkxClient(timeout_seconds=10.0)
     okx_client.warmup()
 
-    # Per-round REST kline fetch path: the gate fires 4 parallel
-    # ``/history-candles`` GETs each round (BTC/ETH/SOL/BNB) anchored to
-    # ``lock_at_ms``. Triggered inside the critical_path wake (configured
-    # via ``RuntimeConfig.critical_path_wakeup_offset_ms``) after the
-    # in-memory pool snapshot. BNB is FIRST-CLASS (the bot bets on
-    # BNB/USD); it's fetched alongside BTC/ETH/SOL even though the
-    # current strategy doesn't consume BNB closes for signal computation.
+    # Per-round REST kline fetch path: the gate fires 3 parallel
+    # ``/history-candles`` GETs each round (BTC/ETH/SOL) anchored to
+    # ``lock_at_ms``. Triggered inside the critical_path wake
+    # (configured via ``RuntimeConfig.critical_path_wakeup_offset_ms``)
+    # after the in-memory pool snapshot. BNB fetch is currently
+    # disabled (the strategy doesn't consume BNB closes for signal
+    # computation, and chain-supplied lock_price covers display/USD
+    # conversion); see ``MomentumGate._SYMBOLS_FETCHED`` for re-enable
+    # steps if a future strategy needs BNB klines.
     momentum_gate = MomentumGate(
         config=momentum_gate_cfg,
         okx_client=okx_client,

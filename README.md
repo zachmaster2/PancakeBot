@@ -100,7 +100,7 @@ from constants in `pancakebot/timing_constants.py`.
 |---|---|---|
 | `wait_for_ntp_sync` | `lock_at - 11095ms` | Force a fresh NTP query; apply (local − ntp) offset to `_utc_now()` for the rest of the round so critical-path scheduling uses freshly-corrected clock |
 | `wait_for_bankroll` | `lock_at - 6095ms` | Refresh wallet balance: live mode = BSC RPC; dry mode = in-memory simulated bankroll. Feeds the risk gates and `decide_open_round` with fresh-truth |
-| `wait_for_critical_path` | `lock_at - 1095ms` | Single critical-path entry. Sequentially: pool snapshot from WSS (`pool_cutoff_seconds = 6` data horizon) → 4 parallel OKX `/history-candles` GETs (kline fetch) → signal compute → bet submit |
+| `wait_for_critical_path` | `lock_at - 1095ms` | Single critical-path entry. Sequentially: pool snapshot from WSS (`pool_cutoff_seconds = 6` data horizon) → 3 parallel OKX `/history-candles` GETs (BTC/ETH/SOL) → signal compute → bet submit |
 | Pre-bet timing guard | `lock_at - 750ms` | Abort if decision-ready past the safety margin (TX would mine after lock) |
 | `wait_for_claim` | `close_at(prev_locked) + buffer_seconds + 5s` (≈ 35s post-close) | Sleep for previous round's settlement; claim winnings (live; receipt-waited with `claim_tx_receipt_timeout_seconds ≈ 35s`, revert/timeout fires Discord `CLAIM FAILED` alert) |
 

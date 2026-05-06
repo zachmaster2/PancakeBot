@@ -73,7 +73,7 @@ from __future__ import annotations
 # --- OKX REST timing -------------------------------------------------------
 
 # OKX /history-candles publishing latency (= time between candle close and
-# the candle being available via REST /history-candles for our 4-symbol
+# the candle being available via REST /history-candles for our 3-symbol
 # parallel fetch).
 #
 # Source: research/p4c_canonical_loop_probe.py at varying wake offsets,

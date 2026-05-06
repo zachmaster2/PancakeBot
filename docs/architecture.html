@@ -607,7 +607,7 @@
       </div>
       <div class="loop-step data">
         <div class="ls-title">Critical-path Wake</div>
-        <div class="ls-desc">Single critical-path entry. Sequentially: read pool aggregate from WSS subscriber (BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds, in-memory ~5ms) &rarr; fire 4 parallel OKX /history-candles GETs (BTC/ETH/SOL/BNB) &rarr; compute multi-TF signal + sizing. The bet-submit deadline gate at lock_at &minus; bet_submit_deadline_offset_ms gates the actual TX submission below.</div>
+        <div class="ls-desc">Single critical-path entry. Sequentially: read pool aggregate from WSS subscriber (BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds, in-memory ~5ms) &rarr; fire 3 parallel OKX /history-candles GETs (BTC/ETH/SOL; BNB disabled, see MomentumGate._SYMBOLS_FETCHED) &rarr; compute multi-TF signal + sizing. The bet-submit deadline gate at lock_at &minus; bet_submit_deadline_offset_ms gates the actual TX submission below.</div>
         <div class="ls-time">lock_at &minus; critical_path_wakeup_offset_ms &rarr; ~1.10s before lock</div>
       </div>
       <div class="loop-step action">
