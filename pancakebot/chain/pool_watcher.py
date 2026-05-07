@@ -431,6 +431,84 @@ class PoolEventWatcher:
     # Internal: diagnostics passthrough
     # ------------------------------------------------------------------
 
+    def _check_force_reconnect_or_raise(self, url: str) -> None:
+        """Synchronous force-reconnect predicate.
+
+        Called at the top of every recv-loop iteration (BEFORE the
+        ``ws.recv()`` await). Raises ``ConnectionError`` if any of:
+
+        - ``_reconnect_requested`` is set (engine fired
+          ``request_reconnect()`` on a data-integrity violation).
+        - ``_NEWHEAD_IDLE_THRESHOLD_SECONDS`` exceeded since last
+          newHead.
+        - ``_LOGS_IDLE_THRESHOLD_SECONDS`` exceeded since last log
+          event.
+
+        Why at the top of the loop, not in the recv-timeout path:
+        on a publicnode-style silent-stall, newHeads keep arriving
+        every ~0.5s, so the 2s recv timeout never trips. Any check
+        in the timeout block is unreachable in that exact scenario
+        (which is the whole reason these checks exist). Moving them
+        to the loop top makes them fire within ~0.5s of any newHead
+        arrival, regardless of which channel is silent.
+
+        See ``var/incident_reports/2026_05_06_overnight_summary.md``
+        for the live capture that revealed this hole.
+        """
+        if self._reconnect_requested:
+            with self._lock:
+                reason = self._reconnect_reason or "engine_request"
+                self._reconnect_requested = False
+                self._reconnect_reason = ""
+            # Event label "ENG_RECON" stays within _EVENT_W=11 (9 chars);
+            # the longer "ENGINE_RECONN" in the original 392eac4 was a
+            # latent bug that never surfaced because the surrounding
+            # code path was itself unreachable (timeout-only check vs
+            # always-flowing newHeads).
+            warn(
+                "POOL_WSS", "ERR", "ENG_RECON",
+                msg=(
+                    f"Reconnect requested by engine on {url}: "
+                    f"reason={reason}; cycling endpoint."
+                ),
+            )
+            raise ConnectionError(
+                f"engine_request_reconnect: reason={reason}"
+            )
+        newhead_idle = time.time() - self._last_newhead_event_at
+        logs_idle = time.time() - self._last_logs_event_at
+        if newhead_idle >= _NEWHEAD_IDLE_THRESHOLD_SECONDS:
+            # Same label-length consideration as ENG_RECON above.
+            warn(
+                "POOL_WSS", "ERR", "NH_STALL",
+                msg=(
+                    f"newHeads channel silent {newhead_idle:.1f}s "
+                    f"on {url} (threshold "
+                    f"{_NEWHEAD_IDLE_THRESHOLD_SECONDS:.1f}s); "
+                    f"forcing reconnect (TCP-up silent-stall on "
+                    f"newHeads subscription)."
+                ),
+            )
+            raise ConnectionError(
+                f"newhead_idle_stall: silent={newhead_idle:.1f}s "
+                f"threshold={_NEWHEAD_IDLE_THRESHOLD_SECONDS:.1f}s"
+            )
+        if logs_idle >= _LOGS_IDLE_THRESHOLD_SECONDS:
+            warn(
+                "POOL_WSS", "ERR", "LOGS_STALL",
+                msg=(
+                    f"logs channel silent {logs_idle:.1f}s on "
+                    f"{url} (threshold "
+                    f"{_LOGS_IDLE_THRESHOLD_SECONDS:.1f}s); "
+                    f"forcing reconnect (newHeads still flowing "
+                    f"but bet-event subscription dropped)."
+                ),
+            )
+            raise ConnectionError(
+                f"logs_idle_stall: silent={logs_idle:.1f}s "
+                f"threshold={_LOGS_IDLE_THRESHOLD_SECONDS:.1f}s"
+            )
+
     def _diag_log_frame(self, kind: str, raw: str | bytes) -> None:
         """Forensic raw-frame logger passthrough. Failures swallowed
         inside the logger; we just dispatch."""
@@ -575,70 +653,26 @@ class PoolEventWatcher:
 
             disconnect_reason = "stop"
             while not self._stop_event.is_set():
+                # Force-reconnect checks BEFORE recv (not in the timeout
+                # path) so they fire even when the OTHER channel keeps
+                # delivering messages. Bug history: in the publicnode
+                # silent-stall scenario, newHeads keep flowing every
+                # ~0.5s while logs go dead. The 2s recv timeout never
+                # trips, so any check inside the timeout block is
+                # unreachable. Engine-driven request_reconnect() and
+                # logs-idle threshold both manifest under exactly this
+                # silent-stall scenario, so both must be checked here.
+                # See `var/incident_reports/2026_05_06_overnight_summary.md`.
+                self._check_force_reconnect_or_raise(url)
+
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 except asyncio.TimeoutError:
-                    # Short timeout exists so the _stop_event check fires AND
-                    # the silent-stall idle checks below run AND the engine-
-                    # driven request_reconnect flag is observed.
-                    #
-                    # Library-level ping_interval=30 / ping_timeout=10 handles
-                    # dead-TCP case (raises ConnectionClosedError); the idle
-                    # checks below handle silent-stall (TCP up + library
-                    # ping/pong working but eth_subscription messages have
-                    # stopped flowing for one or both channels).
-                    if self._reconnect_requested:
-                        # Engine has detected a data-integrity violation
-                        # (pool=0 + connected + backfill_done) and asked
-                        # us to reconnect. Take the hint -- this catches
-                        # silent-stall one round earlier than waiting for
-                        # _LOGS_IDLE_THRESHOLD_SECONDS to trip.
-                        with self._lock:
-                            reason = self._reconnect_reason or "engine_request"
-                            self._reconnect_requested = False
-                            self._reconnect_reason = ""
-                        warn(
-                            "POOL_WSS", "ERR", "ENGINE_RECONN",
-                            msg=(
-                                f"Reconnect requested by engine on {url}: "
-                                f"reason={reason}; cycling endpoint."
-                            ),
-                        )
-                        raise ConnectionError(
-                            f"engine_request_reconnect: reason={reason}"
-                        )
-                    newhead_idle = time.time() - self._last_newhead_event_at
-                    logs_idle = time.time() - self._last_logs_event_at
-                    if newhead_idle >= _NEWHEAD_IDLE_THRESHOLD_SECONDS:
-                        warn(
-                            "POOL_WSS", "ERR", "NEWHEAD_STALL",
-                            msg=(
-                                f"newHeads channel silent {newhead_idle:.1f}s "
-                                f"on {url} (threshold "
-                                f"{_NEWHEAD_IDLE_THRESHOLD_SECONDS:.1f}s); "
-                                f"forcing reconnect (TCP-up silent-stall on "
-                                f"newHeads subscription)."
-                            ),
-                        )
-                        raise ConnectionError(
-                            f"newhead_idle_stall: silent={newhead_idle:.1f}s "
-                            f"threshold={_NEWHEAD_IDLE_THRESHOLD_SECONDS:.1f}s"
-                        )
-                    if logs_idle >= _LOGS_IDLE_THRESHOLD_SECONDS:
-                        warn(
-                            "POOL_WSS", "ERR", "LOGS_STALL",
-                            msg=(
-                                f"logs channel silent {logs_idle:.1f}s on "
-                                f"{url} (threshold "
-                                f"{_LOGS_IDLE_THRESHOLD_SECONDS:.1f}s); "
-                                f"forcing reconnect (newHeads still flowing "
-                                f"but bet-event subscription dropped)."
-                            ),
-                        )
-                        raise ConnectionError(
-                            f"logs_idle_stall: silent={logs_idle:.1f}s "
-                            f"threshold={_LOGS_IDLE_THRESHOLD_SECONDS:.1f}s"
-                        )
+                    # Library-level ping_interval=30 / ping_timeout=10
+                    # handles dead-TCP case (raises ConnectionClosedError).
+                    # Force-reconnect checks happen at top of loop on the
+                    # next iteration; we just need to release control so
+                    # the _stop_event is observable.
                     continue
 
                 self._last_event_at = time.time()
