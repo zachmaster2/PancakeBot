@@ -555,13 +555,20 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Pool data from WSS subscription (no RPC needed, ~0 ms).
         pool_bull_bnb = 0.0
         pool_bear_bnb = 0.0
-        if cfg.pool_watcher is not None and cfg.pool_watcher.connected:
-            # Gate: if backfill is still running, our pool data is incomplete.
-            # Skip rather than decide on partial data. bankroll_bnb was already
-            # resolved at the bankroll wake -- reuse it for audit.
-            if not cfg.pool_watcher.is_backfill_done():
-                warn("POOL_WSS", "BKFILL", "INCOMPL",
-                     msg=f"Skip epoch {current_epoch}: backfill_incomplete")
+        if cfg.pool_watcher is not None:
+            # Unified readiness gate: covers wss_disconnected,
+            # backfill_in_progress, and reconnect_requested in one
+            # check. The watcher's predicate is the canonical source of
+            # truth for "is the pool data fresh and trustworthy right
+            # now"; the engine just gates on its result. bankroll_bnb
+            # was already resolved at the bankroll wake -- reuse it for
+            # audit on the skip path.
+            ready, ready_reason = cfg.pool_watcher.is_pool_ready()
+            if not ready:
+                skip_reason = f"pool_not_ready_{ready_reason}"
+                warn("POOL_WSS", "READY", "SKIP",
+                     msg=f"Skip epoch {current_epoch}: {skip_reason}",
+                     endpoint=cfg.pool_watcher.current_endpoint)
                 _record_dry_cycle_audit(
                     cfg,
                     closed,
@@ -575,10 +582,10 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     open_round=open_round,
                     bankroll_before_action_bnb=bankroll_bnb,
                     bankroll_after_action_bnb=bankroll_bnb,
-                    skip_reason="backfill_incomplete",
+                    skip_reason=skip_reason,
                 )
                 info("RUN", "ACT", "SKIP",
-                     msg=f"Skip epoch {current_epoch}: backfill_incomplete")
+                     msg=f"Skip epoch {current_epoch}: {skip_reason}")
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
             pool_ts_cutoff = lock_ts_t - cfg.pool_cutoff_seconds
@@ -651,11 +658,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                      ))
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
-        elif cfg.pool_watcher is not None:
-            info("POOL_WSS", "ROUND", "DISC",
-                 epoch=current_epoch,
-                 endpoint=cfg.pool_watcher.current_endpoint,
-                 last_ok=f"{cfg.pool_watcher.last_connected_at:.0f}")
 
         # Step 8: Decide. Gate fires 3 parallel OKX /history-candles
         # GETs (BTC/ETH/SOL; BNB disabled, see MomentumGate._SYMBOLS_FETCHED)
