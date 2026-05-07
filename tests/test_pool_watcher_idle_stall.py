@@ -412,6 +412,106 @@ def test_is_pool_ready_thread_safe_under_lock():
     assert reason == ""
 
 
+def test_check_force_reconnect_or_raise_engine_flag_fires():
+    """Top-of-loop check raises immediately when reconnect_requested is set.
+    This is the bug-fix path for the publicnode silent-stall scenario:
+    newHeads keep flowing every ~0.5s, recv() never times out, the
+    timeout-block check is unreachable. Moving the check to the top of
+    the loop makes it fire within one recv interval regardless."""
+    from pancakebot.chain.pool_watcher import PoolEventWatcher
+    pw = PoolEventWatcher(interval_seconds=300, enable_diagnostics=False)
+    pw._connected = True
+    pw._last_newhead_event_at = time.time()  # healthy
+    pw._last_logs_event_at = time.time()     # healthy
+    pw.request_reconnect("pool_zero_chain_active")
+
+    raised: Exception | None = None
+    try:
+        pw._check_force_reconnect_or_raise("wss://test")
+    except ConnectionError as e:
+        raised = e
+    assert isinstance(raised, ConnectionError)
+    assert "engine_request_reconnect" in str(raised)
+    assert "pool_zero_chain_active" in str(raised)
+    # Flag must be cleared after raise so a fresh session doesn't
+    # immediately re-raise on top of the same flag.
+    assert pw._reconnect_requested is False
+    assert pw._reconnect_reason == ""
+
+
+def test_check_force_reconnect_or_raise_no_op_when_healthy():
+    """When everything is healthy, the check returns silently (no raise)."""
+    from pancakebot.chain.pool_watcher import PoolEventWatcher
+    pw = PoolEventWatcher(interval_seconds=300, enable_diagnostics=False)
+    pw._connected = True
+    pw._last_newhead_event_at = time.time()
+    pw._last_logs_event_at = time.time()
+    # Should NOT raise.
+    pw._check_force_reconnect_or_raise("wss://test")
+
+
+def test_check_force_reconnect_or_raise_logs_idle_fires_on_silent_stall():
+    """The publicnode silent-stall scenario: newheads keep flowing
+    (last_newhead_event_at = now) but logs have been silent past the
+    threshold (last_logs_event_at = now - LOGS_IDLE_THRESHOLD - 1).
+    Predicate must raise logs_idle_stall."""
+    from pancakebot.chain.pool_watcher import PoolEventWatcher
+    pw = PoolEventWatcher(interval_seconds=300, enable_diagnostics=False)
+    pw._connected = True
+    now = time.time()
+    pw._last_newhead_event_at = now  # healthy newhead
+    pw._last_logs_event_at = now - pool_watcher._LOGS_IDLE_THRESHOLD_SECONDS - 1.0
+
+    raised: Exception | None = None
+    try:
+        pw._check_force_reconnect_or_raise("wss://test")
+    except ConnectionError as e:
+        raised = e
+    assert isinstance(raised, ConnectionError)
+    assert "logs_idle_stall" in str(raised)
+
+
+def test_check_force_reconnect_or_raise_newhead_idle_fires():
+    """Reverse: newhead silent past threshold, logs may or may not be
+    flowing. newhead_idle is the higher-priority check (more often the
+    canary for total connection death)."""
+    from pancakebot.chain.pool_watcher import PoolEventWatcher
+    pw = PoolEventWatcher(interval_seconds=300, enable_diagnostics=False)
+    pw._connected = True
+    now = time.time()
+    pw._last_newhead_event_at = now - pool_watcher._NEWHEAD_IDLE_THRESHOLD_SECONDS - 1.0
+    pw._last_logs_event_at = now  # logs healthy
+
+    raised: Exception | None = None
+    try:
+        pw._check_force_reconnect_or_raise("wss://test")
+    except ConnectionError as e:
+        raised = e
+    assert isinstance(raised, ConnectionError)
+    assert "newhead_idle_stall" in str(raised)
+
+
+def test_check_force_reconnect_or_raise_priority_engine_first():
+    """When engine flag AND logs idle BOTH fire, engine flag wins.
+    Reason: the engine has more context (it observed pool=0 vs active
+    chain) — its signal is stronger and a reconnect satisfies both."""
+    from pancakebot.chain.pool_watcher import PoolEventWatcher
+    pw = PoolEventWatcher(interval_seconds=300, enable_diagnostics=False)
+    pw._connected = True
+    now = time.time()
+    pw._last_newhead_event_at = now
+    pw._last_logs_event_at = now - pool_watcher._LOGS_IDLE_THRESHOLD_SECONDS - 1.0
+    pw.request_reconnect("pool_zero_chain_active")
+
+    raised: Exception | None = None
+    try:
+        pw._check_force_reconnect_or_raise("wss://test")
+    except ConnectionError as e:
+        raised = e
+    assert isinstance(raised, ConnectionError)
+    assert "engine_request_reconnect" in str(raised)
+
+
 def test_is_pool_ready_recovers_after_reconnect_clears():
     """After reconnect_requested is cleared (recv loop processes it),
     is_pool_ready should return True again -- mimicking the
