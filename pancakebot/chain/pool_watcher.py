@@ -92,12 +92,34 @@ class PoolEventWatcher:
         interval_seconds: int,
         wss_urls: list[str] | None = None,
         contract_address: str = PREDICTION_V2_CONTRACT_ADDRESS,
+        enable_diagnostics: bool = True,
     ) -> None:
         if interval_seconds <= 0:
             raise InvariantError("interval_seconds_nonpositive")
         self._interval_seconds: int = interval_seconds
         self._wss_urls: list[str] = wss_urls if wss_urls is not None else list(BSC_WSS_ENDPOINTS)
         self._contract_addr = contract_address
+
+        # Forensic diagnostics: opt-in (default ON for live/dry runs;
+        # tests construct without diagnostics to keep them lightweight).
+        # See pancakebot/runtime/wss_diagnostics.py.
+        self._diagnostics_enabled: bool = bool(enable_diagnostics)
+        self._raw_wss_logger = None
+        self._sys_stats_poller = None
+        if self._diagnostics_enabled:
+            try:
+                from pancakebot.runtime.wss_diagnostics import (
+                    RawWssLogger, SystemStatsPoller,
+                )
+                self._raw_wss_logger = RawWssLogger()
+                self._sys_stats_poller = SystemStatsPoller()
+            except Exception as e:  # noqa: BLE001
+                warn(
+                    "POOL_WSS", "DIAG", "INIT_FAIL",
+                    msg=f"diagnostics init failed: {type(e).__name__}: {e}",
+                )
+                self._raw_wss_logger = None
+                self._sys_stats_poller = None
 
         self._lock = threading.Lock()
         self._pools: dict[int, _EpochPool] = {}       # epoch -> pool (bounded to 2 entries)
@@ -184,6 +206,37 @@ class PoolEventWatcher:
         """True when no backfill is currently in flight (initial state is True)."""
         return self._backfill_done_event.is_set()
 
+    def is_pool_ready(self) -> tuple[bool, str]:
+        """Return ``(ready, reason)`` for engine-side critical-path gating.
+
+        ``ready=True`` only when ALL of the following hold:
+          - WSS connected with active subscription (``_connected`` set
+            after subscribe handshake).
+          - No backfill in flight (``_backfill_done_event`` set).
+          - No engine-requested reconnect pending (``_reconnect_requested``
+            cleared, meaning the next recv tick will not bubble out).
+
+        ``reason`` is ``""`` when ready; otherwise a short tag identifying
+        the first failing predicate. Tags (matched in priority order):
+          - ``"wss_disconnected"``
+          - ``"backfill_in_progress"``
+          - ``"reconnect_requested"``
+
+        The engine uses this as a precondition gate at critical-path wake;
+        on False it skips the round with a ``pool_not_ready_<tag>`` reason
+        so cycle_audit cleanly distinguishes "we don't have fresh data"
+        (this) from "we read what we had and saw a stale-vs-active-chain
+        violation" (``data_integrity_violation_pool_zero_chain_active``).
+        """
+        with self._lock:
+            if not self._connected:
+                return False, "wss_disconnected"
+            if not self._backfill_done_event.is_set():
+                return False, "backfill_in_progress"
+            if self._reconnect_requested:
+                return False, "reconnect_requested"
+            return True, ""
+
     def request_reconnect(self, reason: str) -> None:
         """Engine-driven reconnect trigger. The current recv-loop iteration
         sees the flag on its next 2-second timeout tick and bubbles out
@@ -234,6 +287,15 @@ class PoolEventWatcher:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
+        # Diagnostics: start the system-stats poller alongside the recv
+        # thread. The raw-frame logger is passive (no thread; recv loop
+        # writes to it inline).
+        if self._sys_stats_poller is not None:
+            try:
+                self._sys_stats_poller.start()
+            except Exception as e:  # noqa: BLE001
+                warn("POOL_WSS", "DIAG", "POLLER_START_FAIL",
+                     msg=f"{type(e).__name__}: {e}")
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="pool-event-watcher",
         )
@@ -247,6 +309,16 @@ class PoolEventWatcher:
             self._thread.join(timeout=10)
             self._thread = None
         self._connected = False
+        if self._sys_stats_poller is not None:
+            try:
+                self._sys_stats_poller.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._raw_wss_logger is not None:
+            try:
+                self._raw_wss_logger.close()
+            except Exception:  # noqa: BLE001
+                pass
         info("POOL_WSS", "STOP", "OK", msg="Pool event watcher stopped")
 
     def get_pool(self, epoch: int, *, max_ts: int) -> tuple[float, float]:
@@ -356,6 +428,24 @@ class PoolEventWatcher:
             self._try_trigger_backfill()
 
     # ------------------------------------------------------------------
+    # Internal: diagnostics passthrough
+    # ------------------------------------------------------------------
+
+    def _diag_log_frame(self, kind: str, raw: str | bytes) -> None:
+        """Forensic raw-frame logger passthrough. Failures swallowed
+        inside the logger; we just dispatch."""
+        if self._raw_wss_logger is None:
+            return
+        if isinstance(raw, bytes):
+            try:
+                payload = raw.decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                payload = repr(raw[:64])
+        else:
+            payload = raw
+        self._raw_wss_logger.log_frame(kind, len(payload), payload)
+
+    # ------------------------------------------------------------------
     # Internal: connection loop
     # ------------------------------------------------------------------
 
@@ -408,8 +498,20 @@ class PoolEventWatcher:
             self._backfill_triggered_this_session = False
             self._backfill_done_event.set()  # nothing pending yet
 
+        # max_size=None disables per-message size limit (default 1 MB,
+        # plenty for our small JSON-RPC payloads but the cap could
+        # mask a future protocol-level abuse; setting None is safer
+        # for a forensic build). max_queue=None disables the
+        # internal-queue cap (default 32) — without this, if recv-loop
+        # processing transiently lags behind incoming frames, the
+        # library applies TCP backpressure and the server may interpret
+        # this as a reason to drop the subscription. Phase 0c spike
+        # observed bursty out-of-order log delivery on drpc.org;
+        # absorbing those bursts without TCP backpressure is the
+        # robust choice. See `var/incident_reports/2026_05_06_phase0_spike_results.md`.
         async with websockets.connect(
             url, ping_interval=30, ping_timeout=10, open_timeout=15,
+            max_size=None, max_queue=None,
         ) as ws:
             # Subscribe to BetBull/BetBear events
             await ws.send(json.dumps({
@@ -420,7 +522,9 @@ class PoolEventWatcher:
                     "topics": [[_BET_BULL_TOPIC, _BET_BEAR_TOPIC]],
                 }],
             }))
-            logs_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            _logs_subscribe_raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            self._diag_log_frame("logs_subscribe_resp", _logs_subscribe_raw)
+            logs_resp = json.loads(_logs_subscribe_raw)
             if "result" not in logs_resp:
                 warn("POOL_WSS", "SUB", "FAIL",
                      msg=f"Logs subscription failed on {url}: {logs_resp}")
@@ -435,7 +539,9 @@ class PoolEventWatcher:
                 "method": "eth_subscribe",
                 "params": ["newHeads"],
             }))
-            heads_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            _heads_subscribe_raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            self._diag_log_frame("heads_subscribe_resp", _heads_subscribe_raw)
+            heads_resp = json.loads(_heads_subscribe_raw)
             if "result" not in heads_resp:
                 warn("POOL_WSS", "SUB", "FAIL",
                      msg=f"newHeads subscription failed on {url}: {heads_resp}")
@@ -537,6 +643,9 @@ class PoolEventWatcher:
 
                 self._last_event_at = time.time()
                 session_events += 1
+                # Forensic: raw-frame log BEFORE parse so even malformed
+                # payloads are recorded for post-mortem.
+                self._diag_log_frame("recv", raw)
 
                 msg = json.loads(raw)
                 params = msg.get("params", {})
@@ -755,7 +864,10 @@ class PoolEventWatcher:
                 # noinspection PyBroadException
                 try:
                     results = self._rpc_batch(rpc, calls)
-                except Exception:
+                except Exception as e:
+                    warn("POOL_WSS", "BKFILL", "BLOCK_FETCH_FAIL",
+                         msg=f"{type(e).__name__}: {e} "
+                             f"(batch_blocks={len(batch_bns)})")
                     blocks_failed += len(batch_bns)
                     continue
 
@@ -791,7 +903,10 @@ class PoolEventWatcher:
                     # noinspection PyBroadException
                     try:
                         rcpt_results = self._rpc_batch(rpc, rcpt_calls)
-                    except Exception:
+                    except Exception as e:
+                        warn("POOL_WSS", "BKFILL", "RCPT_FETCH_FAIL",
+                             msg=f"{type(e).__name__}: {e} "
+                                 f"(receipts={len(rcpt_calls)})")
                         receipt_fails += len(rcpt_calls)
                         continue
 
