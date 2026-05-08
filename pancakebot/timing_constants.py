@@ -202,6 +202,20 @@ RPC_BLOCK_AVAILABILITY_DELAY_P99_MS: int = 600
 # same cap simplifies the implementation).
 RPC_BATCH_BLOCK_RECEIPTS_LIMIT: int = 20
 
+# Per-request HTTP timeout for batched JSON-RPC (eth_getBlockReceipts +
+# eth_getBlockByNumber bundles, batch_size <= RPC_BATCH_BLOCK_RECEIPTS_LIMIT).
+# 5s detects unreachable-endpoint scenarios fast while staying well above
+# the empirical p99 single-batch RTT (RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE:
+# batch=20 -> 1533ms). Was 30s; reduced 2026-05-08 after a publicnode
+# outage where 30s hangs grew the catch-up backlog by ~60 blocks per
+# failed poll.
+RPC_HTTP_BATCH_TIMEOUT_SECONDS: int = 5
+
+# Per-request HTTP timeout for single (non-batched) RPC calls
+# (eth_blockNumber, eth_getBlockByNumber). Smaller request, same 5s
+# timeout for consistency.
+RPC_HTTP_SINGLE_TIMEOUT_SECONDS: int = 5
+
 # Periodic poll cadence during the round. Literal, throughput-oriented:
 # round is 300s; 30s cadence gives ~10 polls per round.
 RPC_PERIODIC_POLL_INTERVAL_SECONDS: int = 30
@@ -211,8 +225,11 @@ RPC_PERIODIC_POLL_INTERVAL_SECONDS: int = 30
 RPC_POLL_FINAL_SAFETY_BUFFER_MS: int = 200
 
 # Per-poll deadline cushion — if a poll's RTT exceeds (next_wake_offset
-# - this), the poll is marked stale and the critical-path skips with
-# pool_not_ready_last_poll_too_slow. Engineering judgment.
+# - this), the poll is marked stale (logged, _last_poll_too_slow=True
+# for diagnostics). The critical-path readiness gate no longer skips
+# on this alone; the round-aware feasibility check
+# (pool_not_ready_catchup_infeasible_for_round) is the canonical
+# integrating signal. Engineering judgment.
 RPC_POLL_DEADLINE_SAFETY_BUFFER_MS: int = 200
 
 # Expected batch sizes used to derive the deadline-driven wake offsets.

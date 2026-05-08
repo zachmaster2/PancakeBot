@@ -479,8 +479,10 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # toward the critical_path snapshot. Fires at lock_at -
         # ramp_poll_1_wakeup_offset_ms (= ~6.616s before lock). Catches
         # blocks since the last periodic poll. deadline_ms = gap to
-        # ramp_2 - safety; the poll completes in time or marks
-        # last_poll_too_slow for the next is_pool_ready() check.
+        # ramp_2 - safety; on RTT-exceeds-deadline the poll marks
+        # _last_poll_too_slow=True for diagnostics, but is_pool_ready()
+        # only returns False when the round-aware feasibility check
+        # has flagged the round.
         if cfg.rpc_poller is not None:
             ramp_poll_1_wake_ts = (
                 lock_ts_t - cfg.ramp_poll_1_wakeup_offset_ms / 1000.0
@@ -629,11 +631,15 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         pool_bull_bnb = 0.0
         pool_bear_bnb = 0.0
         if cfg.rpc_poller is not None:
-            # Unified readiness gate: covers cold_start_in_progress,
-            # last_poll_failed, last_poll_too_slow. Anything that means
-            # "we don't have fresh polled data" maps to a skip with
-            # pool_not_ready_<reason>. bankroll_bnb was already resolved
-            # at the bankroll wake -- reuse for audit on the skip path.
+            # Unified readiness gate. Skip reasons:
+            # - cold_start_in_progress
+            # - catchup_infeasible_for_round (the integrating signal:
+            #   given current cursor, RTT estimates, and time-until-lock,
+            #   math says we cannot catch up in time)
+            # Single-poll failures and slow polls do NOT trigger skips —
+            # they're informational and the next poll might recover.
+            # bankroll_bnb was already resolved at the bankroll wake;
+            # reuse for audit on the skip path.
             ready, ready_reason = cfg.rpc_poller.is_pool_ready(current_epoch)
             if not ready:
                 skip_reason = f"pool_not_ready_{ready_reason}"

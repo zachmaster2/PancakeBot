@@ -783,8 +783,9 @@ def load_app_config(path: str) -> AppConfig:
     # receipt fetch RTT + safety) before the critical_path_wake reads
     # the pool snapshot. Without this gate, a too-small pool_cutoff
     # would push final_rpc_poll_wakeup_offset_ms below
-    # critical_path_wakeup_offset_ms and the engine would skip every
-    # round with pool_not_ready_last_poll_too_slow.
+    # critical_path_wakeup_offset_ms and rounds would systematically
+    # be skipped with pool_not_ready_catchup_infeasible_for_round
+    # (the feasibility check would never have time to clear).
     if final_rpc_poll_wakeup_offset_ms <= (
         critical_path_wakeup_offset_ms + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
     ):
