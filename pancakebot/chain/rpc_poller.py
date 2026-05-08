@@ -539,23 +539,50 @@ class RpcPoller:
             self._poll_lock.release()
 
     def _fetch_and_process_blocks(self, block_numbers: list[int]) -> None:
-        """Fetch eth_getBlockReceipts for each block_number in a single
-        batched HTTP request, then process bet events from the
-        receipts."""
+        """Fetch eth_getBlockReceipts AND eth_getBlockByNumber (header
+        only, full_txs=False) for each block in a SINGLE batched HTTP
+        request, then process bet events + cache block timestamps.
+
+        Why bundle the header fetch into the same batch (Era 11 fix):
+        eth_getBlockReceipts does NOT include block.timestamp in its
+        response, but the engine needs block_ts to filter the pool
+        aggregate by pool_cutoff_seconds. The first implementation
+        called eth_getBlockByNumber lazily as a separate single HTTP
+        call PER BLOCK, which added ~150ms per block (= ~3000ms for a
+        20-block batch on top of the actual receipts batch). Bundling
+        both calls into the same batched JSON-RPC array means a single
+        HTTP roundtrip per batch covers both.
+        """
         if not block_numbers:
             return
-        # batched JSON-RPC: each id corresponds to one block
-        calls = [
-            ("eth_getBlockReceipts", [hex(bn)])
-            for bn in block_numbers
-        ]
+        # Each block contributes TWO sub-calls: receipts + header.
+        # Sub-call layout: [recv(0), hdr(0), recv(1), hdr(1), ...].
+        calls: list[tuple[str, list]] = []
+        for bn in block_numbers:
+            calls.append(("eth_getBlockReceipts", [hex(bn)]))
+            calls.append(("eth_getBlockByNumber", [hex(bn), False]))
         results = self._rpc_batch(calls)
         if len(results) != len(calls):
             raise InvariantError(
                 f"rpc_batch_length_mismatch: expected={len(calls)} got={len(results)}"
             )
-        for bn, (receipts, err) in zip(block_numbers, results):
-            if err is not None:
+        for i, bn in enumerate(block_numbers):
+            receipts, recv_err = results[2 * i]
+            header, hdr_err = results[2 * i + 1]
+            # Cache block timestamp first; needed by _process_receipts
+            # so newly-stored bets have non-zero block_ts at insert time
+            # (avoids the lazy-resolve path inside get_pool).
+            if hdr_err is None and isinstance(header, dict):
+                ts_hex = header.get("timestamp")
+                if isinstance(ts_hex, str):
+                    try:
+                        ts = int(ts_hex, 16)
+                    except ValueError:
+                        ts = 0
+                    if ts > 0:
+                        with self._lock:
+                            self._block_ts[bn] = ts
+            if recv_err is not None:
                 # Single-block error: skip; the next periodic/ramp poll
                 # will retry. Don't raise here because the rest of the
                 # batch might be valid.
@@ -615,31 +642,11 @@ class RpcPoller:
                     ))
                     self._total_events += 1
 
-        # Block timestamp: prefer block.timestamp from any receipt's
-        # parent block; if not present, leave 0 and the next get_pool
-        # call will lazy-resolve from a future block fetch. For
-        # eth_getBlockReceipts the block timestamp is NOT included in
-        # the response — we'd need a separate eth_getBlockByNumber.
-        # That's an O(blocks) extra RPC; defer. For now, lazy-resolve
-        # via cached timestamps from periodic block-header fetches in
-        # _maybe_resolve_block_ts.
-        if block_number not in self._block_ts:
-            self._maybe_resolve_block_ts(block_number)
-
-    def _maybe_resolve_block_ts(self, block_number: int) -> None:
-        """Best-effort: fetch eth_getBlockByNumber(False) for a single
-        block to extract its timestamp. Errors are silent (the
-        timestamp will be lazy-resolved on next poll if missing)."""
-        # Lightweight single call (not batched) to keep this off the
-        # batched-poll critical path.
-        try:
-            blk = self._rpc_call_single("eth_getBlockByNumber", [hex(block_number), False])
-            if isinstance(blk, dict) and "timestamp" in blk:
-                ts = int(blk["timestamp"], 16)
-                with self._lock:
-                    self._block_ts[block_number] = ts
-        except Exception:  # noqa: BLE001
-            return
+        # Block timestamp is cached by _fetch_and_process_blocks BEFORE
+        # this call (the batched RPC includes eth_getBlockByNumber for
+        # every block alongside eth_getBlockReceipts). No per-block
+        # follow-up fetch needed; the get_pool() lazy-resolve path is
+        # the safety net for any block that wasn't in a batch.
 
     # ------------------------------------------------------------------
     # Internal: HTTP RPC helpers (single + batched)
