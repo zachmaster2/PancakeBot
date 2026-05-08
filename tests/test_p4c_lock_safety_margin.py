@@ -8,8 +8,9 @@ tests:
    constants (regression: catch accidental constant edits).
 2. Cross-validations fire when the kline-fetch wake offset exceeds
    `kline_cutoff_seconds * 1000 - OKX_KLINE_PUBLISH_DELAY_P95_MS`
-   or the pool-read wake offset exceeds
-   `pool_cutoff_seconds * 1000 - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS`.
+   or the derived final-RPC-poll offset doesn't leave room for the
+   RPC roundtrip + safety before the critical-path wake (Era 11
+   replacement for the WSS-arrival cross-validation).
    The cutoffs are fixed by strategy; the wake offsets must fit.
 3. Inclusion-math chain remains satisfied at the locked constants
    (median fetch lands block before lock_ts).
@@ -191,23 +192,27 @@ def test_p95_le_p99_invariant_holds():
     assert tc.OKX_KLINE_PUBLISH_DELAY_P95_MS <= tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
 
 
-def test_pool_read_wakeup_exceeds_cutoff_arrival_budget_rejected(tmp_path):
-    """critical_path_wakeup > pool_cutoff*1000 - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS must raise.
+def test_pool_cutoff_too_small_for_rpc_completion_rejected(tmp_path):
+    """final_rpc_poll_offset <= critical_path_offset + safety must raise.
 
-    The pool snapshot fires at the START of the critical path
-    (lock - critical_path_wakeup_offset_ms). With pool_cutoff=4
-    (=4000ms) and WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS=3500, the budget
-    is 4000 - 3500 = 500ms but critical_path_wakeup_offset=1095ms.
-    1095 > 500 -> fires.
+    Era 11 (2026-05-07) replaced the WSS-arrival cross-validation with
+    an RPC-completion gate. final_rpc_poll_offset is derived from
+    pool_cutoff_seconds; if pool_cutoff is too small, the derived
+    final-poll offset doesn't leave time for the RPC roundtrip + safety
+    before the critical-path wake reads the pool snapshot.
+
+    At pool_cutoff=2 (=2000ms): final_offset = 2000 - 500 - 600 - 910
+    - 200 = -210ms; critical_path+safety = 1095 + 200 = 1295ms. -210
+    <= 1295 -> InvariantError fires.
     """
-    extra = "pool_cutoff_seconds = 4"
+    extra = "pool_cutoff_seconds = 2"
     raised: Exception | None = None
     try:
         load_app_config(str(_write_cfg(tmp_path, extra=extra)))
     except InvariantError as e:
         raised = e
     assert isinstance(raised, InvariantError)
-    assert "config_pool_read_wakeup_exceeds_cutoff_arrival_budget" in str(raised)
+    assert "config_pool_cutoff_too_small_for_rpc_completion" in str(raised)
 
 
 def test_pool_cutoff_default_is_6(tmp_path):

@@ -24,6 +24,18 @@ Derivation chain (computed at config-load time in ``pancakebot/config.py``):
                                       + OKX_KLINE_FETCH_RTT_P95_MS
                                       + SIGNAL_COMPUTE_TIME_MS
                                       + POOL_READ_TIME_MS)
+    final_rpc_poll_wakeup_offset_ms = (
+        pool_cutoff_seconds * 1000
+        - BSC_BLOCK_TIME_MS
+        - RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
+        - rpc_rtt_p99_for_batch(EXPECTED_FINAL_POLL_BATCH_SIZE)
+        - RPC_POLL_FINAL_SAFETY_BUFFER_MS)
+    ramp_poll_2_wakeup_offset_ms   = (final_rpc_poll_wakeup_offset_ms
+                                      + rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_2_BATCH_SIZE)
+                                      + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS)
+    ramp_poll_1_wakeup_offset_ms   = (ramp_poll_2_wakeup_offset_ms
+                                      + rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_1_BATCH_SIZE)
+                                      + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS)
     bankroll_wakeup_offset_ms      = (critical_path_wakeup_offset_ms
                                       + BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS)
     ntp_sync_wakeup_offset_ms      = (bankroll_wakeup_offset_ms
@@ -61,11 +73,13 @@ must fit within the cutoff windows.
         published by then; rare publish-delay tail misses are
         absorbed by the streak counter)
 
-    critical_path_wakeup_offset_ms <= (pool_cutoff_seconds * 1000
-                                       - WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS)
-        (the pool snapshot fires at the START of the critical path,
-        i.e. at lock - critical_path_wakeup_offset_ms; the cutoff bet
-        event has typically arrived via WSS by then)
+    final_rpc_poll_wakeup_offset_ms > (
+        critical_path_wakeup_offset_ms
+        + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS)
+        (the final RPC poll must fire AND complete before the
+        critical-path wake reads the pool snapshot; pool_cutoff_seconds
+        too small for the RPC chain raises InvariantError at config
+        load)
 """
 from __future__ import annotations
 
@@ -146,17 +160,91 @@ BSC_BLOCK_TIME_MS: int = 500
 BSC_BET_SUBMIT_RTT_P95_MS: int = 200
 
 
-# --- WSS subscriber timing ------------------------------------------------
-
-# Time between a BSC block being mined (= block.timestamp) and the
-# corresponding BetBull/BetBear event being received by our WSS
-# subscriber. Per-event p99 over the 30-min sample window.
+# --- RPC poll timing (Era 11: 2026-05-07 pivot) ---------------------------
 #
-# Source: research/p4c_wss_arrival_probe.py n=219 events over 30min,
-#         2026-05-03. p50=1041ms, p90=1723, p95=1777, p99=3106,
-#         p99.9=3834.
-# Last measured: 2026-05-03
-WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS: int = 3500  # p99=3106 + ~400ms buffer
+# Replaces the WSS-subscription pool watcher with deterministic
+# batched-RPC polling. WSS arrival timing is no longer relevant on the
+# decision path; the pool aggregate is built from periodic + ramp +
+# final polls of `eth_getBlockReceipts(blockHash)` over HTTP. See
+# var/design/rpc_polling_architecture_2026_05_07.md for the full
+# architecture and var/incident_reports/2026_05_07_rpc_polling_spike_results.md
+# for the empirical provenance.
+
+# Per-batch p99 round-trip time, indexed by batch size. The wake
+# offsets look up this table by EXPECTED_*_BATCH_SIZE constants below.
+#
+# Source: research/probe_rpc_polling.py n=50 per size, 2026-05-07.
+# publicnode only (drpc.org rejects batched JSON-RPC arrays with
+# HTTP 500 at every tested size). size=15's raw measurement was
+# 2285ms but came from 50-sample p99-as-max noise; the monotonic
+# interpolation 1213ms (between sz=10 at 910 and sz=20 at 1533) is
+# the correct provisioning value.
+RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE: dict[int, int] = {
+    2: 421,
+    5: 771,
+    10: 910,
+    15: 1213,   # interpolated (raw 2285ms was small-sample outlier)
+    20: 1533,
+}
+
+# Block availability delay — newhead arrival to first successful
+# eth_getBlockReceipts(block_hash). drpc.org p99 596ms, publicnode
+# p99 436ms (n=133 each, 2026-05-07). Lock 600ms = drpc.org worst-case
+# + small buffer to absorb either endpoint.
+#
+# Source: research/probe_rpc_polling.py n=133 per endpoint, 2026-05-07.
+RPC_BLOCK_AVAILABILITY_DELAY_P99_MS: int = 600
+
+# Hard cap on batch size. publicnode tested up to 100 (p50 3092ms;
+# unusable for deadline path) and 200 (response-too-large rejection).
+# 20 is the operating cap for both deadline-driven polls and cold-start
+# (a larger batch is fine for cold-start latency-wise but giving it the
+# same cap simplifies the implementation).
+RPC_BATCH_BLOCK_RECEIPTS_LIMIT: int = 20
+
+# Periodic poll cadence during the round. Literal, throughput-oriented:
+# round is 300s; 30s cadence gives ~10 polls per round.
+RPC_PERIODIC_POLL_INTERVAL_SECONDS: int = 30
+
+# Final-poll wake derivation safety cushion (cross-RPC variance the
+# spike didn't capture, etc.). Engineering judgment.
+RPC_POLL_FINAL_SAFETY_BUFFER_MS: int = 200
+
+# Per-poll deadline cushion — if a poll's RTT exceeds (next_wake_offset
+# - this), the poll is marked stale and the critical-path skips with
+# pool_not_ready_last_poll_too_slow. Engineering judgment.
+RPC_POLL_DEADLINE_SAFETY_BUFFER_MS: int = 200
+
+# Expected batch sizes used to derive the deadline-driven wake offsets.
+# Runtime batches are dynamic (= blocks since last poll); the schedule
+# arithmetic uses the expected sizes for offset provisioning.
+EXPECTED_FINAL_POLL_BATCH_SIZE: int = 10
+# ramp_2 expected batch size = 15 (measured key in the RTT curve;
+# rounding up from the conceptual ~12 blocks since ramp_1 keeps the
+# RTT lookup honest — interpolating between two measured points would
+# be a measurement gap).
+EXPECTED_RAMP_POLL_2_BATCH_SIZE: int = 15
+EXPECTED_RAMP_POLL_1_BATCH_SIZE: int = 15
+
+
+def rpc_rtt_p99_for_batch(batch_size: int) -> int:
+    """Return P99 RTT for a batch of size <= batch_size, using the
+    closest ceiling key in RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE.
+
+    For sizes above the largest measured key, returns the largest key's
+    RTT. The wake derivation uses EXPECTED_*_BATCH_SIZE constants which
+    are all <= 20, so this fallback is informational; if it ever fires,
+    the calling code is provisioning a batch above the measured range
+    and should be re-checked.
+    """
+    if batch_size <= 0:
+        return 0
+    table = RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE
+    keys = sorted(table.keys())
+    for k in keys:
+        if batch_size <= k:
+            return table[k]
+    return table[keys[-1]]
 
 
 # --- NTP clock sync -------------------------------------------------------

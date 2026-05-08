@@ -193,7 +193,10 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
             f"timing config: kline_cutoff={cfg.cutoff_seconds}s "
             f"pool_cutoff={cfg.pool_cutoff_seconds}s "
             f"ntp_sync_wakeup={cfg.ntp_sync_wakeup_offset_ms}ms "
+            f"ramp_poll_1_wakeup={cfg.ramp_poll_1_wakeup_offset_ms}ms "
             f"bankroll_wakeup={cfg.bankroll_wakeup_offset_ms}ms "
+            f"ramp_poll_2_wakeup={cfg.ramp_poll_2_wakeup_offset_ms}ms "
+            f"final_rpc_poll_wakeup={cfg.final_rpc_poll_wakeup_offset_ms}ms "
             f"critical_path_wakeup={cfg.critical_path_wakeup_offset_ms}ms "
             f"bet_submit_deadline={cfg.bet_submit_deadline_offset_ms}ms "
             f"bet_tx_receipt_timeout={cfg.bet_tx_receipt_timeout_seconds}s "
@@ -331,12 +334,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             last_epoch=current_epoch,
         )
 
-        # Sync round-phase state into pool_watcher immediately after handshake.
-        # This triggers the initial backfill within seconds of WSS subscription
-        # rather than after the prefetch sleep, giving the first cycle accurate
-        # pool data without delay.
-        if cfg.pool_watcher is not None:
-            cfg.pool_watcher.set_round_phase(
+        # Sync round-phase state into rpc_poller immediately after handshake.
+        # On the first call this triggers the cold-start backfill (synchronous;
+        # blocks until done) so the first round has full pool data before any
+        # decisions are made.
+        if cfg.rpc_poller is not None:
+            cfg.rpc_poller.set_round_phase(
                 current_epoch=current_epoch,
                 lock_at=int(_open_round.lock_at),
             )
@@ -468,15 +471,37 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
+        # -- Ramp poll #1 (Era 11) --
+        # First of three RPC polls that ramp the local pool aggregate
+        # toward the critical_path snapshot. Fires at lock_at -
+        # ramp_poll_1_wakeup_offset_ms (= ~6.616s before lock). Catches
+        # blocks since the last periodic poll. deadline_ms = gap to
+        # ramp_2 - safety; the poll completes in time or marks
+        # last_poll_too_slow for the next is_pool_ready() check.
+        if cfg.rpc_poller is not None:
+            ramp_poll_1_wake_ts = (
+                lock_ts_t - cfg.ramp_poll_1_wakeup_offset_ms / 1000.0
+            )
+            _sleep_until_ts(
+                ramp_poll_1_wake_ts,
+                reason="wait_for_ramp_poll_1",
+                epoch=current_epoch,
+            )
+            ramp_1_deadline_ms = max(
+                0,
+                cfg.ramp_poll_1_wakeup_offset_ms
+                - cfg.ramp_poll_2_wakeup_offset_ms
+                - 200,  # safety
+            )
+            cfg.rpc_poller.poll_ramp(deadline_ms=ramp_1_deadline_ms)
+
         # -- Bankroll wake --
-        # Second of three pre-lock wakes. Fires at lock_at -
-        # bankroll_wakeup_offset_ms (= ~6.095s before lock). Refreshes
-        # wallet balance so risk gates + decide_open_round see fresh
-        # truth. Live mode does a BSC RPC call (~50-200ms p99); dry
-        # mode reads in-memory simulated bankroll (sub-ms). Generously
-        # off the critical path: 5000ms wake budget. On live RPC error,
-        # SKIP the iteration with risk_bankroll_stale rather than betting
-        # on stale value.
+        # Refreshes wallet balance so risk gates + decide_open_round
+        # see fresh truth. Live mode does a BSC RPC call (~50-200ms
+        # p99); dry mode reads in-memory simulated bankroll (sub-ms).
+        # Generously off the critical path: 5000ms wake budget. On
+        # live RPC error, SKIP the iteration with risk_bankroll_stale
+        # rather than betting on stale value.
         bankroll_wake_ts = lock_ts_t - cfg.bankroll_wakeup_offset_ms / 1000.0
         _sleep_until_ts(
             bankroll_wake_ts,
@@ -535,8 +560,52 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     start_at=int(open_round.start_at),
                 )
 
+        # -- Ramp poll #2 (Era 11) --
+        # Second RPC poll. Fires at lock_at -
+        # ramp_poll_2_wakeup_offset_ms (= ~5.203s before lock). Bridges
+        # ramp_1 -> final. deadline_ms = gap to final_poll - safety.
+        if cfg.rpc_poller is not None:
+            ramp_poll_2_wake_ts = (
+                lock_ts_t - cfg.ramp_poll_2_wakeup_offset_ms / 1000.0
+            )
+            _sleep_until_ts(
+                ramp_poll_2_wake_ts,
+                reason="wait_for_ramp_poll_2",
+                epoch=current_epoch,
+            )
+            ramp_2_deadline_ms = max(
+                0,
+                cfg.ramp_poll_2_wakeup_offset_ms
+                - cfg.final_rpc_poll_wakeup_offset_ms
+                - 200,  # safety
+            )
+            cfg.rpc_poller.poll_ramp(deadline_ms=ramp_2_deadline_ms)
+
+        # -- Final RPC poll (Era 11) --
+        # Last RPC poll before critical_path reads the pool snapshot.
+        # Fires at lock_at - final_rpc_poll_wakeup_offset_ms (= ~3.79s
+        # before lock). Catches blocks since ramp_2. deadline_ms = gap
+        # to critical_path - safety. Same skip-on-too-slow contract as
+        # ramp polls.
+        if cfg.rpc_poller is not None:
+            final_rpc_poll_wake_ts = (
+                lock_ts_t - cfg.final_rpc_poll_wakeup_offset_ms / 1000.0
+            )
+            _sleep_until_ts(
+                final_rpc_poll_wake_ts,
+                reason="wait_for_final_rpc_poll",
+                epoch=current_epoch,
+            )
+            final_deadline_ms = max(
+                0,
+                cfg.final_rpc_poll_wakeup_offset_ms
+                - cfg.critical_path_wakeup_offset_ms
+                - 200,  # safety
+            )
+            cfg.rpc_poller.poll_final(deadline_ms=final_deadline_ms)
+
         # -- Critical-path wake --
-        # Third (and final) pre-lock scheduled wake. Fires at lock_at -
+        # Last pre-lock scheduled wake. Fires at lock_at -
         # critical_path_wakeup_offset_ms (= ~1.095s before lock at
         # canonical timing constants). Inside the wake the engine
         # sequences: pool snapshot (in-memory, ~5ms) -> kline fetch +
@@ -552,23 +621,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             epoch=current_epoch,
         )
 
-        # Pool data from WSS subscription (no RPC needed, ~0 ms).
+        # Pool data from RPC poller's local store (Era 11; no RPC needed
+        # at this point, the polls already fetched the data).
         pool_bull_bnb = 0.0
         pool_bear_bnb = 0.0
-        if cfg.pool_watcher is not None:
-            # Unified readiness gate: covers wss_disconnected,
-            # backfill_in_progress, and reconnect_requested in one
-            # check. The watcher's predicate is the canonical source of
-            # truth for "is the pool data fresh and trustworthy right
-            # now"; the engine just gates on its result. bankroll_bnb
-            # was already resolved at the bankroll wake -- reuse it for
-            # audit on the skip path.
-            ready, ready_reason = cfg.pool_watcher.is_pool_ready()
+        if cfg.rpc_poller is not None:
+            # Unified readiness gate: covers cold_start_in_progress,
+            # last_poll_failed, last_poll_too_slow. Anything that means
+            # "we don't have fresh polled data" maps to a skip with
+            # pool_not_ready_<reason>. bankroll_bnb was already resolved
+            # at the bankroll wake -- reuse for audit on the skip path.
+            ready, ready_reason = cfg.rpc_poller.is_pool_ready(current_epoch)
             if not ready:
                 skip_reason = f"pool_not_ready_{ready_reason}"
-                warn("POOL_WSS", "READY", "SKIP",
+                warn("RPC_POLL", "READY", "SKIP",
                      msg=f"Skip epoch {current_epoch}: {skip_reason}",
-                     endpoint=cfg.pool_watcher.current_endpoint)
+                     endpoint=cfg.rpc_poller.current_endpoint)
                 _record_dry_cycle_audit(
                     cfg,
                     closed,
@@ -589,75 +657,20 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
             pool_ts_cutoff = lock_ts_t - cfg.pool_cutoff_seconds
-            pool_bull_bnb, pool_bear_bnb = cfg.pool_watcher.get_pool(
+            pool_bull_bnb, pool_bear_bnb = cfg.rpc_poller.get_pool(
                 epoch=current_epoch, max_ts=pool_ts_cutoff,
             )
             pool_total = pool_bull_bnb + pool_bear_bnb
             if pool_total > 0:
-                info("POOL_WSS", "ROUND", "DATA",
+                info("RPC_POLL", "ROUND", "DATA",
                      epoch=current_epoch, pool_bnb=f"{pool_total:.4f}",
-                     endpoint=cfg.pool_watcher.current_endpoint)
-            else:
-                # Data-integrity check (Investigation B fix, 2026-05-05).
-                # Pool=0 at lock-6s on a connected, backfill-done watcher
-                # is essentially always a WSS silent-stall: PancakeSwap
-                # rounds normally accumulate ~10-30 bets in the 5-minute
-                # bet window. If WSS observed nothing but the chain has
-                # the round open, the watcher is missing events.
-                #
-                # Skip with an EXPLICIT reason so the operator sees the
-                # data-availability issue in cycle_audit, not a misleading
-                # `gate_no_signal` or `pool_below_minimum`. Pair with the
-                # idle-stall reconnect in pool_watcher (~8s threshold);
-                # this invariant catches anything the idle check missed
-                # OR fires before the idle check has had time to
-                # reconnect-and-backfill.
-                #
-                # Future Option B: RPC fallback to chain truth via
-                # contract.round_data(). Deferred -- adds 50-200ms to
-                # critical path; the explicit skip is the minimum-change
-                # operator-visibility win.
-                warn(
-                    "POOL_WSS", "INTEG", "VIOLATION",
-                    msg=(
-                        f"Skip epoch {current_epoch}: "
-                        f"data_integrity_violation_pool_zero_chain_active "
-                        f"(WSS pool=0/0 at lock-{cfg.pool_cutoff_seconds}s; "
-                        f"connected=True backfill_done=True endpoint="
-                        f"{cfg.pool_watcher.current_endpoint})"
-                    ),
-                )
-                # Tell the watcher to cycle endpoints next session-loop
-                # iteration. This catches publicnode-style silent logs-
-                # subscription drops one round earlier than the watcher's
-                # own _LOGS_IDLE_THRESHOLD_SECONDS (10 min) would. See
-                # var/incident_reports/2026_05_06_wss_silent_stall_root_cause.md
-                # for the smoking-gun trace.
-                cfg.pool_watcher.request_reconnect(
-                    "pool_zero_chain_active"
-                )
-                _record_dry_cycle_audit(
-                    cfg,
-                    closed,
-                    current_epoch=current_epoch,
-                    locked_epoch=locked_epoch,
-                    lock_ts=lock_ts_t,
-                    cutoff_ts=cutoff_ts_t,
-                    locked_price_bnbusd=bnbusd_price,
-                    action="SKIP",
-                    decision_stage="pipeline",
-                    open_round=open_round,
-                    bankroll_before_action_bnb=bankroll_bnb,
-                    bankroll_after_action_bnb=bankroll_bnb,
-                    skip_reason="data_integrity_violation_pool_zero_chain_active",
-                )
-                info("RUN", "ACT", "SKIP",
-                     msg=(
-                         f"Skip epoch {current_epoch}: "
-                         f"data_integrity_violation_pool_zero_chain_active"
-                     ))
-                _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
-                return
+                     endpoint=cfg.rpc_poller.current_endpoint)
+            # Note: the prior pool=0 + chain_active "data integrity
+            # violation" check is GONE in Era 11. With deterministic
+            # polling, pool=0 just means the round genuinely had no
+            # bets above the filter at cutoff time; it's no longer a
+            # silent-stall signal. The strategy's gate handles
+            # zero-pool rounds via min_pool_bnb.
 
         # Step 8: Decide. Gate fires 3 parallel OKX /history-candles
         # GETs (BTC/ETH/SOL; BNB disabled, see MomentumGate._SYMBOLS_FETCHED)
