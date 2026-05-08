@@ -1,4 +1,4 @@
-"""RuntimeConfig dataclass binding the round store, contract, gate, pool watcher, and runtime knobs."""
+"""RuntimeConfig dataclass binding the round store, contract, gate, RPC poller, and runtime knobs."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pancakebot.config import StrategyConfig
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.chain.prediction_contract import Web3PredictionContract
 from pancakebot.strategy.momentum_gate import MomentumGate
-from pancakebot.chain.pool_watcher import PoolEventWatcher
+from pancakebot.chain.rpc_poller import RpcPoller
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,28 +32,25 @@ class RuntimeConfig:
     # Pre-lock wake schedule (all DERIVED from pancakebot/timing_constants.py
     # at config load; not user-tunable). All in milliseconds before lock_at.
     #
-    #   ntp_sync_wakeup_offset_ms       >  bankroll_wakeup_offset_ms
-    #                                   >  critical_path_wakeup_offset_ms
-    #                                   >  bet_submit_deadline_offset_ms
+    # Chronological order (lock - X ms; bigger X = earlier in the round):
+    #   ntp_sync       (lock - 11.095s)
+    #   ramp_poll_1    (lock -  6.616s)   <-- NEW (Era 11 RPC poll)
+    #   bankroll       (lock -  6.095s)
+    #   ramp_poll_2    (lock -  5.203s)   <-- NEW (Era 11 RPC poll)
+    #   final_rpc_poll (lock -  3.790s)   <-- NEW (Era 11 RPC poll)
+    #   critical_path  (lock -  1.095s)
+    #   bet_submit     (lock -  0.750s)   <-- timing-guard deadline
     #
-    # Engine fires three distinct _sleep_until_ts wakes per round:
-    # ntp_sync -> bankroll -> critical_path. Timing guard fires at
-    # ``lock_at - bet_submit_deadline_offset_ms``.
-    #
-    # The ntp_sync_wake forces a fresh NTP query; the bankroll_wake
-    # refreshes wallet balance (live: BSC RPC; dry: in-memory). Both
-    # land WELL before the critical path -- 5 second gaps deliberately
-    # generous against environmental drift.
-    #
-    # The critical_path_wake is the SINGLE entry point for the
-    # bet-decision sequence. Inside the wake the engine sequences:
-    # pool snapshot (~5ms in-memory) -> kline gate.evaluate() (~340ms
-    # parallel REST + signal compute) -> bet submit (~700ms BSC RTT
-    # + block budget). Prior architecture used a separate pool_read
-    # wake 5ms ahead of kline_fetch wake; that 5ms gap was sequential
-    # operation time, not a scheduled event, and is now correctly
-    # absorbed inside the critical_path wake.
+    # ntp_sync_wake forces a fresh NTP query.
+    # bankroll_wake refreshes wallet balance (live: BSC RPC; dry: in-memory).
+    # ramp + final RPC polls catch up bet events from BSC via batched
+    #   eth_getBlockReceipts so the critical_path snapshot is fresh.
+    # critical_path_wake reads the local pool aggregate, runs the gate,
+    #   and submits the bet.
     ntp_sync_wakeup_offset_ms: int
+    ramp_poll_1_wakeup_offset_ms: int
+    ramp_poll_2_wakeup_offset_ms: int
+    final_rpc_poll_wakeup_offset_ms: int
     bankroll_wakeup_offset_ms: int
     critical_path_wakeup_offset_ms: int
     bet_submit_deadline_offset_ms: int
@@ -83,8 +80,9 @@ class RuntimeConfig:
 
     # User-tunable. Pool cutoff: only bets with on-chain block_timestamp
     # < lock_at - pool_cutoff_seconds are counted in the pool aggregate.
-    # Cross-validated at config load to be >= pool_read_wakeup_offset_ms
-    # + WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS.
+    # Cross-validated at config load to leave room for RPC-poll
+    # completion (block availability + batched receipt fetch RTT +
+    # safety) before the critical_path_wake reads the pool snapshot.
     pool_cutoff_seconds: int
 
     # Protocol constants (from chain via contract_constants.json)
@@ -111,5 +109,9 @@ class RuntimeConfig:
     # Strategy config (10 knobs; loaded from config.toml [strategy.*] sections)
     strategy: StrategyConfig
 
-    # Pool event watcher: accumulates BetBull/BetBear events for accurate pools
-    pool_watcher: PoolEventWatcher | None = None
+    # RPC poller: periodic + ramp + final batched-RPC polls of
+    # PredictionV2 BetBull/BetBear events. Era 11 (2026-05-07) replaced
+    # the WSS-subscription PoolEventWatcher with this deterministic
+    # poll model. Same get_pool / set_round_phase / is_pool_ready
+    # interface so the engine call sites are minimally affected.
+    rpc_poller: RpcPoller | None = None

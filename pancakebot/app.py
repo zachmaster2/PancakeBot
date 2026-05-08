@@ -26,7 +26,7 @@ from pancakebot.runtime import engine
 from pancakebot.market_data.sync import sync_runtime_market_data
 from pancakebot.util import InvariantError
 from pancakebot.log import info
-from pancakebot.chain.pool_watcher import PoolEventWatcher
+from pancakebot.chain.rpc_poller import RpcPoller
 from pancakebot import paths
 
 
@@ -194,10 +194,12 @@ def run_from_config(
     import atexit as _atexit
     _atexit.register(momentum_gate.shutdown)
 
-    # Pool event watcher: subscribes to confirmed BetBull/BetBear events
-    # via public WSS for accurate pool tracking (no signup required).
-    pool_watcher = PoolEventWatcher(interval_seconds=interval_seconds)
-    pool_watcher.start()
+    # RPC poller: deterministic poll schedule (cold-start backfill +
+    # periodic + ramp + final) over batched eth_getBlockReceipts.
+    # Replaces the WSS-subscription pool watcher (Era 11, 2026-05-07);
+    # see var/design/rpc_polling_architecture_2026_05_07.md.
+    rpc_poller = RpcPoller(interval_seconds=interval_seconds)
+    rpc_poller.start()
 
     # Receipt timeouts derived from chain-loaded buffer_seconds +
     # _CLAIM_CHECK_PADDING_SECONDS (≈35s on canonical chain constants).
@@ -213,6 +215,9 @@ def run_from_config(
         wallet_address=contract.wallet_address,
         cutoff_seconds=cfg.kline_cutoff_seconds,
         ntp_sync_wakeup_offset_ms=cfg.ntp_sync_wakeup_offset_ms,
+        ramp_poll_1_wakeup_offset_ms=cfg.ramp_poll_1_wakeup_offset_ms,
+        ramp_poll_2_wakeup_offset_ms=cfg.ramp_poll_2_wakeup_offset_ms,
+        final_rpc_poll_wakeup_offset_ms=cfg.final_rpc_poll_wakeup_offset_ms,
         bankroll_wakeup_offset_ms=cfg.bankroll_wakeup_offset_ms,
         critical_path_wakeup_offset_ms=cfg.critical_path_wakeup_offset_ms,
         bet_submit_deadline_offset_ms=cfg.bet_submit_deadline_offset_ms,
@@ -233,10 +238,10 @@ def run_from_config(
         buffer_seconds=buffer_seconds,
         strategy=cfg.strategy,
         momentum_gate=momentum_gate,
-        pool_watcher=pool_watcher,
+        rpc_poller=rpc_poller,
     )
 
     try:
         engine.run_realtime_loop(runtime_cfg)
     finally:
-        pool_watcher.stop()
+        rpc_poller.stop()

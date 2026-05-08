@@ -348,6 +348,9 @@ class AppConfig:
     # Derived (from timing_constants.py at load time)
     bet_submit_deadline_offset_ms: int
     critical_path_wakeup_offset_ms: int
+    final_rpc_poll_wakeup_offset_ms: int
+    ramp_poll_1_wakeup_offset_ms: int
+    ramp_poll_2_wakeup_offset_ms: int
     bankroll_wakeup_offset_ms: int
     ntp_sync_wakeup_offset_ms: int
     kline_publish_tier: str
@@ -708,6 +711,29 @@ def load_app_config(path: str) -> AppConfig:
         + _tc.NTP_WAKE_OFFSET_PRE_BANKROLL_MS
     )
 
+    # --- RPC poll wake schedule (Era 11: 2026-05-07 pivot) ---
+    # final_rpc_poll fires before the critical_path read; ramp_2 fires
+    # before final; ramp_1 fires before ramp_2. Each gap absorbs the
+    # poll's RTT plus a safety cushion. See
+    # var/design/rpc_polling_architecture_2026_05_07.md.
+    final_rpc_poll_wakeup_offset_ms = (
+        pool_cutoff_seconds * 1000
+        - _tc.BSC_BLOCK_TIME_MS
+        - _tc.RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
+        - _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_FINAL_POLL_BATCH_SIZE)
+        - _tc.RPC_POLL_FINAL_SAFETY_BUFFER_MS
+    )
+    ramp_poll_2_wakeup_offset_ms = (
+        final_rpc_poll_wakeup_offset_ms
+        + _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_2_BATCH_SIZE)
+        + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
+    )
+    ramp_poll_1_wakeup_offset_ms = (
+        ramp_poll_2_wakeup_offset_ms
+        + _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_1_BATCH_SIZE)
+        + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
+    )
+
     # The kline fetch fires INSIDE the critical-path wake, after the
     # ~5ms pool snapshot. So the kline-fetch effective offset (= time
     # until lock when the GETs go out) is the critical-path wake offset
@@ -751,26 +777,25 @@ def load_app_config(path: str) -> AppConfig:
             f"Increase kline_cutoff_seconds or reduce wake offset."
         )
 
-    # Cross-validation: the critical-path wake offset (= the pool-snapshot
-    # time inside the wake) must fit inside the pool-cutoff window minus
-    # WSS bet-event arrival delay (P99). Same framing as klines: the
-    # cutoff is fixed; the wake offset adjusts around it.
-    #
-    # No tier fallback here -- WSS arrival is much more uniform than
-    # REST publishing (single subscriber stream vs. per-symbol
-    # publishing pipeline), so the P99 figure IS the operating budget;
-    # there's no looser percentile to fall back to. If a P95 WSS
-    # arrival probe constant is added later, this could be tier-ified
-    # symmetrically with klines. For now: P99-strict is the only check.
-    if critical_path_wakeup_offset_ms > (
-        pool_cutoff_seconds * 1000 - _tc.WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS
+    # Cross-validation (Era 11 — RPC poll model): the user's
+    # pool_cutoff_seconds must leave enough room for the
+    # final-RPC-poll completion chain (block availability + batched
+    # receipt fetch RTT + safety) before the critical_path_wake reads
+    # the pool snapshot. Without this gate, a too-small pool_cutoff
+    # would push final_rpc_poll_wakeup_offset_ms below
+    # critical_path_wakeup_offset_ms and the engine would skip every
+    # round with pool_not_ready_last_poll_too_slow.
+    if final_rpc_poll_wakeup_offset_ms <= (
+        critical_path_wakeup_offset_ms + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
     ):
         raise InvariantError(
-            f"config_pool_read_wakeup_exceeds_cutoff_arrival_budget: "
-            f"critical_path_wakeup_offset_ms={critical_path_wakeup_offset_ms} "
-            f"> pool_cutoff_seconds*1000={pool_cutoff_seconds * 1000} "
-            f"- WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS"
-            f"={_tc.WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS}"
+            f"config_pool_cutoff_too_small_for_rpc_completion: "
+            f"pool_cutoff_seconds={pool_cutoff_seconds} too small. "
+            f"Derived final_rpc_poll_offset_ms={final_rpc_poll_wakeup_offset_ms}ms "
+            f"doesn't leave time before critical_path_wake at "
+            f"{critical_path_wakeup_offset_ms}ms for the RPC roundtrip "
+            f"+ deadline safety ({_tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS}ms). "
+            f"Increase pool_cutoff_seconds (canonical = 6)."
         )
 
     # Cross-validation: the NTP wake budget must comfortably exceed
@@ -835,6 +860,9 @@ def load_app_config(path: str) -> AppConfig:
         max_consecutive_fetch_failures=max_consecutive_fetch_failures,
         bet_submit_deadline_offset_ms=bet_submit_deadline_offset_ms,
         critical_path_wakeup_offset_ms=critical_path_wakeup_offset_ms,
+        final_rpc_poll_wakeup_offset_ms=final_rpc_poll_wakeup_offset_ms,
+        ramp_poll_1_wakeup_offset_ms=ramp_poll_1_wakeup_offset_ms,
+        ramp_poll_2_wakeup_offset_ms=ramp_poll_2_wakeup_offset_ms,
         bankroll_wakeup_offset_ms=bankroll_wakeup_offset_ms,
         ntp_sync_wakeup_offset_ms=ntp_sync_wakeup_offset_ms,
         kline_publish_tier=kline_publish_tier,
