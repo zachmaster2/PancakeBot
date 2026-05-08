@@ -423,7 +423,14 @@ class RpcPoller:
     def _periodic_loop(self) -> None:
         """Daemon-thread loop. Wakes every periodic_poll_interval_s
         and runs a poll. Idempotent if cold-start hasn't yet completed
-        (no-ops in that case)."""
+        (no-ops in that case).
+
+        Label "period" (6 chars) fits log _SUB_W=6 — a prior version
+        used "periodic" (8 chars) which raised InvariantError in log.py
+        on the first periodic-poll log call, killing the daemon thread
+        silently and leaving ramp/final polls to catch up many minutes
+        of blocks at once.
+        """
         while not self._stop_event.is_set():
             # Sleep first so periodic and cold-start don't collide
             # at startup.
@@ -432,9 +439,9 @@ class RpcPoller:
             if not self._cold_start_done.is_set():
                 continue
             try:
-                self._poll_now(deadline_ms=0, label="periodic")
+                self._poll_now(deadline_ms=0, label="period")
             except Exception as e:  # noqa: BLE001
-                warn("RPC_POLL", "PERIODIC", "FAIL",
+                warn("RPC_POLL", "PERIOD", "FAIL",
                      msg=f"{type(e).__name__}: {e}")
 
     def _poll_now(self, *, deadline_ms: int, label: str) -> None:
