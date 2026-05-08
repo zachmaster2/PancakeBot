@@ -734,7 +734,12 @@ def test_cold_start_does_not_mark_infeasible_when_room_to_backfill():
     cold-start completes, flag stays False."""
     import time as _t
     p = _make_poller()
-    p._lock_at = int(_t.time()) + 290  # near start of round
+    now = int(_t.time())
+    p._lock_at = now + 290  # 10s into round
+    # head_ts = now; round_start_ts = now-10. delta_blocks = 20+20 = 40.
+    p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
+    # _poll_now's batch-fetch loop also calls _rpc_eth_block_number
+    # for the inner head — mock it so the test stays offline.
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
     fetched: list[list[int]] = []
     p._fetch_and_process_blocks = (  # type: ignore[assignment]
@@ -747,17 +752,58 @@ def test_cold_start_does_not_mark_infeasible_when_room_to_backfill():
     assert p._connected is True
     # Cursor is now head (after backfill processed all blocks).
     assert p._last_polled_block_number == 100_000
-    # backfill performed at least one batch
+    # Backfill performed at least one batch.
     assert len(fetched) > 0
+    # Bug regression check: cold_start must scope backfill to current
+    # round only, NOT to a head-relative full-round lookback. ~10s into
+    # round = ~40 blocks (20 actual + 20 safety margin), NOT 620.
+    total_blocks_fetched = sum(len(b) for b in fetched)
+    assert total_blocks_fetched < 100, (
+        f"cold_start over-fetched: {total_blocks_fetched} blocks "
+        f"(expected ~40 for 10s into round; >100 indicates the "
+        f"head-relative full-round lookback bug)"
+    )
+
+
+def test_cold_start_does_not_backfill_past_round_start():
+    """Regression for the 621-block bug: cold_start must NOT backfill
+    from head - blocks_per_round (which would include the previous
+    round's blocks)."""
+    import time as _t
+    p = _make_poller()
+    now = int(_t.time())
+    p._lock_at = now + 240  # 60s into round
+    p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
+    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    fetched: list[list[int]] = []
+    p._fetch_and_process_blocks = (  # type: ignore[assignment]
+        lambda nums: fetched.append(nums)
+    )
+
+    p._cold_start()
+
+    total = sum(len(b) for b in fetched)
+    # 60s / 0.5s = 120 blocks; +20 safety margin = 140. Must be well
+    # under 600 (a full round) which would indicate the bug.
+    assert total < 200, (
+        f"cold_start fetched {total} blocks at 60s into round; "
+        f"expected ~140 (current round only). Bug regression?"
+    )
+    assert total >= 100, (
+        f"cold_start fetched {total} blocks at 60s into round; "
+        f"expected ~140 (too few — round_start derivation broken?)"
+    )
 
 
 def test_cold_start_marks_infeasible_when_backfill_exceeds_remaining_time():
-    """Bot starts with 1s until lock — backfill ~620 blocks would need
-    ~30s; flag set, backfill skipped, cursor jumped to head."""
+    """Bot starts at end of round with 1s until lock — backfill ~620
+    blocks would need ~46s; flag set, backfill skipped, cursor to head."""
     import time as _t
     p = _make_poller()
-    p._lock_at = int(_t.time()) + 1  # only 1s left
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    now = int(_t.time())
+    p._lock_at = now + 1  # only 1s left -- effectively end of round
+    # head_ts = now; round_start_ts = now-299; delta = 599+20 = 619 blocks.
+    p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
     p._fetch_and_process_blocks = (  # type: ignore[assignment]
         lambda nums: pytest.fail("should not have backfilled")
     )
@@ -771,12 +817,37 @@ def test_cold_start_marks_infeasible_when_backfill_exceeds_remaining_time():
     assert p._last_polled_block_number == 100_000
 
 
+def test_cold_start_handles_head_before_round_start():
+    """If head_ts <= round_start_ts (head is BEHIND round_start, e.g.
+    lock_at far in the future), backfill is a no-op."""
+    import time as _t
+    p = _make_poller()
+    now = int(_t.time())
+    p._lock_at = now + 600  # round won't START for another 5 min
+    # round_start_ts = lock_at - 300 = now+300; head_ts = now < round_start_ts.
+    p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
+    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    fetched: list[list[int]] = []
+    p._fetch_and_process_blocks = (  # type: ignore[assignment]
+        lambda nums: fetched.append(nums)
+    )
+
+    p._cold_start()
+
+    # No backfill performed; cursor at head.
+    assert p._connected is True
+    assert p._last_polled_block_number == 100_000
+    total = sum(len(b) for b in fetched)
+    assert total == 0
+
+
 def test_cold_start_logs_infeas_at_warn_severity():
     """The cold-start INFEAS log must be WARN, not INFO."""
     import time as _t
     p = _make_poller()
-    p._lock_at = int(_t.time()) + 1
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    now = int(_t.time())
+    p._lock_at = now + 1
+    p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
     p._fetch_and_process_blocks = lambda nums: None  # type: ignore[assignment]
 
     # We can't easily assert log level via pytest.caplog without the

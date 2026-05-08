@@ -548,15 +548,18 @@ class RpcPoller:
     # ------------------------------------------------------------------
 
     def _cold_start(self) -> None:
-        """Synchronous backfill from round-start block to head.
+        """Synchronous backfill scoped to the CURRENT round only.
         Called from the first set_round_phase() and blocks until done.
 
-        Feasibility-aware: if the bot starts mid-round and there isn't
-        enough time to backfill the full round before lock_at, we skip
-        the backfill (cursor jumps to head), mark the round
-        catch-up-infeasible, and let the next round start clean. This
-        prevents wasting RPC budget on a backfill that wouldn't beat
-        the round's decision deadline anyway.
+        Round-aware: round_start_block is derived from
+        ``lock_at - interval_seconds``, NOT from a head-relative
+        full-round lookback. Past-round blocks are archive-only and
+        never bet on, so backfilling them is wasted work.
+
+        Feasibility-aware: if there isn't enough time to backfill the
+        in-round blocks before lock_at, skip the backfill (cursor jumps
+        to head), mark the round catch-up-infeasible, and let the next
+        round start clean.
         """
         with self._lock:
             if self._cold_start_in_progress:
@@ -564,26 +567,58 @@ class RpcPoller:
             self._cold_start_in_progress = True
 
         try:
-            head = self._rpc_eth_block_number()
-            if head <= 0:
+            # eth_getBlockByNumber('latest') returns head_number AND
+            # head_timestamp in one call — both needed to derive
+            # round_start_block from lock_at - interval_seconds.
+            try:
+                head, head_ts = self._rpc_eth_get_latest_block_header()
+            except Exception as e:  # noqa: BLE001
                 warn("RPC_POLL", "COLD", "FAIL",
-                     msg="cold_start: eth_blockNumber returned 0 or error")
+                     msg=(f"cold_start: eth_getBlockByNumber(latest): "
+                          f"{type(e).__name__}: {e}"))
+                return
+            if head <= 0 or head_ts <= 0:
+                warn("RPC_POLL", "COLD", "FAIL",
+                     msg=f"cold_start: invalid header head={head} ts={head_ts}")
                 return
 
-            # Round-start ≈ lock_at - interval_seconds. Compute the
-            # block at round-start (allow some safety margin for
-            # block-time variance).
-            blocks_per_round = int(
-                (self._interval_seconds * 1000) / _tc.BSC_BLOCK_TIME_MS
-            ) + 20  # safety margin
-            round_start_block = max(0, head - blocks_per_round)
-            blocks_to_backfill = head - round_start_block + 1
-
-            # Feasibility check: same math as Component 4 but bounded
-            # to the full-round backfill (which is the whole work the
-            # cold-start is about to do).
             with self._lock:
                 lock_at_local = self._lock_at
+            round_start_ts = lock_at_local - self._interval_seconds
+
+            if head_ts <= round_start_ts:
+                # Head is behind round_start (chain hasn't caught up
+                # to round_start yet, or lock_at is in the future
+                # beyond head_ts). Nothing to backfill — set cursor
+                # at head and let periodic polls drive forward.
+                with self._lock:
+                    self._last_polled_block_number = head
+                    self._connected = True
+                    self._cold_start_done.set()
+                    self._cold_start_in_progress = False
+                info("RPC_POLL", "COLD", "OK",
+                     msg=(f"cold_start: head_ts {head_ts} <= "
+                          f"round_start_ts {round_start_ts}; no backfill "
+                          f"needed (cursor at head={head})"))
+                return
+
+            # delta_blocks: how many blocks since round_start.
+            # BSC_BLOCK_TIME_MS=500 is the CONSERVATIVE rounding of
+            # empirical 452ms; using it as the divisor underestimates
+            # blocks-elapsed by ~10%. The +20 safety margin handles
+            # that bias plus general block-time variance, ensuring we
+            # don't miss start-of-round blocks. Any over-fetched
+            # prev-round blocks are filtered by the epoch gate in
+            # _process_receipts.
+            delta_blocks = round(
+                (head_ts - round_start_ts) * 1000
+                / _tc.BSC_BLOCK_TIME_MS
+            ) + 20
+            round_start_block = max(0, head - delta_blocks)
+            blocks_to_backfill = max(0, head - round_start_block + 1)
+
+            # Feasibility check: can we backfill the in-round range
+            # before lock_at? Same math as Component 4 trigger A.
             if self._is_catchup_infeasible(
                 blocks_behind=blocks_to_backfill, lock_at=lock_at_local,
             ):
