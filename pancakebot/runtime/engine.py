@@ -472,6 +472,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             return
 
         # -- Ramp poll #1 (Era 11) --
+        # All three polls (ramp_1, ramp_2, final) take a deadline_ms
+        # and skip-on-miss. The label "ramp" is 4 chars, fits the
+        # log SUB_W=6.
         # First of three RPC polls that ramp the local pool aggregate
         # toward the critical_path snapshot. Fires at lock_at -
         # ramp_poll_1_wakeup_offset_ms (= ~6.616s before lock). Catches
