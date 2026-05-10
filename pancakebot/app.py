@@ -199,17 +199,21 @@ def run_from_config(
     # Replaces the WSS-subscription pool watcher (Era 11, 2026-05-07);
     # see var/design/rpc_polling_architecture_2026_05_07.md.
     #
-    # Hedging enabled (2026-05-09): fan_out=2 across the top-3 batched
-    # endpoints from the Track H respike. Track H MC estimated P99
-    # batch RTT drops 2372ms -> 1180ms (-50%) at fan_out=2; hedging
-    # is the chosen lever after Track J Phase 2 (predictive skip) was
-    # CLOSED_OUT against permutation null. See:
+    # Hedging enabled across the top-3 batched endpoints from the
+    # Track H respike. Track H MC estimated P99 batch RTT drops:
+    #   fan_out=1 → 2372ms
+    #   fan_out=2 → 1180ms (-50%)
+    #   fan_out=3 → 943ms  (-20% vs fan_out=2)
+    # Live observation post-fan_out=2 deploy: INFEAS rate 21.6% → 13.5%
+    # (-37% relative). Bumped to fan_out=3 (2026-05-10) for further
+    # reduction; expected INFEAS ~10-12% at 1.5x bandwidth (free tier).
+    # See:
     #   var/design/rpc_endpoint_hedging_2026_05_08.md
-    #   var/incident_reports/2026_05_08_endpoint_respike_n200.json
+    #   var/extended/endpoint_respike_n200.json
     rpc_poller = RpcPoller(
         interval_seconds=interval_seconds,
         rpc_urls=DEFAULT_HEDGED_ENDPOINTS,
-        hedge_fan_out=2,
+        hedge_fan_out=3,
     )
     rpc_poller.start()
 
