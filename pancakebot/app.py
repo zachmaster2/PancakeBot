@@ -26,7 +26,7 @@ from pancakebot.runtime import engine
 from pancakebot.market_data.sync import sync_runtime_market_data
 from pancakebot.util import InvariantError
 from pancakebot.log import info
-from pancakebot.chain.rpc_poller import RpcPoller
+from pancakebot.chain.rpc_poller import RpcPoller, DEFAULT_HEDGED_ENDPOINTS
 from pancakebot import paths
 
 
@@ -198,7 +198,19 @@ def run_from_config(
     # periodic + ramp + final) over batched eth_getBlockReceipts.
     # Replaces the WSS-subscription pool watcher (Era 11, 2026-05-07);
     # see var/design/rpc_polling_architecture_2026_05_07.md.
-    rpc_poller = RpcPoller(interval_seconds=interval_seconds)
+    #
+    # Hedging enabled (2026-05-09): fan_out=2 across the top-3 batched
+    # endpoints from the Track H respike. Track H MC estimated P99
+    # batch RTT drops 2372ms -> 1180ms (-50%) at fan_out=2; hedging
+    # is the chosen lever after Track J Phase 2 (predictive skip) was
+    # CLOSED_OUT against permutation null. See:
+    #   var/design/rpc_endpoint_hedging_2026_05_08.md
+    #   var/incident_reports/2026_05_08_endpoint_respike_n200.json
+    rpc_poller = RpcPoller(
+        interval_seconds=interval_seconds,
+        rpc_urls=DEFAULT_HEDGED_ENDPOINTS,
+        hedge_fan_out=2,
+    )
     rpc_poller.start()
 
     # Receipt timeouts derived from chain-loaded buffer_seconds +
