@@ -187,6 +187,39 @@ RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE: dict[int, int] = {
     20: 1533,
 }
 
+# Hedged P99 RTT for batch=20 across the top defibit/ninicoin/binance_1
+# pool, indexed by ``hedge_fan_out``. The single-endpoint baseline above
+# was measured against publicnode in the original 2026-05-07 spike;
+# Track H respike (2026-05-08, n=200, batch=20) re-measured against the
+# top batched endpoints with N-way fan-out:
+#   fan_out=1 => 2372ms (baseline single-endpoint, defibit)
+#   fan_out=2 => 1180ms
+#   fan_out=3 =>  943ms
+#   fan_out=4 =>  899ms
+#   fan_out=5 =>  883ms
+#
+# Source: var/extended/endpoint_respike_n200.json (Track H respike,
+# 2026-05-08).
+#
+# Only batch=20 (the production cap) is tabulated here. Smaller batches
+# are not exercised on the deadline-driven critical path; if a future
+# code path needs hedged RTT for a different size, extend the table
+# rather than extrapolating silently.
+#
+# Note: the fan_out=1 value (2372) is HIGHER than the single-endpoint
+# baseline (1533) above because the respike measured the new top-tier
+# endpoint pool which has a fatter tail than publicnode at p99 for
+# small N. The hedged advantage emerges at fan_out>=2; consumers
+# decide whether to use the baseline or hedged table based on
+# whether hedging is enabled at runtime.
+RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE_HEDGED: dict[int, dict[int, int]] = {
+    1: {20: 2372},
+    2: {20: 1180},
+    3: {20: 943},
+    4: {20: 899},
+    5: {20: 883},
+}
+
 # Block availability delay — newhead arrival to first successful
 # eth_getBlockReceipts(block_hash). drpc.org p99 596ms, publicnode
 # p99 436ms (n=133 each, 2026-05-07). Lock 600ms = drpc.org worst-case
@@ -244,7 +277,7 @@ EXPECTED_RAMP_POLL_2_BATCH_SIZE: int = 15
 EXPECTED_RAMP_POLL_1_BATCH_SIZE: int = 15
 
 
-def rpc_rtt_p99_for_batch(batch_size: int) -> int:
+def rpc_rtt_p99_for_batch(batch_size: int, hedge_n: int = 1) -> int:
     """Return P99 RTT for a batch of size <= batch_size, using the
     closest ceiling key in RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE.
 
@@ -253,9 +286,32 @@ def rpc_rtt_p99_for_batch(batch_size: int) -> int:
     are all <= 20, so this fallback is informational; if it ever fires,
     the calling code is provisioning a batch above the measured range
     and should be re-checked.
+
+    ``hedge_n`` (default 1, single-endpoint) selects the per-fan_out
+    P99 column from ``RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE_HEDGED``
+    when the requested batch size has a hedged measurement (currently
+    only batch=20, the production cap). For non-tabulated batch sizes
+    the function falls back to the single-endpoint baseline table —
+    consumers running with hedge_n>1 still get the SAFER overestimate,
+    not a silent extrapolation. The default hedge_n=1 preserves the
+    pre-hedging behaviour exactly so wake-schedule derivation remains
+    bit-identical at the canonical operating point.
     """
     if batch_size <= 0:
         return 0
+    if hedge_n > 1:
+        hedged = RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE_HEDGED.get(int(hedge_n))
+        if hedged is not None and batch_size in hedged:
+            # Exact hedged measurement available — use it.
+            return hedged[batch_size]
+        # Hedged table doesn't cover this batch_size (currently only
+        # batch=20). Fall through to the single-endpoint table — using
+        # the hedged batch=20 ceiling for a smaller batch would
+        # over-estimate (smaller batches have lower RTT both
+        # single-endpoint and hedged), and using the hedged batch=20
+        # value for a LARGER batch would under-estimate. Falling back
+        # to the single-endpoint table is the conservative choice
+        # that doesn't require silent extrapolation.
     table = RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE
     keys = sorted(table.keys())
     for k in keys:

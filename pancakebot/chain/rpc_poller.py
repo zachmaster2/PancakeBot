@@ -764,10 +764,12 @@ class RpcPoller:
            rounds are archive-only.
 
         2. **Feasibility check**: compute estimated catch-up wallclock
-           from blocks-behind and the baseline single-batch p99 RTT.
-           If the estimate exceeds time-until-lock, set
-           ``_catchup_infeasible_for_round`` so the engine skips with
-           reason ``catchup_infeasible_for_round``.
+           from blocks-behind and the operating-mode single-batch p99
+           RTT (hedged-table column when ``hedge_fan_out>1``, single-
+           endpoint baseline otherwise). If the estimate exceeds
+           time-until-lock, set ``_catchup_infeasible_for_round`` so
+           the engine skips with reason
+           ``catchup_infeasible_for_round``.
 
         Both halves degrade gracefully on RPC failure: if the RPC calls
         needed for either step error out, we leave state untouched and
@@ -862,12 +864,21 @@ class RpcPoller:
 
     def _estimated_catchup_ms(self, blocks_behind: int) -> int:
         """Estimated wallclock to fetch ``blocks_behind`` blocks at
-        baseline single-batch p99 RTT. Conservative — doesn't account
-        for current degradation."""
+        the current operating-mode p99 RTT. Conservative — doesn't
+        account for current degradation, and uses the static p99
+        table not the live observed p99 from the health tracker.
+
+        Hedging-aware: when ``hedge_fan_out > 1`` the per-fan_out
+        hedged-P99 column is used (Track H respike, 2026-05-08).
+        At ``hedge_fan_out=1`` this returns the single-endpoint
+        baseline P99 unchanged.
+        """
         if blocks_behind <= 0:
             return 0
         batches = (blocks_behind + self._batch_size - 1) // self._batch_size
-        rtt_p99 = _tc.rpc_rtt_p99_for_batch(self._batch_size)
+        rtt_p99 = _tc.rpc_rtt_p99_for_batch(
+            self._batch_size, hedge_n=self._hedge_fan_out,
+        )
         return batches * rtt_p99
 
     def _available_catchup_ms(self, time_until_lock_ms: int) -> int:
