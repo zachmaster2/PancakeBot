@@ -210,10 +210,19 @@ def run_from_config(
     # See:
     #   var/design/rpc_endpoint_hedging_2026_05_08.md
     #   var/extended/endpoint_respike_n200.json
+    # Phase 2 n=4 experiment (2026-05-10): add binance_3 to pool, bump
+    # fan_out=4. binance_3 was rank 4 in Track H spike (p50=898ms).
+    # Goal: measure if real-round cadence shows further INFEAS reduction
+    # vs Phase 1 n=3 (Phase 1 baseline was 4/11 = 36.4% INFEAS, but
+    # 2 of 4 driven by a multi-endpoint correlated outage; counterfactual
+    # ~18%). Phase 2 adds endpoint diversity.
+    _phase2_endpoint_pool = list(DEFAULT_HEDGED_ENDPOINTS) + [
+        "https://bsc-dataseed3.binance.org",
+    ]
     rpc_poller = RpcPoller(
         interval_seconds=interval_seconds,
-        rpc_urls=DEFAULT_HEDGED_ENDPOINTS,
-        hedge_fan_out=3,
+        rpc_urls=_phase2_endpoint_pool,
+        hedge_fan_out=4,
     )
     rpc_poller.start()
 
