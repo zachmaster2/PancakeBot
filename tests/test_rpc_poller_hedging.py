@@ -483,3 +483,110 @@ def test_health_driven_deprioritisation_includes_recovery_path():
     # window outcomes, warmup rule says healthy. 5+20=25 outcomes, all
     # post-recovery 20 successes -> healthy.
     assert h.is_healthy("https://a") is True
+
+
+# ---------------------------------------------------------------------------
+# Hedging-aware feasibility math
+# ---------------------------------------------------------------------------
+#
+# The original 2026-05-07 spike measured P99 batch RTT against
+# publicnode-only as 1533ms (RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE).
+# The 2026-05-08 Track H respike measured the top defibit/ninicoin/
+# binance_1 pool with N-way hedging and produced
+# RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE_HEDGED:
+#   fan_out=1 => 2372ms, =2 => 1180, =3 => 943, =4 => 899, =5 => 883
+#
+# When hedging is enabled the catch-up feasibility math MUST use the
+# hedged P99 — using the single-endpoint baseline overstates by 60%
+# at fan_out=3 (1533 vs 943) and was responsible for 3 of 4 INFEAS
+# false-positives in Phase 1.
+
+def test_rpc_rtt_p99_for_batch_hedged_table_at_fan_out_3():
+    """At hedge_n=3, batch=20 returns the hedged 943ms, not 1533ms."""
+    from pancakebot import timing_constants as _tc  # noqa: WPS433
+    assert _tc.rpc_rtt_p99_for_batch(20, hedge_n=3) == 943
+
+
+def test_rpc_rtt_p99_for_batch_hedged_table_at_fan_out_4():
+    """At hedge_n=4, batch=20 returns 899ms (Track H respike)."""
+    from pancakebot import timing_constants as _tc  # noqa: WPS433
+    assert _tc.rpc_rtt_p99_for_batch(20, hedge_n=4) == 899
+
+
+def test_rpc_rtt_p99_for_batch_default_hedge_n_one_preserves_baseline():
+    """Default hedge_n=1 returns the single-endpoint baseline 1533ms.
+    Critical for the canonical-hash invariant: wake-schedule derivation
+    must remain bit-identical at hedge_n=1."""
+    from pancakebot import timing_constants as _tc  # noqa: WPS433
+    assert _tc.rpc_rtt_p99_for_batch(20) == 1533
+    assert _tc.rpc_rtt_p99_for_batch(20, hedge_n=1) == 1533
+
+
+def test_rpc_rtt_p99_for_batch_hedge_n_two_returns_hedged():
+    """At hedge_n=2 the table value (1180ms) is returned."""
+    from pancakebot import timing_constants as _tc  # noqa: WPS433
+    assert _tc.rpc_rtt_p99_for_batch(20, hedge_n=2) == 1180
+
+
+def test_rpc_rtt_p99_for_batch_hedge_n_above_table_falls_back_to_baseline():
+    """An hedge_n above the highest tabulated key (5) falls back to
+    the single-endpoint baseline. Conservative overestimate beats
+    silent extrapolation."""
+    from pancakebot import timing_constants as _tc  # noqa: WPS433
+    # hedge_n=6 not in table; falls back to 1533ms.
+    assert _tc.rpc_rtt_p99_for_batch(20, hedge_n=6) == 1533
+
+
+def test_rpc_rtt_p99_for_batch_unsupported_batch_size_falls_back_to_baseline():
+    """The hedged table currently only covers batch=20. For other batch
+    sizes (e.g. ramp_2's expected 15) the function falls back to the
+    single-endpoint table even when hedge_n>1. Defensive: extend the
+    hedged table rather than extrapolate silently."""
+    from pancakebot import timing_constants as _tc  # noqa: WPS433
+    # batch_size=10 has no hedged measurement → fall back to baseline.
+    assert _tc.rpc_rtt_p99_for_batch(10, hedge_n=3) == _tc.rpc_rtt_p99_for_batch(10)
+
+
+def test_estimated_catchup_ms_uses_hedged_rtt_at_fan_out_3():
+    """RpcPoller._estimated_catchup_ms must use the hedged P99 column
+    when hedge_fan_out=3.
+
+    Pre-fix: 20 blocks → 1 batch × 1533ms = 1533ms (single-endpoint
+    baseline used regardless of fan_out).
+    Post-fix: 20 blocks → 1 batch × 943ms = 943ms.
+    """
+    pool = ["https://a", "https://b", "https://c"]
+    p = _make_poller(endpoint_pool=pool, hedge_fan_out=3)
+    assert p._estimated_catchup_ms(20) == 943
+    assert p._estimated_catchup_ms(40) == 2 * 943
+
+
+def test_estimated_catchup_ms_at_fan_out_1_unchanged():
+    """At fan_out=1 the estimate must use the single-endpoint baseline
+    (1533ms for batch=20). Critical for canonical-hash preservation:
+    pre-hedging behaviour bit-identical."""
+    p = _make_poller()  # hedge_fan_out=1 default
+    assert p._estimated_catchup_ms(20) == 1533
+
+
+def test_estimated_catchup_ms_phase1_round_479981_regression():
+    """Regression test for the Phase 1 INFEAS false-positive: round
+    479981 had cursor 23 blocks behind (= 2 batches of 20).
+
+    Pre-fix at fan_out=3: 2 × 1533 = 3066ms estimate vs ~2361ms
+    available → INFEAS → SKIP.
+    Post-fix at fan_out=3: 2 × 943 = 1886ms estimate vs ~2361ms
+    available → feasible → no skip.
+    """
+    pool = ["https://a", "https://b", "https://c"]
+    p = _make_poller(endpoint_pool=pool, hedge_fan_out=3)
+    # 23 blocks = 2 batches at batch_size=20 (ceiling).
+    est = p._estimated_catchup_ms(23)
+    assert est == 2 * 943, (
+        f"expected 1886ms (2 batches × 943ms hedged), got {est}ms"
+    )
+    # Sanity: at the pre-fix path this would have been 3066ms.
+    assert est < 3066, (
+        "post-fix estimate must be lower than the pre-fix 3066ms "
+        "(otherwise the false-positive recurs)"
+    )
