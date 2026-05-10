@@ -5,6 +5,7 @@ Architecture: deterministic poll schedule using batched
 ``eth_getBlockReceipts``. See:
 - ``var/design/rpc_polling_architecture_2026_05_07.md`` (architecture)
 - ``var/incident_reports/2026_05_07_rpc_polling_spike_results.md`` (provenance)
+- ``var/design/rpc_endpoint_hedging_2026_05_08.md`` (hedging transport)
 
 The poller has three trigger paths:
 
@@ -29,14 +30,18 @@ Public interface mirrors ``PoolEventWatcher`` where feasible
 (``get_pool``, ``set_round_phase``, ``connected``, ``current_endpoint``,
 ``is_pool_ready``) so the engine call sites are minimally affected.
 
-Single-endpoint dependency: per Phase 0c spike, drpc.org rejects
-batched JSON-RPC arrays. publicnode is the SOLE batched endpoint;
-RPC_URLS is filtered accordingly. drpc.org survives only as a WSS
-newHeads source for the unrelated NTP-clock-skew probe (and even
-that's deprecated by Era 9 NTP).
+Endpoint hedging (opt-in, default off): when ``hedge_fan_out > 1``
+each JSON-RPC call fans out to N endpoints in parallel; the first
+successful response wins, the others are abandoned. Per-endpoint
+health is tracked in ``EndpointHealthTracker`` (rolling 100-outcome
+window; success_rate/p99/consecutive_failures gates). Default
+single-endpoint behaviour is preserved when ``hedge_fan_out=1``
+(single-element ``endpoint_pool``).
 """
 from __future__ import annotations
 
+import collections
+import concurrent.futures
 import json
 import threading
 import time
@@ -55,15 +60,43 @@ _BET_BULL_TOPIC = "0x438122d8cff518d18388099a5181f0d17a12b4f1b55faedf6e4a6acee00
 _BET_BEAR_TOPIC = "0x0d8c1fe3e67ab767116a81f122b83c2557a8c2564019cb7c4f83de1aeb1f1f0d"
 
 
-# HTTP RPC endpoints. publicnode is the SOLE batched endpoint per
-# Phase 0c spike — drpc.org rejects batched JSON-RPC arrays with
-# HTTP 500 at every tested batch size. The list is single-element
-# by design (the architecture accepts the single-endpoint dependency).
+# HTTP RPC endpoints (legacy single-endpoint default). Pre-hedging
+# default; new code paths use ``DEFAULT_HEDGED_ENDPOINTS`` when
+# hedging is enabled via config. Kept for backwards compatibility
+# with existing callers passing ``rpc_urls`` only.
 RPC_BATCH_ENDPOINTS: list[str] = [
     "https://bsc-rpc.publicnode.com",
 ]
 
+# Hedging-mode default endpoint pool. Empirical top 3 by P50 batch
+# RTT from the 2026-05-08 Track H respike (n=200, batch_size=20):
+#
+#   bsc-dataseed1.defibit.io   p50=770ms p99=2226ms
+#   bsc-dataseed1.ninicoin.io  p50=802ms p99=2179ms
+#   bsc-dataseed1.binance.org  p50=828ms p99=1797ms
+#
+# Use this list when constructing an RpcPoller with
+# ``hedge_fan_out >= 2``. NOT the default for single-endpoint
+# operation (``hedge_fan_out=1``); see ``RPC_BATCH_ENDPOINTS``.
+DEFAULT_HEDGED_ENDPOINTS: list[str] = [
+    "https://bsc-dataseed1.defibit.io",
+    "https://bsc-dataseed1.ninicoin.io",
+    "https://bsc-dataseed1.binance.org",
+]
+
 _USER_AGENT = "pancakebot-rpc-poller/1.0"
+
+# EndpointHealthTracker rolling-window size (per-endpoint).
+_HEALTH_WINDOW_SIZE: int = 100
+# Health classification gates (memo §4.2).
+_HEALTH_MIN_SUCCESS_RATE: float = 0.90
+_HEALTH_MAX_P99_RTT_MS: int = 5000
+_HEALTH_MAX_CONSECUTIVE_FAILURES: int = 5
+# Periodic re-test cadence: 1-in-N requests, AND any unhealthy
+# endpoint that hasn't been retested in this many seconds gets a
+# probe regardless of the counter.
+_HEALTH_RETEST_EVERY_N_REQUESTS: int = 10
+_HEALTH_RETEST_FORCED_AFTER_SECONDS: float = 60.0
 
 
 @dataclass
@@ -80,6 +113,280 @@ class _EpochPool:
     bets: list[_Bet] = field(default_factory=list)
 
 
+class HedgedAllFailed(Exception):
+    """Composite exception raised when every endpoint in a hedged
+    fan-out fails. Carries the per-endpoint (endpoint, exception)
+    pairs so the operator log line surfaces all failures at once.
+    """
+
+    def __init__(self, errors: list[tuple[str, BaseException]]) -> None:
+        self.errors: list[tuple[str, BaseException]] = list(errors)
+        msg_parts = [
+            f"{endpoint}: {type(e).__name__}: {e}"
+            for endpoint, e in errors
+        ]
+        super().__init__(
+            f"all_hedged_endpoints_failed ({len(errors)}): "
+            + "; ".join(msg_parts)
+        )
+
+
+@dataclass
+class _EndpointHealth:
+    url: str
+    # Rolling window of (success, rtt_ms) tuples (max _HEALTH_WINDOW_SIZE).
+    recent_outcomes: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=_HEALTH_WINDOW_SIZE),
+    )
+    consecutive_failures: int = 0
+    last_failure_at: float = 0.0
+    last_request_at: float = 0.0
+    total_requests: int = 0
+
+
+class EndpointHealthTracker:
+    """Per-endpoint rolling-window health bookkeeping for the hedging
+    transport.
+
+    State per endpoint: rolling window of last 100 (success, rtt_ms)
+    outcomes, consecutive-failure counter, last-failure timestamp,
+    total-request counter.
+
+    An endpoint is **healthy** iff it has fewer than 100 outcomes
+    (warmup; unconditionally healthy by default) OR all three:
+      - success_rate over the window > 0.90
+      - p99 RTT over the window < 5000 ms
+      - consecutive_failures < 5
+
+    ``pick_n(n)`` returns up to n endpoints, healthy first sorted by
+    p50 RTT ascending. If too few healthy endpoints are available it
+    falls back to unhealthy ones (degraded mode beats no-RPC mode).
+    Periodic re-test: one unhealthy endpoint is included in pick_n
+    every ``_HEALTH_RETEST_EVERY_N_REQUESTS`` requests, OR any
+    unhealthy endpoint not probed in the last 60s, so recovered
+    endpoints can rejoin the pool.
+
+    Thread-safe via internal ``threading.Lock``.
+    """
+
+    def __init__(self, endpoints: list[str]) -> None:
+        if not endpoints:
+            raise InvariantError("endpoint_health_tracker_empty_pool")
+        self._lock = threading.Lock()
+        self._endpoints: list[str] = list(endpoints)
+        self._health: dict[str, _EndpointHealth] = {
+            url: _EndpointHealth(url=url) for url in self._endpoints
+        }
+        # Global pick_n counter — drives the 1-in-N retest pressure.
+        self._pick_counter: int = 0
+        # Last-known healthy bool for transition logging.
+        self._last_healthy_state: dict[str, bool] = {url: True for url in self._endpoints}
+
+    # ------------------------------------------------------------------
+    # Recording outcomes
+    # ------------------------------------------------------------------
+
+    def record(self, endpoint: str, *, success: bool, rtt_ms: int) -> None:
+        """Record a request outcome. Idempotent for unknown endpoints
+        (no-op + invariant violation in tests is more harmful than
+        silent skip during fanned-out edge cases)."""
+        with self._lock:
+            h = self._health.get(endpoint)
+            if h is None:
+                # Unknown endpoint: silently ignore. Defensive — the
+                # hedging transport only ever calls record() with
+                # endpoints it got from pick_n(), but this protects
+                # against future refactors.
+                return
+            h.recent_outcomes.append((bool(success), int(rtt_ms)))
+            h.total_requests += 1
+            h.last_request_at = time.time()
+            if success:
+                h.consecutive_failures = 0
+            else:
+                h.consecutive_failures += 1
+                h.last_failure_at = time.time()
+            self._maybe_log_transition_locked(endpoint, h)
+
+    # ------------------------------------------------------------------
+    # Health classification
+    # ------------------------------------------------------------------
+
+    def _is_healthy_locked(self, h: _EndpointHealth) -> bool:
+        n = len(h.recent_outcomes)
+        if n < _HEALTH_WINDOW_SIZE:
+            # Warmup: insufficient evidence to mark unhealthy. The
+            # consecutive-failures fast-trip still applies, so a brand-
+            # new endpoint that fails 5 in a row is correctly excluded.
+            if h.consecutive_failures >= _HEALTH_MAX_CONSECUTIVE_FAILURES:
+                return False
+            return True
+        if h.consecutive_failures >= _HEALTH_MAX_CONSECUTIVE_FAILURES:
+            return False
+        successes = sum(1 for ok, _ in h.recent_outcomes if ok)
+        if (successes / n) <= _HEALTH_MIN_SUCCESS_RATE:
+            return False
+        # p99 RTT over the window.
+        rtts = sorted(rtt for _, rtt in h.recent_outcomes)
+        # 99th percentile: index = ceil(0.99 * n) - 1 (clamp).
+        p99_idx = max(0, min(n - 1, int(0.99 * n)))
+        if rtts[p99_idx] >= _HEALTH_MAX_P99_RTT_MS:
+            return False
+        return True
+
+    def is_healthy(self, endpoint: str) -> bool:
+        with self._lock:
+            h = self._health.get(endpoint)
+            if h is None:
+                return False
+            return self._is_healthy_locked(h)
+
+    def _p50_locked(self, h: _EndpointHealth) -> int:
+        if not h.recent_outcomes:
+            # Warmup: no data yet. Sort key needs SOMETHING — return 0
+            # so warmup endpoints rank ahead of post-warmup with
+            # measured latency. That's the desired warmup behaviour:
+            # send traffic to under-measured endpoints first to gather
+            # data.
+            return 0
+        rtts = sorted(rtt for _, rtt in h.recent_outcomes)
+        n = len(rtts)
+        return rtts[n // 2]
+
+    def _p99_locked(self, h: _EndpointHealth) -> int:
+        if not h.recent_outcomes:
+            return 0
+        rtts = sorted(rtt for _, rtt in h.recent_outcomes)
+        n = len(rtts)
+        idx = max(0, min(n - 1, int(0.99 * n)))
+        return rtts[idx]
+
+    def _success_rate_locked(self, h: _EndpointHealth) -> float:
+        n = len(h.recent_outcomes)
+        if n == 0:
+            return 1.0
+        successes = sum(1 for ok, _ in h.recent_outcomes if ok)
+        return successes / n
+
+    # ------------------------------------------------------------------
+    # Endpoint selection
+    # ------------------------------------------------------------------
+
+    def pick_n(self, n: int) -> list[str]:
+        """Return up to n endpoints, healthy first sorted by p50
+        ascending. Falls back to unhealthy endpoints when fewer than n
+        healthy ones are available, plus a periodic 1-in-N retest of
+        an unhealthy endpoint to allow recovery."""
+        if n <= 0:
+            return []
+        with self._lock:
+            self._pick_counter += 1
+            counter = self._pick_counter
+
+            healthy: list[tuple[int, str]] = []
+            unhealthy: list[tuple[float, str]] = []
+            for url, h in self._health.items():
+                if self._is_healthy_locked(h):
+                    healthy.append((self._p50_locked(h), url))
+                else:
+                    # Sort key: oldest last_failure_at first (longest-
+                    # down endpoints get retested first).
+                    unhealthy.append((h.last_failure_at, url))
+
+            healthy.sort(key=lambda x: x[0])
+            unhealthy.sort(key=lambda x: x[0])
+
+            healthy_urls = [u for _, u in healthy]
+            unhealthy_urls = [u for _, u in unhealthy]
+
+            now = time.time()
+
+            # Periodic re-test: include one unhealthy endpoint in the
+            # pick whenever the global pick counter is divisible by N
+            # OR an unhealthy endpoint hasn't been tested in 60+ s.
+            should_retest = (
+                bool(unhealthy_urls)
+                and (
+                    counter % _HEALTH_RETEST_EVERY_N_REQUESTS == 0
+                    or any(
+                        now - self._health[u].last_request_at >= _HEALTH_RETEST_FORCED_AFTER_SECONDS
+                        for u in unhealthy_urls
+                    )
+                )
+            )
+
+            selected: list[str] = []
+            if should_retest:
+                # Pick the longest-down or longest-untested unhealthy
+                # endpoint as the retest candidate.
+                retest_candidates = [
+                    u for u in unhealthy_urls
+                    if now - self._health[u].last_request_at >= _HEALTH_RETEST_FORCED_AFTER_SECONDS
+                ]
+                if not retest_candidates:
+                    retest_candidates = unhealthy_urls
+                selected.append(retest_candidates[0])
+
+            # Fill with healthy endpoints (preferred).
+            for url in healthy_urls:
+                if url in selected:
+                    continue
+                if len(selected) >= n:
+                    break
+                selected.append(url)
+
+            # Still short — fall back to remaining unhealthy.
+            for url in unhealthy_urls:
+                if url in selected:
+                    continue
+                if len(selected) >= n:
+                    break
+                selected.append(url)
+
+            return selected[:n]
+
+    # ------------------------------------------------------------------
+    # Diagnostics + transition logging
+    # ------------------------------------------------------------------
+
+    def stats(self) -> dict[str, dict[str, Any]]:
+        """Return per-endpoint health snapshot for stats display."""
+        with self._lock:
+            out: dict[str, dict[str, Any]] = {}
+            for url, h in self._health.items():
+                out[url] = {
+                    "healthy": self._is_healthy_locked(h),
+                    "success_rate": self._success_rate_locked(h),
+                    "p50_rtt_ms": self._p50_locked(h),
+                    "p99_rtt_ms": self._p99_locked(h),
+                    "consecutive_failures": h.consecutive_failures,
+                    "total_requests": h.total_requests,
+                    "window_size": len(h.recent_outcomes),
+                }
+            return out
+
+    def _maybe_log_transition_locked(self, endpoint: str, h: _EndpointHealth) -> None:
+        """Emit a one-shot log line on healthy<->unhealthy transitions.
+        Called under self._lock. Uses sub="HEDGE" (5 chars, fits sub
+        width)."""
+        prev = self._last_healthy_state.get(endpoint, True)
+        curr = self._is_healthy_locked(h)
+        if prev == curr:
+            return
+        self._last_healthy_state[endpoint] = curr
+        sr = self._success_rate_locked(h)
+        p99 = self._p99_locked(h)
+        cf = h.consecutive_failures
+        if curr:
+            info("RPC_POLL", "HEDGE", "UP",
+                 msg=(f"{endpoint} recovered: success_rate={sr:.2%} "
+                      f"p99={p99}ms"))
+        else:
+            info("RPC_POLL", "HEDGE", "DOWN",
+                 msg=(f"{endpoint} unhealthy: success_rate={sr:.2%} "
+                      f"p99={p99}ms consec_fail={cf}"))
+
+
 class RpcPoller:
     """Polls PredictionV2 bet events from BSC via batched
     ``eth_getBlockReceipts`` over HTTP.
@@ -94,6 +401,8 @@ class RpcPoller:
         *,
         interval_seconds: int,
         rpc_urls: list[str] | None = None,
+        endpoint_pool: list[str] | None = None,
+        hedge_fan_out: int = 1,
         contract_address: str = PREDICTION_V2_CONTRACT_ADDRESS,
         periodic_poll_interval_s: int = _tc.RPC_PERIODIC_POLL_INTERVAL_SECONDS,
         batch_size: int = _tc.RPC_BATCH_BLOCK_RECEIPTS_LIMIT,
@@ -108,10 +417,54 @@ class RpcPoller:
                 f"(max {_tc.RPC_BATCH_BLOCK_RECEIPTS_LIMIT})"
             )
 
-        self._interval_seconds = int(interval_seconds)
-        self._rpc_urls = list(rpc_urls) if rpc_urls is not None else list(RPC_BATCH_ENDPOINTS)
-        if not self._rpc_urls:
+        # endpoint_pool is the canonical pool used by the hedging
+        # transport. ``rpc_urls`` is retained as a backwards-compat
+        # alias (existing callers); when both are supplied,
+        # ``endpoint_pool`` wins. Default: single-endpoint
+        # publicnode (current behaviour).
+        if endpoint_pool is not None:
+            pool = list(endpoint_pool)
+        elif rpc_urls is not None:
+            pool = list(rpc_urls)
+        else:
+            pool = list(RPC_BATCH_ENDPOINTS)
+        if not pool:
+            # Existing test contract: empty rpc_urls -> "rpc_urls_empty".
             raise InvariantError("rpc_urls_empty")
+
+        self._interval_seconds = int(interval_seconds)
+        self._endpoint_pool: list[str] = pool
+        # Keep _rpc_urls populated for any internal code/tests still
+        # touching it; treat as alias of the pool.
+        self._rpc_urls = list(self._endpoint_pool)
+
+        if hedge_fan_out < 1:
+            raise InvariantError(
+                f"hedge_fan_out_below_one: {hedge_fan_out}"
+            )
+        if hedge_fan_out > len(self._endpoint_pool):
+            raise InvariantError(
+                f"hedge_fan_out_exceeds_pool_size: "
+                f"fan_out={hedge_fan_out} pool_size={len(self._endpoint_pool)}"
+            )
+        self._hedge_fan_out: int = int(hedge_fan_out)
+
+        # Per-endpoint health tracker. Always constructed so the stats
+        # surface is uniform regardless of fan_out. At fan_out=1 the
+        # tracker is exercised but pick_n always returns the single
+        # endpoint (since there's only one in the pool).
+        self._health = EndpointHealthTracker(self._endpoint_pool)
+
+        # ThreadPoolExecutor for fan-out. Sized at fan_out * 4 per memo
+        # §2 to give headroom for overlapping calls (cold-start + ramp
+        # + final + periodic). Min size 1 to handle fan_out=1 cleanly.
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        if self._hedge_fan_out > 1:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, self._hedge_fan_out * 4),
+                thread_name_prefix="rpc-hedge",
+            )
+
         self._contract_addr = contract_address.lower()
         self._periodic_poll_interval_s = int(periodic_poll_interval_s)
         self._batch_size = int(batch_size)
@@ -135,7 +488,11 @@ class RpcPoller:
 
         # Connection / readiness state.
         self._connected: bool = False  # True after cold-start completes
-        self._current_endpoint: str = self._rpc_urls[0]
+        # Most-recently-used endpoint URL (informational; updated by
+        # the hedging transport on each successful call). For
+        # display/log purposes only — picking is driven by the health
+        # tracker, not this field.
+        self._current_endpoint: str = self._endpoint_pool[0]
         self._cold_start_done: threading.Event = threading.Event()
         self._cold_start_in_progress: bool = False
         self._last_poll_succeeded: bool = False
@@ -182,7 +539,7 @@ class RpcPoller:
     @property
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            return {
+            base = {
                 "connected": self._connected,
                 "current_endpoint": self._current_endpoint,
                 "poll_count": self._poll_count,
@@ -193,7 +550,11 @@ class RpcPoller:
                 "last_polled_block": self._last_polled_block_number,
                 "epochs_tracked": len(self._pools),
                 "total_events": self._total_events,
+                "hedge_fan_out": self._hedge_fan_out,
             }
+        # endpoint_health acquires its own lock; do NOT nest under self._lock.
+        base["endpoint_health"] = self._health.stats()
+        return base
 
     def is_pool_ready(self, epoch: int | None = None) -> tuple[bool, str]:
         """Engine gate. Returns ``(True, "")`` when the bot can place a
@@ -253,6 +614,12 @@ class RpcPoller:
         if self._periodic_thread is not None:
             self._periodic_thread.join(timeout=10)
             self._periodic_thread = None
+        if self._executor is not None:
+            # wait=False — abandoned hedged requests should not block
+            # shutdown. urllib has no real cancellation; the in-flight
+            # sockets will time out on their own.
+            self._executor.shutdown(wait=False)
+            self._executor = None
         info("RPC_POLL", "STOP", "OK", msg="RPC poller stopped")
 
     # ------------------------------------------------------------------
@@ -970,13 +1337,12 @@ class RpcPoller:
             )
         return int(num_hex, 16), int(ts_hex, 16)
 
-    def _rpc_call_single(self, method: str, params: list) -> Any:
-        """Single JSON-RPC call. Raises on transport error or RPC
-        error; returns the ``result`` field on success."""
-        body = json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
-        }).encode()
-        url = self._current_endpoint
+    def _rpc_post(self, url: str, body: bytes, *, timeout_seconds: int) -> bytes:
+        """Single-endpoint HTTP POST. Returns the raw response body.
+        Raises on transport-level failure (urllib.error.URLError,
+        timeout, etc.). The caller parses JSON and decodes the
+        JSON-RPC envelope.
+        """
         req = _urllib_req.Request(
             url, data=body,
             headers={
@@ -984,10 +1350,122 @@ class RpcPoller:
                 "User-Agent": _USER_AGENT,
             },
         )
-        with _urllib_req.urlopen(
-            req, timeout=_tc.RPC_HTTP_SINGLE_TIMEOUT_SECONDS,
-        ) as resp:
-            payload = json.loads(resp.read())
+        with _urllib_req.urlopen(req, timeout=timeout_seconds) as resp:
+            return resp.read()
+
+    def _do_hedged_post(self, body: bytes, *, timeout_seconds: int) -> tuple[str, bytes]:
+        """Hedged HTTP POST. Fans out to ``hedge_fan_out`` endpoints
+        in parallel, returns (endpoint_used, response_bytes) from the
+        first successful endpoint, abandons the rest.
+
+        At fan_out=1 this delegates to a single ``_rpc_post`` call —
+        matching the pre-hedging codepath exactly (no executor, no
+        fan-out overhead). This is the bit-identical fast path.
+
+        Raises ``HedgedAllFailed`` if every endpoint fails. Records
+        per-endpoint outcomes in the health tracker.
+        """
+        endpoints = self._health.pick_n(self._hedge_fan_out)
+        if not endpoints:
+            # pick_n only returns [] when n<=0; with hedge_fan_out>=1
+            # validated at construction, this is a logic bug.
+            raise InvariantError("rpc_no_endpoints_available")
+
+        # Fast path for fan_out=1: keep the call shape identical to
+        # the pre-hedging single-endpoint behaviour. No threadpool,
+        # no future, just a direct urlopen + outcome record.
+        if len(endpoints) == 1:
+            url = endpoints[0]
+            t0 = time.monotonic()
+            try:
+                resp = self._rpc_post(url, body, timeout_seconds=timeout_seconds)
+            except BaseException as e:  # noqa: BLE001
+                rtt_ms = int((time.monotonic() - t0) * 1000)
+                self._health.record(url, success=False, rtt_ms=rtt_ms)
+                raise
+            rtt_ms = int((time.monotonic() - t0) * 1000)
+            self._health.record(url, success=True, rtt_ms=rtt_ms)
+            self._current_endpoint = url
+            return url, resp
+
+        # Hedged path: fan out to N endpoints, FIRST_COMPLETED wins.
+        if self._executor is None:
+            # Defensive: ctor builds executor when fan_out>1, but
+            # protect against later mutation.
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, self._hedge_fan_out * 4),
+                thread_name_prefix="rpc-hedge",
+            )
+
+        # Submit per-endpoint, recording start time per future.
+        fut_to_endpoint: dict[concurrent.futures.Future, str] = {}
+        fut_start: dict[concurrent.futures.Future, float] = {}
+        for ep in endpoints:
+            t0 = time.monotonic()
+            fut = self._executor.submit(
+                self._rpc_post, ep, body, timeout_seconds=timeout_seconds,
+            )
+            fut_to_endpoint[fut] = ep
+            fut_start[fut] = t0
+
+        pending = set(fut_to_endpoint.keys())
+        errors: list[tuple[str, BaseException]] = []
+        deadline = time.monotonic() + float(timeout_seconds)
+
+        while pending:
+            remaining = max(0.001, deadline - time.monotonic())
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=remaining,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                # Timeout fired; mark all still-pending as failed.
+                for fut in list(pending):
+                    ep = fut_to_endpoint[fut]
+                    rtt_ms = int((time.monotonic() - fut_start[fut]) * 1000)
+                    self._health.record(ep, success=False, rtt_ms=rtt_ms)
+                    errors.append((ep, TimeoutError(
+                        f"hedged_timeout_after_{rtt_ms}ms"
+                    )))
+                pending.clear()
+                break
+            for fut in done:
+                ep = fut_to_endpoint[fut]
+                rtt_ms = int((time.monotonic() - fut_start[fut]) * 1000)
+                try:
+                    resp = fut.result()
+                except BaseException as e:  # noqa: BLE001
+                    self._health.record(ep, success=False, rtt_ms=rtt_ms)
+                    errors.append((ep, e))
+                    continue
+                # First successful response wins. Remaining futures
+                # are abandoned (urllib doesn't support real
+                # cancellation; their results are discarded). At
+                # fan_out=3 this is ~2 wasted RPC/sec — acceptable
+                # per memo §2.
+                self._health.record(ep, success=True, rtt_ms=rtt_ms)
+                self._current_endpoint = ep
+                return ep, resp
+
+        # All endpoints failed.
+        raise HedgedAllFailed(errors)
+
+    def _rpc_call_single(self, method: str, params: list) -> Any:
+        """Single JSON-RPC call. Raises on transport error or RPC
+        error; returns the ``result`` field on success.
+
+        Hedging is transparent: at ``hedge_fan_out=1`` this matches
+        the pre-hedging single-endpoint codepath; at fan_out>1 the
+        request is fanned out and the first success wins.
+        """
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+        }).encode()
+        _ep, resp_bytes = self._do_hedged_post(
+            body, timeout_seconds=_tc.RPC_HTTP_SINGLE_TIMEOUT_SECONDS,
+        )
+        payload = json.loads(resp_bytes)
         if "error" in payload:
             raise InvariantError(f"rpc_error:{payload['error']}")
         return payload.get("result")
@@ -996,7 +1474,13 @@ class RpcPoller:
         """Batched JSON-RPC call. Returns list of (result, error_str)
         parallel to calls. On transport-level failures (HTTP error,
         non-list response, id mismatch) raises -- the entire batch is
-        considered failed."""
+        considered failed.
+
+        Hedging is transparent: at ``hedge_fan_out=1`` this matches
+        the pre-hedging single-endpoint codepath; at fan_out>1 the
+        batch is fanned out and the first endpoint to return a
+        well-formed list response wins.
+        """
         if not calls:
             return []
         batch = [
@@ -1004,18 +1488,10 @@ class RpcPoller:
             for i, (method, params) in enumerate(calls)
         ]
         body = json.dumps(batch).encode()
-        url = self._current_endpoint
-        req = _urllib_req.Request(
-            url, data=body,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": _USER_AGENT,
-            },
+        _ep, resp_bytes = self._do_hedged_post(
+            body, timeout_seconds=_tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS,
         )
-        with _urllib_req.urlopen(
-            req, timeout=_tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS,
-        ) as resp:
-            payload = json.loads(resp.read())
+        payload = json.loads(resp_bytes)
         if not isinstance(payload, list):
             raise InvariantError(
                 f"rpc_batch_non_list_response: type={type(payload).__name__}"
