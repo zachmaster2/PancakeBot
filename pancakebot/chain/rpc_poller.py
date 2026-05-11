@@ -80,12 +80,24 @@ RPC_BATCH_ENDPOINTS: list[str] = [
     "https://bsc-rpc.publicnode.com",
 ]
 
-# Hedging-mode default endpoint pool. Empirical top 3 by P50 batch
-# RTT from the 2026-05-08 Track H respike (n=200, batch_size=20):
+# Hedging-mode default endpoint pool. Top 3 by P50 batch RTT from the
+# 2026-05-08 Track H respike (n=200, batch_size=20), extended 2026-05-10
+# with two non-bsc-dataseed-family providers to defeat correlated
+# multi-endpoint outages observed in production (2026-05-09/10: hours-
+# long windows where ALL bsc-dataseed* endpoints timed out at 5s
+# simultaneously, confirming shared upstream infrastructure):
 #
-#   bsc-dataseed1.defibit.io   p50=770ms p99=2226ms
-#   bsc-dataseed1.ninicoin.io  p50=802ms p99=2179ms
-#   bsc-dataseed1.binance.org  p50=828ms p99=1797ms
+#   bsc-dataseed1.defibit.io   p50=770ms  p99=2226ms  (BSC dataseed family)
+#   bsc-dataseed1.ninicoin.io  p50=802ms  p99=2179ms  (BSC dataseed family)
+#   bsc-dataseed1.binance.org  p50=828ms  p99=1797ms  (BSC dataseed family)
+#   bsc-dataseed3.binance.org  p50=898ms  p99=1290ms  (BSC dataseed family)
+#   bsc-rpc.publicnode.com     p50=938ms  p99=1842ms  (Allnodes, distinct)
+#   bsc.rpc.blxrbdn.com        p50~250ms  batch~430ms (bloXroute, distinct)
+#
+# Pool of 6; hedge_fan_out picks top-N by p50 via EndpointHealthTracker.
+# publicnode and bloXroute are kept in the pool even when not selected
+# by pick_n's p50 ordering so they're available as failover when the
+# bsc-dataseed family experiences correlated outages.
 #
 # Use this list when constructing an RpcPoller with
 # ``hedge_fan_out >= 2``. NOT the default for single-endpoint
@@ -94,6 +106,9 @@ DEFAULT_HEDGED_ENDPOINTS: list[str] = [
     "https://bsc-dataseed1.defibit.io",
     "https://bsc-dataseed1.ninicoin.io",
     "https://bsc-dataseed1.binance.org",
+    "https://bsc-dataseed3.binance.org",
+    "https://bsc-rpc.publicnode.com",
+    "https://bsc.rpc.blxrbdn.com",
 ]
 
 _USER_AGENT = "pancakebot-rpc-poller/1.0"
