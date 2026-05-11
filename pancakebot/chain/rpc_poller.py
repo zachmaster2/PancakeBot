@@ -57,9 +57,10 @@ import concurrent.futures
 import json
 import threading
 import time
-import urllib.request as _urllib_req
 from dataclasses import dataclass, field
 from typing import Any
+
+import urllib3
 
 from pancakebot import timing_constants as _tc
 from pancakebot.constants import BNB_WEI, PREDICTION_V2_CONTRACT_ADDRESS
@@ -537,6 +538,24 @@ class RpcPoller:
                 thread_name_prefix="rpc-hedge",
             )
 
+        # urllib3 PoolManager: persistent HTTP/1.1 connections per host.
+        # Eliminates per-call DNS+TCP+TLS handshake cost — the bottleneck
+        # that caused 4-way parallel calls to exceed the 5s deadline at
+        # ~10% rate under bare urllib. Validated 2026-05-11 (max
+        # wallclock 4.745s → 2.502s at fan_out=4); see
+        # var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md.
+        # ``num_pools`` and ``maxsize`` both sized to len(pool) so every
+        # endpoint can hold one persistent connection; default urllib3
+        # behaviour is FIFO connection reuse within each host pool.
+        self._pool: urllib3.PoolManager = urllib3.PoolManager(
+            num_pools=max(1, len(self._endpoint_pool)),
+            maxsize=max(1, len(self._endpoint_pool)),
+            headers={
+                "User-Agent": _USER_AGENT,
+                "Content-Type": "application/json",
+            },
+        )
+
         self._contract_addr = contract_address.lower()
         self._periodic_poll_interval_s = int(periodic_poll_interval_s)
         self._batch_size = int(batch_size)
@@ -688,10 +707,13 @@ class RpcPoller:
             self._periodic_thread = None
         if self._executor is not None:
             # wait=False — abandoned hedged requests should not block
-            # shutdown. urllib has no real cancellation; the in-flight
-            # sockets will time out on their own.
+            # shutdown. The PoolManager has no real cancellation; the
+            # in-flight sockets will time out on their own.
             self._executor.shutdown(wait=False)
             self._executor = None
+        # Drain the urllib3 connection pool — closes any persistent
+        # sockets so the process exits cleanly.
+        self._pool.clear()
         info("RPC_POLL", "STOP", "OK", msg="RPC poller stopped")
 
     # ------------------------------------------------------------------
@@ -1421,20 +1443,31 @@ class RpcPoller:
         return int(num_hex, 16), int(ts_hex, 16)
 
     def _rpc_post(self, url: str, body: bytes, *, timeout_seconds: int) -> bytes:
-        """Single-endpoint HTTP POST. Returns the raw response body.
-        Raises on transport-level failure (urllib.error.URLError,
-        timeout, etc.). The caller parses JSON and decodes the
-        JSON-RPC envelope.
+        """Single-endpoint HTTP POST via the shared urllib3 PoolManager.
+        Returns the raw response body. Raises on transport-level failure
+        (``urllib3.exceptions.HTTPError`` subclasses: TimeoutError,
+        MaxRetryError, ConnectTimeoutError, etc.) or non-200 status.
+        The caller parses JSON and decodes the JSON-RPC envelope.
+
+        Persistent connections via the shared PoolManager mean the
+        first call to each host pays the TLS handshake; subsequent
+        calls reuse the open connection. See
+        var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md
+        for measured impact.
         """
-        req = _urllib_req.Request(
-            url, data=body,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": _USER_AGENT,
-            },
+        resp = self._pool.request(
+            "POST", url, body=body,
+            timeout=urllib3.Timeout(
+                connect=float(timeout_seconds),
+                read=float(timeout_seconds),
+            ),
+            retries=False,
         )
-        with _urllib_req.urlopen(req, timeout=timeout_seconds) as resp:
-            return resp.read()
+        if resp.status != 200:
+            raise urllib3.exceptions.HTTPError(
+                f"http_{resp.status}: {resp.reason}"
+            )
+        return resp.data
 
     def _do_hedged_post(self, body: bytes, *, timeout_seconds: int) -> tuple[str, bytes]:
         """Hedged HTTP POST. Fans out to ``hedge_fan_out`` endpoints
