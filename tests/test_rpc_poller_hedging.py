@@ -590,6 +590,75 @@ def test_estimated_catchup_ms_phase1_round_479981_regression():
         "post-fix estimate must be lower than the pre-fix 3066ms "
         "(otherwise the false-positive recurs)"
     )
+
+
+def test_is_catchup_infeasible_verdict_flips_with_hedge_n_r_i1():
+    """R-I1 end-to-end regression: the verdict (feasible vs infeasible)
+    must actually flip between hedge_n=1 (old single-endpoint baseline)
+    and hedge_n=3 (post-hedging) at a round-479981-class scenario.
+
+    f089b5c's existing tests assert the arithmetic differs but not
+    that ``_is_catchup_infeasible`` returns different booleans for the
+    same wallclock budget. This test pins the actual verdict flip:
+      - hedge_n=1: estimate=3066ms vs ~2800ms available → INFEAS (True)
+      - hedge_n=3: estimate=1886ms vs ~2800ms available → feasible (False)
+
+    Uses ``time.time`` patched so ``lock_at - time.time()`` reproduces
+    the budget deterministically (no wallclock drift). The 3-second
+    gap was chosen because:
+      - lock_at is int-seconds in production; using an integer gap
+        avoids ms truncation inside ``_is_catchup_infeasible``.
+      - 3000ms - 200ms (RPC_POLL_FINAL_SAFETY_BUFFER_MS) = 2800ms
+        bracketed cleanly by the two estimates (1886 < 2800 < 3066).
+
+    The round-479981 log entry reported 2361ms available, which is
+    similarly bracketed; the bracketed verdict-flip relationship is
+    what matters, not the exact wallclock budget.
+    """
+    pool = ["https://a", "https://b", "https://c"]
+    # 23 blocks behind = 2 batches of 20 (matches Phase 1 logs).
+    blocks_behind = 23
+    fake_now = 1_700_000_000.0  # arbitrary fixed wallclock
+    # 3 full seconds gap → time_until_lock_ms = 3000ms; available_ms =
+    # 3000 - RPC_POLL_FINAL_SAFETY_BUFFER_MS = 2800ms. Both estimates
+    # (1886 and 3066) straddle 2800 — verdict flips.
+    lock_at = int(fake_now) + 3
+
+    # hedge_n=3: feasible.
+    p3 = _make_poller(endpoint_pool=pool, hedge_fan_out=3)
+    with mock.patch("pancakebot.chain.rpc_poller.time.time",
+                    return_value=fake_now):
+        infeas_n3 = p3._is_catchup_infeasible(
+            blocks_behind=blocks_behind, lock_at=lock_at,
+        )
+    assert infeas_n3 is False, (
+        f"hedge_n=3 must be FEASIBLE at the bracketed scenario "
+        f"(est={p3._estimated_catchup_ms(blocks_behind)}ms vs "
+        f"~2800ms available)"
+    )
+
+    # hedge_n=1: infeasible.
+    p1 = _make_poller()  # single-endpoint
+    with mock.patch("pancakebot.chain.rpc_poller.time.time",
+                    return_value=fake_now):
+        infeas_n1 = p1._is_catchup_infeasible(
+            blocks_behind=blocks_behind, lock_at=lock_at,
+        )
+    assert infeas_n1 is True, (
+        f"hedge_n=1 must be INFEASIBLE at the bracketed scenario "
+        f"(est={p1._estimated_catchup_ms(blocks_behind)}ms vs "
+        f"~2800ms available) — the bug fix's whole point is that "
+        f"this verdict flipped between code revisions"
+    )
+
+    # Belt-and-braces: the verdict really did flip between the two
+    # configs at IDENTICAL wallclock budget.
+    assert infeas_n1 != infeas_n3, (
+        "verdict must flip between hedge_n=1 (INFEAS) and "
+        "hedge_n=3 (feasible) at the same scenario"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bug #7: abandoned-future observation gap
 # ---------------------------------------------------------------------------
