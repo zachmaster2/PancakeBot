@@ -199,30 +199,14 @@ def run_from_config(
     # Replaces the WSS-subscription pool watcher (Era 11, 2026-05-07);
     # see var/design/rpc_polling_architecture_2026_05_07.md.
     #
-    # Hedging across the top batched endpoints from the Track H
-    # respike. The fan-out is operator-tunable via [runtime].hedge_fan_out
-    # in config.toml — default 1 (single-endpoint, pre-hedging
-    # bit-identical path); production currently runs N=4. Track H MC
-    # estimated P99 batch RTT drops at the canonical batch_size=20:
-    #   fan_out=1 → 2372ms (single-endpoint baseline)
-    #   fan_out=2 → 1180ms (-50%)
-    #   fan_out=3 →  943ms (-20% vs fan_out=2)
-    #   fan_out=4 →  899ms (-5% vs fan_out=3)
-    # Live observation: post-fan_out=2 INFEAS rate 21.6% → 13.5%;
-    # post-fan_out=3 expected ~10-12%; fan_out=4 is the Phase 2
-    # endpoint-diversity experiment (adds binance_3 to the pool). See:
-    #   var/design/rpc_endpoint_hedging_2026_05_08.md
-    #   var/extended/endpoint_respike_n200.json
-    #
-    # Endpoint pool is DEFAULT_HEDGED_ENDPOINTS (six endpoints: top-4
-    # BSC-dataseed-family by Track H p50 + publicnode + bloXroute for
-    # distinct-provider failover). RpcPoller's constructor validates
-    # hedge_fan_out <= len(pool) at startup, so an operator can drop
-    # hedge_fan_out to 1..6 in config without touching the pool.
+    # Every JSON-RPC call fires in parallel to every endpoint in
+    # DEFAULT_HEDGED_ENDPOINTS via a shared urllib3.PoolManager (persistent
+    # HTTP/1.1 connections); first 200 response wins. No selection logic
+    # — if an endpoint misbehaves, remove it from the constant. See
+    # var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md.
     rpc_poller = RpcPoller(
         interval_seconds=interval_seconds,
-        rpc_urls=DEFAULT_HEDGED_ENDPOINTS,
-        hedge_fan_out=cfg.hedge_fan_out,
+        endpoint_pool=DEFAULT_HEDGED_ENDPOINTS,
     )
     rpc_poller.start()
 

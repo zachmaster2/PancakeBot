@@ -344,15 +344,6 @@ class AppConfig:
     kline_cutoff_seconds: int
     pool_cutoff_seconds: int
     max_consecutive_fetch_failures: int
-    # RPC endpoint hedging fan-out (legacy default 1 = no hedging,
-    # bit-identical with the pre-hedging codepath). Higher values fan
-    # out each JSON-RPC call to N endpoints in parallel and return the
-    # first success. Production currently runs N=4 with the top-4
-    # batched BSC endpoints; setting this lower in config.toml
-    # disables hedging or scales it down without code changes. Must
-    # be in ``[1, len(endpoint_pool)]`` — RpcPoller's constructor
-    # validates against the pool size at startup.
-    hedge_fan_out: int
 
     # Derived (from timing_constants.py at load time)
     bet_submit_deadline_offset_ms: int
@@ -694,18 +685,6 @@ def load_app_config(path: str) -> AppConfig:
             f"got={max_consecutive_fetch_failures} valid=[1..100]"
         )
 
-    # ``hedge_fan_out``: per-call RPC endpoint fan-out. Default 1
-    # preserves the pre-hedging single-endpoint behaviour (legacy /
-    # bit-identical fast path in _do_hedged_post). Production runs
-    # higher; see config.toml. Upper bound 16 is a soft sanity check
-    # — RpcPoller's constructor enforces the real binding constraint
-    # (fan_out <= len(endpoint_pool)).
-    hedge_fan_out = _opt_int(runtime, "hedge_fan_out", 1)
-    if not (1 <= hedge_fan_out <= 16):
-        raise InvariantError(
-            f"runtime_hedge_fan_out_out_of_range: "
-            f"got={hedge_fan_out} valid=[1..16]"
-        )
     # --- Derived timing constants (NOT user-tunable) ---
     # All four wake offsets and the bet-submit deadline offset are computed
     # from empirical constants in pancakebot/timing_constants.py. To change
@@ -881,7 +860,6 @@ def load_app_config(path: str) -> AppConfig:
         kline_cutoff_seconds=kline_cutoff_seconds,
         pool_cutoff_seconds=pool_cutoff_seconds,
         max_consecutive_fetch_failures=max_consecutive_fetch_failures,
-        hedge_fan_out=hedge_fan_out,
         bet_submit_deadline_offset_ms=bet_submit_deadline_offset_ms,
         critical_path_wakeup_offset_ms=critical_path_wakeup_offset_ms,
         final_rpc_poll_wakeup_offset_ms=final_rpc_poll_wakeup_offset_ms,
