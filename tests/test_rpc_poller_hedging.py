@@ -1,15 +1,16 @@
-"""Unit tests for RPC endpoint hedging.
+"""Unit tests for the fire-to-all-pool RPC hedging transport.
 
-Covers the fan-out behaviour, EndpointHealthTracker classification +
-retest cadence, and integration at the ``_do_hedged_post`` level.
-
-The strategy hash is preserved by these tests because the hedging
-layer is below the result-parsing logic — the canonical 5-fold +
-holdout assertions in ``tests/test_in_process_runner.py`` are the
-end-to-end check that's still bit-identical.
+Every JSON-RPC call fires in parallel to every endpoint in the pool
+via a shared ThreadPoolExecutor; first 200 response wins, the rest
+are abandoned. There is no endpoint selection logic — if an endpoint
+misbehaves, the operator removes it from the constant.
 
 Tests use ``unittest.mock`` to patch ``_rpc_post`` (the lowest-level
 HTTP call) with controllable timing and outcomes.
+
+See var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md
+for the design rationale (replaces the prior pick_n + per-endpoint
+health-tracker model after measured 4-way parallel failures).
 """
 from __future__ import annotations
 
@@ -27,7 +28,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 from pancakebot.chain.rpc_poller import (  # noqa: E402
     DEFAULT_HEDGED_ENDPOINTS,
-    EndpointHealthTracker,
     HedgedAllFailed,
     RpcPoller,
 )
@@ -38,15 +38,10 @@ from pancakebot.util import InvariantError  # noqa: E402
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_poller(
-    *,
-    endpoint_pool: list[str] | None = None,
-    hedge_fan_out: int = 1,
-) -> RpcPoller:
+def _make_poller(*, endpoint_pool: list[str] | None = None) -> RpcPoller:
     return RpcPoller(
         interval_seconds=300,
         endpoint_pool=endpoint_pool or ["https://test.example.com"],
-        hedge_fan_out=hedge_fan_out,
     )
 
 
@@ -66,830 +61,214 @@ def _make_responder(*, response: bytes, sleep_s: float = 0.0,
 # Construction validation
 # ---------------------------------------------------------------------------
 
-def test_invalid_hedge_fan_out_zero_raises():
-    """fan_out < 1 is invalid."""
-    with pytest.raises(InvariantError, match="hedge_fan_out_below_one"):
-        RpcPoller(
-            interval_seconds=300,
-            endpoint_pool=["https://a"],
-            hedge_fan_out=0,
-        )
-
-
-def test_invalid_hedge_fan_out_exceeds_pool_size_raises():
-    """fan_out > len(pool) is a misconfig — must crash loudly."""
-    with pytest.raises(InvariantError, match="hedge_fan_out_exceeds_pool_size"):
-        RpcPoller(
-            interval_seconds=300,
-            endpoint_pool=["https://a"],
-            hedge_fan_out=3,
-        )
-
-
-def test_invalid_hedge_fan_out_three_with_two_endpoints_raises():
-    """Same misconfig — slightly different sizes for confidence."""
-    with pytest.raises(InvariantError, match="hedge_fan_out_exceeds_pool_size"):
-        RpcPoller(
-            interval_seconds=300,
-            endpoint_pool=["https://a", "https://b"],
-            hedge_fan_out=3,
-        )
+def test_empty_endpoint_pool_raises():
+    with pytest.raises(InvariantError, match="endpoint_pool_empty"):
+        RpcPoller(interval_seconds=300, endpoint_pool=[])
 
 
 def test_default_hedged_endpoints_constant_is_six():
-    """Spec contract: top-3 BSC-dataseed-family endpoints from Track H
-    (defibit/ninicoin/binance_1) plus binance_3 (rank 4) plus two
-    distinct-provider endpoints (publicnode, bloXroute) added 2026-05-10
-    to defeat correlated bsc-dataseed-family outages. If this changes,
-    the in-file docstring and any operator config relying on it needs
-    updating."""
+    """Spec contract: 4 BSC-dataseed-family endpoints + publicnode +
+    bloXroute, in stable order. publicnode + bloXroute are kept in
+    the pool for distinct-provider failover when the bsc-dataseed*
+    family experiences correlated outages.
+    """
     assert len(DEFAULT_HEDGED_ENDPOINTS) == 6
-    # BSC dataseed family (Track H top-4 by p50)
     assert DEFAULT_HEDGED_ENDPOINTS[0].endswith("defibit.io")
     assert DEFAULT_HEDGED_ENDPOINTS[1].endswith("ninicoin.io")
     assert "bsc-dataseed1.binance.org" in DEFAULT_HEDGED_ENDPOINTS[2]
     assert "bsc-dataseed3.binance.org" in DEFAULT_HEDGED_ENDPOINTS[3]
-    # Distinct-provider failover endpoints
     assert "publicnode.com" in DEFAULT_HEDGED_ENDPOINTS[4]
     assert "blxrbdn.com" in DEFAULT_HEDGED_ENDPOINTS[5]
 
 
 # ---------------------------------------------------------------------------
-# Fan-out behaviour
+# Fire-to-all-pool transport behaviour
 # ---------------------------------------------------------------------------
 
-def test_fan_out_1_uses_single_endpoint():
-    """At fan_out=1, _do_hedged_post takes the fast path: a single
-    direct urlopen with the picked endpoint, NO threadpool, no
-    fan-out overhead. External behaviour matches the pre-hedging
-    code exactly."""
+def test_single_endpoint_pool_returns_response():
+    """At pool-size 1, _do_hedged_post takes the single-endpoint
+    fast path (no executor) and returns the response."""
+    body = b'{"jsonrpc":"2.0","method":"x","params":[],"id":1}'
     p = _make_poller(endpoint_pool=["https://only.example.com"])
-    body = b'{"jsonrpc":"2.0","id":1,"method":"x","params":[]}'
-
-    calls = []
-
-    def fake_post(url, b, *, timeout_seconds):
-        calls.append((url, b, timeout_seconds))
-        return b'{"jsonrpc":"2.0","id":1,"result":"ok"}'
-
-    p._rpc_post = fake_post  # type: ignore[assignment]
-
-    ep, resp = p._do_hedged_post(body, timeout_seconds=5)
+    with mock.patch.object(
+        p, "_rpc_post",
+        side_effect=_make_responder(response=b'{"result":42}'),
+    ) as m:
+        ep, resp = p._do_hedged_post(body, timeout_seconds=5)
     assert ep == "https://only.example.com"
-    assert resp == b'{"jsonrpc":"2.0","id":1,"result":"ok"}'
-    assert calls == [("https://only.example.com", body, 5)]
-    assert p._executor is None, "fan_out=1 must not allocate executor"
+    assert resp == b'{"result":42}'
+    assert m.call_count == 1
 
 
-def test_fan_out_2_picks_min_latency():
-    """Fastest endpoint's response wins; slow endpoint's response is
-    discarded. The total wallclock is bounded by the FAST endpoint's
-    RTT, not the slow one."""
-    pool = ["https://slow.example.com", "https://fast.example.com"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=2)
+def test_first_response_wins_three_endpoints():
+    """Three endpoints; whichever returns first wins. Use distinct
+    sleep times to make the winner deterministic."""
+    pool = ["https://slow.example.com", "https://medium.example.com",
+            "https://fast.example.com"]
+    p = _make_poller(endpoint_pool=pool)
 
-    fast_body = b'{"jsonrpc":"2.0","id":1,"result":"fast"}'
-    slow_body = b'{"jsonrpc":"2.0","id":1,"result":"slow"}'
-
-    def fake_post(url, b, *, timeout_seconds):
+    def per_url(url, body, *, timeout_seconds):
         if "fast" in url:
-            time.sleep(0.05)
-            return fast_body
-        else:
-            time.sleep(0.50)
-            return slow_body
+            return b'{"result":"fast"}'
+        if "medium" in url:
+            time.sleep(0.2)
+            return b'{"result":"medium"}'
+        time.sleep(2.0)
+        return b'{"result":"slow"}'
 
-    p._rpc_post = fake_post  # type: ignore[assignment]
-
-    t0 = time.monotonic()
-    ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
-    elapsed = time.monotonic() - t0
-
+    with mock.patch.object(p, "_rpc_post", side_effect=per_url):
+        ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
     assert ep == "https://fast.example.com"
-    assert resp == fast_body
-    # Bounded by fast RTT (0.05s) + small overhead, well below slow RTT.
-    assert elapsed < 0.40, f"hedging took {elapsed:.3f}s; expected ~0.05s"
+    assert resp == b'{"result":"fast"}'
 
 
-def test_fan_out_2_handles_one_endpoint_failure():
-    """One endpoint raises; the other succeeds. Result returned;
-    failing endpoint marked unhealthy."""
+def test_first_success_among_mixed_outcomes_wins():
+    """One endpoint succeeds fast, others fail. The success wins
+    even though there are failed siblings."""
     pool = ["https://broken.example.com", "https://good.example.com"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=2)
+    p = _make_poller(endpoint_pool=pool)
 
-    good_body = b'{"jsonrpc":"2.0","id":1,"result":"good"}'
-
-    def fake_post(url, b, *, timeout_seconds):
+    def per_url(url, body, *, timeout_seconds):
         if "broken" in url:
-            raise ConnectionError("simulated_outage")
-        time.sleep(0.05)  # ensure broken's failure registers first
-        return good_body
+            raise ConnectionError("oops")
+        return b'{"result":"ok"}'
 
-    p._rpc_post = fake_post  # type: ignore[assignment]
-
-    ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
+    with mock.patch.object(p, "_rpc_post", side_effect=per_url):
+        ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
     assert ep == "https://good.example.com"
-    assert resp == good_body
-
-    # Health tracker: broken=failure, good=success.
-    stats = p._health.stats()
-    assert stats["https://broken.example.com"]["consecutive_failures"] == 1
-    assert stats["https://good.example.com"]["consecutive_failures"] == 0
+    assert resp == b'{"result":"ok"}'
 
 
-def test_fan_out_3_handles_two_endpoint_failures():
-    """Two endpoints raise; one succeeds. Result returned."""
-    pool = ["https://bad1.example.com", "https://bad2.example.com",
-            "https://good.example.com"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=3)
-
-    good_body = b'{"jsonrpc":"2.0","id":1,"result":"good"}'
-
-    def fake_post(url, b, *, timeout_seconds):
-        if "bad" in url:
-            raise ConnectionError(f"outage_{url}")
-        time.sleep(0.10)  # ensure bad's failures register first
-        return good_body
-
-    p._rpc_post = fake_post  # type: ignore[assignment]
-
-    ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
-    assert ep == "https://good.example.com"
-    assert resp == good_body
-
-    stats = p._health.stats()
-    assert stats["https://bad1.example.com"]["consecutive_failures"] == 1
-    assert stats["https://bad2.example.com"]["consecutive_failures"] == 1
-    assert stats["https://good.example.com"]["consecutive_failures"] == 0
-
-
-def test_all_endpoints_fail_raises_composite_error():
-    """Every endpoint raises -> HedgedAllFailed with all errors
-    surfaced in the message."""
+def test_all_fail_raises_hedged_all_failed():
+    """Every endpoint raises -> HedgedAllFailed with per-endpoint
+    errors attached."""
     pool = ["https://a.example.com", "https://b.example.com",
             "https://c.example.com"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=3)
+    p = _make_poller(endpoint_pool=pool)
 
-    def fake_post(url, b, *, timeout_seconds):
-        raise ConnectionError(f"down_{url}")
+    def per_url(url, body, *, timeout_seconds):
+        raise ConnectionError(f"down: {url}")
 
-    p._rpc_post = fake_post  # type: ignore[assignment]
-
-    with pytest.raises(HedgedAllFailed) as exc_info:
-        p._do_hedged_post(b"x", timeout_seconds=5)
-
-    msg = str(exc_info.value)
-    assert "all_hedged_endpoints_failed (3)" in msg
-    # All three endpoints listed.
-    assert "a.example.com" in msg
-    assert "b.example.com" in msg
-    assert "c.example.com" in msg
+    with mock.patch.object(p, "_rpc_post", side_effect=per_url):
+        with pytest.raises(HedgedAllFailed) as exc_info:
+            p._do_hedged_post(b"x", timeout_seconds=5)
     assert len(exc_info.value.errors) == 3
-
-
-# ---------------------------------------------------------------------------
-# EndpointHealthTracker — classification + retest
-# ---------------------------------------------------------------------------
-
-def test_health_tracker_warmup_is_healthy_by_default():
-    """Brand-new endpoint with no recorded outcomes: healthy."""
-    h = EndpointHealthTracker(["https://a"])
-    assert h.is_healthy("https://a") is True
-
-
-def test_health_tracker_marks_unhealthy_on_consecutive_failures():
-    """5 consecutive failures triggers fast-trip (consecutive_failures
-    gate), even before the rolling window fills."""
-    h = EndpointHealthTracker(["https://a"])
-    for _ in range(4):
-        h.record("https://a", success=False, rtt_ms=100)
-    assert h.is_healthy("https://a") is True, "4 fails: still healthy"
-    h.record("https://a", success=False, rtt_ms=100)
-    assert h.is_healthy("https://a") is False, "5th fail: tripped"
-
-
-def test_health_tracker_rolling_window_success_rate_gate():
-    """Once the window fills (100 outcomes), success_rate <= 0.90 -> unhealthy."""
-    h = EndpointHealthTracker(["https://a"])
-    # 89 successes + 11 failures interleaved so consecutive_failures resets.
-    # We want consecutive_failures < 5 so only the success_rate gate fires.
-    for i in range(100):
-        # fail every 10th so consec_failures stays at 1.
-        success = (i % 10 != 0)
-        h.record("https://a", success=success, rtt_ms=100)
-    # 90 successes / 100: success_rate = 0.90, threshold is "> 0.90" so
-    # exactly 0.90 should NOT pass. Spec: success_rate > 0.90.
-    # Implementation rejects when (successes/n) <= 0.90. So 0.90 -> unhealthy.
-    assert h.is_healthy("https://a") is False
-
-
-def test_health_tracker_rolling_window_recovers():
-    """Window full of mostly successes (95%) -> healthy."""
-    h = EndpointHealthTracker(["https://a"])
-    for i in range(100):
-        success = (i % 20 != 0)  # 95 successes / 100
-        h.record("https://a", success=success, rtt_ms=100)
-    assert h.is_healthy("https://a") is True
-
-
-def test_health_tracker_excludes_unhealthy_from_pick_n():
-    """When healthy endpoints are available, pick_n returns only the
-    healthy ones (no fallback to unhealthy needed)."""
-    h = EndpointHealthTracker(["https://good", "https://broken"])
-    # broken: 5 consecutive failures -> unhealthy.
-    for _ in range(5):
-        h.record("https://broken", success=False, rtt_ms=100)
-    # good: 1 success -> healthy.
-    h.record("https://good", success=True, rtt_ms=100)
-
-    # Reset the global pick counter to bypass periodic-retest pressure
-    # for THIS particular pick. Use a small N.
-    picks = h.pick_n(1)
-    assert picks == ["https://good"]
-
-
-def test_health_tracker_picks_fastest_healthy_first():
-    """pick_n sorts healthy endpoints by p50 RTT ascending."""
-    h = EndpointHealthTracker(["https://slow", "https://medium", "https://fast"])
-    # 5 outcomes per endpoint with distinct p50.
-    for _ in range(5):
-        h.record("https://slow", success=True, rtt_ms=900)
-        h.record("https://medium", success=True, rtt_ms=500)
-        h.record("https://fast", success=True, rtt_ms=100)
-    picks = h.pick_n(3)
-    assert picks == ["https://fast", "https://medium", "https://slow"]
-
-
-def test_health_tracker_falls_back_to_unhealthy_when_short():
-    """If only 1 healthy endpoint exists but pick_n(3) requested,
-    fall back to unhealthy ones to fill the count (degraded mode
-    beats no-RPC mode)."""
-    h = EndpointHealthTracker(["https://good", "https://bad1", "https://bad2"])
-    h.record("https://good", success=True, rtt_ms=100)
-    for _ in range(5):
-        h.record("https://bad1", success=False, rtt_ms=100)
-        h.record("https://bad2", success=False, rtt_ms=100)
-    picks = h.pick_n(3)
-    assert len(picks) == 3
-    assert "https://good" in picks
-    assert "https://bad1" in picks
-    assert "https://bad2" in picks
-
-
-def test_health_tracker_periodic_retest():
-    """Even when healthy alternatives exist, an unhealthy endpoint
-    gets re-tested every Nth pick (1-in-10 retry pressure) AND when
-    it hasn't been probed in 60+ seconds. Verify the 60s-stall path."""
-    h = EndpointHealthTracker(["https://good1", "https://good2", "https://broken"])
-    # broken: 5 fails ago = unhealthy.
-    for _ in range(5):
-        h.record("https://broken", success=False, rtt_ms=100)
-    h.record("https://good1", success=True, rtt_ms=200)
-    h.record("https://good2", success=True, rtt_ms=300)
-
-    # Force broken's last_request_at to be >60s ago to trigger retest.
-    with h._lock:
-        h._health["https://broken"].last_request_at = time.time() - 120
-
-    picks = h.pick_n(2)
-    # broken should be included as the retest candidate; one healthy joins.
-    assert "https://broken" in picks
-    assert len(picks) == 2
-
-
-def test_health_tracker_records_under_pick_n_counter_for_one_in_ten():
-    """1-in-10 retest cadence kicks in even without 60s stall. After
-    10 picks, broken should be included at least once."""
-    h = EndpointHealthTracker(["https://good", "https://broken"])
-    for _ in range(5):
-        h.record("https://broken", success=False, rtt_ms=100)
-    h.record("https://good", success=True, rtt_ms=200)
-
-    # Reset broken's last_request_at to "now" so the 60s-forced retest
-    # does NOT kick in. Only the 10th-pick counter should trigger inclusion.
-    with h._lock:
-        h._health["https://broken"].last_request_at = time.time()
-
-    saw_broken = False
-    for _ in range(15):
-        picks = h.pick_n(1)
-        if "https://broken" in picks:
-            saw_broken = True
-            break
-    assert saw_broken, "broken should be retested within 15 picks"
-
-
-def test_health_tracker_stats_shape():
-    """stats() returns one entry per endpoint with documented fields."""
-    h = EndpointHealthTracker(["https://a", "https://b"])
-    h.record("https://a", success=True, rtt_ms=300)
-    h.record("https://b", success=False, rtt_ms=5000)
-    s = h.stats()
-    assert set(s.keys()) == {"https://a", "https://b"}
-    for url, fields in s.items():
-        assert "healthy" in fields
-        assert "success_rate" in fields
-        assert "p50_rtt_ms" in fields
-        assert "p99_rtt_ms" in fields
-        assert "consecutive_failures" in fields
-        assert "total_requests" in fields
-
-
-# ---------------------------------------------------------------------------
-# Integration: RpcPoller stats expose health
-# ---------------------------------------------------------------------------
-
-def test_rpc_poller_stats_expose_endpoint_health():
-    """RpcPoller.stats includes per-endpoint health breakdown."""
-    p = _make_poller(
-        endpoint_pool=["https://a", "https://b"],
-        hedge_fan_out=2,
-    )
-    s = p.stats
-    assert "endpoint_health" in s
-    assert "https://a" in s["endpoint_health"]
-    assert "https://b" in s["endpoint_health"]
-    assert s["hedge_fan_out"] == 2
-
-
-def test_rpc_call_single_uses_hedging_at_fan_out_2():
-    """End-to-end at the _rpc_call_single boundary: parses JSON-RPC
-    envelope, returns result, distributes calls across endpoints."""
-    pool = ["https://a", "https://b"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=2)
-
-    a_body = b'{"jsonrpc":"2.0","id":1,"result":"0x42"}'
-    b_body = b'{"jsonrpc":"2.0","id":1,"result":"0x99"}'
-
-    def fake_post(url, b, *, timeout_seconds):
-        if "a" in url and "/" not in url[8:]:
-            time.sleep(0.02)
-            return a_body
-        time.sleep(0.30)
-        return b_body
-
-    p._rpc_post = fake_post  # type: ignore[assignment]
-    result = p._rpc_call_single("eth_blockNumber", [])
-    # 'a' wins (faster); result is the 'a' body.
-    assert result == "0x42"
-
-
-def test_rpc_batch_uses_hedging_at_fan_out_2():
-    """End-to-end at the _rpc_batch boundary: parses JSON-RPC list,
-    returns aligned results, distributes batched calls across endpoints."""
-    pool = ["https://a", "https://b"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=2)
-
-    fast_body = (
-        b'[{"jsonrpc":"2.0","id":0,"result":"r0"},'
-        b'{"jsonrpc":"2.0","id":1,"result":"r1"}]'
-    )
-
-    def fake_post(url, b, *, timeout_seconds):
-        if "a" in url and "/" not in url[8:]:
-            return fast_body
-        time.sleep(0.30)
-        return b'[]'  # malformed for b — but a wins, so b's body is discarded
-
-    p._rpc_post = fake_post  # type: ignore[assignment]
-    results = p._rpc_batch([("eth_blockNumber", []), ("eth_blockNumber", [])])
-    assert len(results) == 2
-    assert results[0] == ("r0", None)
-    assert results[1] == ("r1", None)
-
-
-# ---------------------------------------------------------------------------
-# Health-driven endpoint rotation across many calls
-# ---------------------------------------------------------------------------
-
-def test_health_driven_deprioritisation_includes_recovery_path():
-    """Endpoint that fails 5 times becomes unhealthy AND is excluded
-    from pick_n until it recovers (or the periodic retest brings it back)."""
-    pool = ["https://a", "https://b"]
-    h = EndpointHealthTracker(pool)
-    # a fails 5 times.
-    for _ in range(5):
-        h.record("https://a", success=False, rtt_ms=100)
-    # b succeeds.
-    h.record("https://b", success=True, rtt_ms=200)
-
-    # pick_n(1): without retest pressure, only b should be picked.
-    # We disable retest by setting a's last_request_at to NOW.
-    with h._lock:
-        h._health["https://a"].last_request_at = time.time()
-    # Force pick_counter to a non-multiple of 10.
-    with h._lock:
-        h._pick_counter = 5
-
-    picks = h.pick_n(1)
-    assert picks == ["https://b"]
-
-    # Now: simulate recovery — record many successes for a.
-    for _ in range(20):
-        h.record("https://a", success=True, rtt_ms=100)
-    # a's consecutive_failures reset on first success; with <100
-    # window outcomes, warmup rule says healthy. 5+20=25 outcomes, all
-    # post-recovery 20 successes -> healthy.
-    assert h.is_healthy("https://a") is True
-
-
-# ---------------------------------------------------------------------------
-# Hedging-aware feasibility math
-# ---------------------------------------------------------------------------
-#
-# The original 2026-05-07 spike measured P99 batch RTT against
-# publicnode-only as 1533ms (RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE).
-# The 2026-05-08 Track H respike measured the top defibit/ninicoin/
-# binance_1 pool with N-way hedging and produced
-# RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE_HEDGED:
-#   fan_out=1 => 2372ms, =2 => 1180, =3 => 943, =4 => 899, =5 => 883
-#
-# When hedging is enabled the catch-up feasibility math MUST use the
-# hedged P99 — using the single-endpoint baseline overstates by 60%
-# at fan_out=3 (1533 vs 943) and was responsible for 3 of 4 INFEAS
-# false-positives in Phase 1.
-
-def test_rpc_rtt_p99_for_batch_hedged_table_at_fan_out_3():
-    """At hedge_n=3, batch=20 returns the hedged 943ms, not 1533ms."""
-    from pancakebot import timing_constants as _tc  # noqa: WPS433
-    assert _tc.rpc_rtt_p99_for_batch(20, hedge_n=3) == 943
-
-
-def test_rpc_rtt_p99_for_batch_hedged_table_at_fan_out_4():
-    """At hedge_n=4, batch=20 returns 899ms (Track H respike)."""
-    from pancakebot import timing_constants as _tc  # noqa: WPS433
-    assert _tc.rpc_rtt_p99_for_batch(20, hedge_n=4) == 899
-
-
-def test_rpc_rtt_p99_for_batch_default_hedge_n_one_preserves_baseline():
-    """Default hedge_n=1 returns the single-endpoint baseline 1533ms.
-    Critical for the canonical-hash invariant: wake-schedule derivation
-    must remain bit-identical at hedge_n=1."""
-    from pancakebot import timing_constants as _tc  # noqa: WPS433
-    assert _tc.rpc_rtt_p99_for_batch(20) == 1533
-    assert _tc.rpc_rtt_p99_for_batch(20, hedge_n=1) == 1533
-
-
-def test_rpc_rtt_p99_for_batch_hedge_n_two_returns_hedged():
-    """At hedge_n=2 the table value (1180ms) is returned."""
-    from pancakebot import timing_constants as _tc  # noqa: WPS433
-    assert _tc.rpc_rtt_p99_for_batch(20, hedge_n=2) == 1180
-
-
-def test_rpc_rtt_p99_for_batch_hedge_n_above_table_falls_back_to_baseline():
-    """An hedge_n above the highest tabulated key (5) falls back to
-    the single-endpoint baseline. Conservative overestimate beats
-    silent extrapolation."""
-    from pancakebot import timing_constants as _tc  # noqa: WPS433
-    # hedge_n=6 not in table; falls back to 1533ms.
-    assert _tc.rpc_rtt_p99_for_batch(20, hedge_n=6) == 1533
-
-
-def test_rpc_rtt_p99_for_batch_unsupported_batch_size_falls_back_to_baseline():
-    """The hedged table currently only covers batch=20. For other batch
-    sizes (e.g. ramp_2's expected 15) the function falls back to the
-    single-endpoint table even when hedge_n>1. Defensive: extend the
-    hedged table rather than extrapolate silently."""
-    from pancakebot import timing_constants as _tc  # noqa: WPS433
-    # batch_size=10 has no hedged measurement → fall back to baseline.
-    assert _tc.rpc_rtt_p99_for_batch(10, hedge_n=3) == _tc.rpc_rtt_p99_for_batch(10)
-
-
-def test_estimated_catchup_ms_uses_hedged_rtt_at_fan_out_3():
-    """RpcPoller._estimated_catchup_ms must use the hedged P99 column
-    when hedge_fan_out=3.
-
-    Pre-fix: 20 blocks → 1 batch × 1533ms = 1533ms (single-endpoint
-    baseline used regardless of fan_out).
-    Post-fix: 20 blocks → 1 batch × 943ms = 943ms.
-    """
-    pool = ["https://a", "https://b", "https://c"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=3)
-    assert p._estimated_catchup_ms(20) == 943
-    assert p._estimated_catchup_ms(40) == 2 * 943
-
-
-def test_estimated_catchup_ms_at_fan_out_1_unchanged():
-    """At fan_out=1 the estimate must use the single-endpoint baseline
-    (1533ms for batch=20). Critical for canonical-hash preservation:
-    pre-hedging behaviour bit-identical."""
-    p = _make_poller()  # hedge_fan_out=1 default
-    assert p._estimated_catchup_ms(20) == 1533
-
-
-def test_estimated_catchup_ms_phase1_round_479981_regression():
-    """Regression test for the Phase 1 INFEAS false-positive: round
-    479981 had cursor 23 blocks behind (= 2 batches of 20).
-
-    Pre-fix at fan_out=3: 2 × 1533 = 3066ms estimate vs ~2361ms
-    available → INFEAS → SKIP.
-    Post-fix at fan_out=3: 2 × 943 = 1886ms estimate vs ~2361ms
-    available → feasible → no skip.
-    """
-    pool = ["https://a", "https://b", "https://c"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=3)
-    # 23 blocks = 2 batches at batch_size=20 (ceiling).
-    est = p._estimated_catchup_ms(23)
-    assert est == 2 * 943, (
-        f"expected 1886ms (2 batches × 943ms hedged), got {est}ms"
-    )
-    # Sanity: at the pre-fix path this would have been 3066ms.
-    assert est < 3066, (
-        "post-fix estimate must be lower than the pre-fix 3066ms "
-        "(otherwise the false-positive recurs)"
+    endpoints_in_errors = {ep for ep, _ in exc_info.value.errors}
+    assert endpoints_in_errors == set(pool)
+
+
+def test_all_timeout_raises_hedged_all_failed():
+    """Every endpoint exceeds the deadline -> HedgedAllFailed with
+    TimeoutError entries."""
+    pool = ["https://a.example.com", "https://b.example.com"]
+    p = _make_poller(endpoint_pool=pool)
+
+    def slow(url, body, *, timeout_seconds):
+        time.sleep(2.0)
+        return b'{"result":"too late"}'
+
+    with mock.patch.object(p, "_rpc_post", side_effect=slow):
+        with pytest.raises(HedgedAllFailed) as exc_info:
+            # 0.3s timeout < 2s sleep on every endpoint
+            p._do_hedged_post(b"x", timeout_seconds=0.3)
+    assert len(exc_info.value.errors) >= 1
+    assert all(
+        isinstance(e, TimeoutError) for _, e in exc_info.value.errors
     )
 
 
-def test_is_catchup_infeasible_verdict_flips_with_hedge_n_r_i1():
-    """R-I1 end-to-end regression: the verdict (feasible vs infeasible)
-    must actually flip between hedge_n=1 (old single-endpoint baseline)
-    and hedge_n=3 (post-hedging) at a round-479981-class scenario.
-
-    f089b5c's existing tests assert the arithmetic differs but not
-    that ``_is_catchup_infeasible`` returns different booleans for the
-    same wallclock budget. This test pins the actual verdict flip:
-      - hedge_n=1: estimate=3066ms vs ~2800ms available → INFEAS (True)
-      - hedge_n=3: estimate=1886ms vs ~2800ms available → feasible (False)
-
-    Uses ``time.time`` patched so ``lock_at - time.time()`` reproduces
-    the budget deterministically (no wallclock drift). The 3-second
-    gap was chosen because:
-      - lock_at is int-seconds in production; using an integer gap
-        avoids ms truncation inside ``_is_catchup_infeasible``.
-      - 3000ms - 200ms (RPC_POLL_FINAL_SAFETY_BUFFER_MS) = 2800ms
-        bracketed cleanly by the two estimates (1886 < 2800 < 3066).
-
-    The round-479981 log entry reported 2361ms available, which is
-    similarly bracketed; the bracketed verdict-flip relationship is
-    what matters, not the exact wallclock budget.
-    """
-    pool = ["https://a", "https://b", "https://c"]
-    # 23 blocks behind = 2 batches of 20 (matches Phase 1 logs).
-    blocks_behind = 23
-    fake_now = 1_700_000_000.0  # arbitrary fixed wallclock
-    # 3 full seconds gap → time_until_lock_ms = 3000ms; available_ms =
-    # 3000 - RPC_POLL_FINAL_SAFETY_BUFFER_MS = 2800ms. Both estimates
-    # (1886 and 3066) straddle 2800 — verdict flips.
-    lock_at = int(fake_now) + 3
-
-    # hedge_n=3: feasible.
-    p3 = _make_poller(endpoint_pool=pool, hedge_fan_out=3)
-    with mock.patch("pancakebot.chain.rpc_poller.time.time",
-                    return_value=fake_now):
-        infeas_n3 = p3._is_catchup_infeasible(
-            blocks_behind=blocks_behind, lock_at=lock_at,
-        )
-    assert infeas_n3 is False, (
-        f"hedge_n=3 must be FEASIBLE at the bracketed scenario "
-        f"(est={p3._estimated_catchup_ms(blocks_behind)}ms vs "
-        f"~2800ms available)"
-    )
-
-    # hedge_n=1: infeasible.
-    p1 = _make_poller()  # single-endpoint
-    with mock.patch("pancakebot.chain.rpc_poller.time.time",
-                    return_value=fake_now):
-        infeas_n1 = p1._is_catchup_infeasible(
-            blocks_behind=blocks_behind, lock_at=lock_at,
-        )
-    assert infeas_n1 is True, (
-        f"hedge_n=1 must be INFEASIBLE at the bracketed scenario "
-        f"(est={p1._estimated_catchup_ms(blocks_behind)}ms vs "
-        f"~2800ms available) — the bug fix's whole point is that "
-        f"this verdict flipped between code revisions"
-    )
-
-    # Belt-and-braces: the verdict really did flip between the two
-    # configs at IDENTICAL wallclock budget.
-    assert infeas_n1 != infeas_n3, (
-        "verdict must flip between hedge_n=1 (INFEAS) and "
-        "hedge_n=3 (feasible) at the same scenario"
-    )
+def test_single_endpoint_failure_raises_hedged_all_failed():
+    """At pool-size 1, transport-level failure still produces a
+    HedgedAllFailed (preserves caller's error contract)."""
+    p = _make_poller(endpoint_pool=["https://only.example.com"])
+    with mock.patch.object(
+        p, "_rpc_post", side_effect=ConnectionError("nope"),
+    ):
+        with pytest.raises(HedgedAllFailed) as exc_info:
+            p._do_hedged_post(b"x", timeout_seconds=5)
+    assert len(exc_info.value.errors) == 1
+    assert exc_info.value.errors[0][0] == "https://only.example.com"
 
 
-# ---------------------------------------------------------------------------
-# Bug #7: abandoned-future observation gap
-# ---------------------------------------------------------------------------
-#
-# When one hedged endpoint wins the race the others' outcomes used to
-# be discarded — slow-but-broken endpoints stayed in warmup forever
-# because their failure rate never reached the 100-outcome window.
-# Fix (2026-05-10): record DONE-but-discarded siblings with actual
-# RTT, and register done-callbacks on still-pending siblings so their
-# eventual outcome reaches the health tracker (recorded with a
-# sentinel RTT that's filtered from p50/p99 but counted for
-# success_rate / consecutive_failures).
+def test_winner_updates_current_endpoint():
+    pool = ["https://broken.example.com", "https://winner.example.com"]
+    p = _make_poller(endpoint_pool=pool)
 
+    def per_url(url, body, *, timeout_seconds):
+        if "broken" in url:
+            raise ConnectionError("broken is down")
+        return b'{"result":"winner"}'
 
-def test_bug7_already_done_siblings_recorded_with_actual_rtt():
-    """When multiple futures complete inside the same ``wait()``
-    batch, the winner is returned AND the siblings' outcomes are
-    recorded with their actual RTTs. Pre-fix, only the winner's RTT
-    was recorded — siblings were silently dropped."""
-    pool = ["https://a", "https://b", "https://c"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=3)
-    body_ok = b'{"jsonrpc":"2.0","id":1,"result":"ok"}'
-
-    # All three return ~simultaneously so wait() likely delivers
-    # multiple in one batch. Force the same sleep so the race is
-    # deterministic-ish across runs (we don't assert on which wins,
-    # only that ALL THREE are recorded).
-    barrier = threading.Barrier(3, timeout=2.0)
-
-    def fake_post(url, b, *, timeout_seconds):
-        # All three threads converge here, then proceed together.
-        barrier.wait()
-        return body_ok
-
-    p._rpc_post = fake_post  # type: ignore[assignment]
-    ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
-    assert resp == body_ok
-
-    # Drain any abandoned-callback registrations for futures that
-    # finished after the winner returned. Give them a brief moment.
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline:
-        s = p._health.stats()
-        total = sum(v["total_requests"] for v in s.values())
-        if total == 3:
-            break
-        time.sleep(0.01)
-
-    stats = p._health.stats()
-    # Every endpoint should have at least one recorded outcome.
-    for url in pool:
-        assert stats[url]["total_requests"] >= 1, (
-            f"{url} had {stats[url]['total_requests']} recorded "
-            f"requests; expected >=1 (Bug #7: siblings dropped)"
-        )
-    # Total should be exactly 3 — one per endpoint.
-    assert sum(v["total_requests"] for v in stats.values()) == 3
-
-
-def test_bug7_pending_sibling_recorded_via_callback_after_winner_returns():
-    """When the winner returns FAST and the slow sibling is still
-    pending, the slow sibling's outcome must still be recorded once
-    it completes (via the done-callback). Pre-fix the slow sibling's
-    outcome was silently dropped."""
-    pool = ["https://fast", "https://slow"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=2)
-    body_fast = b'{"jsonrpc":"2.0","id":1,"result":"fast"}'
-    body_slow = b'{"jsonrpc":"2.0","id":1,"result":"slow"}'
-
-    def fake_post(url, b, *, timeout_seconds):
-        if "fast" in url:
-            time.sleep(0.02)
-            return body_fast
-        # Slow sibling completes ~200ms after winner returns.
-        time.sleep(0.30)
-        return body_slow
-
-    p._rpc_post = fake_post  # type: ignore[assignment]
-    ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
-    assert ep == "https://fast"
-    assert resp == body_fast
-
-    # Right after return, fast is recorded but slow may not be yet.
-    stats = p._health.stats()
-    assert stats["https://fast"]["total_requests"] == 1
-
-    # Wait for slow's callback to fire.
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        if p._health.stats()["https://slow"]["total_requests"] >= 1:
-            break
-        time.sleep(0.01)
-
-    stats = p._health.stats()
-    assert stats["https://slow"]["total_requests"] == 1, (
-        "slow sibling must have its outcome recorded via done-callback"
-    )
-    # Slow returned successfully -> recorded as success.
-    assert stats["https://slow"]["consecutive_failures"] == 0
-
-
-def test_bug7_pending_sibling_failure_recorded_via_callback():
-    """Same as above but the slow sibling FAILS. The failure must
-    reach consecutive_failures so a slow-but-broken endpoint can
-    eventually be marked unhealthy instead of hiding in warmup."""
-    pool = ["https://fast", "https://broken_slow"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=2)
-    body_fast = b'{"jsonrpc":"2.0","id":1,"result":"fast"}'
-
-    def fake_post(url, b, *, timeout_seconds):
-        if "fast" in url:
-            time.sleep(0.02)
-            return body_fast
-        time.sleep(0.25)
-        raise ConnectionError("simulated_slow_outage")
-
-    p._rpc_post = fake_post  # type: ignore[assignment]
-    ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
-    assert ep == "https://fast"
-
-    # Wait for broken_slow's callback.
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        if p._health.stats()["https://broken_slow"]["total_requests"] >= 1:
-            break
-        time.sleep(0.01)
-
-    stats = p._health.stats()
-    assert stats["https://broken_slow"]["total_requests"] == 1
-    assert stats["https://broken_slow"]["consecutive_failures"] == 1, (
-        "slow-failing sibling must increment consecutive_failures so "
-        "5 such events trip the consecutive_failures gate"
-    )
-
-
-def test_bug7_repeated_slow_failures_eventually_mark_unhealthy():
-    """Five hedged rounds where the slow sibling fails each time:
-    consecutive_failures climbs to 5 and the endpoint is marked
-    unhealthy. Pre-fix this could never happen because the slow
-    sibling's outcomes never reached the health tracker."""
-    pool = ["https://fast", "https://broken_slow"]
-    p = _make_poller(endpoint_pool=pool, hedge_fan_out=2)
-    body_fast = b'{"jsonrpc":"2.0","id":1,"result":"fast"}'
-
-    def fake_post(url, b, *, timeout_seconds):
-        if "fast" in url:
-            time.sleep(0.01)
-            return body_fast
-        time.sleep(0.20)
-        raise ConnectionError("simulated_slow_outage")
-
-    p._rpc_post = fake_post  # type: ignore[assignment]
-    for _ in range(5):
+    with mock.patch.object(p, "_rpc_post", side_effect=per_url):
         ep, _ = p._do_hedged_post(b"x", timeout_seconds=5)
-        assert ep == "https://fast"
+    assert ep == "https://winner.example.com"
+    assert p.current_endpoint == "https://winner.example.com"
 
-    # Wait for all 5 broken_slow callbacks.
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        s = p._health.stats()["https://broken_slow"]
-        if s["total_requests"] >= 5:
-            break
-        time.sleep(0.01)
 
-    stats = p._health.stats()
-    assert stats["https://broken_slow"]["total_requests"] == 5
-    assert stats["https://broken_slow"]["consecutive_failures"] >= 5
-    assert stats["https://broken_slow"]["healthy"] is False, (
-        "broken_slow must be marked unhealthy after 5 consecutive "
-        "callback-recorded failures (Bug #7: previously silently OK)"
+def test_fires_one_request_per_pool_endpoint():
+    """Verifies every endpoint in the pool receives the request
+    (no selection, no fan-out N: it's len(pool))."""
+    pool = ["https://a.example.com", "https://b.example.com",
+            "https://c.example.com", "https://d.example.com"]
+    p = _make_poller(endpoint_pool=pool)
+    seen_urls: set[str] = set()
+    lock = threading.Lock()
+
+    def record(url, body, *, timeout_seconds):
+        with lock:
+            seen_urls.add(url)
+        # Stagger so the test isn't a race for `seen` to grow
+        time.sleep(0.05)
+        return b'{"result":"ok"}'
+
+    with mock.patch.object(p, "_rpc_post", side_effect=record):
+        p._do_hedged_post(b"x", timeout_seconds=5)
+    assert seen_urls == set(pool)
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+def test_stats_exposes_pool_size_no_health_tracker():
+    """The stats surface no longer carries pick_n / health metrics —
+    just the pool size and per-call status."""
+    pool = ["https://a.example.com", "https://b.example.com"]
+    p = _make_poller(endpoint_pool=pool)
+    s = p.stats
+    assert s["endpoint_pool_size"] == 2
+    assert "endpoint_health" not in s
+    assert "hedge_fan_out" not in s
+
+
+# ---------------------------------------------------------------------------
+# Integration: _rpc_call_single + _rpc_batch hit the hedged transport
+# ---------------------------------------------------------------------------
+
+def test_rpc_call_single_uses_hedged_transport():
+    pool = ["https://a.example.com", "https://b.example.com"]
+    p = _make_poller(endpoint_pool=pool)
+    with mock.patch.object(
+        p, "_rpc_post",
+        side_effect=_make_responder(response=b'{"jsonrpc":"2.0","id":1,"result":"0x10"}'),
+    ):
+        out = p._rpc_call_single("eth_blockNumber", [])
+    assert out == "0x10"
+
+
+def test_rpc_batch_uses_hedged_transport():
+    pool = ["https://a.example.com", "https://b.example.com"]
+    p = _make_poller(endpoint_pool=pool)
+    batch_resp = (
+        b'[{"jsonrpc":"2.0","id":0,"result":"0xa"},'
+        b'{"jsonrpc":"2.0","id":1,"result":"0xb"}]'
     )
-
-
-def test_health_tracker_sentinel_rtt_excluded_from_p50_p99():
-    """Direct EndpointHealthTracker test for the sentinel RTT: a
-    sentinel-valued outcome counts toward total_requests +
-    success_rate + consecutive_failures, but its RTT is filtered out
-    of p50/p99."""
-    from pancakebot.chain.rpc_poller import _RTT_SENTINEL_UNKNOWN
-    h = EndpointHealthTracker(["https://a"])
-
-    # 5 real successes with rtt=300ms.
-    for _ in range(5):
-        h.record("https://a", success=True, rtt_ms=300)
-    # 5 sentinel-valued successes.
-    for _ in range(5):
-        h.record("https://a", success=True, rtt_ms=_RTT_SENTINEL_UNKNOWN)
-
-    stats = h.stats()["https://a"]
-    assert stats["total_requests"] == 10
-    # p50/p99 from the 5 real measurements (all 300ms).
-    assert stats["p50_rtt_ms"] == 300, (
-        "p50 must exclude sentinel-valued RTTs"
-    )
-    assert stats["p99_rtt_ms"] == 300, (
-        "p99 must exclude sentinel-valued RTTs"
-    )
-    # success_rate counts all 10.
-    assert abs(stats["success_rate"] - 1.0) < 1e-9
-
-
-def test_health_tracker_sentinel_rtt_counts_for_consecutive_failures():
-    """Sentinel-valued FAILURES increment consecutive_failures —
-    critical for the slow-but-broken-endpoint detection path."""
-    from pancakebot.chain.rpc_poller import _RTT_SENTINEL_UNKNOWN
-    h = EndpointHealthTracker(["https://a"])
-    for _ in range(5):
-        h.record("https://a", success=False, rtt_ms=_RTT_SENTINEL_UNKNOWN)
-    assert h.is_healthy("https://a") is False, (
-        "5 consecutive sentinel failures must trip the "
-        "consecutive_failures gate just like real-RTT failures"
-    )
-
-
-def test_health_tracker_sentinel_only_window_p50_falls_back_to_zero():
-    """Edge case: if EVERY outcome in the window is sentinel-valued,
-    p50/p99 fall back to 0 (warmup-rank behaviour) instead of crashing."""
-    from pancakebot.chain.rpc_poller import _RTT_SENTINEL_UNKNOWN
-    h = EndpointHealthTracker(["https://a"])
-    for _ in range(10):
-        h.record("https://a", success=True, rtt_ms=_RTT_SENTINEL_UNKNOWN)
-    stats = h.stats()["https://a"]
-    assert stats["p50_rtt_ms"] == 0
-    assert stats["p99_rtt_ms"] == 0
-    # Still healthy (warmup, all successes).
-    assert stats["healthy"] is True
+    with mock.patch.object(
+        p, "_rpc_post",
+        side_effect=_make_responder(response=batch_resp),
+    ):
+        results = p._rpc_batch([
+            ("eth_blockNumber", []),
+            ("eth_blockNumber", []),
+        ])
+    assert results == [("0xa", None), ("0xb", None)]

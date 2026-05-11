@@ -29,10 +29,10 @@ from pancakebot.util import InvariantError  # noqa: E402
 
 
 def _make_poller() -> RpcPoller:
-    """Construct a poller with default args + lightweight rpc_urls."""
+    """Construct a poller with default args + lightweight endpoint_pool."""
     return RpcPoller(
         interval_seconds=300,
-        rpc_urls=["https://test.example.com"],
+        endpoint_pool=["https://test.example.com"],
     )
 
 
@@ -48,16 +48,16 @@ def test_construct_default_params():
 
 def test_construct_invalid_interval_raises():
     with pytest.raises(InvariantError, match="interval_seconds"):
-        RpcPoller(interval_seconds=0, rpc_urls=["https://x"])
+        RpcPoller(interval_seconds=0, endpoint_pool=["https://x"])
     with pytest.raises(InvariantError, match="interval_seconds"):
-        RpcPoller(interval_seconds=-1, rpc_urls=["https://x"])
+        RpcPoller(interval_seconds=-1, endpoint_pool=["https://x"])
 
 
 def test_construct_invalid_periodic_interval_raises():
     with pytest.raises(InvariantError, match="periodic_poll_interval"):
         RpcPoller(
             interval_seconds=300,
-            rpc_urls=["https://x"],
+            endpoint_pool=["https://x"],
             periodic_poll_interval_s=0,
         )
 
@@ -67,14 +67,14 @@ def test_construct_batch_size_too_large_raises():
     with pytest.raises(InvariantError, match="batch_size_out_of_range"):
         RpcPoller(
             interval_seconds=300,
-            rpc_urls=["https://x"],
+            endpoint_pool=["https://x"],
             batch_size=_tc.RPC_BATCH_BLOCK_RECEIPTS_LIMIT + 1,
         )
 
 
 def test_construct_empty_rpc_urls_raises():
-    with pytest.raises(InvariantError, match="rpc_urls_empty"):
-        RpcPoller(interval_seconds=300, rpc_urls=[])
+    with pytest.raises(InvariantError, match="endpoint_pool_empty"):
+        RpcPoller(interval_seconds=300, endpoint_pool=[])
 
 
 # ---------------------------------------------------------------------------
