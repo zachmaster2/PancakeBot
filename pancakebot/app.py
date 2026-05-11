@@ -214,17 +214,14 @@ def run_from_config(
     #   var/design/rpc_endpoint_hedging_2026_05_08.md
     #   var/extended/endpoint_respike_n200.json
     #
-    # Endpoint pool is the top-4 from Track H (DEFAULT_HEDGED_ENDPOINTS
-    # = top-3 + binance_3 added as the diversity slot). RpcPoller's
-    # constructor validates hedge_fan_out <= len(pool) at startup, so
-    # an operator can drop hedge_fan_out to 1/2/3 in config without
-    # touching the pool definition.
-    _hedged_endpoint_pool = list(DEFAULT_HEDGED_ENDPOINTS) + [
-        "https://bsc-dataseed3.binance.org",
-    ]
+    # Endpoint pool is DEFAULT_HEDGED_ENDPOINTS (six endpoints: top-4
+    # BSC-dataseed-family by Track H p50 + publicnode + bloXroute for
+    # distinct-provider failover). RpcPoller's constructor validates
+    # hedge_fan_out <= len(pool) at startup, so an operator can drop
+    # hedge_fan_out to 1..6 in config without touching the pool.
     rpc_poller = RpcPoller(
         interval_seconds=interval_seconds,
-        rpc_urls=_hedged_endpoint_pool,
+        rpc_urls=DEFAULT_HEDGED_ENDPOINTS,
         hedge_fan_out=cfg.hedge_fan_out,
     )
     rpc_poller.start()
