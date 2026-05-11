@@ -98,6 +98,21 @@ _HEALTH_MAX_CONSECUTIVE_FAILURES: int = 5
 _HEALTH_RETEST_EVERY_N_REQUESTS: int = 10
 _HEALTH_RETEST_FORCED_AFTER_SECONDS: float = 60.0
 
+# Sentinel RTT for outcomes whose wallclock isn't known to the caller
+# at record time. Specifically: hedged-fan-out siblings that are still
+# pending when the winning future returns are recorded via a done-
+# callback in their executor thread, but the actual elapsed wallclock
+# from request-start to that completion is not captured (the
+# fut_start map is local to the original call; capturing it through
+# the callback is what the recording does). To keep that case from
+# polluting p50/p99 with values that are correlated with "won the
+# hedge race" rather than baseline endpoint latency, the success/
+# failure flag IS recorded (so consecutive_failures and
+# success_rate stay honest) but the RTT is set to this sentinel,
+# which is then filtered OUT of the rolling-window p50/p99 stats.
+# See Bug #7 (2026-05-10): abandoned-future observation gap.
+_RTT_SENTINEL_UNKNOWN: int = -1
+
 
 @dataclass
 class _Bet:
@@ -189,7 +204,15 @@ class EndpointHealthTracker:
     def record(self, endpoint: str, *, success: bool, rtt_ms: int) -> None:
         """Record a request outcome. Idempotent for unknown endpoints
         (no-op + invariant violation in tests is more harmful than
-        silent skip during fanned-out edge cases)."""
+        silent skip during fanned-out edge cases).
+
+        ``rtt_ms`` may be ``_RTT_SENTINEL_UNKNOWN`` (-1) when the actual
+        elapsed wallclock isn't captured at record time. In that case
+        the outcome (success/failure) still counts toward success_rate
+        and consecutive_failures, but the RTT is filtered OUT of the
+        rolling-window p50/p99 (otherwise sentinel values would skew
+        the latency stats). See Bug #7 (2026-05-10).
+        """
         with self._lock:
             h = self._health.get(endpoint)
             if h is None:
@@ -226,12 +249,20 @@ class EndpointHealthTracker:
         successes = sum(1 for ok, _ in h.recent_outcomes if ok)
         if (successes / n) <= _HEALTH_MIN_SUCCESS_RATE:
             return False
-        # p99 RTT over the window.
-        rtts = sorted(rtt for _, rtt in h.recent_outcomes)
-        # 99th percentile: index = ceil(0.99 * n) - 1 (clamp).
-        p99_idx = max(0, min(n - 1, int(0.99 * n)))
-        if rtts[p99_idx] >= _HEALTH_MAX_P99_RTT_MS:
-            return False
+        # p99 RTT over the window. Filter out sentinel RTTs (recorded
+        # by abandoned-future callbacks where the actual wallclock
+        # wasn't captured) — see Bug #7. Empty-after-filter is treated
+        # as "warmup-like for the RTT gate": skip the gate.
+        rtts = sorted(
+            rtt for _, rtt in h.recent_outcomes
+            if rtt != _RTT_SENTINEL_UNKNOWN
+        )
+        if rtts:
+            # 99th percentile: index = ceil(0.99 * len) - 1 (clamp).
+            m = len(rtts)
+            p99_idx = max(0, min(m - 1, int(0.99 * m)))
+            if rtts[p99_idx] >= _HEALTH_MAX_P99_RTT_MS:
+                return False
         return True
 
     def is_healthy(self, endpoint: str) -> bool:
@@ -242,21 +273,30 @@ class EndpointHealthTracker:
             return self._is_healthy_locked(h)
 
     def _p50_locked(self, h: _EndpointHealth) -> int:
-        if not h.recent_outcomes:
-            # Warmup: no data yet. Sort key needs SOMETHING — return 0
-            # so warmup endpoints rank ahead of post-warmup with
-            # measured latency. That's the desired warmup behaviour:
-            # send traffic to under-measured endpoints first to gather
-            # data.
+        # Filter out sentinel RTTs (abandoned-future recordings) — they
+        # carry success/failure info but no measured wallclock; see Bug
+        # #7. If everything in the window is sentinel-valued, fall
+        # through to the warmup-rank-0 behaviour.
+        rtts = sorted(
+            rtt for _, rtt in h.recent_outcomes
+            if rtt != _RTT_SENTINEL_UNKNOWN
+        )
+        if not rtts:
+            # Warmup or sentinel-only: no measured latency yet. Sort
+            # key needs SOMETHING — return 0 so warmup endpoints rank
+            # ahead of post-warmup with measured latency. That's the
+            # desired warmup behaviour: send traffic to under-measured
+            # endpoints first to gather data.
             return 0
-        rtts = sorted(rtt for _, rtt in h.recent_outcomes)
-        n = len(rtts)
-        return rtts[n // 2]
+        return rtts[len(rtts) // 2]
 
     def _p99_locked(self, h: _EndpointHealth) -> int:
-        if not h.recent_outcomes:
+        rtts = sorted(
+            rtt for _, rtt in h.recent_outcomes
+            if rtt != _RTT_SENTINEL_UNKNOWN
+        )
+        if not rtts:
             return 0
-        rtts = sorted(rtt for _, rtt in h.recent_outcomes)
         n = len(rtts)
         idx = max(0, min(n - 1, int(0.99 * n)))
         return rtts[idx]
@@ -1441,6 +1481,13 @@ class RpcPoller:
                     )))
                 pending.clear()
                 break
+            # Find the first successful future among `done`. Record
+            # outcomes for ALL `done` futures (Bug #7: previously
+            # already-done siblings beyond the winner were dropped on
+            # the floor, hiding their failure rate from the health
+            # tracker). Failed siblings get their actual RTT; the
+            # winner is recorded with actual RTT and returned.
+            winner: tuple[str, bytes] | None = None
             for fut in done:
                 ep = fut_to_endpoint[fut]
                 rtt_ms = int((time.monotonic() - fut_start[fut]) * 1000)
@@ -1450,17 +1497,73 @@ class RpcPoller:
                     self._health.record(ep, success=False, rtt_ms=rtt_ms)
                     errors.append((ep, e))
                     continue
-                # First successful response wins. Remaining futures
-                # are abandoned (urllib doesn't support real
-                # cancellation; their results are discarded). At
-                # fan_out=3 this is ~2 wasted RPC/sec — acceptable
-                # per memo §2.
-                self._health.record(ep, success=True, rtt_ms=rtt_ms)
-                self._current_endpoint = ep
-                return ep, resp
+                if winner is None:
+                    # First successful response wins. Record it and
+                    # remember to return after we've handled the rest
+                    # of the `done` set + registered callbacks for any
+                    # still-pending siblings.
+                    self._health.record(ep, success=True, rtt_ms=rtt_ms)
+                    self._current_endpoint = ep
+                    winner = (ep, resp)
+                else:
+                    # Already have a winner; record the sibling's
+                    # success but don't return its body. Use ACTUAL
+                    # RTT (not sentinel) — the wallclock is known.
+                    self._health.record(ep, success=True, rtt_ms=rtt_ms)
+            if winner is not None:
+                # Pending futures are abandoned (urllib doesn't
+                # support real cancellation; their bodies are
+                # discarded). At fan_out=3 this is ~2 wasted RPC/sec
+                # — acceptable per memo §2. Register a callback so
+                # their eventual outcome IS recorded in the health
+                # tracker (Bug #7: prior code dropped them, which kept
+                # slow-but-broken endpoints in unconditional warmup
+                # since their fail rate never reached 100 outcomes).
+                # The callback runs in the executor's worker thread
+                # when the urllib socket returns/errors; the executor
+                # is owned by RpcPoller for the process lifetime so
+                # there's no shutdown-race.
+                self._register_abandoned_callbacks(pending, fut_to_endpoint)
+                return winner
 
         # All endpoints failed.
         raise HedgedAllFailed(errors)
+
+    def _register_abandoned_callbacks(
+        self,
+        pending: set[concurrent.futures.Future],
+        fut_to_endpoint: dict[concurrent.futures.Future, str],
+    ) -> None:
+        """Register done-callbacks on still-pending hedged futures
+        so their eventual outcome reaches the health tracker (Bug #7).
+
+        RTT is recorded with the ``_RTT_SENTINEL_UNKNOWN`` sentinel —
+        the actual wallclock from request-start to completion is
+        captured here too, but recording it as p50/p99 would skew the
+        rolling-window stats with values correlated with "lost the
+        hedge race". Sentinel preserves the success/failure signal
+        (consecutive_failures + success_rate stay honest) and is
+        filtered out of the latency percentile gates.
+        """
+        for fut in pending:
+            ep = fut_to_endpoint[fut]
+
+            def _on_done(f: concurrent.futures.Future, _ep: str = ep) -> None:
+                # Runs in the executor's worker thread. Guard against
+                # all exception types — a raised exception inside a
+                # done-callback is silently swallowed by Future, but
+                # we shouldn't even start that fire.
+                try:
+                    f.result()
+                    self._health.record(
+                        _ep, success=True, rtt_ms=_RTT_SENTINEL_UNKNOWN,
+                    )
+                except BaseException:  # noqa: BLE001
+                    self._health.record(
+                        _ep, success=False, rtt_ms=_RTT_SENTINEL_UNKNOWN,
+                    )
+
+            fut.add_done_callback(_on_done)
 
     def _rpc_call_single(self, method: str, params: list) -> Any:
         """Single JSON-RPC call. Raises on transport error or RPC

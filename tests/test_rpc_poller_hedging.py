@@ -590,3 +590,229 @@ def test_estimated_catchup_ms_phase1_round_479981_regression():
         "post-fix estimate must be lower than the pre-fix 3066ms "
         "(otherwise the false-positive recurs)"
     )
+# ---------------------------------------------------------------------------
+# Bug #7: abandoned-future observation gap
+# ---------------------------------------------------------------------------
+#
+# When one hedged endpoint wins the race the others' outcomes used to
+# be discarded — slow-but-broken endpoints stayed in warmup forever
+# because their failure rate never reached the 100-outcome window.
+# Fix (2026-05-10): record DONE-but-discarded siblings with actual
+# RTT, and register done-callbacks on still-pending siblings so their
+# eventual outcome reaches the health tracker (recorded with a
+# sentinel RTT that's filtered from p50/p99 but counted for
+# success_rate / consecutive_failures).
+
+
+def test_bug7_already_done_siblings_recorded_with_actual_rtt():
+    """When multiple futures complete inside the same ``wait()``
+    batch, the winner is returned AND the siblings' outcomes are
+    recorded with their actual RTTs. Pre-fix, only the winner's RTT
+    was recorded — siblings were silently dropped."""
+    pool = ["https://a", "https://b", "https://c"]
+    p = _make_poller(endpoint_pool=pool, hedge_fan_out=3)
+    body_ok = b'{"jsonrpc":"2.0","id":1,"result":"ok"}'
+
+    # All three return ~simultaneously so wait() likely delivers
+    # multiple in one batch. Force the same sleep so the race is
+    # deterministic-ish across runs (we don't assert on which wins,
+    # only that ALL THREE are recorded).
+    barrier = threading.Barrier(3, timeout=2.0)
+
+    def fake_post(url, b, *, timeout_seconds):
+        # All three threads converge here, then proceed together.
+        barrier.wait()
+        return body_ok
+
+    p._rpc_post = fake_post  # type: ignore[assignment]
+    ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
+    assert resp == body_ok
+
+    # Drain any abandoned-callback registrations for futures that
+    # finished after the winner returned. Give them a brief moment.
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        s = p._health.stats()
+        total = sum(v["total_requests"] for v in s.values())
+        if total == 3:
+            break
+        time.sleep(0.01)
+
+    stats = p._health.stats()
+    # Every endpoint should have at least one recorded outcome.
+    for url in pool:
+        assert stats[url]["total_requests"] >= 1, (
+            f"{url} had {stats[url]['total_requests']} recorded "
+            f"requests; expected >=1 (Bug #7: siblings dropped)"
+        )
+    # Total should be exactly 3 — one per endpoint.
+    assert sum(v["total_requests"] for v in stats.values()) == 3
+
+
+def test_bug7_pending_sibling_recorded_via_callback_after_winner_returns():
+    """When the winner returns FAST and the slow sibling is still
+    pending, the slow sibling's outcome must still be recorded once
+    it completes (via the done-callback). Pre-fix the slow sibling's
+    outcome was silently dropped."""
+    pool = ["https://fast", "https://slow"]
+    p = _make_poller(endpoint_pool=pool, hedge_fan_out=2)
+    body_fast = b'{"jsonrpc":"2.0","id":1,"result":"fast"}'
+    body_slow = b'{"jsonrpc":"2.0","id":1,"result":"slow"}'
+
+    def fake_post(url, b, *, timeout_seconds):
+        if "fast" in url:
+            time.sleep(0.02)
+            return body_fast
+        # Slow sibling completes ~200ms after winner returns.
+        time.sleep(0.30)
+        return body_slow
+
+    p._rpc_post = fake_post  # type: ignore[assignment]
+    ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
+    assert ep == "https://fast"
+    assert resp == body_fast
+
+    # Right after return, fast is recorded but slow may not be yet.
+    stats = p._health.stats()
+    assert stats["https://fast"]["total_requests"] == 1
+
+    # Wait for slow's callback to fire.
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if p._health.stats()["https://slow"]["total_requests"] >= 1:
+            break
+        time.sleep(0.01)
+
+    stats = p._health.stats()
+    assert stats["https://slow"]["total_requests"] == 1, (
+        "slow sibling must have its outcome recorded via done-callback"
+    )
+    # Slow returned successfully -> recorded as success.
+    assert stats["https://slow"]["consecutive_failures"] == 0
+
+
+def test_bug7_pending_sibling_failure_recorded_via_callback():
+    """Same as above but the slow sibling FAILS. The failure must
+    reach consecutive_failures so a slow-but-broken endpoint can
+    eventually be marked unhealthy instead of hiding in warmup."""
+    pool = ["https://fast", "https://broken_slow"]
+    p = _make_poller(endpoint_pool=pool, hedge_fan_out=2)
+    body_fast = b'{"jsonrpc":"2.0","id":1,"result":"fast"}'
+
+    def fake_post(url, b, *, timeout_seconds):
+        if "fast" in url:
+            time.sleep(0.02)
+            return body_fast
+        time.sleep(0.25)
+        raise ConnectionError("simulated_slow_outage")
+
+    p._rpc_post = fake_post  # type: ignore[assignment]
+    ep, resp = p._do_hedged_post(b"x", timeout_seconds=5)
+    assert ep == "https://fast"
+
+    # Wait for broken_slow's callback.
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if p._health.stats()["https://broken_slow"]["total_requests"] >= 1:
+            break
+        time.sleep(0.01)
+
+    stats = p._health.stats()
+    assert stats["https://broken_slow"]["total_requests"] == 1
+    assert stats["https://broken_slow"]["consecutive_failures"] == 1, (
+        "slow-failing sibling must increment consecutive_failures so "
+        "5 such events trip the consecutive_failures gate"
+    )
+
+
+def test_bug7_repeated_slow_failures_eventually_mark_unhealthy():
+    """Five hedged rounds where the slow sibling fails each time:
+    consecutive_failures climbs to 5 and the endpoint is marked
+    unhealthy. Pre-fix this could never happen because the slow
+    sibling's outcomes never reached the health tracker."""
+    pool = ["https://fast", "https://broken_slow"]
+    p = _make_poller(endpoint_pool=pool, hedge_fan_out=2)
+    body_fast = b'{"jsonrpc":"2.0","id":1,"result":"fast"}'
+
+    def fake_post(url, b, *, timeout_seconds):
+        if "fast" in url:
+            time.sleep(0.01)
+            return body_fast
+        time.sleep(0.20)
+        raise ConnectionError("simulated_slow_outage")
+
+    p._rpc_post = fake_post  # type: ignore[assignment]
+    for _ in range(5):
+        ep, _ = p._do_hedged_post(b"x", timeout_seconds=5)
+        assert ep == "https://fast"
+
+    # Wait for all 5 broken_slow callbacks.
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        s = p._health.stats()["https://broken_slow"]
+        if s["total_requests"] >= 5:
+            break
+        time.sleep(0.01)
+
+    stats = p._health.stats()
+    assert stats["https://broken_slow"]["total_requests"] == 5
+    assert stats["https://broken_slow"]["consecutive_failures"] >= 5
+    assert stats["https://broken_slow"]["healthy"] is False, (
+        "broken_slow must be marked unhealthy after 5 consecutive "
+        "callback-recorded failures (Bug #7: previously silently OK)"
+    )
+
+
+def test_health_tracker_sentinel_rtt_excluded_from_p50_p99():
+    """Direct EndpointHealthTracker test for the sentinel RTT: a
+    sentinel-valued outcome counts toward total_requests +
+    success_rate + consecutive_failures, but its RTT is filtered out
+    of p50/p99."""
+    from pancakebot.chain.rpc_poller import _RTT_SENTINEL_UNKNOWN
+    h = EndpointHealthTracker(["https://a"])
+
+    # 5 real successes with rtt=300ms.
+    for _ in range(5):
+        h.record("https://a", success=True, rtt_ms=300)
+    # 5 sentinel-valued successes.
+    for _ in range(5):
+        h.record("https://a", success=True, rtt_ms=_RTT_SENTINEL_UNKNOWN)
+
+    stats = h.stats()["https://a"]
+    assert stats["total_requests"] == 10
+    # p50/p99 from the 5 real measurements (all 300ms).
+    assert stats["p50_rtt_ms"] == 300, (
+        "p50 must exclude sentinel-valued RTTs"
+    )
+    assert stats["p99_rtt_ms"] == 300, (
+        "p99 must exclude sentinel-valued RTTs"
+    )
+    # success_rate counts all 10.
+    assert abs(stats["success_rate"] - 1.0) < 1e-9
+
+
+def test_health_tracker_sentinel_rtt_counts_for_consecutive_failures():
+    """Sentinel-valued FAILURES increment consecutive_failures —
+    critical for the slow-but-broken-endpoint detection path."""
+    from pancakebot.chain.rpc_poller import _RTT_SENTINEL_UNKNOWN
+    h = EndpointHealthTracker(["https://a"])
+    for _ in range(5):
+        h.record("https://a", success=False, rtt_ms=_RTT_SENTINEL_UNKNOWN)
+    assert h.is_healthy("https://a") is False, (
+        "5 consecutive sentinel failures must trip the "
+        "consecutive_failures gate just like real-RTT failures"
+    )
+
+
+def test_health_tracker_sentinel_only_window_p50_falls_back_to_zero():
+    """Edge case: if EVERY outcome in the window is sentinel-valued,
+    p50/p99 fall back to 0 (warmup-rank behaviour) instead of crashing."""
+    from pancakebot.chain.rpc_poller import _RTT_SENTINEL_UNKNOWN
+    h = EndpointHealthTracker(["https://a"])
+    for _ in range(10):
+        h.record("https://a", success=True, rtt_ms=_RTT_SENTINEL_UNKNOWN)
+    stats = h.stats()["https://a"]
+    assert stats["p50_rtt_ms"] == 0
+    assert stats["p99_rtt_ms"] == 0
+    # Still healthy (warmup, all successes).
+    assert stats["healthy"] is True
