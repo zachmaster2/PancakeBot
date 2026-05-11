@@ -30,13 +30,25 @@ Public interface mirrors ``PoolEventWatcher`` where feasible
 (``get_pool``, ``set_round_phase``, ``connected``, ``current_endpoint``,
 ``is_pool_ready``) so the engine call sites are minimally affected.
 
-Endpoint hedging (opt-in, default off): when ``hedge_fan_out > 1``
-each JSON-RPC call fans out to N endpoints in parallel; the first
-successful response wins, the others are abandoned. Per-endpoint
-health is tracked in ``EndpointHealthTracker`` (rolling 100-outcome
-window; success_rate/p99/consecutive_failures gates). Default
-single-endpoint behaviour is preserved when ``hedge_fan_out=1``
-(single-element ``endpoint_pool``).
+Endpoint hedging: the ``hedge_fan_out`` ctor knob defaults to 1
+(single-endpoint, bit-identical with the pre-hedging codepath) and
+is also exposed as ``[runtime].hedge_fan_out`` in config.toml.
+Production currently runs N=4 across the top-4 batched BSC
+endpoints; tests and legacy fixtures keep the ctor default of 1.
+
+When ``hedge_fan_out > 1`` each JSON-RPC call fans out to N
+endpoints in parallel; the first successful response wins. The
+other futures' outcomes are still recorded in the health tracker
+(Bug #7 fix, 2026-05-10) — already-done siblings with their actual
+RTT, still-pending siblings via add_done_callback using a sentinel
+RTT (``_RTT_SENTINEL_UNKNOWN``). The sentinel is filtered out of
+the p50/p99 latency gates but still counts toward success_rate and
+consecutive_failures, so a slow-but-broken endpoint accumulates
+the right kind of evidence to eventually trip the health gates.
+
+Per-endpoint health is tracked in ``EndpointHealthTracker``
+(rolling 100-outcome window; success_rate/p99/consecutive_failures
+gates).
 """
 from __future__ import annotations
 
@@ -165,12 +177,17 @@ class EndpointHealthTracker:
 
     State per endpoint: rolling window of last 100 (success, rtt_ms)
     outcomes, consecutive-failure counter, last-failure timestamp,
-    total-request counter.
+    total-request counter. Outcomes recorded for abandoned hedged-
+    fan-out siblings carry ``rtt_ms == _RTT_SENTINEL_UNKNOWN`` and
+    are filtered out of the p50/p99 latency calculations but still
+    count toward success_rate / consecutive_failures (Bug #7 fix,
+    2026-05-10).
 
     An endpoint is **healthy** iff it has fewer than 100 outcomes
-    (warmup; unconditionally healthy by default) OR all three:
+    (warmup; unconditionally healthy unless consecutive_failures
+    fast-trips) OR all three:
       - success_rate over the window > 0.90
-      - p99 RTT over the window < 5000 ms
+      - p99 RTT (sentinel-filtered) over the window < 5000 ms
       - consecutive_failures < 5
 
     ``pick_n(n)`` returns up to n endpoints, healthy first sorted by
