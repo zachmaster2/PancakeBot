@@ -9,6 +9,16 @@
 # (the cutoff is fixed by strategy; the offsets adjust around it).
 kline_cutoff_seconds = 2
 
+# Per-call RPC endpoint fan-out. Default 1 = single-endpoint
+# (pre-hedging bit-identical path). When > 1 each JSON-RPC call
+# fans out to N endpoints in parallel and returns the first
+# success; the rest are abandoned but recorded in the health
+# tracker (Bug #7 fix). Production currently runs 4 across the
+# top-4 batched BSC endpoints. Must be in [1, len(endpoint_pool)]
+# — the RpcPoller constructor validates against pool size at
+# startup. See var/design/rpc_endpoint_hedging_2026_05_08.md.
+hedge_fan_out = 4
+
 [dry]
 # Starting bankroll for fresh dry runs (ignored when continuing from existing state)
 initial_bankroll_bnb = 5.0

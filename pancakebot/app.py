@@ -199,30 +199,33 @@ def run_from_config(
     # Replaces the WSS-subscription pool watcher (Era 11, 2026-05-07);
     # see var/design/rpc_polling_architecture_2026_05_07.md.
     #
-    # Hedging enabled across the top-3 batched endpoints from the
-    # Track H respike. Track H MC estimated P99 batch RTT drops:
-    #   fan_out=1 → 2372ms
+    # Hedging across the top batched endpoints from the Track H
+    # respike. The fan-out is operator-tunable via [runtime].hedge_fan_out
+    # in config.toml — default 1 (single-endpoint, pre-hedging
+    # bit-identical path); production currently runs N=4. Track H MC
+    # estimated P99 batch RTT drops at the canonical batch_size=20:
+    #   fan_out=1 → 2372ms (single-endpoint baseline)
     #   fan_out=2 → 1180ms (-50%)
-    #   fan_out=3 → 943ms  (-20% vs fan_out=2)
-    # Live observation post-fan_out=2 deploy: INFEAS rate 21.6% → 13.5%
-    # (-37% relative). Bumped to fan_out=3 (2026-05-10) for further
-    # reduction; expected INFEAS ~10-12% at 1.5x bandwidth (free tier).
-    # See:
+    #   fan_out=3 →  943ms (-20% vs fan_out=2)
+    #   fan_out=4 →  899ms (-5% vs fan_out=3)
+    # Live observation: post-fan_out=2 INFEAS rate 21.6% → 13.5%;
+    # post-fan_out=3 expected ~10-12%; fan_out=4 is the Phase 2
+    # endpoint-diversity experiment (adds binance_3 to the pool). See:
     #   var/design/rpc_endpoint_hedging_2026_05_08.md
     #   var/extended/endpoint_respike_n200.json
-    # Phase 2 n=4 experiment (2026-05-10): add binance_3 to pool, bump
-    # fan_out=4. binance_3 was rank 4 in Track H spike (p50=898ms).
-    # Goal: measure if real-round cadence shows further INFEAS reduction
-    # vs Phase 1 n=3 (Phase 1 baseline was 4/11 = 36.4% INFEAS, but
-    # 2 of 4 driven by a multi-endpoint correlated outage; counterfactual
-    # ~18%). Phase 2 adds endpoint diversity.
-    _phase2_endpoint_pool = list(DEFAULT_HEDGED_ENDPOINTS) + [
+    #
+    # Endpoint pool is the top-4 from Track H (DEFAULT_HEDGED_ENDPOINTS
+    # = top-3 + binance_3 added as the diversity slot). RpcPoller's
+    # constructor validates hedge_fan_out <= len(pool) at startup, so
+    # an operator can drop hedge_fan_out to 1/2/3 in config without
+    # touching the pool definition.
+    _hedged_endpoint_pool = list(DEFAULT_HEDGED_ENDPOINTS) + [
         "https://bsc-dataseed3.binance.org",
     ]
     rpc_poller = RpcPoller(
         interval_seconds=interval_seconds,
-        rpc_urls=_phase2_endpoint_pool,
-        hedge_fan_out=4,
+        rpc_urls=_hedged_endpoint_pool,
+        hedge_fan_out=cfg.hedge_fan_out,
     )
     rpc_poller.start()
 
