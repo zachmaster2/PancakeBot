@@ -166,12 +166,16 @@ class RpcPoller:
         self._endpoint_pool: list[str] = pool
 
         # ThreadPoolExecutor for parallel fan-out across the full pool.
-        # Sized to len(pool) so every endpoint can fire concurrently
-        # without queueing. Always constructed (single-endpoint case is
-        # supported via a pool of length 1).
+        # Sized to 3 * len(pool) so abandoned-future stragglers from a
+        # previous call (whose urllib3 sockets haven't timed out yet)
+        # can't block the next call's submit. Workers are lazily
+        # spawned, so unused slots are free.
+        # Always constructed — the pool-size-1 fast path in
+        # _do_hedged_post bypasses it, but a never-used executor is
+        # cheap (no threads spawned until submit()).
         self._executor: concurrent.futures.ThreadPoolExecutor = (
             concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, len(self._endpoint_pool)),
+                max_workers=max(1, 3 * len(self._endpoint_pool)),
                 thread_name_prefix="rpc-hedge",
             )
         )

@@ -205,6 +205,34 @@ def test_winner_updates_current_endpoint():
     assert p.current_endpoint == "https://winner.example.com"
 
 
+def test_stragglers_do_not_block_winner_return():
+    """Critical latency property: when ONE endpoint returns fast and the
+    rest sleep long enough to outlive any plausible bot deadline,
+    _do_hedged_post must still return promptly (driven by the
+    FIRST_COMPLETED winner — abandoned futures keep running in the
+    executor but don't gate the caller).
+    """
+    pool = ["https://slow1.example.com", "https://fast.example.com",
+            "https://slow2.example.com"]
+    p = _make_poller(endpoint_pool=pool)
+
+    def per_url(url, body, *, timeout_seconds):
+        if "fast" in url:
+            return b'{"result":"fast"}'
+        # Sleep way longer than any test should tolerate.
+        time.sleep(5.0)
+        return b'{"result":"too late"}'
+
+    t0 = time.monotonic()
+    with mock.patch.object(p, "_rpc_post", side_effect=per_url):
+        ep, _ = p._do_hedged_post(b"x", timeout_seconds=5)
+    elapsed = time.monotonic() - t0
+    assert ep == "https://fast.example.com"
+    # Winner returns immediately; abandoned futures must not block.
+    # Allow 1s for thread submit/wait overhead under load.
+    assert elapsed < 1.0, f"winner-return took {elapsed:.2f}s; stragglers blocked"
+
+
 def test_fires_one_request_per_pool_endpoint():
     """Verifies every endpoint in the pool receives the request
     (no selection, no fan-out N: it's len(pool))."""
