@@ -96,14 +96,22 @@ def test_invalid_hedge_fan_out_three_with_two_endpoints_raises():
         )
 
 
-def test_default_hedged_endpoints_constant_is_three():
-    """Spec contract: top-3 endpoints from Track H. If this changes,
-    the memo (and any operator config relying on it) needs updating."""
-    assert len(DEFAULT_HEDGED_ENDPOINTS) == 3
-    # Specific endpoints from memo. If you tune the pool, update both.
+def test_default_hedged_endpoints_constant_is_six():
+    """Spec contract: top-3 BSC-dataseed-family endpoints from Track H
+    (defibit/ninicoin/binance_1) plus binance_3 (rank 4) plus two
+    distinct-provider endpoints (publicnode, bloXroute) added 2026-05-10
+    to defeat correlated bsc-dataseed-family outages. If this changes,
+    the in-file docstring and any operator config relying on it needs
+    updating."""
+    assert len(DEFAULT_HEDGED_ENDPOINTS) == 6
+    # BSC dataseed family (Track H top-4 by p50)
     assert DEFAULT_HEDGED_ENDPOINTS[0].endswith("defibit.io")
     assert DEFAULT_HEDGED_ENDPOINTS[1].endswith("ninicoin.io")
-    assert DEFAULT_HEDGED_ENDPOINTS[2].endswith("binance.org")
+    assert "bsc-dataseed1.binance.org" in DEFAULT_HEDGED_ENDPOINTS[2]
+    assert "bsc-dataseed3.binance.org" in DEFAULT_HEDGED_ENDPOINTS[3]
+    # Distinct-provider failover endpoints
+    assert "publicnode.com" in DEFAULT_HEDGED_ENDPOINTS[4]
+    assert "blxrbdn.com" in DEFAULT_HEDGED_ENDPOINTS[5]
 
 
 # ---------------------------------------------------------------------------
