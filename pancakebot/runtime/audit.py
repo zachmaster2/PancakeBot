@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import csv
+import os
 import time
 from pathlib import Path
 
 from pancakebot.constants import BNB_WEI
+from pancakebot.log import warn
 from pancakebot.util import InvariantError
 from pancakebot.types import Round
 
@@ -95,6 +97,15 @@ def ensure_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         # column over p_bull. All four columns are gone.
         "decision_latency_ms",
         "skip_reason",
+        # Per-symbol kline-fetch RTT (ms), captured by MomentumGate via
+        # gate.last_fetch_timing after the critical-path completes.
+        # Persisted to audit for offline tail-distribution analysis;
+        # empty string when the gate didn't run (cold-start / pre-strategy
+        # phases) or when the symbol was disabled (BNB is disabled today).
+        # Added 2026-05-12.
+        "btc_fetch_ms",
+        "eth_fetch_ms",
+        "sol_fetch_ms",
     ]
     p = Path(path)
     if reset or not p.exists():
@@ -102,7 +113,86 @@ def ensure_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(header_cols)
+        _CYCLE_AUDIT_HEADER_OK_PATHS.add(str(p.resolve()))
+    else:
+        # Header-mismatch auto-rotate: if an existing file's first row
+        # doesn't match the current header_cols (e.g. after a schema
+        # change), preserve the old file with a timestamped suffix and
+        # write a fresh file. This keeps downstream tooling that
+        # assumes a fixed column count from breaking silently.
+        #
+        # Per-write call cost (Y5): once the header has matched OR been
+        # rotated on this process, cache the path so subsequent writes
+        # skip the I/O. The cache is process-local; a fresh process
+        # always re-validates (catches off-process schema drift).
+        resolved = str(p.resolve())
+        if resolved in _CYCLE_AUDIT_HEADER_OK_PATHS:
+            return header_cols
+        try:
+            with open(path, "r", newline="") as f:
+                r = csv.reader(f)
+                existing_header = next(r, None)
+        except (OSError, csv.Error, StopIteration):
+            # Malformed CSV (partial-write crash artifact, encoding glitch,
+            # truncated bytes, etc.). Treat as "no usable header" and let
+            # the rotate path replace it. Bot startup must not be blocked
+            # by a corrupted file. (Y4 fix 2026-05-12.)
+            existing_header = None
+        if existing_header is not None and existing_header == header_cols:
+            _CYCLE_AUDIT_HEADER_OK_PATHS.add(resolved)
+            return header_cols
+        # Mismatch: rotate.
+        import time as _t
+        ts = _t.strftime("%Y%m%d-%H%M%S", _t.gmtime())
+        rotated_base = f"{path}.pre-rotate-{ts}"
+        rotated = rotated_base
+        # Y3 fix: use os.replace (cross-platform overwrite-safe; Windows
+        # os.rename raises on existing target) and handle the rare cases
+        # where the destination is locked (Excel/pandas reader holding
+        # a handle) or another collision occurs. Unique-suffix fallback
+        # tries `<base>-N` for N in 1..99 before giving up. As an absolute
+        # last resort, write the new header to a parallel file with the
+        # rotated suffix as the active path; bot startup is not blocked
+        # by a stuck rotate.
+        rotated_ok = False
+        try:
+            os.replace(path, rotated)
+            rotated_ok = True
+        except OSError:
+            for n in range(1, 100):
+                candidate = f"{rotated_base}-{n}"
+                try:
+                    os.replace(path, candidate)
+                    rotated = candidate
+                    rotated_ok = True
+                    break
+                except OSError:
+                    continue
+        if not rotated_ok:
+            # Absolute fallback: leave the old file in place and write the
+            # new schema to a parallel path. Surfaced via warn log so the
+            # operator notices.
+            warn("AUDIT", "CSV", "ROTATE_FAIL",
+                 msg=f"could not rotate {path}; writing new schema "
+                     f"to {path}.rotate-fallback")
+            fallback_path = f"{path}.rotate-fallback"
+            with open(fallback_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(header_cols)
+            _CYCLE_AUDIT_HEADER_OK_PATHS.add(str(Path(fallback_path).resolve()))
+            return header_cols
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header_cols)
+        _CYCLE_AUDIT_HEADER_OK_PATHS.add(resolved)
     return header_cols
+
+
+# Process-local cache of cycle-audit CSV paths whose header has been
+# verified to match ``header_cols``. Avoids re-reading + re-validating
+# the file on every append. Cleared per-process (fresh bot start
+# re-validates). (Y5 perf optimization 2026-05-12.)
+_CYCLE_AUDIT_HEADER_OK_PATHS: set[str] = set()
 
 
 def append_cycle_audit_row(path: str, row: dict[str, object]) -> None:
@@ -181,6 +271,9 @@ def record_cycle_audit(
     decision_latency_ms: float | None = None,
     pool_bull_bnb: float = 0.0,
     pool_bear_bnb: float = 0.0,
+    btc_fetch_ms: int | None = None,
+    eth_fetch_ms: int | None = None,
+    sol_fetch_ms: int | None = None,
 ) -> None:
     # Use RPC-fetched pool values when available (live/dry mode);
     # fall back to round_t.bets snapshot (backtest / no RPC data).
@@ -269,6 +362,9 @@ def record_cycle_audit(
                 "" if decision_latency_ms is None else decision_latency_ms
             ),
             "skip_reason": "" if skip_reason is None else skip_reason,
+            "btc_fetch_ms": "" if btc_fetch_ms is None else btc_fetch_ms,
+            "eth_fetch_ms": "" if eth_fetch_ms is None else eth_fetch_ms,
+            "sol_fetch_ms": "" if sol_fetch_ms is None else sol_fetch_ms,
         },
     )
 

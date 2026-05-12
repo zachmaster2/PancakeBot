@@ -216,6 +216,46 @@ def test_pool_cutoff_too_small_for_rpc_completion_rejected(tmp_path):
     assert "final_rpc_poll_rtt_budget_insufficient" in str(raised)
 
 
+def test_ramp_1_to_ramp_2_interval_insufficient_rejected(tmp_path, monkeypatch):
+    """If RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS is set below
+    rtt_p99(EXPECTED_RAMP_POLL_1_BATCH_SIZE) + safety, config-load must
+    raise ``ramp_poll_1_to_ramp_2_interval_insufficient``. Y6 coverage
+    for the 2026-05-12 per-leg ramp interval refactor.
+    """
+    # Required at current constants: rtt_p99(20)=1319 + safety=200 = 1519.
+    # Set interval just below required to trip the invariant.
+    monkeypatch.setattr(tc, "RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS", 1500)
+    raised: Exception | None = None
+    try:
+        load_app_config(str(_write_cfg(tmp_path)))
+    except InvariantError as e:
+        raised = e
+    assert isinstance(raised, InvariantError), (
+        f"Expected InvariantError; got {type(raised).__name__}: {raised}"
+    )
+    assert "ramp_poll_1_to_ramp_2_interval_insufficient" in str(raised)
+
+
+def test_ramp_2_to_final_interval_insufficient_rejected(tmp_path, monkeypatch):
+    """If RPC_RAMP_2_TO_FINAL_INTERVAL_MS is set below
+    rtt_p99(EXPECTED_RAMP_POLL_2_BATCH_SIZE) + safety, config-load must
+    raise ``ramp_poll_2_to_final_interval_insufficient``. Y6 coverage
+    for the 2026-05-12 per-leg ramp interval refactor.
+    """
+    # Required at current constants: rtt_p99(5)=771 + safety=200 = 971.
+    # Set interval just below required to trip the invariant.
+    monkeypatch.setattr(tc, "RPC_RAMP_2_TO_FINAL_INTERVAL_MS", 900)
+    raised: Exception | None = None
+    try:
+        load_app_config(str(_write_cfg(tmp_path)))
+    except InvariantError as e:
+        raised = e
+    assert isinstance(raised, InvariantError), (
+        f"Expected InvariantError; got {type(raised).__name__}: {raised}"
+    )
+    assert "ramp_poll_2_to_final_interval_insufficient" in str(raised)
+
+
 def test_pool_cutoff_default_is_6(tmp_path):
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     assert cfg.pool_cutoff_seconds == 6

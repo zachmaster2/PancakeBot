@@ -201,6 +201,13 @@ class MomentumGate:
                 signal=None, tier=None, skip_reason=None,
             )
 
+        # Reset per-round fetch-timing state BEFORE any work that can fail.
+        # An early failure (executor / as_completed / shape validation) below
+        # line 255 must not leak the previous round's timings into the
+        # current round's audit row. The successful path overwrites this at
+        # line 255 with the fetched durations. (Y2 fix 2026-05-12.)
+        self.last_fetch_timing = None
+
         cutoff_ts_ms = lock_at_ms - self._cfg.cutoff_seconds * 1000
         max_lookback = max(self._cfg.mtf_lookbacks)
         newest_open_ms = lock_at_ms - self._cfg.cutoff_seconds * 1000 - 1000

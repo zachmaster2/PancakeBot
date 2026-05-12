@@ -488,6 +488,9 @@ def _record_dry_cycle_audit(
     decision_latency_ms: float | None = None,
     pool_bull_bnb: float = 0.0,
     pool_bear_bnb: float = 0.0,
+    btc_fetch_ms: int | None = None,
+    eth_fetch_ms: int | None = None,
+    sol_fetch_ms: int | None = None,
 ) -> None:
     if not cfg.dry:
         return
@@ -509,6 +512,9 @@ def _record_dry_cycle_audit(
         decision_latency_ms=decision_latency_ms,
         pool_bull_bnb=pool_bull_bnb,
         pool_bear_bnb=pool_bear_bnb,
+        btc_fetch_ms=btc_fetch_ms,
+        eth_fetch_ms=eth_fetch_ms,
+        sol_fetch_ms=sol_fetch_ms,
     )
 
 
