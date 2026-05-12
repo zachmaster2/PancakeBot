@@ -173,18 +173,30 @@ BSC_BET_SUBMIT_RTT_P95_MS: int = 200
 # Per-batch p99 round-trip time, indexed by batch size. The wake
 # offsets look up this table by EXPECTED_*_BATCH_SIZE constants below.
 #
-# Source: research/probe_rpc_polling.py n=50 per size, 2026-05-07.
-# publicnode only (drpc.org rejects batched JSON-RPC arrays with
-# HTTP 500 at every tested size). size=15's raw measurement was
-# 2285ms but came from 50-sample p99-as-max noise; the monotonic
-# interpolation 1213ms (between sz=10 at 910 and sz=20 at 1533) is
-# the correct provisioning value.
+# Sizes 2-15: research/probe_rpc_polling.py n=50 per size, 2026-05-07,
+# publicnode single-endpoint. Wake-offset derivation uses sizes 10
+# (EXPECTED_FINAL_POLL_BATCH_SIZE) and 15 (EXPECTED_RAMP_POLL_{1,2}_BATCH_SIZE);
+# these stay at the original publicnode baseline. drpc.org rejects
+# batched JSON-RPC arrays with HTTP 500 at every tested size. size=15's
+# raw measurement was 2285ms but came from 50-sample p99-as-max noise;
+# the monotonic interpolation 1213ms (between sz=10 at 910 and sz=20
+# at 1533) is the correct provisioning value.
+#
+# Size=20: research/probe_fire_to_all_p99_batch20_clean_2026_05_11.py
+# n=30, fire-to-all-pool (6 endpoints), urllib3 PoolManager, 30s
+# inter-call spacing, BOT STOPPED. 30/30 successes. The bot-stopped
+# measurement matters because the 2026-05-11 transport switch
+# (urllib3 PoolManager + fire-to-all) means production now hedges
+# across 6 endpoints; running the probe alongside the bot inflated
+# RTTs ~3.5x due to same-IP / Windows-TCP / urllib3-pool contention
+# between the two processes. The 1319ms is the bot's actual
+# operating value (no concurrent caller in production).
 RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE: dict[int, int] = {
     2: 421,
     5: 771,
     10: 910,
     15: 1213,   # interpolated (raw 2285ms was small-sample outlier)
-    20: 1533,
+    20: 1319,   # fire-to-all p99, 2026-05-11 (was 1533, single-publicnode)
 }
 
 # Block availability delay — newhead arrival to first successful
