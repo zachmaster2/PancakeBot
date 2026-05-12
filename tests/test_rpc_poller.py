@@ -24,6 +24,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from pancakebot import timing_constants as _tc  # noqa: E402
 from pancakebot.chain.rpc_poller import RpcPoller, _Bet, _EpochPool  # noqa: E402
 from pancakebot.util import InvariantError  # noqa: E402
 
@@ -484,12 +485,18 @@ def test_first_call_set_round_phase_does_not_invoke_clamp(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_estimated_catchup_ms_calculation():
-    """20 blocks at batch_size=20 -> 1 batch * p99(20)=1533ms."""
+    """20 blocks at batch_size=20 -> 1 batch * p99(20)=1319ms.
+
+    1319ms is the 2026-05-11 fire-to-all-pool measurement (n=30, bot
+    stopped). See RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE docstring in
+    timing_constants.py.
+    """
     p = _make_poller()
+    rtt = _tc.rpc_rtt_p99_for_batch(20)
     assert p._estimated_catchup_ms(0) == 0
-    assert p._estimated_catchup_ms(20) == 1533  # 1 batch
-    assert p._estimated_catchup_ms(21) == 2 * 1533  # 2 batches (ceiling)
-    assert p._estimated_catchup_ms(60) == 3 * 1533  # 3 batches
+    assert p._estimated_catchup_ms(20) == rtt  # 1 batch
+    assert p._estimated_catchup_ms(21) == 2 * rtt  # 2 batches (ceiling)
+    assert p._estimated_catchup_ms(60) == 3 * rtt  # 3 batches
 
 
 def test_is_catchup_infeasible_returns_false_when_no_backlog():
@@ -513,12 +520,38 @@ def test_is_catchup_infeasible_returns_true_when_estimate_exceeds_budget():
 
 
 def test_is_catchup_infeasible_returns_false_when_estimate_fits_budget():
-    """20 blocks => 1 batch * 1533ms = 1533ms estimated.
-    Available = 60_000 - 200 = 59_800ms. Feasible."""
+    """20 blocks => 1 batch * p99(20)ms estimated. Available = 60_000 -
+    200 = 59_800ms. Feasible regardless of p99 value."""
     import time as _t
     p = _make_poller()
     far_lock = int(_t.time()) + 60
     assert p._is_catchup_infeasible(blocks_behind=20, lock_at=far_lock) is False
+
+
+def test_catchup_feasibility_at_typical_30_block_lag():
+    """Regression: at canonical pool_cutoff=6 (final fires at lock-3.79s),
+    a 30-block lag should be FEASIBLE (not trip INFEAS). 30-block lag at
+    batch_size=20 = ceil(30/20)=2 batches * p99(20). With the 2026-05-11
+    fire-to-all p99=1319ms, 2 * 1319 = 2638ms, vs available at final-poll
+    time ~= 3.79s - 200ms safety = 3590ms. Feasible.
+
+    Also tests the 23-block-lag false-positive scenario the
+    2026-05-11_fire_to_all_p99_measurement.md memo flagged: at 23 blocks
+    (= 2 batches), the math must NOT trip INFEAS just because of stale
+    constants. Anchors the constant value as load-bearing.
+    """
+    import time as _t
+    p = _make_poller()
+    # Lock 3.79s in the future (canonical final-poll moment).
+    lock_at = int(_t.time()) + 4  # ~3.79s + tiny rounding margin
+    # 23-block lag: 2 batches at p99=1319ms = 2638ms; available ~3800ms. Feasible.
+    assert p._is_catchup_infeasible(blocks_behind=23, lock_at=lock_at) is False, (
+        "23-block lag must be feasible at canonical final-poll timing. "
+        "If this fails, RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE[20] may be "
+        "stale relative to current transport — re-measure."
+    )
+    # 30-block lag: same 2 batches. Same result.
+    assert p._is_catchup_infeasible(blocks_behind=30, lock_at=lock_at) is False
 
 
 # ---------------------------------------------------------------------------
