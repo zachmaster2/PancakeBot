@@ -27,7 +27,13 @@ from pancakebot import timing_constants as _tc  # noqa: E402
 
 def _derive_schedule(pool_cutoff_seconds: int) -> dict[str, int]:
     """Derive the four lock-relative offsets (ms) from pool_cutoff
-    using the exact same formula as pancakebot/config.py."""
+    using the exact same formula as pancakebot/config.py.
+
+    Refactor 2026-05-12: runtime offsets no longer depend on
+    rpc_rtt_p99_for_batch lookups. The RTT lives in the startup
+    invariant (validates the chosen offset can absorb the actual
+    p99 + safety), not in the wake-time derivation itself.
+    """
     bet_submit_deadline_offset_ms = (
         _tc.BSC_BET_SUBMIT_RTT_P95_MS
         + _tc.BSC_BLOCK_TIME_MS
@@ -43,18 +49,15 @@ def _derive_schedule(pool_cutoff_seconds: int) -> dict[str, int]:
         pool_cutoff_seconds * 1000
         - _tc.BSC_BLOCK_TIME_MS
         - _tc.RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
-        - _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_FINAL_POLL_BATCH_SIZE)
         - _tc.RPC_POLL_FINAL_SAFETY_BUFFER_MS
     )
     ramp_poll_2_wakeup_offset_ms = (
         final_rpc_poll_wakeup_offset_ms
-        + _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_2_BATCH_SIZE)
-        + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
+        + _tc.RPC_RAMP_POLL_INTERVAL_MS
     )
     ramp_poll_1_wakeup_offset_ms = (
         ramp_poll_2_wakeup_offset_ms
-        + _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_1_BATCH_SIZE)
-        + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
+        + _tc.RPC_RAMP_POLL_INTERVAL_MS
     )
     return {
         "bet_submit": bet_submit_deadline_offset_ms,
@@ -134,76 +137,112 @@ def test_final_offset_within_pool_cutoff_window(pool_cutoff):
 
 @pytest.mark.parametrize("pool_cutoff", [6, 7, 8, 10, 12])
 def test_final_offset_leaves_room_for_critical_path_completion(pool_cutoff):
-    """final_rpc_poll_offset must be > critical_path_offset + safety so
-    the engine has time between the final poll and the critical-path
-    snapshot. This is the cross-validation gate enforced at runtime.
+    """final_rpc_poll completion (at empirical rtt_p99) must arrive
+    before critical_path + safety. Mirrors the runtime invariant
+    ``final_rpc_poll_rtt_budget_insufficient`` enforced in
+    pancakebot/config.py at load time (refactored 2026-05-12 to be
+    strictly stronger than the prior ``final > critical_path + safety``
+    check by additionally subtracting rtt_p99).
     """
     s = _derive_schedule(pool_cutoff)
+    rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_FINAL_POLL_BATCH_SIZE)
     safety = _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-    assert s["final"] > s["critical_path"] + safety, (
-        f"final_offset {s['final']}ms <= critical_path_offset "
-        f"{s['critical_path']}ms + safety {safety}ms at "
-        f"pool_cutoff={pool_cutoff}"
+    final_completion_offset = s["final"] - rtt - safety
+    assert final_completion_offset >= s["critical_path"], (
+        f"final_completion_offset {final_completion_offset}ms < "
+        f"critical_path {s['critical_path']}ms at pool_cutoff={pool_cutoff} "
+        f"(final={s['final']}ms - rtt_p99({_tc.EXPECTED_FINAL_POLL_BATCH_SIZE})="
+        f"{rtt}ms - safety={safety}ms)"
     )
 
 
 @pytest.mark.parametrize("pool_cutoff", [6, 7, 8, 10, 12])
 def test_ramp_2_after_final_in_chronology(pool_cutoff):
     """ramp_2 fires BEFORE final (i.e., its lock-relative offset is
-    bigger). The ramp_2 -> final gap must absorb the ramp_2 RTT."""
+    bigger). The ramp_2 -> final gap = RPC_RAMP_POLL_INTERVAL_MS,
+    which the startup invariant validates is >= rtt_p99(ramp_2) +
+    safety."""
     s = _derive_schedule(pool_cutoff)
     assert s["ramp_2"] > s["final"], (
         f"ramp_2 offset {s['ramp_2']}ms not > final offset "
         f"{s['final']}ms at pool_cutoff={pool_cutoff}"
     )
     gap = s["ramp_2"] - s["final"]
+    assert gap == _tc.RPC_RAMP_POLL_INTERVAL_MS, (
+        f"ramp_2->final gap {gap}ms != RPC_RAMP_POLL_INTERVAL_MS "
+        f"({_tc.RPC_RAMP_POLL_INTERVAL_MS}ms) at pool_cutoff={pool_cutoff}"
+    )
+    # Sanity: the interval must cover rtt_p99 + safety. This is the
+    # invariant enforced at config-load time.
     ramp_2_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_2_BATCH_SIZE)
     safety = _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-    assert gap >= ramp_2_rtt + safety, (
-        f"ramp_2->final gap {gap}ms < ramp_2_rtt {ramp_2_rtt}ms + "
-        f"safety {safety}ms"
+    assert _tc.RPC_RAMP_POLL_INTERVAL_MS >= ramp_2_rtt + safety, (
+        f"RPC_RAMP_POLL_INTERVAL_MS {_tc.RPC_RAMP_POLL_INTERVAL_MS}ms "
+        f"< ramp_2_rtt {ramp_2_rtt}ms + safety {safety}ms"
     )
 
 
 @pytest.mark.parametrize("pool_cutoff", [6, 7, 8, 10, 12])
 def test_ramp_1_after_ramp_2_in_chronology(pool_cutoff):
     """ramp_1 fires BEFORE ramp_2 (bigger lock-relative offset).
-    ramp_1 -> ramp_2 gap must absorb the ramp_1 RTT."""
+    ramp_1 -> ramp_2 gap = RPC_RAMP_POLL_INTERVAL_MS."""
     s = _derive_schedule(pool_cutoff)
     assert s["ramp_1"] > s["ramp_2"], (
         f"ramp_1 offset {s['ramp_1']}ms not > ramp_2 offset "
         f"{s['ramp_2']}ms at pool_cutoff={pool_cutoff}"
     )
     gap = s["ramp_1"] - s["ramp_2"]
+    assert gap == _tc.RPC_RAMP_POLL_INTERVAL_MS, (
+        f"ramp_1->ramp_2 gap {gap}ms != RPC_RAMP_POLL_INTERVAL_MS "
+        f"({_tc.RPC_RAMP_POLL_INTERVAL_MS}ms) at pool_cutoff={pool_cutoff}"
+    )
     ramp_1_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_1_BATCH_SIZE)
     safety = _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-    assert gap >= ramp_1_rtt + safety
+    assert _tc.RPC_RAMP_POLL_INTERVAL_MS >= ramp_1_rtt + safety
 
 
 def test_canonical_pool_cutoff_6_produces_expected_offsets():
-    """Pin the canonical-baseline schedule values. If a future change
-    to RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE shifts these by more than
-    a few ms, this test fails so the operator notices the shift."""
+    """Pin the canonical-baseline schedule values.
+
+    Refactor 2026-05-12: the wake-time derivation no longer depends
+    on rpc_rtt_p99_for_batch lookups; offsets are now derived from
+    pool_cutoff + RPC_RAMP_POLL_INTERVAL_MS + safety constants only.
+    Values shifted to give the final poll a full RTT of headroom
+    before critical_path arrives.
+
+    Schedule at canonical pool_cutoff=6:
+        final  = 6000 - 500 - 600 - 200             = 4700ms
+        ramp_2 = 4700 + 1500 (RPC_RAMP_POLL_INTERVAL) = 6200ms
+        ramp_1 = 6200 + 1500                         = 7700ms
+    """
     s = _derive_schedule(6)
     # critical_path is unchanged from pre-Era-11
     assert s["critical_path"] == 1095
     assert s["bet_submit"] == 750
-    # New offsets at canonical pool_cutoff=6
-    assert s["final"] == 3790
-    assert s["ramp_2"] == 5203
-    assert s["ramp_1"] == 6616
+    # New offsets at canonical pool_cutoff=6 (refactored 2026-05-12).
+    assert s["final"] == 4700
+    assert s["ramp_2"] == 6200
+    assert s["ramp_1"] == 7700
 
 
 def test_pool_cutoff_too_small_would_violate_final_offset_floor():
-    """pool_cutoff=2 (or any value where final_offset <=
-    critical_path + safety) would trip the runtime cross-validation
-    gate. Sanity-check the trip point."""
-    # At pool_cutoff=2: final_offset = 2000 - 500 - 600 - 910 - 200 = -210
-    # which is below critical_path (1095) + safety (200) = 1295.
-    # The runtime gate raises InvariantError; here we just assert
-    # the math works as expected.
+    """pool_cutoff=2 (or any value where final_offset - rtt_p99 -
+    safety <= critical_path) would trip the startup invariant.
+    Sanity-check the trip point.
+
+    At pool_cutoff=2 the refactored formula:
+        final = 2000 - 500 - 600 - 200 = 700ms
+    rtt_p99(10) = 910ms (current table); safety = 200ms.
+    final - 910 - 200 = -410ms, way below critical_path = 1095ms.
+    The startup invariant raises InvariantError; here we just assert
+    the math works as expected.
+    """
     s = _derive_schedule(2)
+    rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_FINAL_POLL_BATCH_SIZE)
     safety = _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-    assert s["final"] <= s["critical_path"] + safety, (
-        "pool_cutoff=2 should be too small for RPC completion"
+    final_completion_offset = s["final"] - rtt - safety
+    assert final_completion_offset < s["critical_path"], (
+        f"pool_cutoff=2 should violate startup invariant "
+        f"(final_completion_offset={final_completion_offset}ms "
+        f">= critical_path={s['critical_path']}ms)"
     )

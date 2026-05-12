@@ -28,14 +28,11 @@ Derivation chain (computed at config-load time in ``pancakebot/config.py``):
         pool_cutoff_seconds * 1000
         - BSC_BLOCK_TIME_MS
         - RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
-        - rpc_rtt_p99_for_batch(EXPECTED_FINAL_POLL_BATCH_SIZE)
         - RPC_POLL_FINAL_SAFETY_BUFFER_MS)
     ramp_poll_2_wakeup_offset_ms   = (final_rpc_poll_wakeup_offset_ms
-                                      + rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_2_BATCH_SIZE)
-                                      + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS)
+                                      + RPC_RAMP_POLL_INTERVAL_MS)
     ramp_poll_1_wakeup_offset_ms   = (ramp_poll_2_wakeup_offset_ms
-                                      + rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_1_BATCH_SIZE)
-                                      + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS)
+                                      + RPC_RAMP_POLL_INTERVAL_MS)
     bankroll_wakeup_offset_ms      = (critical_path_wakeup_offset_ms
                                       + BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS)
     ntp_sync_wakeup_offset_ms      = (bankroll_wakeup_offset_ms
@@ -73,13 +70,24 @@ must fit within the cutoff windows.
         published by then; rare publish-delay tail misses are
         absorbed by the streak counter)
 
-    final_rpc_poll_wakeup_offset_ms > (
-        critical_path_wakeup_offset_ms
+    (final_rpc_poll_wakeup_offset_ms
+        - rpc_rtt_p99_for_batch(EXPECTED_FINAL_POLL_BATCH_SIZE)
+        - RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
+        >= critical_path_wakeup_offset_ms)
+        (the final RPC poll must fire AND complete (at empirical p99
+        RTT) before the critical-path wake reads the pool snapshot;
+        pool_cutoff_seconds too small OR an upward drift in
+        rpc_rtt_p99_for_batch raises ``final_rpc_poll_rtt_budget_insufficient``
+        at config load — refactored 2026-05-12 to be strictly stronger
+        than the prior ``final > critical_path + safety`` check.)
+
+    RPC_RAMP_POLL_INTERVAL_MS >= (
+        max(rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_1_BATCH_SIZE),
+            rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_2_BATCH_SIZE))
         + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS)
-        (the final RPC poll must fire AND complete before the
-        critical-path wake reads the pool snapshot; pool_cutoff_seconds
-        too small for the RPC chain raises InvariantError at config
-        load)
+        (the fixed ramp-poll interval must accommodate the actual ramp
+        poll RTT + safety; upward drift in rpc_rtt_p99_for_batch raises
+        ``ramp_poll_interval_insufficient`` at config load.)
 """
 from __future__ import annotations
 
@@ -244,9 +252,15 @@ RPC_HTTP_BATCH_TIMEOUT_SECONDS: int = 5
 # timeout for consistency.
 RPC_HTTP_SINGLE_TIMEOUT_SECONDS: int = 5
 
-# Periodic poll cadence during the round. Literal, throughput-oriented:
-# round is 300s; 30s cadence gives ~10 polls per round.
-RPC_PERIODIC_POLL_INTERVAL_SECONDS: int = 30
+# Periodic poll cadence during the round. Was 30s (giving ~10 polls/round)
+# until 2026-05-12. Lowered to 8s after INFEAS rate analysis: at 30s
+# cadence, ~67 BSC blocks accumulate between polls (BSC block ~0.45s,
+# rounded to BSC_BLOCK_TIME_MS=500). 67 blocks forces multi-batch
+# catch-up that often exceeds available time before lock. 8s cadence
+# = ~17.8 blocks per poll = single batch at batch_size=20 with margin.
+# Any poll failure costs less cursor advance; periodic poll's job is
+# keeping cursor close to head.
+RPC_PERIODIC_POLL_INTERVAL_SECONDS: int = 8
 
 # Final-poll wake derivation safety cushion (cross-RPC variance the
 # spike didn't capture, etc.). Engineering judgment.
@@ -259,6 +273,28 @@ RPC_POLL_FINAL_SAFETY_BUFFER_MS: int = 200
 # (pool_not_ready_catchup_infeasible_for_round) is the canonical
 # integrating signal. Engineering judgment.
 RPC_POLL_DEADLINE_SAFETY_BUFFER_MS: int = 200
+
+# Fixed interval between successive ramp polls (ramp_1 → ramp_2,
+# ramp_2 → final). Replaces the prior runtime computation
+# ``rpc_rtt_p99_for_batch(15) + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS``
+# which coupled the wake derivation to a measured constant. The
+# startup invariant in pancakebot/config.py validates that this
+# interval covers the actual rtt_p99 + safety at config-load time;
+# a future drift in RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE that
+# violates the invariant fails-fast at startup rather than silently
+# producing a too-tight schedule.
+#
+# Value: 1500ms. Covers rtt_p99(15)=1213ms + safety(200)=1413ms with
+# ~87ms margin for measurement drift.
+#
+# Tight-margin trade-off is INTENTIONAL: if a future re-measurement of
+# rpc_rtt_p99_for_batch(15) revises above ~1300ms, the startup invariant
+# fails fast at config-load time (``ramp_poll_interval_insufficient``)
+# rather than silently producing a too-tight schedule. The fix in that
+# case is to bump this constant and re-derive — co-locked with the
+# probe data — instead of pretending nothing changed. See
+# pancakebot/config.py for the invariant.
+RPC_RAMP_POLL_INTERVAL_MS: int = 1500
 
 # Expected batch sizes used to derive the deadline-driven wake offsets.
 # Runtime batches are dynamic (= blocks since last poll); the schedule
