@@ -725,17 +725,24 @@ def load_app_config(path: str) -> AppConfig:
     # direction. The ramp_1/ramp_2 derivations had the same RTT
     # coupling (direction-correct but still runtime-fragile).
     #
-    # New shape:
+    # Shape:
     #   final = pool_cutoff*1000 − BSC_BLOCK_TIME − RPC_BLOCK_AVAILABILITY_DELAY_P99
     #           − RPC_POLL_FINAL_SAFETY_BUFFER
-    #   ramp_2 = final + RPC_RAMP_POLL_INTERVAL_MS
-    #   ramp_1 = ramp_2 + RPC_RAMP_POLL_INTERVAL_MS
+    #   ramp_2 = final + RPC_RAMP_2_TO_FINAL_INTERVAL_MS
+    #   ramp_1 = ramp_2 + RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS
     #
-    # The runtime offset no longer depends on the rtt_p99 lookup. The
-    # startup invariant below checks that the chosen offset still
+    # The runtime offsets no longer depend on the rtt_p99 lookup. The
+    # startup invariants below check that each chosen offset still
     # accommodates the actual rtt_p99 + safety; if rtt_p99 drifts past
     # what the schedule can absorb, startup fails-fast with a clear
     # InvariantError.
+    #
+    # Per-leg ramp intervals (2026-05-12 refactor): ramp_1's worst-case
+    # workload (catching up an 8s periodic interval = ~18 blocks) is
+    # much larger than ramp_2's incremental top-up (~4 blocks). The
+    # uniform RPC_RAMP_POLL_INTERVAL_MS=1500 it replaced was sized for a
+    # stale batch=15 assumption and under-provisioned ramp_1 while
+    # over-provisioning ramp_2/final.
     final_rpc_poll_wakeup_offset_ms = (
         pool_cutoff_seconds * 1000
         - _tc.BSC_BLOCK_TIME_MS
@@ -744,11 +751,11 @@ def load_app_config(path: str) -> AppConfig:
     )
     ramp_poll_2_wakeup_offset_ms = (
         final_rpc_poll_wakeup_offset_ms
-        + _tc.RPC_RAMP_POLL_INTERVAL_MS
+        + _tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS
     )
     ramp_poll_1_wakeup_offset_ms = (
         ramp_poll_2_wakeup_offset_ms
-        + _tc.RPC_RAMP_POLL_INTERVAL_MS
+        + _tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS
     )
 
     # --- Startup invariants: validate the refactored schedule still
@@ -775,29 +782,42 @@ def load_app_config(path: str) -> AppConfig:
             f"pool_cutoff_seconds or investigate RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE."
         )
 
-    # Ramp poll interval must cover the actual ramp poll rtt_p99 +
-    # safety. Both ramp_1 and ramp_2 expected batches; take max.
-    _ramp_max_rtt = max(
-        _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_1_BATCH_SIZE),
-        _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_2_BATCH_SIZE),
-    )
-    _ramp_required = _ramp_max_rtt + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-    if _tc.RPC_RAMP_POLL_INTERVAL_MS < _ramp_required:
+    # Per-leg ramp interval invariants. Each interval must cover its
+    # corresponding ramp poll's actual rtt_p99 + safety; future drift
+    # in RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE that violates either
+    # fails-fast at startup rather than silently producing a too-tight
+    # schedule.
+    _ramp_1_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_1_BATCH_SIZE)
+    _ramp_1_required = _ramp_1_rtt + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
+    if _tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS < _ramp_1_required:
         raise InvariantError(
-            f"ramp_poll_interval_insufficient: "
-            f"RPC_RAMP_POLL_INTERVAL_MS={_tc.RPC_RAMP_POLL_INTERVAL_MS}ms "
-            f"< ramp_rtt_p99={_ramp_max_rtt}ms + "
+            f"ramp_poll_1_to_ramp_2_interval_insufficient: "
+            f"RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS={_tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS}ms "
+            f"< rtt_p99({_tc.EXPECTED_RAMP_POLL_1_BATCH_SIZE})={_ramp_1_rtt}ms + "
             f"safety={_tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS}ms "
-            f"= {_ramp_required}ms. "
-            f"Raise RPC_RAMP_POLL_INTERVAL_MS or investigate "
+            f"= {_ramp_1_required}ms. "
+            f"Raise RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS or investigate "
+            f"RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE drift."
+        )
+
+    _ramp_2_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_2_BATCH_SIZE)
+    _ramp_2_required = _ramp_2_rtt + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
+    if _tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS < _ramp_2_required:
+        raise InvariantError(
+            f"ramp_poll_2_to_final_interval_insufficient: "
+            f"RPC_RAMP_2_TO_FINAL_INTERVAL_MS={_tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS}ms "
+            f"< rtt_p99({_tc.EXPECTED_RAMP_POLL_2_BATCH_SIZE})={_ramp_2_rtt}ms + "
+            f"safety={_tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS}ms "
+            f"= {_ramp_2_required}ms. "
+            f"Raise RPC_RAMP_2_TO_FINAL_INTERVAL_MS or investigate "
             f"RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE drift."
         )
 
     # ramp_poll_1 must be scheduled AFTER ntp_sync_wake (ramp_1 offset
     # < ntp_sync offset) so the ntp-sync wake has its budget intact
     # when it fires. At canonical pool_cutoff=6 this holds with margin
-    # (7700 < 11095), but a larger pool_cutoff combined with growth in
-    # RPC_RAMP_POLL_INTERVAL_MS could push ramp_1 above ntp_sync and
+    # (7500 < 11095), but a larger pool_cutoff combined with growth in
+    # the ramp interval constants could push ramp_1 above ntp_sync and
     # silently degrade the schedule. Fail fast instead.
     if ramp_poll_1_wakeup_offset_ms >= ntp_sync_wakeup_offset_ms:
         raise InvariantError(
@@ -805,10 +825,11 @@ def load_app_config(path: str) -> AppConfig:
             f"ramp_poll_1_wakeup={ramp_poll_1_wakeup_offset_ms}ms "
             f">= ntp_sync_wakeup={ntp_sync_wakeup_offset_ms}ms. "
             f"pool_cutoff_seconds={pool_cutoff_seconds}, "
-            f"RPC_RAMP_POLL_INTERVAL_MS={_tc.RPC_RAMP_POLL_INTERVAL_MS}ms. "
-            f"Either lower pool_cutoff_seconds or shrink "
-            f"RPC_RAMP_POLL_INTERVAL_MS — having ramp_1 fire before "
-            f"ntp_sync would scramble the round's wake ordering."
+            f"RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS={_tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS}ms, "
+            f"RPC_RAMP_2_TO_FINAL_INTERVAL_MS={_tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS}ms. "
+            f"Either lower pool_cutoff_seconds or shrink the ramp "
+            f"interval constants — having ramp_1 fire before ntp_sync "
+            f"would scramble the round's wake ordering."
         )
 
     # The kline fetch fires INSIDE the critical-path wake, after the

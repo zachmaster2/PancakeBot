@@ -53,11 +53,11 @@ def _derive_schedule(pool_cutoff_seconds: int) -> dict[str, int]:
     )
     ramp_poll_2_wakeup_offset_ms = (
         final_rpc_poll_wakeup_offset_ms
-        + _tc.RPC_RAMP_POLL_INTERVAL_MS
+        + _tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS
     )
     ramp_poll_1_wakeup_offset_ms = (
         ramp_poll_2_wakeup_offset_ms
-        + _tc.RPC_RAMP_POLL_INTERVAL_MS
+        + _tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS
     )
     return {
         "bet_submit": bet_submit_deadline_offset_ms,
@@ -159,7 +159,7 @@ def test_final_offset_leaves_room_for_critical_path_completion(pool_cutoff):
 @pytest.mark.parametrize("pool_cutoff", [6, 7, 8, 10, 12])
 def test_ramp_2_after_final_in_chronology(pool_cutoff):
     """ramp_2 fires BEFORE final (i.e., its lock-relative offset is
-    bigger). The ramp_2 -> final gap = RPC_RAMP_POLL_INTERVAL_MS,
+    bigger). The ramp_2 -> final gap = RPC_RAMP_2_TO_FINAL_INTERVAL_MS,
     which the startup invariant validates is >= rtt_p99(ramp_2) +
     safety."""
     s = _derive_schedule(pool_cutoff)
@@ -168,16 +168,16 @@ def test_ramp_2_after_final_in_chronology(pool_cutoff):
         f"{s['final']}ms at pool_cutoff={pool_cutoff}"
     )
     gap = s["ramp_2"] - s["final"]
-    assert gap == _tc.RPC_RAMP_POLL_INTERVAL_MS, (
-        f"ramp_2->final gap {gap}ms != RPC_RAMP_POLL_INTERVAL_MS "
-        f"({_tc.RPC_RAMP_POLL_INTERVAL_MS}ms) at pool_cutoff={pool_cutoff}"
+    assert gap == _tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS, (
+        f"ramp_2->final gap {gap}ms != RPC_RAMP_2_TO_FINAL_INTERVAL_MS "
+        f"({_tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS}ms) at pool_cutoff={pool_cutoff}"
     )
     # Sanity: the interval must cover rtt_p99 + safety. This is the
     # invariant enforced at config-load time.
     ramp_2_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_2_BATCH_SIZE)
     safety = _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-    assert _tc.RPC_RAMP_POLL_INTERVAL_MS >= ramp_2_rtt + safety, (
-        f"RPC_RAMP_POLL_INTERVAL_MS {_tc.RPC_RAMP_POLL_INTERVAL_MS}ms "
+    assert _tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS >= ramp_2_rtt + safety, (
+        f"RPC_RAMP_2_TO_FINAL_INTERVAL_MS {_tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS}ms "
         f"< ramp_2_rtt {ramp_2_rtt}ms + safety {safety}ms"
     )
 
@@ -185,44 +185,46 @@ def test_ramp_2_after_final_in_chronology(pool_cutoff):
 @pytest.mark.parametrize("pool_cutoff", [6, 7, 8, 10, 12])
 def test_ramp_1_after_ramp_2_in_chronology(pool_cutoff):
     """ramp_1 fires BEFORE ramp_2 (bigger lock-relative offset).
-    ramp_1 -> ramp_2 gap = RPC_RAMP_POLL_INTERVAL_MS."""
+    ramp_1 -> ramp_2 gap = RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS."""
     s = _derive_schedule(pool_cutoff)
     assert s["ramp_1"] > s["ramp_2"], (
         f"ramp_1 offset {s['ramp_1']}ms not > ramp_2 offset "
         f"{s['ramp_2']}ms at pool_cutoff={pool_cutoff}"
     )
     gap = s["ramp_1"] - s["ramp_2"]
-    assert gap == _tc.RPC_RAMP_POLL_INTERVAL_MS, (
-        f"ramp_1->ramp_2 gap {gap}ms != RPC_RAMP_POLL_INTERVAL_MS "
-        f"({_tc.RPC_RAMP_POLL_INTERVAL_MS}ms) at pool_cutoff={pool_cutoff}"
+    assert gap == _tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS, (
+        f"ramp_1->ramp_2 gap {gap}ms != RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS "
+        f"({_tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS}ms) at pool_cutoff={pool_cutoff}"
     )
     ramp_1_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_1_BATCH_SIZE)
     safety = _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-    assert _tc.RPC_RAMP_POLL_INTERVAL_MS >= ramp_1_rtt + safety
+    assert _tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS >= ramp_1_rtt + safety
 
 
 def test_canonical_pool_cutoff_6_produces_expected_offsets():
     """Pin the canonical-baseline schedule values.
 
-    Refactor 2026-05-12: the wake-time derivation no longer depends
-    on rpc_rtt_p99_for_batch lookups; offsets are now derived from
-    pool_cutoff + RPC_RAMP_POLL_INTERVAL_MS + safety constants only.
-    Values shifted to give the final poll a full RTT of headroom
-    before critical_path arrives.
+    Refactor 2026-05-12 (round 2): per-leg ramp intervals replace the
+    uniform RPC_RAMP_POLL_INTERVAL_MS=1500. ramp_1's interval to ramp_2
+    covers its worst-case 8s-periodic-catchup workload (~18 blocks,
+    batch=20 → 1319ms p99 + 200ms safety + ~181ms margin = 1700ms).
+    ramp_2's interval to final covers the small incremental top-up
+    (~4 blocks, batch=5 → 771ms p99 + 200ms safety + ~129ms margin
+    = 1100ms).
 
     Schedule at canonical pool_cutoff=6:
         final  = 6000 - 500 - 600 - 200             = 4700ms
-        ramp_2 = 4700 + 1500 (RPC_RAMP_POLL_INTERVAL) = 6200ms
-        ramp_1 = 6200 + 1500                         = 7700ms
+        ramp_2 = 4700 + 1100 (RPC_RAMP_2_TO_FINAL)  = 5800ms
+        ramp_1 = 5800 + 1700 (RPC_RAMP_1_TO_RAMP_2) = 7500ms
     """
     s = _derive_schedule(6)
     # critical_path is unchanged from pre-Era-11
     assert s["critical_path"] == 1095
     assert s["bet_submit"] == 750
-    # New offsets at canonical pool_cutoff=6 (refactored 2026-05-12).
+    # New per-leg offsets at canonical pool_cutoff=6 (refactored 2026-05-12 r2).
     assert s["final"] == 4700
-    assert s["ramp_2"] == 6200
-    assert s["ramp_1"] == 7700
+    assert s["ramp_2"] == 5800
+    assert s["ramp_1"] == 7500
 
 
 def test_pool_cutoff_too_small_would_violate_final_offset_floor():

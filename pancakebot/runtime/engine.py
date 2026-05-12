@@ -98,6 +98,22 @@ def _utc_now() -> float:
     return time.time() - _get_ntp_sync().current_offset()
 
 
+def _kline_timing_get(gate, key: str) -> int | None:
+    """Safe lookup into ``gate.last_fetch_timing[key]``.
+
+    Returns ``None`` when ``gate`` is itself None (non-strategy runs) or
+    when ``last_fetch_timing`` hasn't been populated yet (cold-start /
+    rounds before the gate runs). Cycle-audit code persists None as an
+    empty string in the CSV.
+    """
+    if gate is None:
+        return None
+    timing = gate.last_fetch_timing
+    if timing is None:
+        return None
+    return timing.get(key)
+
+
 # -- Heartbeat context -------------------------------------------------------
 # _run_one_iteration refreshes this at the top of every tick; _sleep_until_ts
 # reads it to emit a per-second heartbeat during long sleeps (deadlock
@@ -477,8 +493,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # log SUB_W=6.
         # First of three RPC polls that ramp the local pool aggregate
         # toward the critical_path snapshot. Fires at lock_at -
-        # ramp_poll_1_wakeup_offset_ms (= ~7.700s before lock at canonical
-        # pool_cutoff=6 post 2026-05-12 refactor). Catches
+        # ramp_poll_1_wakeup_offset_ms (= ~7.500s before lock at canonical
+        # pool_cutoff=6 per the per-leg refactor 2026-05-12). Catches
         # blocks since the last periodic poll. deadline_ms = gap to
         # ramp_2 - safety; on RTT-exceeds-deadline the poll marks
         # _last_poll_too_slow=True for diagnostics, but is_pool_ready()
@@ -568,9 +584,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         # -- Ramp poll #2 (Era 11) --
         # Second RPC poll. Fires at lock_at -
-        # ramp_poll_2_wakeup_offset_ms (= ~6.200s nominal at canonical
-        # pool_cutoff=6 post 2026-05-12 refactor; fires right after
-        # bankroll completes in practice — see runtime/config.py note). Bridges
+        # ramp_poll_2_wakeup_offset_ms (= ~5.800s at canonical
+        # pool_cutoff=6 per the per-leg refactor 2026-05-12; naturally
+        # falls after bankroll completes). Bridges
         # ramp_1 -> final. deadline_ms = gap to final_poll - safety.
         if cfg.rpc_poller is not None:
             ramp_poll_2_wake_ts = (
@@ -734,6 +750,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
                 pool_bull_bnb=pool_bull_bnb,
                 pool_bear_bnb=pool_bear_bnb,
+                btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
+                eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
+                sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
             )
             info("RUN", "ACT", "SKIP", msg=f"Skip epoch {current_epoch}: {reason}")
             # SKIP path: no time pressure, safe to log timing here.
@@ -783,6 +802,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
                 pool_bull_bnb=pool_bull_bnb,
                 pool_bear_bnb=pool_bear_bnb,
+                btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
+                eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
+                sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
             )
             info(
                 "RUN",
@@ -960,6 +982,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
                 pool_bull_bnb=pool_bull_bnb,
                 pool_bear_bnb=pool_bear_bnb,
+                btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
+                eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
+                sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
             )
 
         # Step 14b: Deferred GATE logging -- emit AFTER bet so file I/O

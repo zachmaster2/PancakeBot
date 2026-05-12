@@ -30,9 +30,9 @@ Derivation chain (computed at config-load time in ``pancakebot/config.py``):
         - RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
         - RPC_POLL_FINAL_SAFETY_BUFFER_MS)
     ramp_poll_2_wakeup_offset_ms   = (final_rpc_poll_wakeup_offset_ms
-                                      + RPC_RAMP_POLL_INTERVAL_MS)
+                                      + RPC_RAMP_2_TO_FINAL_INTERVAL_MS)
     ramp_poll_1_wakeup_offset_ms   = (ramp_poll_2_wakeup_offset_ms
-                                      + RPC_RAMP_POLL_INTERVAL_MS)
+                                      + RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS)
     bankroll_wakeup_offset_ms      = (critical_path_wakeup_offset_ms
                                       + BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS)
     ntp_sync_wakeup_offset_ms      = (bankroll_wakeup_offset_ms
@@ -81,13 +81,16 @@ must fit within the cutoff windows.
         at config load — refactored 2026-05-12 to be strictly stronger
         than the prior ``final > critical_path + safety`` check.)
 
-    RPC_RAMP_POLL_INTERVAL_MS >= (
-        max(rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_1_BATCH_SIZE),
-            rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_2_BATCH_SIZE))
+    RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS >= (
+        rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_1_BATCH_SIZE)
         + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS)
-        (the fixed ramp-poll interval must accommodate the actual ramp
-        poll RTT + safety; upward drift in rpc_rtt_p99_for_batch raises
-        ``ramp_poll_interval_insufficient`` at config load.)
+    RPC_RAMP_2_TO_FINAL_INTERVAL_MS >= (
+        rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_2_BATCH_SIZE)
+        + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS)
+        (each per-leg interval must accommodate its corresponding ramp
+        poll's actual rtt_p99 + safety; upward drift in
+        rpc_rtt_p99_for_batch raises ``ramp_poll_1_to_ramp_2_interval_insufficient``
+        or ``ramp_poll_2_to_final_interval_insufficient`` at config load.)
 """
 from __future__ import annotations
 
@@ -274,38 +277,48 @@ RPC_POLL_FINAL_SAFETY_BUFFER_MS: int = 200
 # integrating signal. Engineering judgment.
 RPC_POLL_DEADLINE_SAFETY_BUFFER_MS: int = 200
 
-# Fixed interval between successive ramp polls (ramp_1 → ramp_2,
-# ramp_2 → final). Replaces the prior runtime computation
-# ``rpc_rtt_p99_for_batch(15) + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS``
-# which coupled the wake derivation to a measured constant. The
-# startup invariant in pancakebot/config.py validates that this
-# interval covers the actual rtt_p99 + safety at config-load time;
-# a future drift in RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE that
-# violates the invariant fails-fast at startup rather than silently
-# producing a too-tight schedule.
+# Per-leg fixed intervals between successive RPC polls. Replaces the
+# prior uniform ``RPC_RAMP_POLL_INTERVAL_MS=1500`` (2026-05-12) which
+# coupled both ramp gaps to the same constant and was sized for a
+# stale 30s-periodic-cadence assumption (batch=15 for both ramps).
+# With 8s periodic cadence (post 740328f), the actual expected ramp
+# workloads diverge sharply:
 #
-# Value: 1500ms. Covers rtt_p99(15)=1213ms + safety(200)=1413ms with
-# ~87ms margin for measurement drift.
+#   ramp_1: catches up since the last periodic poll. Worst case = one
+#           periodic interval (8s) at BSC 0.45s blocks ≈ 17.8 blocks
+#           → batch=20 (clamped at RPC_BATCH_BLOCK_RECEIPTS_LIMIT).
+#           Needs rtt_p99(20)=1319ms + safety + margin → 1700ms.
+#   ramp_2: catches up since ramp_1 cursor advance. Wall gap is
+#           bounded by RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS plus bankroll
+#           work; ≈ 1700-2000ms / 450ms/block ≈ 4 blocks → batch=5.
+#           Needs rtt_p99(5)=771ms + safety + margin → 1100ms.
 #
-# Tight-margin trade-off is INTENTIONAL: if a future re-measurement of
-# rpc_rtt_p99_for_batch(15) revises above ~1300ms, the startup invariant
-# fails fast at config-load time (``ramp_poll_interval_insufficient``)
-# rather than silently producing a too-tight schedule. The fix in that
-# case is to bump this constant and re-derive — co-locked with the
-# probe data — instead of pretending nothing changed. See
-# pancakebot/config.py for the invariant.
-RPC_RAMP_POLL_INTERVAL_MS: int = 1500
+# Startup invariants in pancakebot/config.py validate each interval
+# covers its corresponding rtt_p99 + safety; future drift in
+# RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE that violates either invariant
+# fails-fast at config-load time rather than silently producing a
+# too-tight schedule.
+RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS: int = 1700
+RPC_RAMP_2_TO_FINAL_INTERVAL_MS: int = 1100
 
-# Expected batch sizes used to derive the deadline-driven wake offsets.
-# Runtime batches are dynamic (= blocks since last poll); the schedule
-# arithmetic uses the expected sizes for offset provisioning.
-EXPECTED_FINAL_POLL_BATCH_SIZE: int = 10
-# ramp_2 expected batch size = 15 (measured key in the RTT curve;
-# rounding up from the conceptual ~12 blocks since ramp_1 keeps the
-# RTT lookup honest — interpolating between two measured points would
-# be a measurement gap).
-EXPECTED_RAMP_POLL_2_BATCH_SIZE: int = 15
-EXPECTED_RAMP_POLL_1_BATCH_SIZE: int = 15
+# Expected batch sizes used to derive the deadline-driven wake offsets'
+# rtt_p99 lookups (in the startup invariants). Runtime batches are
+# dynamic (= blocks since last poll); these are sized for the worst-case
+# blocks-behind each poll could plausibly see at the canonical 8s
+# periodic cadence (BSC 0.45s blocks):
+#
+#   ramp_1: catches up since last periodic poll. Worst case = full
+#           periodic interval (8s) → ~17.8 blocks → batch=20 (clamped at
+#           RPC_BATCH_BLOCK_RECEIPTS_LIMIT).
+#   ramp_2: catches up since ramp_1 cursor advance (1.7-2s wall gap) →
+#           ~4 blocks → batch=5.
+#   final:  catches up since ramp_2 cursor advance (1.1s wall gap) →
+#           ~3 blocks → batch=5.
+#
+# Refactored 2026-05-12 from the prior 30s-periodic-era values (10/15/15).
+EXPECTED_FINAL_POLL_BATCH_SIZE: int = 5
+EXPECTED_RAMP_POLL_2_BATCH_SIZE: int = 5
+EXPECTED_RAMP_POLL_1_BATCH_SIZE: int = 20
 
 
 def rpc_rtt_p99_for_batch(batch_size: int) -> int:
