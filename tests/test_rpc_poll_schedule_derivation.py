@@ -105,7 +105,11 @@ def test_rtt_curve_monotonic():
 
 
 def test_rpc_rtt_p99_for_batch_helper():
-    """Helper returns ceiling-key value, with sensible boundaries."""
+    """Helper passes exact keys through, ceilings at small/large ends,
+    and returns 0 for non-positive sizes. Same contract as before the
+    2026-05-12 interpolation refactor — all current callers (config.py
+    invariants + rpc_poller with _batch_size=20) use exact keys, so this
+    test guards backward-compat at the canonical pin points."""
     table = _tc.RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE
     keys = sorted(table.keys())
     # Below the smallest key returns the smallest key's RTT.
@@ -118,6 +122,50 @@ def test_rpc_rtt_p99_for_batch_helper():
     # Zero or negative returns 0.
     assert _tc.rpc_rtt_p99_for_batch(0) == 0
     assert _tc.rpc_rtt_p99_for_batch(-1) == 0
+
+
+def test_rpc_rtt_p99_for_batch_interp_passthrough_at_keys():
+    """Refactor 2026-05-12: rpc_rtt_p99_for_batch interpolates linearly
+    between measured keys. At every measured key, the result must equal
+    the table value exactly (pure passthrough, no rounding drift)."""
+    table = _tc.RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE
+    for k, v in table.items():
+        assert _tc.rpc_rtt_p99_for_batch(k) == v, (
+            f"passthrough failed at key={k}: table={v} got={_tc.rpc_rtt_p99_for_batch(k)}"
+        )
+
+
+def test_rpc_rtt_p99_for_batch_interp_interior_points():
+    """Linear-interpolation between bracketing adjacent keys, with
+    rounding to the nearest integer. Spec values computed against the
+    canonical table {2:421, 5:771, 10:910, 15:1213, 20:1319}.
+    """
+    # batch=3: between (2,421) and (5,771); 421 + (350)*1/3 = 537.67 -> 538
+    assert _tc.rpc_rtt_p99_for_batch(3) == 538
+    # batch=4: between (2,421) and (5,771); 421 + (350)*2/3 = 654.33 -> 654
+    assert _tc.rpc_rtt_p99_for_batch(4) == 654
+    # batch=7: between (5,771) and (10,910); 771 + (139)*2/5 = 826.6 -> 827
+    assert _tc.rpc_rtt_p99_for_batch(7) == 827
+    # batch=12: between (10,910) and (15,1213); 910 + (303)*2/5 = 1031.2 -> 1031
+    assert _tc.rpc_rtt_p99_for_batch(12) == 1031
+    # batch=18: between (15,1213) and (20,1319); 1213 + (106)*3/5 = 1276.6 -> 1277
+    assert _tc.rpc_rtt_p99_for_batch(18) == 1277
+
+
+def test_rpc_rtt_p99_for_batch_interp_edges():
+    """Edge cases preserved by the refactor:
+      - 0, -1 -> 0
+      - 1 -> table[2] (ceiling at small end)
+      - 25, 100 -> table[20] (ceiling at large end)
+    """
+    table = _tc.RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE
+    keys = sorted(table.keys())
+    smallest, largest = keys[0], keys[-1]
+    assert _tc.rpc_rtt_p99_for_batch(0) == 0
+    assert _tc.rpc_rtt_p99_for_batch(-1) == 0
+    assert _tc.rpc_rtt_p99_for_batch(1) == table[smallest]
+    assert _tc.rpc_rtt_p99_for_batch(25) == table[largest]
+    assert _tc.rpc_rtt_p99_for_batch(100) == table[largest]
 
 
 # ---------------------------------------------------------------------------

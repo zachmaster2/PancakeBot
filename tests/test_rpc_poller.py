@@ -485,18 +485,68 @@ def test_first_call_set_round_phase_does_not_invoke_clamp(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_estimated_catchup_ms_calculation():
-    """20 blocks at batch_size=20 -> 1 batch * p99(20)=1319ms.
+    """Full-batch backlogs: ``full_batches * p99(batch_size)`` plus the
+    partial-batch tail. Refactored 2026-05-12: the helper is now
+    batch-size-aware (full batches at p99(batch_size), partial at
+    p99(remainder)).
 
-    1319ms is the 2026-05-11 fire-to-all-pool measurement (n=30, bot
-    stopped). See RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE docstring in
-    timing_constants.py.
+    1319ms is the 2026-05-11 fire-to-all-pool measurement for batch=20
+    (n=30, bot stopped). See RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE
+    docstring in timing_constants.py.
     """
     p = _make_poller()
-    rtt = _tc.rpc_rtt_p99_for_batch(20)
+    rtt_full = _tc.rpc_rtt_p99_for_batch(20)  # 1319 canonical
+    rtt_one = _tc.rpc_rtt_p99_for_batch(1)    # 421 canonical (ceiling at small end)
     assert p._estimated_catchup_ms(0) == 0
-    assert p._estimated_catchup_ms(20) == rtt  # 1 batch
-    assert p._estimated_catchup_ms(21) == 2 * rtt  # 2 batches (ceiling)
-    assert p._estimated_catchup_ms(60) == 3 * rtt  # 3 batches
+    assert p._estimated_catchup_ms(20) == rtt_full           # 1 full batch, 0 remainder
+    assert p._estimated_catchup_ms(21) == rtt_full + rtt_one  # 1 full + 1-block partial
+    assert p._estimated_catchup_ms(60) == 3 * rtt_full        # 3 full batches, 0 remainder
+
+
+def test_estimated_catchup_ms_partial_batch_uses_remainder_rtt():
+    """The partial trailing batch uses the (smaller) p99 for the
+    remainder size — not the full-batch p99 — eliminating the prior
+    ceiling-style overestimate. At blocks_behind=7 (= remainder only,
+    no full batches), the result is rtt_p99(7) ~ 827ms (interpolated),
+    NOT the prior unconditional rtt_p99(20)=1319ms.
+    """
+    p = _make_poller()
+    # 7 blocks: 0 full batches + 7-block partial.
+    assert p._estimated_catchup_ms(7) == _tc.rpc_rtt_p99_for_batch(7)
+    # 18 blocks: same — 0 full batches + 18-block partial.
+    assert p._estimated_catchup_ms(18) == _tc.rpc_rtt_p99_for_batch(18)
+    # 27 blocks: 1 full batch + 7-block partial.
+    assert p._estimated_catchup_ms(27) == (
+        _tc.rpc_rtt_p99_for_batch(20) + _tc.rpc_rtt_p99_for_batch(7)
+    )
+
+
+def test_estimated_catchup_ms_strictly_smaller_than_old_ceiling_math():
+    """Regression guard: the new estimate is at most equal to the prior
+    ``ceil(n/batch_size) * p99(batch_size)`` ceiling math, and strictly
+    smaller for any non-multiple of batch_size. At canonical batch=20:
+      - blocks=7  : old 1319, new ~827
+      - blocks=21 : old 2638, new 1319+421=1740
+      - blocks=27 : old 2638, new 1319+827=2146
+    This is the load-bearing property: small backlogs no longer
+    false-INFEAS due to ceiling overestimation.
+    """
+    p = _make_poller()
+    rtt20 = _tc.rpc_rtt_p99_for_batch(20)
+    for blocks in (7, 21, 27, 33, 47):
+        full, remainder = divmod(blocks, 20)
+        old_ceiling = (full + (1 if remainder else 0)) * rtt20
+        new_estimate = p._estimated_catchup_ms(blocks)
+        # When remainder > 0, new estimate must be strictly smaller
+        # (since rtt_p99(remainder) < rtt_p99(20) for remainder < 20).
+        if remainder > 0:
+            assert new_estimate < old_ceiling, (
+                f"blocks={blocks}: new={new_estimate} should be < "
+                f"old_ceiling={old_ceiling} (smaller partial RTT)"
+            )
+        else:
+            # Multiples of batch_size: same result, both math models.
+            assert new_estimate == old_ceiling
 
 
 def test_is_catchup_infeasible_returns_false_when_no_backlog():
@@ -549,14 +599,238 @@ def test_catchup_feasibility_at_typical_30_block_lag():
     import time as _t
     p = _make_poller()
     lock_at = int(_t.time()) + 5  # 5s out: ~4800ms available after safety
-    # 23-block lag: 2 batches at p99=1319ms = 2638ms < 4800ms. Feasible.
+    # 23-block lag (post-2026-05-12 batch-aware math):
+    #   1 full batch (20) * p99(20)=1319ms + 3-block partial at
+    #   p99(3)=538ms (interpolated) = 1857ms < 4800ms. Feasible.
     assert p._is_catchup_infeasible(blocks_behind=23, lock_at=lock_at) is False, (
         "23-block lag must be feasible at canonical final-poll timing. "
         "If this fails, RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE[20] may be "
         "stale relative to current transport — re-measure."
     )
-    # 30-block lag: same 2 batches. Same result.
+    # 30-block lag: 1 full + 10-block partial @ p99(10)=910ms = 2229ms. Same result.
     assert p._is_catchup_infeasible(blocks_behind=30, lock_at=lock_at) is False
+
+
+# ---------------------------------------------------------------------------
+# _compute_periodic_timeout: lock-anchored 3-state cadence math (2026-05-12)
+# ---------------------------------------------------------------------------
+
+def _make_anchored_poller() -> RpcPoller:
+    """Poller with default canonical ramp_poll_1 offset (7500ms) and
+    interval=300s for periodic-loop math tests."""
+    return RpcPoller(
+        interval_seconds=300,
+        endpoint_pool=["https://test.example.com"],
+        ramp_poll_1_wakeup_offset_ms=7500,
+    )
+
+
+def test_periodic_timeout_state_b_anchored_to_round_open_plus_8():
+    """State B steady. At now = round_open + 5s, next anchored tick
+    fires at round_open + 8s (k=1). Timeout = 3s."""
+    p = _make_anchored_poller()
+    lock_at = 1_000_300
+    round_open = lock_at - 300  # 1_000_000
+    now = round_open + 5  # 5s into the open round
+    timeout, state = p._compute_periodic_timeout(
+        now=float(now), lock_at=lock_at, period=8,
+    )
+    assert state == "steady"
+    assert timeout == pytest.approx(3.0, abs=1e-6)
+
+
+def test_periodic_timeout_state_b_advances_k_after_each_tick():
+    """At now = round_open + 17s (between ticks at +16 and +24), the
+    next-tick computation yields k=3, next_at = round_open + 24.
+    Timeout = 7s."""
+    p = _make_anchored_poller()
+    lock_at = 1_000_300
+    round_open = lock_at - 300
+    now = round_open + 17
+    timeout, state = p._compute_periodic_timeout(
+        now=float(now), lock_at=lock_at, period=8,
+    )
+    assert state == "steady"
+    assert timeout == pytest.approx(7.0, abs=1e-6)
+
+
+def test_periodic_timeout_state_b_suspend_in_ramp_window():
+    """At now = lock_at - 6s, the next anchored tick would land at
+    round_open + 296 = lock_at - 4s (inside the ramp window
+    (lock_at - 7.5s, lock_at]). Suspend: sleep to lock_at + 0.1s,
+    i.e. timeout = 6.1s."""
+    p = _make_anchored_poller()
+    lock_at = 1_000_300
+    now = lock_at - 6
+    timeout, state = p._compute_periodic_timeout(
+        now=float(now), lock_at=lock_at, period=8,
+    )
+    assert state == "suspend"
+    assert timeout == pytest.approx(6.1, abs=1e-6)
+
+
+def test_periodic_timeout_state_b_last_in_bounds_tick_just_before_ramp():
+    """At now = lock_at - 13s (just before the last in-bounds tick
+    at lock_at - 12s = round_open + 288), the cadence still fires
+    that tick — it lands at lock_at - 12s, which is outside the
+    ramp window (starts at lock_at - 7.5s). Timeout = 1s."""
+    p = _make_anchored_poller()
+    lock_at = 1_000_300
+    now = lock_at - 13
+    timeout, state = p._compute_periodic_timeout(
+        now=float(now), lock_at=lock_at, period=8,
+    )
+    assert state == "steady"
+    assert timeout == pytest.approx(1.0, abs=1e-6)
+
+
+def test_periodic_timeout_state_c_stale_anchor_wall_clock_fallback():
+    """At now > lock_at (engine in _sleep_and_claim, set_round_phase
+    hasn't fired for the next round yet), fall back to wall-clock
+    cadence at the configured period — timeout = period seconds."""
+    p = _make_anchored_poller()
+    lock_at = 1_000_300
+    now = lock_at + 2  # 2s past lock, mid-claim window
+    timeout, state = p._compute_periodic_timeout(
+        now=float(now), lock_at=lock_at, period=8,
+    )
+    assert state == "stale"
+    assert timeout == pytest.approx(8.0, abs=1e-6)
+
+
+def test_periodic_timeout_state_b_re_anchors_when_lock_at_advances():
+    """After an epoch advance updates _lock_at, the next computation
+    uses the new anchor. Simulates the natural re-anchoring at round
+    boundaries when set_round_phase fires."""
+    p = _make_anchored_poller()
+    lock_at_old = 1_000_300
+    lock_at_new = lock_at_old + 300  # 1_000_600
+    round_open_new = lock_at_new - 300  # 1_000_300
+
+    # Halfway through the new round at lock_old + 17s = round_open_new + 17.
+    now = lock_at_old + 17
+    timeout, state = p._compute_periodic_timeout(
+        now=float(now), lock_at=lock_at_new, period=8,
+    )
+    assert state == "steady"
+    # k=3, next_at = round_open_new + 24 = now + 7.
+    assert timeout == pytest.approx(7.0, abs=1e-6)
+
+
+def test_periodic_timeout_state_b_exact_boundary_suspends():
+    """Reviewer Y2 (2026-05-12): the suspend predicate is
+    ``next_at >= ramp_window_start`` (closed at the boundary, not open).
+    At canonical (period=8s, ramp_offset=7500ms) no boundary-aligned
+    tick exists, but a future change to either constant could produce
+    one. Construct a config where it does and pin the >= behavior.
+
+    Construction: ``ramp_poll_1_wakeup_offset_ms=200_000`` (200s) →
+    ``ramp_window_start = lock_at − 200``. With ``round_open = 0``,
+    ``period = 8``, ticks land at 8, 16, ..., 800. The 800 tick
+    falls EXACTLY on the ramp_window_start boundary at lock_at=1000.
+    With ``>`` predicate, that tick would fire steady at lock_at−200,
+    racing ramp_1. With ``>=`` predicate, it suspends.
+    """
+    p = RpcPoller(
+        interval_seconds=1000,
+        endpoint_pool=["https://test.example.com"],
+        ramp_poll_1_wakeup_offset_ms=200_000,
+    )
+    lock_at = 1000
+    # next-tick math at now=795: k = max(1, 795//8 + 1) = 100;
+    # next_at = 100 * 8 = 800. ramp_window_start = 1000 - 200 = 800.
+    # next_at == ramp_window_start exactly.
+    now = 795.0
+    timeout, state = p._compute_periodic_timeout(
+        now=now, lock_at=lock_at, period=8,
+    )
+    assert state == "suspend", (
+        "exact-boundary tick must suspend under the >= predicate; "
+        "if this fails, the suspend predicate has regressed to >"
+    )
+    # Suspend timeout sleeps past lock: lock_at + 0.1 - now = 205.1.
+    assert timeout == pytest.approx(lock_at + 0.1 - now, abs=1e-6)
+
+
+def test_poll_lock_arbitration_periodic_yields_to_concurrent_ramp_poll():
+    """Reviewer Y3 (2026-05-12): when two polls fire near-simultaneously
+    (periodic loop wake racing engine ramp_1 wake), the non-blocking
+    ``_poll_lock.acquire(blocking=False)`` in ``_poll_now`` ensures one
+    wins and the other returns immediately — periodic is best-effort so
+    yielding is correct behavior.
+
+    Setup: a slow-fetch holds the lock long enough that a second
+    ``_poll_now`` call attempts to acquire it. Verify only one fetch
+    ran (the winner) and the second call returned cleanly with no
+    cursor advance or state mutation.
+    """
+    import threading
+    import time as _t
+    p = _make_poller()
+    _prep_for_epoch_advance(p)
+    p._last_polled_block_number = 99_990  # 10 blocks behind; feasible budget
+
+    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    # Plenty of time to lock so feasibility doesn't trip.
+    p._lock_at = int(_t.time()) + 60
+
+    fetch_started = threading.Event()
+    fetch_can_finish = threading.Event()
+    fetched_calls: list[int] = []
+
+    def slow_fetch(block_numbers):
+        fetch_started.set()
+        # Emulate a slow eth_getBlockReceipts batch by parking here.
+        # The test signals fetch_can_finish once the racing call has
+        # had its chance to attempt _poll_lock acquisition.
+        if not fetch_can_finish.wait(timeout=5.0):
+            raise RuntimeError("test deadlock waiting on fetch_can_finish")
+        fetched_calls.append(len(block_numbers))
+
+    p._fetch_and_process_blocks = slow_fetch  # type: ignore[assignment]
+
+    # Thread A: simulates the engine-driven ramp_1 poll — acquires the
+    # lock and parks inside the slow fetch.
+    def run_ramp():
+        p._poll_now(deadline_ms=0, label="ramp")
+
+    t_ramp = threading.Thread(target=run_ramp, daemon=True, name="test-ramp")
+    t_ramp.start()
+    assert fetch_started.wait(timeout=2.0), (
+        "ramp poll never reached the fetch — setup error"
+    )
+
+    # Thread B: simulates a periodic-loop wake firing while ramp is
+    # mid-flight. Should return promptly because _poll_lock is held.
+    fetches_before_periodic = len(fetched_calls)
+    cursor_before_periodic = p._last_polled_block_number
+
+    def run_periodic():
+        p._poll_now(deadline_ms=0, label="period")
+
+    t_period = threading.Thread(target=run_periodic, daemon=True, name="test-period")
+    t_period.start()
+    t_period.join(timeout=2.0)
+    assert not t_period.is_alive(), (
+        "periodic must have returned immediately when _poll_lock held by ramp"
+    )
+
+    # Periodic must have done nothing: no extra fetch, no cursor advance,
+    # no flag flip.
+    assert len(fetched_calls) == fetches_before_periodic, (
+        "periodic should NOT have invoked the fetcher while ramp held the lock"
+    )
+    assert p._last_polled_block_number == cursor_before_periodic, (
+        "periodic should NOT have advanced the cursor (ramp owns this poll)"
+    )
+
+    # Let ramp finish; verify exactly one fetch happened (ramp's).
+    fetch_can_finish.set()
+    t_ramp.join(timeout=2.0)
+    assert not t_ramp.is_alive(), "ramp poll must complete"
+    assert len(fetched_calls) == 1, (
+        f"exactly one fetch should have run (the winner); got {len(fetched_calls)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -594,9 +868,16 @@ def test_rpc_eth_get_latest_block_header_raises_on_missing_fields():
 # ---------------------------------------------------------------------------
 
 def test_poll_now_aborts_early_when_catchup_infeasible_mid_round(caplog):
-    """If during a round the cursor falls way behind and math says
-    can't catch up, _poll_now aborts without fetching batches and sets
-    the infeasibility flag."""
+    """Pre-lock infeasibility (time_until_lock_ms > 0) sets the flag
+    AND emits a WARN. The cursor doesn't advance because no batches
+    were fetched.
+
+    Post-2026-05-12 gating: lock_at must be strictly in the future for
+    the flag to set; the previous version used ``lock_at = int(now)``
+    which under the new gating is post-lock (time_until_lock_ms == 0)
+    and now exercises the no-flag branch. Use ``now + 1`` to ensure
+    we land on the pre-lock branch.
+    """
     import time as _t
     p = _make_poller()
     _prep_for_epoch_advance(p)
@@ -609,12 +890,103 @@ def test_poll_now_aborts_early_when_catchup_infeasible_mid_round(caplog):
         lambda block_numbers: pytest.fail("should not have fetched")
     )
 
-    # Tight time: lock_at is "now"; available = 0; clearly infeasible.
-    p._lock_at = int(_t.time())
+    # Pre-lock + tight time: ~1s until lock, available ~800ms. Math
+    # says 99_000 blocks of catch-up dwarfs available → INFEAS, flag set.
+    p._lock_at = int(_t.time()) + 1
 
     p._poll_now(deadline_ms=0, label="period")
 
     assert p._catchup_infeasible_for_round is True
+
+
+def test_poll_now_post_lock_infeas_does_not_set_flag(capsys):
+    """Post-2026-05-12 gating: when ``time_until_lock_ms <= 0`` (the
+    round has already locked but set_round_phase hasn't advanced
+    ``_lock_at`` for the next round yet — a trailing periodic in the
+    claim window), an INFEAS verdict must NOT set
+    ``_catchup_infeasible_for_round``. The flag is for the CURRENT
+    bettable round; once lock has passed it's moot. The poll still
+    aborts (math says it cannot finish), but no flag, no WARN.
+
+    Note: pancakebot.log writes via sys.stdout (not stdlib logging), so
+    capsys captures emitted lines and we grep for "INFEAS" rather than
+    using caplog records.
+    """
+    import time as _t
+    p = _make_poller()
+    _prep_for_epoch_advance(p)
+    p._last_polled_block_number = 1_000
+
+    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._fetch_and_process_blocks = (  # type: ignore[assignment]
+        lambda block_numbers: pytest.fail("should not have fetched")
+    )
+
+    # Stale anchor: lock_at strictly in the past relative to _t.time().
+    # Even with int() truncation, lock_at - 2 is guaranteed < now.
+    p._lock_at = int(_t.time()) - 2
+    # Pre-test False so we detect if any branch flips it.
+    p._catchup_infeasible_for_round = False
+
+    # Drain any stdout from poller construction so we only inspect this
+    # call's emissions.
+    capsys.readouterr()
+
+    p._poll_now(deadline_ms=0, label="period")
+
+    assert p._catchup_infeasible_for_round is False, (
+        "post-lock INFEAS must NOT set the flag (round is already locked; "
+        "flag gates the next live round, not a closed one)"
+    )
+    captured = capsys.readouterr()
+    assert "INFEAS" not in captured.out, (
+        "post-lock INFEAS must NOT emit WARN line; got: " + captured.out
+    )
+
+
+def test_poll_now_post_lock_cursor_advances_after_set_round_phase():
+    """After a post-lock INFEAS abort (no flag set), the next poll
+    against a fresh _lock_at advances the cursor normally — confirming
+    the cursor isn't stuck and the flag-less abort is a true no-op for
+    next-round readiness.
+
+    Backlog sized at 100 blocks (5 batches at canonical batch=20) so it
+    is infeasible against a stale (past) lock_at (available_ms=0 → any
+    estimate > 0 trips INFEAS) but feasible against a 10-minute-out
+    next-round lock_at (available_ms ~ 598_500ms ≫ 5*1319=6595ms).
+    """
+    import time as _t
+    p = _make_poller()
+    _prep_for_epoch_advance(p)
+    p._last_polled_block_number = 99_900  # 100 blocks behind head=100_000
+
+    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+
+    fetched: list[list[int]] = []
+    p._fetch_and_process_blocks = (  # type: ignore[assignment]
+        lambda nums: fetched.append(list(nums))
+    )
+
+    # First call: post-lock periodic (lock_at in the past). INFEAS path
+    # short-circuits the fetch but must NOT set the flag (post-lock
+    # gating). Cursor stays put for this poll.
+    p._lock_at = int(_t.time()) - 2
+    p._catchup_infeasible_for_round = False
+    p._poll_now(deadline_ms=0, label="period")
+    assert p._catchup_infeasible_for_round is False
+    assert fetched == [], "post-lock INFEAS must short-circuit the fetch"
+    assert p._last_polled_block_number == 99_900, (
+        "cursor stays put on post-lock INFEAS (matches pre-lock INFEAS behavior)"
+    )
+
+    # Second call: simulate set_round_phase advancing _lock_at to the
+    # next round's future lock (plenty of catch-up budget).
+    p._lock_at = int(_t.time()) + 600  # 10 minutes out
+    p._poll_now(deadline_ms=0, label="period")
+    assert len(fetched) > 0, "cursor should advance on the next poll"
+    assert p._last_polled_block_number == 100_000, (
+        "cursor advances to head after feasible catch-up poll"
+    )
 
 
 def test_poll_now_skips_feasibility_check_when_lock_at_zero():
@@ -745,7 +1117,14 @@ def test_poll_now_clears_poll_in_progress_when_head_fetch_fails():
 
 def test_poll_now_clears_poll_in_progress_when_infeasible_aborts_early():
     """Mid-round feasibility check aborts before any batch fetch;
-    flag still must clear."""
+    _poll_in_progress is still cleared and _catchup_infeasible_for_round
+    is set (pre-lock branch).
+
+    Post-2026-05-12 gating: lock_at must be strictly in the future for
+    the flag to set. ``now + 1`` keeps the test pre-lock; the previous
+    version's ``int(now)`` is post-lock under int() truncation and now
+    exercises the no-flag branch.
+    """
     import time as _t
     p = _make_poller()
     _prep_for_epoch_advance(p)
@@ -756,7 +1135,7 @@ def test_poll_now_clears_poll_in_progress_when_infeasible_aborts_early():
         lambda nums: pytest.fail("should not have fetched")
     )
 
-    p._lock_at = int(_t.time())  # tight => infeasible
+    p._lock_at = int(_t.time()) + 1  # pre-lock, tight => infeasible
     p._poll_now(deadline_ms=0, label="period")
 
     assert p._catchup_infeasible_for_round is True
