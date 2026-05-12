@@ -147,6 +147,7 @@ class RpcPoller:
         contract_address: str = PREDICTION_V2_CONTRACT_ADDRESS,
         periodic_poll_interval_s: int = _tc.RPC_PERIODIC_POLL_INTERVAL_SECONDS,
         batch_size: int = _tc.RPC_BATCH_BLOCK_RECEIPTS_LIMIT,
+        ramp_poll_1_wakeup_offset_ms: int = 7500,
     ) -> None:
         if interval_seconds <= 0:
             raise InvariantError("interval_seconds_nonpositive")
@@ -157,6 +158,8 @@ class RpcPoller:
                 f"batch_size_out_of_range: {batch_size} "
                 f"(max {_tc.RPC_BATCH_BLOCK_RECEIPTS_LIMIT})"
             )
+        if ramp_poll_1_wakeup_offset_ms <= 0:
+            raise InvariantError("ramp_poll_1_wakeup_offset_ms_nonpositive")
 
         pool = list(endpoint_pool)
         if not pool:
@@ -200,6 +203,14 @@ class RpcPoller:
         self._contract_addr = contract_address.lower()
         self._periodic_poll_interval_s = int(periodic_poll_interval_s)
         self._batch_size = int(batch_size)
+        # Engine-side ramp_poll_1 lock-relative offset (config-derived in
+        # production via pancakebot/config.py from pool_cutoff_seconds;
+        # canonical value at pool_cutoff=6 is 7500ms). Used by the
+        # lock-anchored _periodic_loop to suspend periodic ticks that
+        # would otherwise land inside the (lock - ramp_1_offset, lock]
+        # ramp/final window and race the engine-driven polls for the
+        # non-blocking _poll_lock.
+        self._ramp_poll_1_wakeup_offset_ms = int(ramp_poll_1_wakeup_offset_ms)
 
         self._lock = threading.Lock()
 
@@ -539,14 +550,21 @@ class RpcPoller:
             return
 
         if self._is_catchup_infeasible(blocks_behind=blocks_behind, lock_at=lock_at):
-            with self._lock:
-                self._catchup_infeasible_for_round = True
+            # Gate the flag/warn on a live (pre-lock) round. After lock
+            # passes, an INFEAS signal is moot — the round is already
+            # closed; the cursor just needs to keep advancing for the
+            # next round (no flag, no warn). _on_epoch_advance only fires
+            # at round transition so this branch is defensively rare here
+            # but mirrors the same gating as _poll_now for consistency.
             time_until_lock_ms = max(0, int((lock_at - time.time()) * 1000))
-            warn("RPC_POLL", "CATCH", "INFEAS",
-                 msg=(f"behind {blocks_behind} blocks, "
-                      f"est {self._estimated_catchup_ms(blocks_behind)}ms "
-                      f"> avail {self._available_catchup_ms(time_until_lock_ms)}ms; "
-                      f"skipping round {current_epoch}"))
+            if time_until_lock_ms > 0:
+                with self._lock:
+                    self._catchup_infeasible_for_round = True
+                warn("RPC_POLL", "CATCH", "INFEAS",
+                     msg=(f"behind {blocks_behind} blocks, "
+                          f"est {self._estimated_catchup_ms(blocks_behind)}ms "
+                          f"> avail {self._available_catchup_ms(time_until_lock_ms)}ms; "
+                          f"skipping round {current_epoch}"))
 
     def _compute_round_start_block(self, round_start_ts: int) -> int | None:
         """Return the block-number whose timestamp ~= round_start_ts.
@@ -594,12 +612,23 @@ class RpcPoller:
         per-batch p99 RTT. Conservative — doesn't account for current
         degradation, and uses the static p99 table not a live observed
         p99.
+
+        Batch-size-aware (2026-05-12): full batches use the table's
+        ``batch_size`` p99; the final partial batch uses the (smaller)
+        p99 for ``remainder`` blocks. For a 7-block lag at batch_size=20,
+        the prior unconditional ``rtt_p99(20)=1319ms`` estimate drops to
+        ``rtt_p99(7) = 827ms`` (interpolated between table[5]=771 and
+        table[10]=910), eliminating false-INFEAS at small backlogs.
+        For a 47-block lag: 2 full batches * rtt_p99(20) + rtt_p99(7).
         """
         if blocks_behind <= 0:
             return 0
-        batches = (blocks_behind + self._batch_size - 1) // self._batch_size
-        rtt_p99 = _tc.rpc_rtt_p99_for_batch(self._batch_size)
-        return batches * rtt_p99
+        full_batches, remainder = divmod(blocks_behind, self._batch_size)
+        full_rtt = _tc.rpc_rtt_p99_for_batch(self._batch_size)
+        total_ms = full_batches * full_rtt
+        if remainder > 0:
+            total_ms += _tc.rpc_rtt_p99_for_batch(remainder)
+        return total_ms
 
     def _available_catchup_ms(self, time_until_lock_ms: int) -> int:
         """Time available for catch-up, with the same safety buffer
@@ -763,21 +792,80 @@ class RpcPoller:
                 self._cold_start_in_progress = False
 
     def _periodic_loop(self) -> None:
-        """Daemon-thread loop. Wakes every periodic_poll_interval_s
-        and runs a poll. Idempotent if cold-start hasn't yet completed
-        (no-ops in that case).
+        """Daemon-thread loop with lock-anchored 3-state cadence.
+
+        Refactored 2026-05-12 from a pure wall-clock 8s tick to a
+        lock-anchored cadence: ticks land at round_open + k*period for
+        k=1..(interval_seconds//period − 1), aligned fresh to each
+        round's lock_at. Solves the INFEAS spam pattern observed in
+        the 1h soak (Event 2: late-round periodic firing at lock−1.13s
+        with 7-block lag → math returned est=1319ms > avail=930ms →
+        flag set → next round's critical_path READY check found the
+        flag and SKIPped).
+
+        Three-state design:
+
+        State A — cold-start (``_lock_at <= 0``): sleep one periodic
+            interval on ``_stop_event.wait(timeout=period)`` and re-check
+            the loop. No polling. The cold-start path inside
+            ``set_round_phase`` sets ``_lock_at`` AND ``_cold_start_done``
+            atomically before returning, so by the next loop iteration
+            we either land in State B (anchor valid) or, if a State B/C
+            wake completes before cold-start finishes, the
+            ``_cold_start_done.is_set()`` gate further down still skips
+            the poll. Using ``_stop_event`` for the wait (instead of
+            ``_cold_start_done``) keeps ``stop()`` reactive — a shutdown
+            signal during cold-start exits the loop within ``period``
+            seconds. This state becomes vestigial after the queued
+            cold-start collapse follow-up (Bundle 2).
+
+        State B — steady (``now < _lock_at``): anchor cadence to
+            ``round_open = _lock_at − interval_seconds``. Compute the
+            next anchored tick ``next_at = round_open + k * period``
+            for smallest k>=1 such that ``next_at > now``. If
+            ``next_at`` would land inside the ramp/final window
+            ``[_lock_at − ramp_poll_1_offset, _lock_at]`` (closed at the
+            ramp boundary — see ``_compute_periodic_timeout``), drop it:
+            sleep to ``_lock_at + 0.1s`` so the next loop iteration
+            picks up State C (and shortly afterwards, the fresh anchor
+            from the next set_round_phase).
+
+        State C — stale anchor (``now >= _lock_at``): round just locked,
+            engine is in _sleep_and_claim, set_round_phase for the next
+            round hasn't fired yet (~35-40s latency). Fall back to
+            wall-clock cadence — _poll_now still runs and the cursor
+            advances for round N+2, but the post-lock INFEAS gating in
+            ``_poll_now`` suppresses false flag/WARN noise for ticks
+            in this window.
 
         Label "period" (6 chars) fits log _SUB_W=6 — a prior version
         used "periodic" (8 chars) which raised InvariantError in log.py
-        on the first periodic-poll log call, killing the daemon thread
-        silently and leaving ramp/final polls to catch up many minutes
-        of blocks at once.
+        on the first periodic-poll log call.
         """
         while not self._stop_event.is_set():
-            # Sleep first so periodic and cold-start don't collide
-            # at startup.
-            if self._stop_event.wait(timeout=self._periodic_poll_interval_s):
+            with self._lock:
+                lock_at = self._lock_at
+            period = self._periodic_poll_interval_s
+            now = time.time()
+
+            # State A: cold-start (anchor not yet set by first
+            # set_round_phase call). No polling — block on the event
+            # with a periodic-interval timeout so stop() still works.
+            if lock_at <= 0:
+                if self._stop_event.wait(timeout=period):
+                    break
+                continue
+
+            timeout, state = self._compute_periodic_timeout(
+                now=now, lock_at=lock_at, period=period,
+            )
+            del state  # informational; not used at runtime
+
+            if self._stop_event.wait(timeout=timeout):
                 break
+            # Defensive: even if State B/C scheduled a wake, only poll
+            # once cold-start has set its event. (After Bundle 2 this
+            # check + State A both collapse.)
             if not self._cold_start_done.is_set():
                 continue
             try:
@@ -785,6 +873,49 @@ class RpcPoller:
             except Exception as e:  # noqa: BLE001
                 warn("RPC_POLL", "PERIOD", "FAIL",
                      msg=f"{type(e).__name__}: {e}")
+
+    def _compute_periodic_timeout(
+        self, *, now: float, lock_at: int, period: int,
+    ) -> tuple[float, str]:
+        """Return ``(wait_timeout_seconds, state_label)`` for the
+        lock-anchored periodic loop. Extracted from ``_periodic_loop``
+        so the State B / State C / suspend math is unit-testable
+        without spinning up the daemon thread.
+
+        - ``"steady"`` (State B, ``now < lock_at``): timeout = time until
+          next anchored tick at ``round_open + k*period``.
+        - ``"suspend"`` (State B sub-case): the next anchored tick falls
+          inside the ramp/final window
+          ``[lock_at − ramp_poll_1_offset, lock_at]``. Timeout sleeps to
+          ``lock_at + 0.1s`` so the next iteration falls into State C.
+        - ``"stale"`` (State C, ``now >= lock_at``): wall-clock fallback
+          at ``period`` seconds (engine in ``_sleep_and_claim``;
+          set_round_phase hasn't yet advanced ``_lock_at`` to the next
+          round). Periodic still polls; post-lock INFEAS gating in
+          ``_poll_now`` suppresses false flag/WARN.
+
+        The suspend predicate is ``next_at >= ramp_window_start``
+        (closed at the boundary, not open). At canonical config (period=8s,
+        ramp_offset=7500ms) no exact-boundary tick exists, but a future
+        change to either constant could create one. Keeping the safer
+        side of the inequality is defensive: a tick landing exactly on
+        ``lock_at − ramp_offset`` is the FIRST possible race candidate
+        for ``_poll_lock`` against ramp_1, so we suspend it.
+
+        Caller is responsible for State A (``lock_at <= 0``) before
+        invoking this helper.
+        """
+        if now >= lock_at:
+            return float(period), "stale"
+        round_open = lock_at - self._interval_seconds
+        ramp_window_start = (
+            lock_at - self._ramp_poll_1_wakeup_offset_ms / 1000.0
+        )
+        k = max(1, int((now - round_open) // period) + 1)
+        next_at = round_open + k * period
+        if next_at >= ramp_window_start:
+            return max(0.1, lock_at + 0.1 - now), "suspend"
+        return max(0.0, next_at - now), "steady"
 
     def _poll_now(self, *, deadline_ms: int, label: str) -> None:
         """Core poll: fetch new blocks since _last_polled_block_number,
@@ -835,18 +966,31 @@ class RpcPoller:
             # round, a periodic poll might find that math says it can't
             # catch up before lock_at. Abort early — no batches fetched,
             # set _catchup_infeasible_for_round so the engine skips.
+            #
+            # Post-lock gating (2026-05-12): when ``time_until_lock_ms``
+            # has already gone non-positive (a trailing periodic firing
+            # in the claim window before set_round_phase advances
+            # _lock_at), an INFEAS verdict is moot — the round is closed
+            # and the flag would not gate any live bet. Still abort the
+            # poll (math says we cannot finish in the imagined window),
+            # but DO NOT set the flag or emit WARN. The cursor advances
+            # on the next non-INFEAS tick for the next round.
             blocks_to_catchup = head - from_block + 1
             if self._is_catchup_infeasible(
                 blocks_behind=blocks_to_catchup, lock_at=lock_at_local,
             ):
-                with self._lock:
-                    self._catchup_infeasible_for_round = True
                 time_until_lock_ms = max(0, int((lock_at_local - time.time()) * 1000))
-                warn("RPC_POLL", label.upper(), "INFEAS",
-                     msg=(f"behind {blocks_to_catchup} blocks, "
-                          f"est {self._estimated_catchup_ms(blocks_to_catchup)}ms "
-                          f"> avail {self._available_catchup_ms(time_until_lock_ms)}ms; "
-                          f"aborting poll"))
+                if time_until_lock_ms > 0:
+                    with self._lock:
+                        self._catchup_infeasible_for_round = True
+                    warn("RPC_POLL", label.upper(), "INFEAS",
+                         msg=(f"behind {blocks_to_catchup} blocks, "
+                              f"est {self._estimated_catchup_ms(blocks_to_catchup)}ms "
+                              f"> avail {self._available_catchup_ms(time_until_lock_ms)}ms; "
+                              f"aborting poll"))
+                # else: trailing post-lock periodic; cursor will advance on
+                # the next successful poll once set_round_phase updates
+                # _lock_at for the new round. No flag, no warn.
                 return
 
             n_blocks = head - from_block + 1

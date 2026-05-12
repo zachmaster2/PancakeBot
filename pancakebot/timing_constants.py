@@ -322,22 +322,51 @@ EXPECTED_RAMP_POLL_1_BATCH_SIZE: int = 20
 
 
 def rpc_rtt_p99_for_batch(batch_size: int) -> int:
-    """Return P99 RTT for a batch of size <= batch_size, using the
-    closest ceiling key in RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE.
+    """Return P99 RTT for a batch of ``batch_size``, linearly interpolated
+    between adjacent measured keys in RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE.
 
-    For sizes above the largest measured key, returns the largest key's
-    RTT. The wake derivation uses EXPECTED_*_BATCH_SIZE constants which
-    are all <= 20, so this fallback is informational; if it ever fires,
-    the calling code is provisioning a batch above the measured range
-    and should be re-checked.
+    Behavior spec (refactored 2026-05-12 from a ceiling-only lookup):
+      - ``batch_size <= 0``          -> ``0``
+      - ``batch_size <= smallest``   -> ``table[smallest]`` (ceiling at small end)
+      - ``batch_size`` is a key      -> ``table[batch_size]`` (exact passthrough)
+      - between keys k_lo < n < k_hi -> linear interpolation:
+            round(table[k_lo] + (table[k_hi] - table[k_lo])
+                  * (n - k_lo) / (k_hi - k_lo))
+      - ``batch_size > largest``     -> ``table[largest]`` (ceiling at large end)
+
+    All current callers (config.py invariants + rpc_poller._estimated_catchup_ms
+    with ``_batch_size=20``) pass exact measured keys, so the change is
+    pure-passthrough at canonical config. Interpolation only matters when
+    ``_estimated_catchup_ms`` calls with a per-batch remainder (e.g. 7, 12, 18)
+    after the batch-size-aware refactor; there it tightens the estimate vs
+    the prior ceiling lookup, reducing false-INFEAS at small backlogs.
+
+    For sizes above the largest measured key, the ceiling fallback is
+    informational; if it fires, the calling code is provisioning a batch
+    above the measured range and should be re-checked.
     """
     if batch_size <= 0:
         return 0
     table = RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE
     keys = sorted(table.keys())
-    for k in keys:
-        if batch_size <= k:
-            return table[k]
+    # Ceiling at small end: batch_size <= smallest measured key.
+    if batch_size <= keys[0]:
+        return table[keys[0]]
+    # Ceiling at large end: above the largest measured key.
+    if batch_size >= keys[-1]:
+        return table[keys[-1]]
+    # Exact-key passthrough (covers interior measured points).
+    if batch_size in table:
+        return table[batch_size]
+    # Linear interpolation between the bracketing adjacent keys.
+    for k_lo, k_hi in zip(keys, keys[1:]):
+        if k_lo < batch_size < k_hi:
+            rtt_lo = table[k_lo]
+            rtt_hi = table[k_hi]
+            return int(round(
+                rtt_lo + (rtt_hi - rtt_lo) * (batch_size - k_lo) / (k_hi - k_lo)
+            ))
+    # Defensive: unreachable given the bounds checks above.
     return table[keys[-1]]
 
 

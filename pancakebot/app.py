@@ -207,6 +207,7 @@ def run_from_config(
     rpc_poller = RpcPoller(
         interval_seconds=interval_seconds,
         endpoint_pool=DEFAULT_HEDGED_ENDPOINTS,
+        ramp_poll_1_wakeup_offset_ms=cfg.ramp_poll_1_wakeup_offset_ms,
     )
     rpc_poller.start()
 
