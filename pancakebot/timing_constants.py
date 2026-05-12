@@ -176,11 +176,16 @@ BSC_BET_SUBMIT_RTT_P95_MS: int = 200
 # Sizes 2-15: research/probe_rpc_polling.py n=50 per size, 2026-05-07,
 # publicnode single-endpoint. Wake-offset derivation uses sizes 10
 # (EXPECTED_FINAL_POLL_BATCH_SIZE) and 15 (EXPECTED_RAMP_POLL_{1,2}_BATCH_SIZE);
-# these stay at the original publicnode baseline. drpc.org rejects
-# batched JSON-RPC arrays with HTTP 500 at every tested size. size=15's
-# raw measurement was 2285ms but came from 50-sample p99-as-max noise;
-# the monotonic interpolation 1213ms (between sz=10 at 910 and sz=20
-# at 1533) is the correct provisioning value.
+# these are preserved at the original publicnode baseline to keep the
+# canonical wake-offset schedule (pinned by
+# test_canonical_pool_cutoff_6_produces_expected_offsets) stable across
+# the 2026-05-11 transport switch. Re-measuring sizes 10/15 under the
+# new fire-to-all transport would force a wake-schedule shift the
+# wider system isn't asking for. drpc.org rejected batched JSON-RPC
+# arrays with HTTP 500 at every tested size. size=15's raw measurement
+# was 2285ms but came from 50-sample p99-as-max noise; the monotonic
+# interpolation 1213ms (between size=10 at 910 and the OLD size=20
+# publicnode baseline of 1533ms) is the correct provisioning value.
 #
 # Size=20: research/probe_fire_to_all_p99_batch20_clean_2026_05_11.py
 # n=30, fire-to-all-pool (6 endpoints), urllib3 PoolManager, 30s
@@ -189,14 +194,25 @@ BSC_BET_SUBMIT_RTT_P95_MS: int = 200
 # (urllib3 PoolManager + fire-to-all) means production now hedges
 # across 6 endpoints; running the probe alongside the bot inflated
 # RTTs ~3.5x due to same-IP / Windows-TCP / urllib3-pool contention
-# between the two processes. The 1319ms is the bot's actual
-# operating value (no concurrent caller in production).
+# between the two processes. The 1319ms is the bot's actual operating
+# value (no concurrent caller in production).
+#
+# CAVEAT: n=30 is statistically thin for a P99 estimate (~2nd-highest
+# sample out of 30). The true population P99 could realistically sit
+# anywhere from p93 to p100 of this sample; rule of thumb for a stable
+# P99 is n>=100. The value is used by ``_estimated_catchup_ms`` for
+# the catch-up feasibility check; runtime graceful degradation absorbs
+# undermeasurement via the per-batch deadline check + per-batch
+# try/except in ``RpcPoller._poll_now`` (which downgrades partial
+# failures to ``pool_not_ready`` rather than crashing). If a tighter
+# estimate is needed (e.g. INFEAS rate diagnostics still suggest the
+# value is wrong), re-measure with n>=100.
 RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE: dict[int, int] = {
     2: 421,
     5: 771,
     10: 910,
-    15: 1213,   # interpolated (raw 2285ms was small-sample outlier)
-    20: 1319,   # fire-to-all p99, 2026-05-11 (was 1533, single-publicnode)
+    15: 1213,   # interpolated against OLD size=20 publicnode baseline 1533
+    20: 1319,   # fire-to-all p99 n=30, 2026-05-11 (was 1533 single-publicnode)
 }
 
 # Block availability delay — newhead arrival to first successful
@@ -218,9 +234,9 @@ RPC_BATCH_BLOCK_RECEIPTS_LIMIT: int = 20
 # eth_getBlockByNumber bundles, batch_size <= RPC_BATCH_BLOCK_RECEIPTS_LIMIT).
 # 5s detects unreachable-endpoint scenarios fast while staying well above
 # the empirical p99 single-batch RTT (RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE:
-# batch=20 -> 1533ms). Was 30s; reduced 2026-05-08 after a publicnode
-# outage where 30s hangs grew the catch-up backlog by ~60 blocks per
-# failed poll.
+# batch=20 -> 1319ms fire-to-all, 2026-05-11). Was 30s; reduced 2026-05-08
+# after a publicnode outage where 30s hangs grew the catch-up backlog by
+# ~60 blocks per failed poll.
 RPC_HTTP_BATCH_TIMEOUT_SECONDS: int = 5
 
 # Per-request HTTP timeout for single (non-batched) RPC calls

@@ -416,14 +416,14 @@ def test_on_epoch_advance_marks_infeasible_when_catchup_exceeds_budget():
     p._last_polled_block_number = 1_000  # very stale
 
     # head_ts to make round_start_block = 90_000, head=100_000 -> 10_000 behind.
-    # 10_000 / 20 = 500 batches @ 1533ms p99 = 766_500 ms estimated catch-up.
+    # 10_000 / 20 = 500 batches @ p99(20)ms estimated catch-up (way past deadline).
     # Set lock_at to "now + 1s" to make available_ms tiny.
     p._rpc_eth_get_latest_block_header = lambda: (100_000, _t.time())  # type: ignore[assignment]
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
 
     # round_start_ts = lock_at - 300, round_start_block ~= 100_000 -
     #   (head_ts - round_start_ts)*2 = 100_000 - 600 = 99_400.
-    # So blocks_behind = 100_000 - 99_400 = 600. 30 batches * 1533 = 45_990ms.
+    # So blocks_behind = 100_000 - 99_400 = 600. 30 batches * p99(20) ms.
     # available = max(0, 1000 - 200) = 800 ms. infeasible.
     near_lock_at = int(_t.time()) + 1
 
@@ -511,8 +511,8 @@ def test_is_catchup_infeasible_returns_false_when_lock_at_zero():
 
 
 def test_is_catchup_infeasible_returns_true_when_estimate_exceeds_budget():
-    """600 blocks => 30 batches * 1533ms = 45_990ms estimated.
-    Available = 1000 - 200 = 800ms. Infeasible."""
+    """600 blocks => 30 batches * p99(20) ms estimated.
+    Available = 1000 - 200 = 800ms. Infeasible regardless of exact p99 value."""
     import time as _t
     p = _make_poller()
     near_lock = int(_t.time()) + 1
@@ -532,19 +532,24 @@ def test_catchup_feasibility_at_typical_30_block_lag():
     """Regression: at canonical pool_cutoff=6 (final fires at lock-3.79s),
     a 30-block lag should be FEASIBLE (not trip INFEAS). 30-block lag at
     batch_size=20 = ceil(30/20)=2 batches * p99(20). With the 2026-05-11
-    fire-to-all p99=1319ms, 2 * 1319 = 2638ms, vs available at final-poll
-    time ~= 3.79s - 200ms safety = 3590ms. Feasible.
+    fire-to-all p99=1319ms, 2 * 1319 = 2638ms, must fit comfortably
+    within available_catchup_ms.
 
     Also tests the 23-block-lag false-positive scenario the
     2026-05-11_fire_to_all_p99_measurement.md memo flagged: at 23 blocks
     (= 2 batches), the math must NOT trip INFEAS just because of stale
     constants. Anchors the constant value as load-bearing.
+
+    Pin lock_at = now + 5s (well above canonical final-poll timing of
+    3.79s) so the test has comfortable margin against int() truncation
+    of the current wallclock and any small wallclock drift between the
+    pin and the assertion. The point is to test the math contract, not
+    race CI timers.
     """
     import time as _t
     p = _make_poller()
-    # Lock 3.79s in the future (canonical final-poll moment).
-    lock_at = int(_t.time()) + 4  # ~3.79s + tiny rounding margin
-    # 23-block lag: 2 batches at p99=1319ms = 2638ms; available ~3800ms. Feasible.
+    lock_at = int(_t.time()) + 5  # 5s out: ~4800ms available after safety
+    # 23-block lag: 2 batches at p99=1319ms = 2638ms < 4800ms. Feasible.
     assert p._is_catchup_infeasible(blocks_behind=23, lock_at=lock_at) is False, (
         "23-block lag must be feasible at canonical final-poll timing. "
         "If this fails, RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE[20] may be "
@@ -654,7 +659,7 @@ def test_poll_now_logs_partial_at_info_when_some_batches_succeeded(caplog):
     p._fetch_and_process_blocks = flaky_fetch  # type: ignore[assignment]
 
     # Tight enough to NOT trigger feasibility. 60 blocks / 20 = 3 batches *
-    # 1533 = 4599ms estimated. Need available > 4599ms.
+    # p99(20) ms estimated. 60s available is >> any plausible p99 * 3.
     import time as _t
     p._lock_at = int(_t.time()) + 60  # 60s out -> 59800ms available
 
