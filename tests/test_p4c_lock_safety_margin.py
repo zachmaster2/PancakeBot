@@ -193,17 +193,18 @@ def test_p95_le_p99_invariant_holds():
 
 
 def test_pool_cutoff_too_small_for_rpc_completion_rejected(tmp_path):
-    """final_rpc_poll_offset <= critical_path_offset + safety must raise.
+    """final_rpc_poll completion budget invariant must reject too-small pool_cutoff.
 
-    Era 11 (2026-05-07) replaced the WSS-arrival cross-validation with
-    an RPC-completion gate. final_rpc_poll_offset is derived from
-    pool_cutoff_seconds; if pool_cutoff is too small, the derived
-    final-poll offset doesn't leave time for the RPC roundtrip + safety
-    before the critical-path wake reads the pool snapshot.
+    Era 11 (2026-05-07) introduced the RPC-completion gate; the
+    2026-05-12 refactor strengthened it: instead of just checking
+    ``final_offset > critical_path + safety``, the invariant now
+    validates ``final_offset - rtt_p99 - safety >= critical_path``,
+    i.e., the final poll's actual completion time at empirical p99 RTT
+    must arrive before critical_path with the safety cushion.
 
-    At pool_cutoff=2 (=2000ms): final_offset = 2000 - 500 - 600 - 910
-    - 200 = -210ms; critical_path+safety = 1095 + 200 = 1295ms. -210
-    <= 1295 -> InvariantError fires.
+    At pool_cutoff=2 (=2000ms): final_offset = 2000 - 500 - 600 - 200
+    = 700ms. final_offset - rtt_p99(10)=910 - safety=200 = -410ms, well
+    below critical_path = 1095ms -> InvariantError fires.
     """
     extra = "pool_cutoff_seconds = 2"
     raised: Exception | None = None
@@ -212,7 +213,7 @@ def test_pool_cutoff_too_small_for_rpc_completion_rejected(tmp_path):
     except InvariantError as e:
         raised = e
     assert isinstance(raised, InvariantError)
-    assert "config_pool_cutoff_too_small_for_rpc_completion" in str(raised)
+    assert "final_rpc_poll_rtt_budget_insufficient" in str(raised)
 
 
 def test_pool_cutoff_default_is_6(tmp_path):

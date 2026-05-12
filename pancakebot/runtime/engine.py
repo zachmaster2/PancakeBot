@@ -477,7 +477,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # log SUB_W=6.
         # First of three RPC polls that ramp the local pool aggregate
         # toward the critical_path snapshot. Fires at lock_at -
-        # ramp_poll_1_wakeup_offset_ms (= ~6.616s before lock). Catches
+        # ramp_poll_1_wakeup_offset_ms (= ~7.700s before lock at canonical
+        # pool_cutoff=6 post 2026-05-12 refactor). Catches
         # blocks since the last periodic poll. deadline_ms = gap to
         # ramp_2 - safety; on RTT-exceeds-deadline the poll marks
         # _last_poll_too_slow=True for diagnostics, but is_pool_ready()
@@ -567,7 +568,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         # -- Ramp poll #2 (Era 11) --
         # Second RPC poll. Fires at lock_at -
-        # ramp_poll_2_wakeup_offset_ms (= ~5.203s before lock). Bridges
+        # ramp_poll_2_wakeup_offset_ms (= ~6.200s nominal at canonical
+        # pool_cutoff=6 post 2026-05-12 refactor; fires right after
+        # bankroll completes in practice — see runtime/config.py note). Bridges
         # ramp_1 -> final. deadline_ms = gap to final_poll - safety.
         if cfg.rpc_poller is not None:
             ramp_poll_2_wake_ts = (
@@ -588,7 +591,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         # -- Final RPC poll (Era 11) --
         # Last RPC poll before critical_path reads the pool snapshot.
-        # Fires at lock_at - final_rpc_poll_wakeup_offset_ms (= ~3.79s
+        # Fires at lock_at - final_rpc_poll_wakeup_offset_ms (= ~4.7s
+        # at canonical pool_cutoff=6 post 2026-05-12 refactor; was ~3.79s
         # before lock). Catches blocks since ramp_2. deadline_ms = gap
         # to critical_path - safety. Same skip-on-too-slow contract as
         # ramp polls.

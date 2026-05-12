@@ -34,12 +34,22 @@ class RuntimeConfig:
     #
     # Chronological order (lock - X ms; bigger X = earlier in the round):
     #   ntp_sync       (lock - 11.095s)
-    #   ramp_poll_1    (lock -  6.616s)   <-- NEW (Era 11 RPC poll)
+    #   ramp_poll_1    (lock -  7.700s)   <-- Era 11 RPC poll (refactored 2026-05-12)
+    #   ramp_poll_2    (lock -  6.200s)   <-- Era 11 RPC poll (refactored 2026-05-12)
     #   bankroll       (lock -  6.095s)
-    #   ramp_poll_2    (lock -  5.203s)   <-- NEW (Era 11 RPC poll)
-    #   final_rpc_poll (lock -  3.790s)   <-- NEW (Era 11 RPC poll)
+    #   final_rpc_poll (lock -  4.700s)   <-- Era 11 RPC poll (refactored 2026-05-12)
     #   critical_path  (lock -  1.095s)
     #   bet_submit     (lock -  0.750s)   <-- timing-guard deadline
+    #
+    # Note (post-2026-05-12 refactor): ramp_poll_2's nominal scheduled
+    # offset (6.200s) is 105ms EARLIER than bankroll's (6.095s) in wall
+    # clock, but engine.py calls the wakes in fixed code order
+    # (ramp_1 → bankroll → ramp_2 → final). When main thread reaches
+    # ``_sleep_until_ts(ramp_poll_2_wake_ts)`` after bankroll completes,
+    # ramp_2's scheduled time has already passed; sleep returns
+    # immediately and ramp_2 fires right after bankroll. Functionally
+    # fine: ramp_2's deadline_ms is measured against poll start time,
+    # not scheduled wake, so the poll's runtime is still bounded.
     #
     # ntp_sync_wake forces a fresh NTP query.
     # bankroll_wake refreshes wallet balance (live: BSC RPC; dry: in-memory).

@@ -529,7 +529,7 @@ def test_is_catchup_infeasible_returns_false_when_estimate_fits_budget():
 
 
 def test_catchup_feasibility_at_typical_30_block_lag():
-    """Regression: at canonical pool_cutoff=6 (final fires at lock-3.79s),
+    """Regression: at canonical pool_cutoff=6 (final fires at lock-4.7s),
     a 30-block lag should be FEASIBLE (not trip INFEAS). 30-block lag at
     batch_size=20 = ceil(30/20)=2 batches * p99(20). With the 2026-05-11
     fire-to-all p99=1319ms, 2 * 1319 = 2638ms, must fit comfortably
@@ -541,7 +541,7 @@ def test_catchup_feasibility_at_typical_30_block_lag():
     constants. Anchors the constant value as load-bearing.
 
     Pin lock_at = now + 5s (well above canonical final-poll timing of
-    3.79s) so the test has comfortable margin against int() truncation
+    4.7s) so the test has comfortable margin against int() truncation
     of the current wallclock and any small wallclock drift between the
     pin and the assertion. The point is to test the math contract, not
     race CI timers.
