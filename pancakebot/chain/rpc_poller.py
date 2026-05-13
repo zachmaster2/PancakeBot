@@ -10,14 +10,22 @@ Architecture: deterministic poll schedule using batched
 
 The poller has three trigger paths:
 
-1. **Cold-start backfill** — synchronous; runs on first
-   ``set_round_phase()`` call. Catches up bet events from round-start
-   to head.
+1. **Cursor initialization** — synchronous; runs on first
+   ``set_round_phase()`` call (``_initialize_cursor_from_head``).
+   One ``eth_getBlockByNumber(latest)`` RPC to derive the in-round
+   ``round_start_block`` from ``lock_at - interval_seconds``, sets
+   the cursor, returns. Bundle 2 (2026-05-13) replaced the prior
+   synchronous backfill (30-90s engine block) with this fast path;
+   the actual catch-up runs via the periodic daemon's first tick.
 
-2. **Periodic polls** — daemon-thread timer; every
-   ``RPC_PERIODIC_POLL_INTERVAL_SECONDS``. Catches new blocks since
-   last poll. Off the critical path; failures are non-fatal (next
-   periodic poll retries).
+2. **Periodic polls** — daemon-thread timer; lock-anchored cadence
+   (``round_open + k * RPC_PERIODIC_POLL_INTERVAL_SECONDS``). Catches
+   new blocks since last poll AND drives the initial post-cursor-init
+   catch-up. The first successful ``_poll_now`` flips
+   ``_connected`` + ``_cold_start_done`` via
+   ``_latch_first_successful_poll_locked``; until then
+   ``is_pool_ready`` returns ``cold_start_in_progress``. Off the
+   critical path; failures are non-fatal (next periodic poll retries).
 
 3. **Ramp + final polls** — engine-driven, called from the wake
    schedule. Synchronous; deadline-aware. RTT-exceeds-deadline marks
@@ -224,13 +232,18 @@ class RpcPoller:
         self._lock_at: int = 0
 
         # Cursor: the highest block number we've polled receipts for.
-        # Cold-start sets this to round-start - margin; subsequent polls
-        # advance it. Periodic and ramp/final polls all read+write under
-        # self._lock to keep dedup honest.
+        # Cursor-init sets this to round_start_block - 1 on the first
+        # set_round_phase; subsequent polls advance it. Periodic and
+        # ramp/final polls all read+write under self._lock to keep
+        # dedup honest.
         self._last_polled_block_number: int = 0
 
         # Connection / readiness state.
-        self._connected: bool = False  # True after cold-start completes
+        # Bundle 2 (2026-05-13): True after the first successful
+        # periodic/ramp/final poll latches via
+        # _latch_first_successful_poll_locked. Until then, is_pool_ready
+        # returns (False, "cold_start_in_progress") and the engine skips.
+        self._connected: bool = False
         # Most-recently-used endpoint URL (informational; updated by
         # the hedging transport on each successful call). Display/log
         # only — every call still fires to every endpoint in the pool.
@@ -334,8 +347,10 @@ class RpcPoller:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the periodic-poll daemon thread. Cold-start backfill
-        runs lazily on the first ``set_round_phase`` call."""
+        """Start the periodic-poll daemon thread. Cursor initialization
+        runs lazily on the first ``set_round_phase`` call (~1 RPC); the
+        daemon's periodic ticks drive the in-round catch-up. The
+        ``_connected`` latch flips on the first successful poll."""
         if self._periodic_thread is not None and self._periodic_thread.is_alive():
             return
         self._stop_event.clear()
@@ -377,8 +392,10 @@ class RpcPoller:
         same-epoch + DIFFERENT lock_at raises (chain corruption);
         strictly-decreasing epochs raise.
 
-        Triggers cold-start on the first call. Subsequent calls drop
-        stale-epoch state and update tracked epochs.
+        Triggers cursor initialization on the first call (~1 RPC,
+        non-blocking; daemon's periodic ticks drive the catch-up).
+        Subsequent calls drop stale-epoch state and update tracked
+        epochs via _on_epoch_advance.
         """
         if current_epoch < 0:
             raise InvariantError("set_round_phase_negative_epoch")
@@ -431,14 +448,13 @@ class RpcPoller:
                     del self._block_ts[bn]
 
         if is_first_call:
-            # Cold-start outside the lock so the periodic poller (also
-            # under self._lock for store updates) doesn't deadlock with
-            # us. Cold-start is synchronous: set_round_phase blocks
-            # until the first round's blocks are polled. This is the
-            # same behaviour as the prior PoolEventWatcher backfill
-            # but inline in set_round_phase rather than triggered by
-            # the recv-loop's first newhead.
-            self._cold_start()
+            # Bundle 2 (2026-05-13): synchronous cursor-init only — fast
+            # (~1 RPC roundtrip). Actual catch-up happens via the daemon's
+            # normal periodic ticks. _connected stays False until the
+            # first successful _poll_now flips the latch; is_pool_ready
+            # gates the engine away from acting on a half-built pool
+            # aggregate during that window.
+            self._initialize_cursor_from_head()
         elif is_epoch_advance:
             # Round-aware cursor clamp + catch-up feasibility check.
             # Past rounds are archive-only — the bot only bets on the
@@ -674,122 +690,157 @@ class RpcPoller:
     # Internal: cold-start + periodic + poll mechanics
     # ------------------------------------------------------------------
 
-    def _cold_start(self) -> None:
-        """Synchronous backfill scoped to the CURRENT round only.
-        Called from the first set_round_phase() and blocks until done.
+    def _initialize_cursor_from_head(self) -> None:
+        """Synchronous cursor-init from chain head. Called from the first
+        ``set_round_phase()`` call; returns within ~1 RPC roundtrip.
+
+        Bundle 2 refactor (2026-05-13): replaced the prior ``_cold_start``
+        one-shot path that synchronously backfilled the in-round range
+        before returning (30-90s engine block at startup). Now the cursor
+        is set to ``round_start_block - 1`` and the actual catch-up
+        happens via the daemon's normal periodic ticks. The engine is
+        unblocked immediately; ``is_pool_ready`` returns False with
+        ``cold_start_in_progress`` until the periodic loop's first
+        successful ``_poll_now`` flips the ``_connected`` latch.
+
+        Race fix Y1 (reviewer 2026-05-13): cursor-init acquires
+        ``_poll_lock`` for its full duration. Without it, the periodic
+        daemon's first tick (released from State A by ``_lock_at`` going
+        non-zero in ``set_round_phase``) can race ``_poll_now`` against
+        an un-initialized cursor (``_last_polled_block_number == 0``),
+        compute a 50M-block backlog, INFEAS-flag the round, and wedge
+        the engine into skipping round 1 with
+        ``pool_not_ready_catchup_infeasible_for_round``. With the lock
+        held, the racing ``_poll_now`` sees ``acquire(blocking=False)``
+        fail and skips that tick cleanly.
+
+        Belt-and-suspenders: cursor-init also clears
+        ``_catchup_infeasible_for_round = False`` on every successful
+        exit (feasible or head-behind-round-start branch). Covers the
+        microsecond window where the daemon may have acquired
+        ``_poll_lock`` before cursor-init did and already poisoned the
+        flag — by the time cursor-init lands, the daemon's bad poll has
+        completed and we authoritatively reset the verdict against the
+        correct cursor.
 
         Round-aware: round_start_block is derived from
         ``lock_at - interval_seconds``, NOT from a head-relative
         full-round lookback. Past-round blocks are archive-only and
-        never bet on, so backfilling them is wasted work.
+        never bet on, so seeking earlier is wasted.
 
-        Feasibility-aware: if there isn't enough time to backfill the
-        in-round blocks before lock_at, skip the backfill (cursor jumps
-        to head), mark the round catch-up-infeasible, and let the next
-        round start clean.
+        Feasibility-aware: if math says the first periodic tick can't
+        plausibly catch up before lock_at, the round is marked
+        catch-up-infeasible (cursor jumped to head) and the next round
+        starts clean. Same semantics as the prior cold-start INFEAS
+        branch — just routed via the new daemon-entry path.
         """
-        with self._lock:
-            if self._cold_start_in_progress:
-                return
-            self._cold_start_in_progress = True
-
+        # Y1: hold _poll_lock for the duration so a racing daemon tick
+        # cannot enter _poll_now against an uninitialized cursor. Blocking
+        # acquire is safe: cursor-init runs at most once per RpcPoller
+        # lifetime (gated by is_first_call in set_round_phase), and the
+        # only other holder of _poll_lock is _poll_now itself (non-blocking
+        # acquire, so it yields immediately if we got there first).
+        self._poll_lock.acquire()
         try:
-            # eth_getBlockByNumber('latest') returns head_number AND
-            # head_timestamp in one call — both needed to derive
-            # round_start_block from lock_at - interval_seconds.
+            with self._lock:
+                if self._cold_start_in_progress:
+                    return
+                self._cold_start_in_progress = True
+
             try:
-                head, head_ts = self._rpc_eth_get_latest_block_header()
+                # eth_getBlockByNumber('latest') returns head_number AND
+                # head_timestamp in one call — both needed to derive
+                # round_start_block from lock_at - interval_seconds.
+                try:
+                    head, head_ts = self._rpc_eth_get_latest_block_header()
+                except Exception as e:  # noqa: BLE001
+                    warn("RPC_POLL", "COLD", "FAIL",
+                         msg=(f"init_cursor: eth_getBlockByNumber(latest): "
+                              f"{type(e).__name__}: {e}"))
+                    return
+                if head <= 0 or head_ts <= 0:
+                    warn("RPC_POLL", "COLD", "FAIL",
+                         msg=f"init_cursor: invalid header head={head} ts={head_ts}")
+                    return
+
+                with self._lock:
+                    lock_at_local = self._lock_at
+                round_start_ts = lock_at_local - self._interval_seconds
+
+                if head_ts <= round_start_ts:
+                    # Head is behind round_start (chain hasn't caught up
+                    # to round_start yet, or lock_at is in the future
+                    # beyond head_ts). Nothing to seek — set cursor at
+                    # head; daemon's periodic ticks will drive forward.
+                    with self._lock:
+                        self._last_polled_block_number = head
+                        # Y1 safeguard: authoritatively clear any flag a
+                        # racing daemon poll may have set.
+                        self._catchup_infeasible_for_round = False
+                    info("RPC_POLL", "COLD", "OK",
+                         msg=(f"init_cursor: head_ts {head_ts} <= "
+                              f"round_start_ts {round_start_ts}; cursor at "
+                              f"head={head} (no in-round blocks yet)"))
+                    return
+
+                # delta_blocks: how many blocks since round_start.
+                # BSC_BLOCK_TIME_MS=500 is the CONSERVATIVE rounding of
+                # empirical 452ms; using it as the divisor underestimates
+                # blocks-elapsed by ~10%. The +20 safety margin handles
+                # that bias plus general block-time variance, ensuring we
+                # don't miss start-of-round blocks. Any over-fetched
+                # prev-round blocks are filtered by the epoch gate in
+                # _process_receipts.
+                delta_blocks = round(
+                    (head_ts - round_start_ts) * 1000
+                    / _tc.BSC_BLOCK_TIME_MS
+                ) + 20
+                round_start_block = max(0, head - delta_blocks)
+                blocks_to_backfill = max(0, head - round_start_block + 1)
+
+                # Feasibility check: can the upcoming periodic tick catch up
+                # the in-round range before lock_at? Same math as the
+                # _on_epoch_advance and _poll_now feasibility branches.
+                if self._is_catchup_infeasible(
+                    blocks_behind=blocks_to_backfill, lock_at=lock_at_local,
+                ):
+                    with self._lock:
+                        self._catchup_infeasible_for_round = True
+                        # Advance cursor past the un-backfilled range so
+                        # the daemon's first periodic poll sees a small
+                        # gap and doesn't try to refill round-start blocks.
+                        self._last_polled_block_number = head
+                    time_until_lock_ms = max(
+                        0, int((lock_at_local - time.time()) * 1000),
+                    )
+                    warn("RPC_POLL", "COLD", "INFEAS",
+                         msg=(f"init_cursor: catchup {blocks_to_backfill} blocks "
+                              f"would take ~{self._estimated_catchup_ms(blocks_to_backfill)}ms "
+                              f"> {self._available_catchup_ms(time_until_lock_ms)}ms "
+                              f"available; cursor jumped to head, "
+                              f"will resume on next round"))
+                    return
+
+                with self._lock:
+                    self._last_polled_block_number = round_start_block - 1
+                    # Y1 safeguard: authoritatively clear any flag a
+                    # racing daemon poll may have set against the
+                    # uninitialized cursor=0 sentinel.
+                    self._catchup_infeasible_for_round = False
+
+                info("RPC_POLL", "COLD", "INIT",
+                     msg=(f"init_cursor: cursor at {round_start_block - 1}; "
+                          f"first periodic tick will catch up "
+                          f"{blocks_to_backfill} blocks"))
+
             except Exception as e:  # noqa: BLE001
                 warn("RPC_POLL", "COLD", "FAIL",
-                     msg=(f"cold_start: eth_getBlockByNumber(latest): "
-                          f"{type(e).__name__}: {e}"))
-                return
-            if head <= 0 or head_ts <= 0:
-                warn("RPC_POLL", "COLD", "FAIL",
-                     msg=f"cold_start: invalid header head={head} ts={head_ts}")
-                return
-
-            with self._lock:
-                lock_at_local = self._lock_at
-            round_start_ts = lock_at_local - self._interval_seconds
-
-            if head_ts <= round_start_ts:
-                # Head is behind round_start (chain hasn't caught up
-                # to round_start yet, or lock_at is in the future
-                # beyond head_ts). Nothing to backfill — set cursor
-                # at head and let periodic polls drive forward.
+                     msg=f"{type(e).__name__}: {e}")
+            finally:
                 with self._lock:
-                    self._last_polled_block_number = head
-                    self._connected = True
-                    self._cold_start_done.set()
                     self._cold_start_in_progress = False
-                info("RPC_POLL", "COLD", "OK",
-                     msg=(f"cold_start: head_ts {head_ts} <= "
-                          f"round_start_ts {round_start_ts}; no backfill "
-                          f"needed (cursor at head={head})"))
-                return
-
-            # delta_blocks: how many blocks since round_start.
-            # BSC_BLOCK_TIME_MS=500 is the CONSERVATIVE rounding of
-            # empirical 452ms; using it as the divisor underestimates
-            # blocks-elapsed by ~10%. The +20 safety margin handles
-            # that bias plus general block-time variance, ensuring we
-            # don't miss start-of-round blocks. Any over-fetched
-            # prev-round blocks are filtered by the epoch gate in
-            # _process_receipts.
-            delta_blocks = round(
-                (head_ts - round_start_ts) * 1000
-                / _tc.BSC_BLOCK_TIME_MS
-            ) + 20
-            round_start_block = max(0, head - delta_blocks)
-            blocks_to_backfill = max(0, head - round_start_block + 1)
-
-            # Feasibility check: can we backfill the in-round range
-            # before lock_at? Same math as Component 4 trigger A.
-            if self._is_catchup_infeasible(
-                blocks_behind=blocks_to_backfill, lock_at=lock_at_local,
-            ):
-                with self._lock:
-                    self._catchup_infeasible_for_round = True
-                    # Advance cursor past the un-backfilled range so
-                    # the periodic poll doesn't try to refill it on
-                    # the next tick.
-                    self._last_polled_block_number = head
-                    self._connected = True
-                    self._cold_start_done.set()
-                    self._cold_start_in_progress = False
-                time_until_lock_ms = max(
-                    0, int((lock_at_local - time.time()) * 1000),
-                )
-                warn("RPC_POLL", "COLD", "INFEAS",
-                     msg=(f"cold_start: backfill {blocks_to_backfill} blocks "
-                          f"would take ~{self._estimated_catchup_ms(blocks_to_backfill)}ms "
-                          f"> {self._available_catchup_ms(time_until_lock_ms)}ms "
-                          f"available; skipping backfill, "
-                          f"will resume on next round"))
-                return
-
-            with self._lock:
-                self._last_polled_block_number = round_start_block - 1
-
-            info("RPC_POLL", "COLD", "START",
-                 msg=f"cold_start: backfilling {blocks_to_backfill} blocks "
-                     f"({round_start_block}..{head})")
-            self._poll_now(deadline_ms=0, label="cold")
-
-            with self._lock:
-                self._connected = True
-                self._cold_start_done.set()
-                self._cold_start_in_progress = False
-
-            info("RPC_POLL", "COLD", "OK",
-                 msg=f"cold_start complete; {self._total_events} events recorded")
-
-        except Exception as e:  # noqa: BLE001
-            warn("RPC_POLL", "COLD", "FAIL",
-                 msg=f"{type(e).__name__}: {e}")
-            with self._lock:
-                self._cold_start_in_progress = False
+        finally:
+            self._poll_lock.release()
 
     def _periodic_loop(self) -> None:
         """Daemon-thread loop with lock-anchored 3-state cadence.
@@ -805,19 +856,17 @@ class RpcPoller:
 
         Three-state design:
 
-        State A — cold-start (``_lock_at <= 0``): sleep one periodic
+        State A — pre-init (``_lock_at <= 0``): sleep one periodic
             interval on ``_stop_event.wait(timeout=period)`` and re-check
-            the loop. No polling. The cold-start path inside
-            ``set_round_phase`` sets ``_lock_at`` AND ``_cold_start_done``
-            atomically before returning, so by the next loop iteration
-            we either land in State B (anchor valid) or, if a State B/C
-            wake completes before cold-start finishes, the
-            ``_cold_start_done.is_set()`` gate further down still skips
-            the poll. Using ``_stop_event`` for the wait (instead of
-            ``_cold_start_done``) keeps ``stop()`` reactive — a shutdown
-            signal during cold-start exits the loop within ``period``
-            seconds. This state becomes vestigial after the queued
-            cold-start collapse follow-up (Bundle 2).
+            the loop. No polling. This state only triggers in the brief
+            race window between ``start()`` and the first
+            ``set_round_phase()`` call from the engine — once
+            set_round_phase synchronously initializes the cursor via
+            ``_initialize_cursor_from_head`` and sets ``_lock_at``, the
+            next loop iteration falls into State B and drives the
+            catch-up. Using ``_stop_event`` for the wait keeps
+            ``stop()`` reactive — a shutdown signal during this race
+            window exits the loop within ``period`` seconds.
 
         State B — steady (``now < _lock_at``): anchor cadence to
             ``round_open = _lock_at − interval_seconds``. Compute the
@@ -863,11 +912,13 @@ class RpcPoller:
 
             if self._stop_event.wait(timeout=timeout):
                 break
-            # Defensive: even if State B/C scheduled a wake, only poll
-            # once cold-start has set its event. (After Bundle 2 this
-            # check + State A both collapse.)
-            if not self._cold_start_done.is_set():
-                continue
+            # Bundle 2 (2026-05-13): the periodic loop IS the cold-start
+            # path now. The prior ``_cold_start_done.is_set()`` gate
+            # would deadlock the latch (only _poll_now sets the event,
+            # so gating _poll_now on it means nothing ever polls).
+            # State A above already guards the pre-set_round_phase race
+            # window; once _lock_at is non-zero, this loop must drive
+            # the catch-up.
             try:
                 self._poll_now(deadline_ms=0, label="period")
             except Exception as e:  # noqa: BLE001
@@ -917,6 +968,27 @@ class RpcPoller:
             return max(0.1, lock_at + 0.1 - now), "suspend"
         return max(0.0, next_at - now), "steady"
 
+    def _latch_first_successful_poll_locked(self) -> None:
+        """Flip ``_connected`` + ``_cold_start_done`` exactly once on the
+        first successful poll. Caller MUST hold ``self._lock``.
+
+        Bundle 2 refactor (2026-05-13): replaces the prior ``_cold_start``
+        path's atomic "backfill complete -> set flags" handoff. Now the
+        flags flip lazily once the daemon's first ``_poll_now`` succeeds
+        (either fetched ≥1 batch with no error, or found head already
+        caught up). Until then, ``is_pool_ready`` returns ``(False,
+        "cold_start_in_progress")`` and the engine skips, identical to
+        the pre-refactor behaviour during the synchronous backfill
+        window.
+        """
+        if not self._connected:
+            self._connected = True
+            self._cold_start_done.set()
+            info("RPC_POLL", "COLD", "OK",
+                 msg=f"first poll complete; pool aggregate ready "
+                     f"(cursor={self._last_polled_block_number}, "
+                     f"epochs_tracked={len(self._pools)})")
+
     def _poll_now(self, *, deadline_ms: int, label: str) -> None:
         """Core poll: fetch new blocks since _last_polled_block_number,
         in chunks of self._batch_size, until caught up to head.
@@ -960,6 +1032,7 @@ class RpcPoller:
                     self._last_poll_at = time.time()
                     self._last_poll_rtt_ms = rtt_ms
                     self._poll_count += 1
+                    self._latch_first_successful_poll_locked()
                 return
 
             # Mid-round feasibility check: if RTT degrades during the
@@ -1040,6 +1113,7 @@ class RpcPoller:
                 else:
                     self._last_poll_succeeded = True
                     self._last_poll_error = ""
+                    self._latch_first_successful_poll_locked()
                 self._last_poll_too_slow = too_slow
 
             # Status taxonomy:

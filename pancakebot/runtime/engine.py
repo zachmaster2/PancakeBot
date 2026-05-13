@@ -351,9 +351,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         )
 
         # Sync round-phase state into rpc_poller immediately after handshake.
-        # On the first call this triggers the cold-start backfill (synchronous;
-        # blocks until done) so the first round has full pool data before any
-        # decisions are made.
+        # Bundle 2 (2026-05-13): on the first call this synchronously initializes
+        # the cursor from chain head (~1 RPC, sub-second) but does NOT block on
+        # backfill — the periodic daemon's first tick + the ramp/final polls
+        # drive the in-round catch-up. is_pool_ready below gates against acting
+        # on a half-built pool aggregate via the cold_start_in_progress reason.
         if cfg.rpc_poller is not None:
             cfg.rpc_poller.set_round_phase(
                 current_epoch=current_epoch,
