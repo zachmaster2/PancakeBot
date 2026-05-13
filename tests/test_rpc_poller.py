@@ -463,18 +463,20 @@ def test_on_epoch_advance_handles_compute_round_start_failure_gracefully():
 
 
 def test_first_call_set_round_phase_does_not_invoke_clamp(monkeypatch):
-    """First call goes through cold-start, NOT the epoch-advance hook."""
+    """First call goes through cursor-init (_initialize_cursor_from_head),
+    NOT the epoch-advance hook. Bundle 2 (2026-05-13): renamed from
+    _cold_start; same dispatch decision tree."""
     p = _make_poller()
     invoked = {"n": 0}
 
     def fake_advance(**kw):
         invoked["n"] += 1
 
-    def fake_cold():
+    def fake_init():
         pass
 
     monkeypatch.setattr(p, "_on_epoch_advance", fake_advance)
-    monkeypatch.setattr(p, "_cold_start", fake_cold)
+    monkeypatch.setattr(p, "_initialize_cursor_from_head", fake_init)
 
     p.set_round_phase(current_epoch=100, lock_at=1000)
     assert invoked["n"] == 0
@@ -1143,123 +1145,125 @@ def test_poll_now_clears_poll_in_progress_when_infeasible_aborts_early():
 
 
 # ---------------------------------------------------------------------------
-# _cold_start: feasibility-aware backfill
+# _initialize_cursor_from_head: cursor init only, no synchronous backfill
+# (Bundle 2 refactor 2026-05-13: replaces the prior _cold_start one-shot
+# that synchronously backfilled blocks before returning.)
 # ---------------------------------------------------------------------------
 
-def test_cold_start_does_not_mark_infeasible_when_room_to_backfill():
-    """At round start with full 5min, backfill is feasible -> normal
-    cold-start completes, flag stays False."""
+def test_init_cursor_positions_at_round_start_minus_1_when_feasible():
+    """At round start with full 5min, cursor init sets
+    _last_polled_block_number = round_start_block - 1. NO batch fetch
+    is performed — the daemon's first periodic tick does that.
+
+    Regression for the 621-block bug: cursor target must be scoped to
+    the CURRENT round only (head - delta_blocks_in_round - safety),
+    NOT to a head-relative full-round lookback.
+    """
     import time as _t
     p = _make_poller()
     now = int(_t.time())
     p._lock_at = now + 290  # 10s into round
-    # head_ts = now; round_start_ts = now-10. delta_blocks = 20+20 = 40.
+    # head_ts = now; round_start_ts = now - 10. delta_blocks = 20+20 = 40.
+    # Expected cursor = head - 40 - 1 = 99_959.
     p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
-    # _poll_now's batch-fetch loop also calls _rpc_eth_block_number
-    # for the inner head — mock it so the test stays offline.
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
-    fetched: list[list[int]] = []
+    # cursor-init must NOT call _fetch_and_process_blocks: blow up if it does.
     p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: fetched.append(nums)
+        lambda nums: pytest.fail("init_cursor must not fetch batches")
     )
 
-    p._cold_start()
+    p._initialize_cursor_from_head()
 
     assert p._catchup_infeasible_for_round is False
-    assert p._connected is True
-    # Cursor is now head (after backfill processed all blocks).
-    assert p._last_polled_block_number == 100_000
-    # Backfill performed at least one batch.
-    assert len(fetched) > 0
-    # Bug regression check: cold_start must scope backfill to current
-    # round only, NOT to a head-relative full-round lookback. ~10s into
-    # round = ~40 blocks (20 actual + 20 safety margin), NOT 620.
-    total_blocks_fetched = sum(len(b) for b in fetched)
-    assert total_blocks_fetched < 100, (
-        f"cold_start over-fetched: {total_blocks_fetched} blocks "
-        f"(expected ~40 for 10s into round; >100 indicates the "
-        f"head-relative full-round lookback bug)"
+    # Cursor init must NOT flip _connected — that's the first-poll latch.
+    assert p._connected is False
+    assert p._cold_start_done.is_set() is False
+    # 10s into round + 20 safety margin = 40 blocks behind head -> cursor at
+    # head - 40 - 1 = 99_959.
+    assert p._last_polled_block_number == 99_959, (
+        f"cursor positioned at {p._last_polled_block_number}; "
+        f"expected 99_959 (head-40-1). >630 blocks back would indicate "
+        f"the head-relative full-round lookback regression."
     )
 
 
-def test_cold_start_does_not_backfill_past_round_start():
-    """Regression for the 621-block bug: cold_start must NOT backfill
-    from head - blocks_per_round (which would include the previous
-    round's blocks)."""
+def test_init_cursor_scopes_target_to_current_round_only():
+    """Regression for the 621-block bug: at 60s into round, cursor
+    target must reflect ~120 blocks (60s/0.5s/block) + 20 safety, NOT
+    a full round's worth of blocks (600+)."""
     import time as _t
     p = _make_poller()
     now = int(_t.time())
     p._lock_at = now + 240  # 60s into round
     p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
-    fetched: list[list[int]] = []
     p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: fetched.append(nums)
+        lambda nums: pytest.fail("init_cursor must not fetch batches")
     )
 
-    p._cold_start()
+    p._initialize_cursor_from_head()
 
-    total = sum(len(b) for b in fetched)
-    # 60s / 0.5s = 120 blocks; +20 safety margin = 140. Must be well
-    # under 600 (a full round) which would indicate the bug.
-    assert total < 200, (
-        f"cold_start fetched {total} blocks at 60s into round; "
-        f"expected ~140 (current round only). Bug regression?"
+    blocks_behind_head = 100_000 - p._last_polled_block_number
+    # 60s / 0.5s = 120 blocks; +20 safety + 1 (cursor=round_start-1) = 141.
+    assert blocks_behind_head < 200, (
+        f"cursor {blocks_behind_head} blocks behind head; expected ~141 "
+        f"(current round only). >600 indicates the full-round lookback bug."
     )
-    assert total >= 100, (
-        f"cold_start fetched {total} blocks at 60s into round; "
-        f"expected ~140 (too few — round_start derivation broken?)"
+    assert blocks_behind_head >= 100, (
+        f"cursor only {blocks_behind_head} blocks behind head; "
+        f"expected ~141 (round_start derivation broken?)"
     )
 
 
-def test_cold_start_marks_infeasible_when_backfill_exceeds_remaining_time():
-    """Bot starts at end of round with 1s until lock — backfill ~620
-    blocks would need ~46s; flag set, backfill skipped, cursor to head."""
+def test_init_cursor_marks_infeasible_and_jumps_to_head_when_no_time():
+    """Bot starts 1s before lock — math says first periodic tick can't
+    catch up ~620 blocks in time. Cursor jumps to head, flag set,
+    _connected stays False (no successful poll has run yet)."""
     import time as _t
     p = _make_poller()
     now = int(_t.time())
-    p._lock_at = now + 1  # only 1s left -- effectively end of round
-    # head_ts = now; round_start_ts = now-299; delta = 599+20 = 619 blocks.
+    p._lock_at = now + 1  # only 1s left
     p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
     p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: pytest.fail("should not have backfilled")
+        lambda nums: pytest.fail("init_cursor must not fetch batches")
     )
 
-    p._cold_start()
+    p._initialize_cursor_from_head()
 
     assert p._catchup_infeasible_for_round is True
-    assert p._connected is True  # still finishes cold-start
-    assert p._cold_start_done.is_set()
-    # Cursor advanced to head so periodic polls don't try to refill.
+    # _connected NOT set yet — that requires a successful poll. Bundle 2
+    # behaviour: cursor-init never flips the latch by itself.
+    assert p._connected is False
+    assert p._cold_start_done.is_set() is False
+    # Cursor jumped to head so the upcoming periodic tick has zero gap
+    # (no infeasible backlog carryover to next round).
     assert p._last_polled_block_number == 100_000
 
 
-def test_cold_start_handles_head_before_round_start():
+def test_init_cursor_handles_head_before_round_start():
     """If head_ts <= round_start_ts (head is BEHIND round_start, e.g.
-    lock_at far in the future), backfill is a no-op."""
+    lock_at far in the future), set cursor to head and return — daemon's
+    periodic ticks will drive forward from there."""
     import time as _t
     p = _make_poller()
     now = int(_t.time())
     p._lock_at = now + 600  # round won't START for another 5 min
     # round_start_ts = lock_at - 300 = now+300; head_ts = now < round_start_ts.
     p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
-    fetched: list[list[int]] = []
     p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: fetched.append(nums)
+        lambda nums: pytest.fail("init_cursor must not fetch batches")
     )
 
-    p._cold_start()
+    p._initialize_cursor_from_head()
 
-    # No backfill performed; cursor at head.
-    assert p._connected is True
+    # Cursor at head; no flag; _connected NOT set (no successful poll yet).
+    assert p._connected is False
+    assert p._cold_start_done.is_set() is False
+    assert p._catchup_infeasible_for_round is False
     assert p._last_polled_block_number == 100_000
-    total = sum(len(b) for b in fetched)
-    assert total == 0
 
 
-def test_cold_start_logs_infeas_at_warn_severity():
-    """The cold-start INFEAS log must be WARN, not INFO."""
+def test_init_cursor_logs_infeas_at_warn_severity():
+    """The cursor-init INFEAS log must be WARN, not INFO. Same severity
+    contract as the pre-Bundle-2 cold-start path."""
     import time as _t
     p = _make_poller()
     now = int(_t.time())
@@ -1287,7 +1291,7 @@ def test_cold_start_logs_infeas_at_warn_severity():
     _mod.warn = fake_warn
     _mod.info = fake_info
     try:
-        p._cold_start()
+        p._initialize_cursor_from_head()
     finally:
         _mod.warn = orig_warn
         _mod.info = orig_info
@@ -1298,6 +1302,122 @@ def test_cold_start_logs_infeas_at_warn_severity():
     ]
     assert len(cold_infeas_warn) == 1, (
         "exactly one COLD INFEAS log expected at WARN severity"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bundle 2 (2026-05-13): first-successful-poll latch + no .wait() callers
+# ---------------------------------------------------------------------------
+
+def test_first_successful_poll_latches_connected_and_cold_start_done():
+    """The first successful _poll_now (either fetched ≥1 batch with no
+    error, OR found head already caught up) flips _connected=True and
+    sets _cold_start_done. Subsequent polls must not re-fire the latch
+    (idempotent); _connected stays True across transient failures.
+    """
+    import time as _t
+    p = _make_poller()
+    # Cursor initialized (as if _initialize_cursor_from_head ran), but
+    # latch not yet flipped — this is the post-init pre-first-poll state.
+    p._current_epoch = 100
+    p._lock_at = int(_t.time()) + 290
+    p._last_polled_block_number = 99_900
+
+    assert p._connected is False
+    assert p._cold_start_done.is_set() is False
+
+    # Mock a successful poll: head advanced 50 blocks since cursor.
+    p._rpc_eth_block_number = lambda: 99_950  # type: ignore[assignment]
+    fetched: list[list[int]] = []
+    p._fetch_and_process_blocks = (  # type: ignore[assignment]
+        lambda nums: fetched.append(list(nums))
+    )
+
+    p._poll_now(deadline_ms=0, label="period")
+
+    # First-poll latch fired.
+    assert p._connected is True
+    assert p._cold_start_done.is_set() is True
+    assert len(fetched) > 0  # batches actually processed
+
+    # Second poll: head hasn't moved, _poll_now hits the "no new blocks"
+    # branch. Latch must already be set; this exercises the idempotent
+    # path (set-if-not-already-set inside _latch_first_successful_poll_locked).
+    p._poll_now(deadline_ms=0, label="period")
+    assert p._connected is True
+    assert p._cold_start_done.is_set() is True
+
+
+def test_first_successful_poll_latch_fires_in_no_new_blocks_branch():
+    """If the first _poll_now finds head already at cursor (no work to
+    do), the success markers + the first-poll latch must still fire.
+    Otherwise a quiet startup (no on-chain bets yet) would leave the
+    poller in cold_start_in_progress forever."""
+    import time as _t
+    p = _make_poller()
+    p._current_epoch = 100
+    p._lock_at = int(_t.time()) + 290
+    p._last_polled_block_number = 100_000
+
+    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]  # head == cursor
+    p._fetch_and_process_blocks = (  # type: ignore[assignment]
+        lambda nums: pytest.fail("no-new-blocks branch must not fetch")
+    )
+
+    assert p._connected is False
+    p._poll_now(deadline_ms=0, label="period")
+    assert p._connected is True
+    assert p._cold_start_done.is_set() is True
+
+
+def test_first_poll_failure_does_not_set_latch():
+    """If the first _poll_now's head-fetch RPC fails, _last_poll_succeeded
+    flips False but _connected stays False (latch only fires on success).
+    A later successful poll then sets the latch."""
+    import time as _t
+    p = _make_poller()
+    p._current_epoch = 100
+    p._lock_at = int(_t.time()) + 290
+    p._last_polled_block_number = 99_900
+
+    def boom():
+        raise RuntimeError("publicnode_unreachable")
+    p._rpc_eth_block_number = boom  # type: ignore[assignment]
+    p._poll_now(deadline_ms=0, label="period")
+
+    assert p._connected is False
+    assert p._cold_start_done.is_set() is False
+    assert p._last_poll_succeeded is False
+
+    # Now a successful poll: head fetches OK, no new blocks.
+    p._rpc_eth_block_number = lambda: 99_900  # type: ignore[assignment]
+    p._poll_now(deadline_ms=0, label="period")
+    assert p._connected is True
+    assert p._cold_start_done.is_set() is True
+
+
+def test_no_cold_start_done_wait_callers_in_production_code():
+    """Acceptance (c): nothing in pancakebot/ awaits _cold_start_done.wait().
+    Bundle 2 removed the synchronous backfill path, so any remaining
+    .wait() call would deadlock waiting on an event that's now lazy.
+    """
+    import os, re
+    repo_root = Path(__file__).resolve().parent.parent / "pancakebot"
+    pattern = re.compile(r"_cold_start_done\s*\.\s*wait\b")
+    offending: list[tuple[str, int, str]] = []
+    for root, _, files in os.walk(str(repo_root)):
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(root, fn)
+            with open(path, encoding="utf-8") as f:
+                for lineno, line in enumerate(f, 1):
+                    if pattern.search(line):
+                        offending.append((path, lineno, line.rstrip()))
+    assert offending == [], (
+        f"Found {len(offending)} _cold_start_done.wait() call(s) in production "
+        f"code; Bundle 2 expects zero (latch is fire-and-set, no awaiters): "
+        f"{offending}"
     )
 
 
