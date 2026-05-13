@@ -34,6 +34,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Iterable
@@ -394,20 +395,88 @@ def _append_kline_record(symbol: str, record: dict) -> None:
         os.fsync(f.fileno())
 
 
+def _fetch_one_symbol_for_week(
+    sym: str,
+    bucket: list[dict],
+    checkpoints: dict[str, dict],
+    summary_per_sym: dict[str, dict],
+) -> tuple[str, int, float]:
+    """Fetch klines for one symbol across all rounds in a week-bucket.
+
+    Each thread:
+    - Owns its symbol's JSONL file + checkpoint (no inter-thread contention).
+    - Iterates rounds sequentially within the symbol.
+    - Calls into the shared ``okx_rate_acquire`` token bucket (capacity 8,
+      8/s refill); 4 threads x 1 fetch in flight = up to 4 OKX requests/sec.
+
+    Returns ``(sym, n_attempts, elapsed_seconds)``.
+    """
+    ckpt = checkpoints[sym]
+    last_done = ckpt.get("last_completed_epoch")
+    n_attempts = 0
+    t_sym_start = time.time()
+    for r in bucket:
+        ep = int(r["epoch"])
+        if last_done is not None and ep <= last_done:
+            continue
+        start_at = int(r["startAt"])
+        lock_at = start_at + INTERVAL_SECONDS
+        oldest_ms, newest_ms = _build_kline_window(start_at)
+        rows, status, detail = lenient_fetch_kline_window(
+            sym, oldest_ms, newest_ms,
+            rate_acquire_fn=okx_rate_acquire,
+        )
+        rec = {
+            "epoch": ep,
+            "lock_at": lock_at,
+            "klines_1s": rows,
+            "data_status": status,
+            "detail": detail,
+        }
+        _append_kline_record(sym, rec)
+        if status == STATUS_OK_FULL:
+            ckpt["n_ok_full"] = ckpt.get("n_ok_full", 0) + 1
+        elif status == STATUS_OK_PARTIAL:
+            ckpt["n_partial"] = ckpt.get("n_partial", 0) + 1
+        elif status == STATUS_MISSING:
+            ckpt["n_missing"] = ckpt.get("n_missing", 0) + 1
+        else:
+            ckpt["n_error"] = ckpt.get("n_error", 0) + 1
+        ckpt["last_completed_epoch"] = ep
+        _save_checkpoint(sym, ckpt)
+        summary_per_sym[sym][status] = summary_per_sym[sym].get(status, 0) + 1
+        if summary_per_sym[sym]["first_epoch"] is None:
+            summary_per_sym[sym]["first_epoch"] = ep
+        summary_per_sym[sym]["last_epoch"] = ep
+        n_attempts += 1
+    return sym, n_attempts, time.time() - t_sym_start
+
+
 def fetch_extended_klines(
     symbols: list[str] | None = None,
     *,
     days_per_week: int = 7,
+    max_workers: int = 4,
 ) -> dict:
     """Fetch klines for all rounds in var/extended/closed_rounds.jsonl, week-major.
 
     Iteration order:
         for week in oldest_week..newest_week:
-            for sym in symbols (in order):
-                fetch all rounds in this week for this symbol.
+            ThreadPoolExecutor(max_workers=4) dispatches all 4 symbols
+            concurrently. Per-week barrier on symbol completion keeps the
+            week-major reporting clean.
 
-    Resumability: if a symbol's checkpoint indicates a last_completed_epoch
-    >= the round being considered, skip it.
+    Concurrency model (one thread per symbol, no shared queue):
+        - 4 worker threads, one per symbol. Each thread owns its symbol's
+          JSONL file + checkpoint -- no inter-thread file/checkpoint
+          contention.
+        - Shared ``okx_rate_acquire`` token bucket (capacity 8, refill 8/s)
+          throttles fetches across the 4 threads. With ~600ms wall-clock
+          per fetch, peak throughput is 4 / 0.6 = ~6.7 fetches/sec
+          (under the 8/sec bucket cap, no rate-limiter back-pressure).
+
+    Resumability: if a symbol's checkpoint indicates last_completed_epoch
+    >= the round being considered, the round is skipped.
     """
     symbols = symbols or list(SYMBOL_TO_FILE.keys())
     rounds = _load_extended_rounds()
@@ -422,66 +491,57 @@ def fetch_extended_klines(
         week_buckets.setdefault(int(bucket_idx), []).append(r)
 
     checkpoints = {sym: _load_checkpoint(sym) for sym in symbols}
-
     summary_per_sym = {sym: {"OK_FULL": 0, "OK_PARTIAL": 0, "MISSING": 0, "ERROR": 0,
                               "first_epoch": None, "last_epoch": None}
                        for sym in symbols}
 
     t_start = time.time()
+    grand_total = 0
     for week_idx in sorted(week_buckets.keys()):
         bucket = week_buckets[week_idx]
         first_epoch = bucket[0]["epoch"]
         last_epoch = bucket[-1]["epoch"]
-        print(f"\n=== Week {week_idx} (epochs {first_epoch}..{last_epoch}, {len(bucket)} rounds) ===", flush=True)
+        # Pre-compute per-symbol pending count (rounds not yet checkpointed).
+        per_sym_pending: dict[str, int] = {}
         for sym in symbols:
-            ckpt = checkpoints[sym]
-            last_done = ckpt.get("last_completed_epoch")
-            n_attempts = 0
-            t_sym_start = time.time()
-            for r in bucket:
-                ep = int(r["epoch"])
-                if last_done is not None and ep <= last_done:
-                    continue
-                start_at = int(r["startAt"])
-                lock_at = start_at + INTERVAL_SECONDS
-                oldest_ms, newest_ms = _build_kline_window(start_at)
-                rows, status, detail = lenient_fetch_kline_window(
-                    sym, oldest_ms, newest_ms,
-                    rate_acquire_fn=okx_rate_acquire,
-                )
-                rec = {
-                    "epoch": ep,
-                    "lock_at": lock_at,
-                    "klines_1s": rows,
-                    "data_status": status,
-                    "detail": detail,
-                }
-                _append_kline_record(sym, rec)
-                # bump counts
-                if status == STATUS_OK_FULL:
-                    ckpt["n_ok_full"] = ckpt.get("n_ok_full", 0) + 1
-                elif status == STATUS_OK_PARTIAL:
-                    ckpt["n_partial"] = ckpt.get("n_partial", 0) + 1
-                elif status == STATUS_MISSING:
-                    ckpt["n_missing"] = ckpt.get("n_missing", 0) + 1
-                else:
-                    ckpt["n_error"] = ckpt.get("n_error", 0) + 1
-                ckpt["last_completed_epoch"] = ep
-                _save_checkpoint(sym, ckpt)
-                summary_per_sym[sym][status] = summary_per_sym[sym].get(status, 0) + 1
-                if summary_per_sym[sym]["first_epoch"] is None:
-                    summary_per_sym[sym]["first_epoch"] = ep
-                summary_per_sym[sym]["last_epoch"] = ep
-                n_attempts += 1
-            t_sym = time.time() - t_sym_start
-            print(f"  {sym}: {n_attempts} fetches in {t_sym:.1f}s "
-                  f"(OK_FULL={ckpt.get('n_ok_full',0)} P={ckpt.get('n_partial',0)} "
-                  f"M={ckpt.get('n_missing',0)} E={ckpt.get('n_error',0)})", flush=True)
+            last_done = checkpoints[sym].get("last_completed_epoch") or 0
+            per_sym_pending[sym] = sum(1 for r in bucket if int(r["epoch"]) > last_done)
+        if sum(per_sym_pending.values()) == 0:
+            print(f"\n=== Week {week_idx} (epochs {first_epoch}..{last_epoch}, "
+                  f"{len(bucket)} rounds) -- ALL DONE per checkpoints ===", flush=True)
+            continue
+        print(f"\n=== Week {week_idx} (epochs {first_epoch}..{last_epoch}, "
+              f"{len(bucket)} rounds; pending="
+              f"{','.join(f'{sym}:{n}' for sym, n in per_sym_pending.items())}; "
+              f"workers={max_workers}) ===", flush=True)
+        t_week = time.time()
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futs = {
+                pool.submit(_fetch_one_symbol_for_week,
+                            sym, bucket, checkpoints, summary_per_sym): sym
+                for sym in symbols
+            }
+            week_total = 0
+            for fut in as_completed(futs):
+                sym, n, elapsed = fut.result()
+                week_total += n
+                grand_total += n
+                ckpt = checkpoints[sym]
+                print(f"  {sym}: {n} fetches in {elapsed:.1f}s "
+                      f"(OK_FULL={ckpt.get('n_ok_full', 0)} P={ckpt.get('n_partial', 0)} "
+                      f"M={ckpt.get('n_missing', 0)} E={ckpt.get('n_error', 0)} "
+                      f"last_done={ckpt.get('last_completed_epoch')})", flush=True)
+        elapsed_week = time.time() - t_week
+        rate = week_total / elapsed_week if elapsed_week > 0 else 0
+        print(f"  week {week_idx} wall: {elapsed_week:.1f}s "
+              f"({week_total} fetches, {rate:.2f}/sec)", flush=True)
 
     elapsed = time.time() - t_start
     return {
         "elapsed_seconds": round(elapsed, 2),
         "weeks_processed": len(week_buckets),
+        "total_fetches": grand_total,
+        "throughput_per_sec": round(grand_total / max(elapsed, 0.001), 2),
         "per_symbol": summary_per_sym,
     }
 
