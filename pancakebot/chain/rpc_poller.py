@@ -59,7 +59,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import urllib3
 
@@ -118,6 +118,184 @@ class _Bet:
 @dataclass
 class _EpochPool:
     bets: list[_Bet] = field(default_factory=list)
+
+
+@dataclass
+class AnchorState:
+    """BEP-520 ms-precise chain anchor for Bundle 4 dynamic deadline math.
+
+    Captured from any observed block header (coarse-phase: existing batched
+    eth_getBlockByNumber/eth_getBlockReceipts calls; fine-phase: dedicated
+    latest-block polls during the last ~2s before critical_path wake).
+
+    Monotonic on ``block_number``: updates only when the incoming block_number
+    is strictly greater than the current anchor's. ``observed_at_local_ms`` is
+    a local wallclock timestamp (microsecond-precision time.time() multiplied
+    by 1000) at the moment the RPC response was parsed, used for staleness
+    checks / debugging only — the dynamic deadline prediction uses
+    ``milli_ts`` directly and extrapolates forward by exact 450ms increments.
+    """
+    block_number: int
+    milli_ts: int           # BEP-520 MilliTimestamp = header.Time*1000 + mix_ms
+    observed_at_local_ms: int
+
+
+def decode_mixhash_ms(mix_hash_hex: str) -> int | None:
+    """Extract the BEP-520 millisecond component from a block's mixHash.
+
+    Returns ms in [0, 999], or ``None`` if the value is out of range
+    (defensive guard against pre-Lorentz blocks where mixHash holds
+    arbitrary content).
+
+    Encoding (per BEP-520, Lorentz hardfork April 2025): the last 2 bytes
+    of the 32-byte mixHash carry the millisecond component as big-endian
+    uint16. Range observed in the chain (Bundle 4 reconnaissance
+    2026-05-13): values quantized to 50ms multiples in [0, 950].
+    """
+    if not isinstance(mix_hash_hex, str):
+        return None
+    raw = mix_hash_hex[2:] if mix_hash_hex.startswith("0x") else mix_hash_hex
+    if len(raw) != 64:
+        return None
+    try:
+        ms = int(raw[-4:], 16)
+    except ValueError:
+        return None
+    if not (0 <= ms <= 999):
+        return None
+    return ms
+
+
+def compute_milli_ts(block_dict: dict) -> int | None:
+    """Reconstruct full BEP-520 MilliTimestamp from a block-header dict.
+
+    Returns ``header.Time * 1000 + mix_ms`` if the mixHash decode succeeds,
+    or ``None`` if the encoding is missing/malformed (caller should fall
+    back to static-deadline timing for that round).
+    """
+    ts_hex = block_dict.get("timestamp")
+    mh_hex = block_dict.get("mixHash")
+    if not isinstance(ts_hex, str) or not isinstance(mh_hex, str):
+        return None
+    ms = decode_mixhash_ms(mh_hex)
+    if ms is None:
+        return None
+    try:
+        ts_s = int(ts_hex, 16)
+    except ValueError:
+        return None
+    return ts_s * 1000 + ms
+
+
+def predict_predecessor_milli_ts(
+    *, anchor_milli_ts: int, lock_ms: int,
+    block_time_ms: int = None, jitter_ms: int = 10,
+) -> int:
+    """Predict the chain-time of the block immediately BEFORE the lock block.
+
+    The lock block is the first block whose ``milli_ts >= lock_ms``. Its
+    predecessor is one ``block_time_ms`` earlier — that's the latest block
+    that can include our bet TX. The bet must reach the validator's
+    mempool before THAT block's assembly window closes.
+
+    Math: extrapolate forward from the anchor by exact 450ms increments.
+    Use ``math.ceil(...)`` to find the smallest ``k`` such that
+    ``anchor_milli_ts + k * block_time_ms >= lock_ms``; that's the lock
+    block's milli_ts. Predecessor = lock_block_milli_ts - block_time_ms.
+
+    The ``jitter_ms`` parameter (default 10) shaves a few ms off lock_ms
+    in the ceil calculation to handle the edge case where the predicted
+    lock-block milli_ts lands EXACTLY on lock_ms (in which case our bet's
+    target window is the block *before* that one — still correct, but the
+    formula needs the slight pull-back to round into the correct slot).
+
+    No safety margin beyond ``jitter_ms``: the empirical "misses only
+    delay, never advance" property (verified across 5000 consecutive
+    blocks) makes the prediction conservative by construction — every
+    slot miss gives us EXTRA budget, never less.
+    """
+    import math
+    if block_time_ms is None:
+        block_time_ms = _tc.BSC_BLOCK_TIME_MS
+    delta = lock_ms - jitter_ms - anchor_milli_ts
+    k = math.ceil(delta / block_time_ms)
+    predicted_lock_block_milli_ts = anchor_milli_ts + k * block_time_ms
+    return predicted_lock_block_milli_ts - block_time_ms
+
+
+def compute_submit_deadline_ms(
+    *, predicted_predecessor_milli_ts: int, lock_ms: int,
+    block_time_ms: int = None, quantum_ms: int = None,
+    assembly_window_ms: int = None, one_way_ms: int = None,
+) -> int:
+    """Per-round dynamic bet-submit deadline (Unix epoch ms, local wallclock).
+
+    Returns the local-clock millisecond by which
+    ``contract.send_raw_transaction(...)`` must START so the TX reaches the
+    validator's mempool before the predecessor block's assembly window
+    closes, ensuring inclusion in that block (one block before lock).
+
+    Math:
+      1. Start at predicted_predecessor_milli_ts (when that block "closes"
+         per consensus — equals its successor's milli_ts in steady state).
+      2. Quantum-shift guard: if the prediction is within one 50ms quantum
+         of lock_ms, a quantum-shift event could push the predecessor's
+         actual milli_ts past lock_ms, making our target block the lock
+         block itself (definite revert). Back off one full block.
+      3. Subtract the validator's TX-list freeze window (TX must arrive
+         BEFORE the validator stops accepting TXs into the candidate).
+      4. Subtract the one-way RPC send latency (TX must be sent from this
+         host BEFORE the validator's mempool needs to receive it).
+
+    The result is a local wallclock target. The engine compares it to
+    ``time.time() * 1000`` at submit time and aborts if past.
+    """
+    if block_time_ms is None:
+        block_time_ms = _tc.BSC_BLOCK_TIME_MS
+    if quantum_ms is None:
+        quantum_ms = _tc.BSC_QUANTUM_MS
+    if assembly_window_ms is None:
+        assembly_window_ms = _tc.VALIDATOR_ASSEMBLY_WINDOW_MS
+    if one_way_ms is None:
+        one_way_ms = _tc.BSC_BET_SUBMIT_ONE_WAY_MS
+
+    bet_inclusion_deadline = predicted_predecessor_milli_ts
+    # Quantum-shift protection: if predecessor's predicted milli_ts is
+    # within one quantum of lock_ms, a 50ms shift could land it past
+    # lock_ms (making the predicted "predecessor" actually the lock
+    # block). Back off one full block to play safe.
+    if (bet_inclusion_deadline + quantum_ms) >= lock_ms:
+        bet_inclusion_deadline -= block_time_ms
+    # Validator TX-list freeze: bet must arrive BEFORE this.
+    bet_inclusion_deadline -= assembly_window_ms
+    # One-way RPC send: deadline at this host is one_way_ms BEFORE the
+    # validator must receive the TX.
+    return bet_inclusion_deadline - one_way_ms
+
+
+def detect_lorentz_active(block_a: dict, block_b: dict) -> bool:
+    """Heuristic Lorentz-active check against two consecutive blocks.
+
+    Pre-Lorentz blocks have mixHash all-zero (or the proof-of-work
+    legacy nonce, but BSC has been PoS throughout this code's history).
+    If BOTH sample blocks decode to ms == 0, we conservatively assume
+    pre-Lorentz and fall back to static timing.
+
+    A single ms == 0 block is plausible on a Lorentz chain (1 in 20 blocks
+    naturally lands on the 0 quantum); requiring two consecutive zeros
+    makes a false-negative (pre-Lorentz mistakenly labeled active)
+    impossible while keeping the false-positive (active chain mistakenly
+    labeled pre-Lorentz) probability at (1/20)^2 = 0.25% per detection.
+    Detection runs once at RpcPoller start, so a single bad sample
+    sticks for the session; consequence is the bot uses the conservative
+    700ms static fallback for the whole session — graceful degradation.
+    """
+    ms_a = compute_milli_ts(block_a)
+    ms_b = compute_milli_ts(block_b)
+    if ms_a is None or ms_b is None:
+        return False  # malformed encoding -> pre-Lorentz assumption
+    # ms_a / ms_b are full milli_ts values; extract the sub-second component.
+    return not ((ms_a % 1000) == 0 and (ms_b % 1000) == 0)
 
 
 class HedgedAllFailed(Exception):
@@ -262,6 +440,32 @@ class RpcPoller:
         # Reset on epoch advance.
         self._catchup_infeasible_for_round: bool = False
 
+        # Bundle 4 (2026-05-14): BEP-520 ms-precise chain anchor for
+        # dynamic deadline math. Updated by every block-header parse
+        # (coarse-phase, piggybacked on existing batched fetches) AND
+        # by the fine-phase head poller (last ~2s before critical_path
+        # wake). Read by compute_dynamic_submit_deadline_ms() at submit
+        # time. Monotonic on block_number; older blocks ignored.
+        self._anchor: AnchorState | None = None
+
+        # Bundle 4: Lorentz ms-encoding active? Determined at first head
+        # fetch (see _detect_and_set_lorentz_active). When False, the
+        # dynamic deadline computation returns None and the engine falls
+        # back to the static bet_submit_deadline_offset_ms (700ms).
+        # Three-state: None (not yet checked), True (active), False
+        # (chain is pre-Lorentz, fall back).
+        self._lorentz_active: bool | None = None
+
+        # Bundle 4: watchdog counters for block-cadence anomalies.
+        # Incremented in-place (atomic int ops under GIL); flushed at
+        # round-end via stats / a one-line summary log.
+        self._anomaly_quantum_shift: int = 0      # delta = 500ms
+        self._anomaly_slot_miss: int = 0          # delta >= 900ms
+        self._anomaly_advance: int = 0            # delta < 450ms (would falsify the safety property — raises InvariantError)
+        self._anomaly_other: int = 0              # other unexpected deltas
+        self._last_observed_block_number: int = 0
+        self._last_observed_milli_ts: int = 0
+
         # True while a poll is actively fetching/processing blocks.
         # is_pool_ready returns False when this is set so the engine
         # cannot read a half-built pool aggregate. Set/cleared under
@@ -307,6 +511,239 @@ class RpcPoller:
                 "total_events": self._total_events,
                 "endpoint_pool_size": len(self._endpoint_pool),
             }
+
+    # ------------------------------------------------------------------
+    # Bundle 4 (2026-05-14): BEP-520 ms-precise anchor + dynamic deadline
+    # ------------------------------------------------------------------
+
+    def _update_anchor_from_block(self, block_dict: dict) -> None:
+        """Try to extract milli_ts from a block-header dict and update
+        the anchor if the block_number is newer than the current anchor.
+        Called from every block-header parse in ``_fetch_and_process_blocks``
+        (coarse-phase, no extra RPC) AND from ``fine_phase_head_poll``
+        (dedicated latest-block polls). Safe to call with any dict;
+        silently no-ops on malformed/missing fields.
+
+        Also dispatches the watchdog on every successful decode.
+        """
+        bn_hex = block_dict.get("number")
+        if not isinstance(bn_hex, str):
+            return
+        try:
+            bn = int(bn_hex, 16)
+        except ValueError:
+            return
+        milli_ts = compute_milli_ts(block_dict)
+        if milli_ts is None:
+            return
+        with self._lock:
+            current_bn = self._anchor.block_number if self._anchor else -1
+            if bn <= current_bn:
+                return  # monotonic guard: ignore older / same blocks
+            self._anchor = AnchorState(
+                block_number=bn,
+                milli_ts=milli_ts,
+                observed_at_local_ms=int(time.time() * 1000),
+            )
+            # Watchdog: observe block-cadence anomaly if we have a prior obs
+            self._observe_block_for_watchdog_locked(bn, milli_ts)
+
+    def _observe_block_for_watchdog_locked(self, bn: int, milli_ts: int) -> None:
+        """Increment block-cadence anomaly counters. Caller MUST hold
+        ``self._lock``. Only meaningful for *consecutive* block_numbers;
+        skipped block ranges (e.g. epoch-boundary cursor clamp) are
+        ignored to avoid spurious slot_miss counts.
+        """
+        prev_bn = self._last_observed_block_number
+        prev_ms = self._last_observed_milli_ts
+        # Update last-observed state BEFORE any early return, so future
+        # observations chain correctly.
+        self._last_observed_block_number = bn
+        self._last_observed_milli_ts = milli_ts
+
+        if prev_bn <= 0 or bn != prev_bn + 1:
+            # First observation or non-consecutive block — no delta to compare.
+            return
+
+        delta = milli_ts - prev_ms
+        if delta == _tc.BSC_BLOCK_TIME_MS:
+            return  # nominal (~99% of blocks)
+        if delta == _tc.BSC_BLOCK_TIME_MS + _tc.BSC_QUANTUM_MS:
+            # 500ms — quantum-shift, NOT a miss. Log at info (rare,
+            # informational; no decision impact).
+            self._anomaly_quantum_shift += 1
+            return
+        if delta < _tc.BSC_BLOCK_TIME_MS:
+            # < 450ms — falsifies the "misses only delay, never advance"
+            # property that Bundle 4's no-margin dynamic deadline math
+            # depends on. If observed, BSC Parlia consensus has changed
+            # (BEP update? validator misbehavior?) and the bot's chain-time
+            # arithmetic is broken; continuing to bet on extrapolations
+            # the chain no longer honors would mean placing wrong bets.
+            # Fail-loud via InvariantError aligns with the bot's existing
+            # pattern for consensus-violation events: supervisor restarts
+            # + Discord alerts + operator investigation, instead of silent
+            # incorrect operation.
+            self._anomaly_advance += 1
+            raise InvariantError(
+                f"BSC_PARLIA_ADVANCE_DETECTED: block={bn} delta={delta}ms "
+                f"< BSC_BLOCK_TIME_MS={_tc.BSC_BLOCK_TIME_MS}ms — "
+                f"Parlia consensus may have changed; halt for investigation"
+            )
+        if delta >= 2 * _tc.BSC_BLOCK_TIME_MS:
+            # 900ms+ — at least 1 slot missed. Common in low-traffic
+            # periods or under network distress. Log at info (rare).
+            self._anomaly_slot_miss += 1
+            return
+        # Everything else (delta in (450, 500) or (500, 900) — should
+        # not occur with the 50ms-quantum encoding, but defensive).
+        self._anomaly_other += 1
+
+    def anchor_state(self) -> AnchorState | None:
+        """Snapshot of the current chain anchor. Returns None if no
+        block has been observed yet."""
+        with self._lock:
+            return self._anchor
+
+    def anomaly_counters(self) -> dict[str, int]:
+        """Snapshot of the watchdog counters. Cumulative since RpcPoller
+        construction; not reset between rounds."""
+        with self._lock:
+            return {
+                "quantum_shift": self._anomaly_quantum_shift,
+                "slot_miss": self._anomaly_slot_miss,
+                "advance": self._anomaly_advance,
+                "other": self._anomaly_other,
+            }
+
+    def compute_dynamic_submit_deadline_ms(self, lock_ms: int) -> int | None:
+        """Bundle 4 public API. Return the local-wallclock-ms deadline by
+        which ``contract.send_raw_transaction(...)`` must START so the bet
+        TX lands in the block immediately before lock.
+
+        Returns ``None`` only if:
+          - Lorentz ms-encoding hasn't been verified active yet
+            (``_lorentz_active`` is None or False), OR
+          - No anchor has been observed yet.
+
+        The dynamic extrapolation is computed UNCONDITIONALLY when Lorentz
+        is active and an anchor exists, regardless of anchor age:
+        ``anchor + k × BSC_BLOCK_TIME_MS`` is exact under the verified
+        "misses only delay, never advance" property. The watchdog
+        ``_observe_block_for_watchdog_locked`` raises ``InvariantError``
+        if that property is ever falsified by an observed advance event.
+
+        In any None case, the engine falls back to
+        ``cfg.bet_submit_deadline_offset_ms`` (700ms static).
+
+        On success: a Unix epoch ms value. Engine compares to
+        ``_utc_now() * 1000`` (skew-corrected) and aborts the bet if past.
+        """
+        with self._lock:
+            anchor = self._anchor
+            lorentz_active = self._lorentz_active
+        if not lorentz_active or anchor is None:
+            return None
+        predecessor_ms = predict_predecessor_milli_ts(
+            anchor_milli_ts=anchor.milli_ts,
+            lock_ms=lock_ms,
+        )
+        return compute_submit_deadline_ms(
+            predicted_predecessor_milli_ts=predecessor_ms,
+            lock_ms=lock_ms,
+        )
+
+    def fine_phase_head_poll(
+        self, *, deadline_s: float,
+        now_fn: Callable[[], float] = time.time,
+        interval_ms: int = 200,
+    ) -> int:
+        """Serial fine-phase polling of ``eth_getBlockByNumber('latest')``
+        until ``deadline_s`` (in whatever wallclock frame ``now_fn``
+        returns — caller should pass ``_utc_now`` for skew-corrected
+        comparison). Each successful response updates ``self._anchor``
+        via ``_update_anchor_from_block``.
+
+        Replaces the engine's ``_sleep_until_ts(critical_path_wake_ts)``
+        in the (final_rpc_poll, critical_path) gap. Loop interval is
+        wallclock-anchored (no drift): next_fire = next_fire + interval.
+
+        Returns the number of successful head fetches performed in the
+        window (for diagnostics).
+
+        Failures are logged at INFO and skipped — a transient RPC error
+        leaves the anchor at its last value. The dynamic deadline
+        extrapolation in ``compute_dynamic_submit_deadline_ms`` uses
+        exact ``BSC_BLOCK_TIME_MS`` arithmetic so anchor age does not
+        bias the prediction (under the load-bearing "misses only delay,
+        never advance" property which is enforced by the watchdog's
+        InvariantError on any observed advance event).
+
+        ``interval_ms`` default is 200ms — half the 450ms block time,
+        guaranteeing every block-window contains ≥ 2 polls (every block
+        will be observed as "latest" for ~450ms). At 500ms cadence ~11%
+        of intermediate blocks would be missed; 200ms is the right
+        guarantee tier.
+        """
+        next_fire_s = now_fn()
+        ok_count = 0
+        while True:
+            now_s = now_fn()
+            if now_s >= deadline_s:
+                break
+            if now_s < next_fire_s:
+                sleep_for = min(next_fire_s - now_s, deadline_s - now_s)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                continue
+            try:
+                block = self._rpc_call_single(
+                    "eth_getBlockByNumber", ["latest", False],
+                )
+                if isinstance(block, dict):
+                    self._update_anchor_from_block(block)
+                    ok_count += 1
+            except Exception as e:  # noqa: BLE001
+                info("RPC_POLL", "FINE", "ERR",
+                     msg=f"head_fetch: {type(e).__name__}: {e}")
+            next_fire_s += interval_ms / 1000.0
+        return ok_count
+
+    def _detect_and_set_lorentz_active(self) -> None:
+        """One-time check at first successful head fetch: are 2 consecutive
+        recent blocks both encoding ms == 0? If so, treat the chain as
+        pre-Lorentz and lock in the static fallback for the session.
+        Idempotent — only runs while ``_lorentz_active`` is None.
+        """
+        with self._lock:
+            if self._lorentz_active is not None:
+                return
+        try:
+            head_block = self._rpc_call_single(
+                "eth_getBlockByNumber", ["latest", False],
+            )
+            if not isinstance(head_block, dict):
+                return
+            head_bn = int(head_block["number"], 16)
+            prev_block = self._rpc_call_single(
+                "eth_getBlockByNumber", [hex(head_bn - 1), False],
+            )
+            if not isinstance(prev_block, dict):
+                return
+        except Exception as e:  # noqa: BLE001
+            info("RPC_POLL", "LORTZ", "ERR",
+                 msg=f"detect_lorentz: {type(e).__name__}: {e}")
+            return
+        active = detect_lorentz_active(head_block, prev_block)
+        with self._lock:
+            self._lorentz_active = active
+        if active:
+            info("RPC_POLL", "LORTZ", "ACTIVE",
+                 msg=f"BEP-520 ms-encoding detected; dynamic deadline active")
+        else:
+            warn("RPC_POLL", "LORTZ", "FALLBACK",
+                 msg=("BEP-520 ms-encoding NOT detected (both recent blocks "
+                      "had ms==0); using static 700ms fallback for session"))
 
     def is_pool_ready(self, epoch: int | None = None) -> tuple[bool, str]:
         """Engine gate. Returns ``(True, "")`` when the bot can place a
@@ -455,6 +892,11 @@ class RpcPoller:
             # gates the engine away from acting on a half-built pool
             # aggregate during that window.
             self._initialize_cursor_from_head()
+            # Bundle 4 (2026-05-14): one-time check whether the chain has
+            # BEP-520 ms-encoding active. If yes, the dynamic deadline
+            # path activates; if no, the static 700ms fallback is used
+            # for the session. Adds 2 RPC calls at startup (negligible).
+            self._detect_and_set_lorentz_active()
         elif is_epoch_advance:
             # Round-aware cursor clamp + catch-up feasibility check.
             # Past rounds are archive-only — the bot only bets on the
@@ -784,17 +1226,19 @@ class RpcPoller:
                     return
 
                 # delta_blocks: how many blocks since round_start.
-                # BSC_BLOCK_TIME_MS=500 is the CONSERVATIVE rounding of
-                # empirical 452ms; using it as the divisor underestimates
-                # blocks-elapsed by ~10%. The +20 safety margin handles
-                # that bias plus general block-time variance, ensuring we
-                # don't miss start-of-round blocks. Any over-fetched
-                # prev-round blocks are filtered by the epoch gate in
-                # _process_receipts.
+                # Bundle 4 (2026-05-14): BSC_BLOCK_TIME_MS is now 450 (was 500),
+                # matching the empirical post-Lorentz block interval exactly.
+                # Prior +20 safety margin compensated for the 500ms-vs-actual
+                # divisor bias (~10% under-estimate of blocks-elapsed); now
+                # that the divisor is exact, the bias is gone. Keep a small
+                # +5-block safety for general block-time variance (the chain
+                # might briefly miss slots and the round_start-to-now distance
+                # could end up off by 1-2 blocks). Over-fetched prev-round
+                # blocks are filtered by the epoch gate in _process_receipts.
                 delta_blocks = round(
                     (head_ts - round_start_ts) * 1000
                     / _tc.BSC_BLOCK_TIME_MS
-                ) + 20
+                ) + 5
                 round_start_block = max(0, head - delta_blocks)
                 blocks_to_backfill = max(0, head - round_start_block + 1)
 
@@ -1191,6 +1635,11 @@ class RpcPoller:
                     if ts > 0:
                         with self._lock:
                             self._block_ts[bn] = ts
+                # Bundle 4: piggyback anchor + watchdog update on this
+                # block-header parse. No extra RPC; uses the data we
+                # already fetched. Monotonic on block_number — older
+                # blocks ignored.
+                self._update_anchor_from_block(header)
             if recv_err is not None:
                 # Single-block error: skip; the next periodic/ramp poll
                 # will retry. Don't raise here because the rest of the

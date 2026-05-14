@@ -16,6 +16,7 @@ architecture.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -260,14 +261,19 @@ def test_set_round_phase_advancing_epoch_drops_stale_pools(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_compute_round_start_block_uses_cache_when_available():
-    """If _block_ts has a recent-enough anchor, no RPC call needed."""
+    """If _block_ts has a recent-enough anchor, no RPC call needed.
+
+    Bundle 4 (2026-05-14): block-time divisor is BSC_BLOCK_TIME_MS=450
+    (post-Lorentz empirical), down from 500. With a 30s anchor delta,
+    blocks-ahead = round(30000/450) = 67 (was 60 with 500ms divisor).
+    """
     p = _make_poller()
     target_ts = 10_000  # Unix-second-ish
-    # Anchor 30s before target with block 5000 -> 30s @ 500ms/block = 60 blocks.
+    # Anchor 30s before target with block 5000.
     p._block_ts[5000] = target_ts - 30
     rs = p._compute_round_start_block(target_ts)
-    # 30s * 1000 / 500ms_per_block = 60 blocks ahead of anchor.
-    assert rs == 5000 + 60
+    # 30s * 1000 / 450ms_per_block = round(66.67) = 67 blocks ahead of anchor.
+    assert rs == 5000 + 67
 
 
 def test_compute_round_start_block_rejects_stale_anchor():
@@ -286,8 +292,9 @@ def test_compute_round_start_block_rejects_stale_anchor():
 
     p._rpc_eth_get_latest_block_header = fake_header  # type: ignore[assignment]
     rs = p._compute_round_start_block(target_ts)
-    # head_ts = target+10 -> 10s back -> 20 blocks back from 10000 = 9980.
-    assert rs == 9980
+    # Bundle 4: head_ts = target+10 -> 10s back -> round(10000/450)=22
+    # blocks back from 10000 = 9978 (was 9980 with 500ms divisor).
+    assert rs == 9978
     assert invoked["n"] == 1, "RPC fallback should have been invoked"
 
 
@@ -300,9 +307,10 @@ def test_compute_round_start_block_falls_back_to_rpc_when_cache_empty():
 
     p._rpc_eth_get_latest_block_header = fake_header  # type: ignore[assignment]
     rs = p._compute_round_start_block(round_start_ts=49_000)
-    # delta_seconds = 50000 - 49000 = 1000s -> 2000 blocks at 500ms/block.
-    # round_start_block = 1_000_000 - 2000 = 998_000.
-    assert rs == 998_000
+    # Bundle 4: delta_seconds = 50000 - 49000 = 1000s -> round(1_000_000/450) = 2222
+    # blocks at 450ms/block. round_start_block = 1_000_000 - 2222 = 997_778
+    # (was 998_000 with 500ms divisor).
+    assert rs == 997_778
 
 
 def test_compute_round_start_block_returns_none_on_rpc_failure():
@@ -352,22 +360,15 @@ def test_on_epoch_advance_clamps_cursor_after_long_silence():
     p._rpc_eth_get_latest_block_header = lambda: (100_000, 1_000_050)  # type: ignore[assignment]
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
 
-    # round_start_ts = lock_at(2_000_000) - interval(300) = 1_999_700,
-    # but our header gave head_ts=1_000_050 => head_ts < round_start_ts =>
-    # _compute_round_start_block returns head_num. Use a different lock_at
-    # that aligns with our mocks: lock_at - 300 = round_start_ts.
-    # Pick lock_at = head_ts (1_000_050) + 300 = 1_000_350.
-    # Then round_start_ts = 1_000_050. Anchor cache empty -> RPC path.
-    # delta_seconds = 1_000_050 - 1_000_050 = 0 -> 0 blocks back -> rs=100_000.
-    # That's not "behind"; let me use a clear scenario:
     # head_ts = 1_000_300, lock_at = 1_000_350, round_start_ts = 1_000_050.
-    # delta = 250s -> 500 blocks -> rs = 100_000 - 500 = 99_500.
+    # Bundle 4: delta = 250s -> round(250_000/450) = 556 blocks ->
+    # rs = 100_000 - 556 = 99_444 (was 99_500 with 500ms divisor).
     p._rpc_eth_get_latest_block_header = lambda: (100_000, 1_000_300)  # type: ignore[assignment]
 
     p._on_epoch_advance(lock_at=1_000_350, current_epoch=101)
 
-    # Cursor should now be 99_500 - 1 = 99_499.
-    assert p._last_polled_block_number == 99_499
+    # Cursor should now be 99_444 - 1 = 99_443 (Bundle 4 ms-precise correction).
+    assert p._last_polled_block_number == 99_443
 
 
 def test_on_epoch_advance_does_not_rewind_cursor_when_in_round():
@@ -1158,13 +1159,17 @@ def test_init_cursor_positions_at_round_start_minus_1_when_feasible():
     Regression for the 621-block bug: cursor target must be scoped to
     the CURRENT round only (head - delta_blocks_in_round - safety),
     NOT to a head-relative full-round lookback.
+
+    Bundle 4 (2026-05-14): BSC_BLOCK_TIME_MS divisor 500 → 450 (post-
+    Lorentz empirical), safety margin +20 → +5 (the prior 500ms-vs-actual
+    bias is gone now that divisor is exact). New expected cursor:
+    delta_blocks = round(10000/450) + 5 = 27, cursor = head - 27 - 1
+    = 99_972 (was 99_959 with old constants).
     """
     import time as _t
     p = _make_poller()
     now = int(_t.time())
     p._lock_at = now + 290  # 10s into round
-    # head_ts = now; round_start_ts = now - 10. delta_blocks = 20+20 = 40.
-    # Expected cursor = head - 40 - 1 = 99_959.
     p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
     # cursor-init must NOT call _fetch_and_process_blocks: blow up if it does.
     p._fetch_and_process_blocks = (  # type: ignore[assignment]
@@ -1177,12 +1182,13 @@ def test_init_cursor_positions_at_round_start_minus_1_when_feasible():
     # Cursor init must NOT flip _connected — that's the first-poll latch.
     assert p._connected is False
     assert p._cold_start_done.is_set() is False
-    # 10s into round + 20 safety margin = 40 blocks behind head -> cursor at
-    # head - 40 - 1 = 99_959.
-    assert p._last_polled_block_number == 99_959, (
+    # Bundle 4: 10s into round + 5 safety = round(10000/450)+5 = 27 blocks
+    # behind head -> cursor at head - 27 - 1 = 99_972.
+    assert p._last_polled_block_number == 99_972, (
         f"cursor positioned at {p._last_polled_block_number}; "
-        f"expected 99_959 (head-40-1). >630 blocks back would indicate "
-        f"the head-relative full-round lookback regression."
+        f"expected 99_972 (head-27-1 under Bundle 4 ms-precise math). "
+        f">630 blocks back would indicate the head-relative full-round "
+        f"lookback regression."
     )
 
 
@@ -1506,3 +1512,353 @@ def test_is_backfill_done_compat_shim():
     assert p.is_backfill_done() is False
     p._cold_start_done.set()
     assert p.is_backfill_done() is True
+
+
+# ---------------------------------------------------------------------------
+# Bundle 4 (2026-05-14): BEP-520 ms-precise anchor + dynamic deadline math
+# ---------------------------------------------------------------------------
+
+# Import the new module-level helpers for direct testing
+from pancakebot.chain.rpc_poller import (  # noqa: E402
+    AnchorState, decode_mixhash_ms, compute_milli_ts,
+    detect_lorentz_active, predict_predecessor_milli_ts,
+    compute_submit_deadline_ms,
+)
+
+
+# --- decode_mixhash_ms ---
+
+def test_decode_mixhash_ms_canonical():
+    """Encoding observed in empirical Bundle 4 probe: last 2 bytes
+    as big-endian uint16, leading bytes all-zero."""
+    # 0x...0352 = 850
+    mh = "0x" + "00" * 30 + "0352"
+    assert decode_mixhash_ms(mh) == 850
+    # 0x...0000 = 0 (valid; corresponds to a quantum=0 block)
+    mh0 = "0x" + "00" * 32
+    assert decode_mixhash_ms(mh0) == 0
+    # 0x...03e7 = 999 (max valid)
+    mh_max = "0x" + "00" * 30 + "03e7"
+    assert decode_mixhash_ms(mh_max) == 999
+
+
+def test_decode_mixhash_ms_out_of_range_returns_none():
+    """Values > 999 are out of the BEP-520 valid range. Defensive
+    against legacy/pre-Lorentz mixHash content."""
+    # 0x...0400 = 1024 (out of [0, 999])
+    mh = "0x" + "00" * 30 + "0400"
+    assert decode_mixhash_ms(mh) is None
+    # 0x...ffff = 65535 (max uint16)
+    mh = "0x" + "00" * 30 + "ffff"
+    assert decode_mixhash_ms(mh) is None
+
+
+def test_decode_mixhash_ms_malformed_returns_none():
+    """Bad input types or shapes return None, never raise."""
+    assert decode_mixhash_ms(None) is None
+    assert decode_mixhash_ms("") is None
+    assert decode_mixhash_ms("0x12") is None  # too short
+    assert decode_mixhash_ms("not_hex") is None
+    assert decode_mixhash_ms("0x" + "zz" * 32) is None  # invalid hex
+
+
+def test_decode_mixhash_ms_accepts_no_0x_prefix():
+    """Both '0x...' and bare-hex forms work (defensive against varying
+    RPC implementations)."""
+    assert decode_mixhash_ms("00" * 30 + "0352") == 850
+
+
+# --- compute_milli_ts ---
+
+def test_compute_milli_ts_canonical():
+    """Returns header.Time*1000 + mix_ms when both parse cleanly."""
+    block = {
+        "timestamp": hex(1778712807),  # 0x6a04fee4
+        "mixHash": "0x" + "00" * 30 + "0352",  # 850ms
+    }
+    assert compute_milli_ts(block) == 1778712807 * 1000 + 850
+
+
+def test_compute_milli_ts_returns_none_on_bad_input():
+    assert compute_milli_ts({}) is None
+    assert compute_milli_ts({"timestamp": "0x1"}) is None  # missing mixHash
+    assert compute_milli_ts({"mixHash": "0x" + "00" * 32}) is None  # missing timestamp
+    assert compute_milli_ts({"timestamp": "0xZZ", "mixHash": "0x" + "00" * 32}) is None
+
+
+# --- detect_lorentz_active ---
+
+def test_detect_lorentz_active_true_when_either_has_ms():
+    """Two recent blocks with at least one non-zero ms encoding → active."""
+    block_a = {"timestamp": hex(1778712807), "mixHash": "0x" + "00" * 30 + "0352"}
+    block_b = {"timestamp": hex(1778712808), "mixHash": "0x" + "00" * 30 + "012c"}
+    assert detect_lorentz_active(block_a, block_b) is True
+
+
+def test_detect_lorentz_active_false_when_both_zero():
+    """Pre-Lorentz heuristic: both blocks with ms=0 → inactive."""
+    block_a = {"timestamp": hex(1778712807), "mixHash": "0x" + "00" * 32}
+    block_b = {"timestamp": hex(1778712808), "mixHash": "0x" + "00" * 32}
+    assert detect_lorentz_active(block_a, block_b) is False
+
+
+def test_detect_lorentz_active_false_when_malformed():
+    """Malformed mixHash (decode fails) → conservative pre-Lorentz assumption."""
+    block_a = {"timestamp": hex(1778712807), "mixHash": "garbage"}
+    block_b = {"timestamp": hex(1778712808), "mixHash": "0x" + "00" * 30 + "0352"}
+    assert detect_lorentz_active(block_a, block_b) is False
+
+
+# --- predict_predecessor_milli_ts ---
+
+def test_predict_predecessor_milli_ts_ms_precise_extrapolation():
+    """Anchor 3600ms before lock → 8 blocks ahead at 450ms/block; lock
+    block milli_ts = anchor + 3600 = lock_ms; predecessor = lock - 450."""
+    anchor = 1_000_000
+    lock = 1_003_600  # exactly 8 blocks ahead
+    result = predict_predecessor_milli_ts(anchor_milli_ts=anchor, lock_ms=lock)
+    # delta = 3600 - 10 (jitter) = 3590; ceil(3590/450) = 8
+    # predicted_lock_block = anchor + 8*450 = 1_003_600
+    # predecessor = 1_003_600 - 450 = 1_003_150
+    assert result == 1_003_150
+
+
+def test_predict_predecessor_milli_ts_handles_off_grid_anchor():
+    """Anchor not aligned to the block grid: extrapolation still produces
+    a valid predecessor that's strictly before lock."""
+    anchor = 1_000_150  # 150ms into a slot
+    lock = 1_003_700
+    result = predict_predecessor_milli_ts(anchor_milli_ts=anchor, lock_ms=lock)
+    # delta = 3700 - 10 - 150 = 3540; ceil(3540/450) = 8
+    # predicted_lock_block = 1_000_150 + 8*450 = 1_003_750
+    # predecessor = 1_003_750 - 450 = 1_003_300
+    assert result == 1_003_300
+    assert result < lock
+
+
+# --- compute_submit_deadline_ms (all 9 discrete gap values) ---
+
+def _deadline_at_gap(gap_ms: int) -> int:
+    """Helper: predecessor at lock - gap_ms, compute deadline."""
+    lock = 1_000_000
+    pred = lock - gap_ms
+    return compute_submit_deadline_ms(predicted_predecessor_milli_ts=pred, lock_ms=lock)
+
+
+def test_submit_deadline_gap_50_triggers_boundary_backoff():
+    """gap == quantum: bet_inclusion_deadline + 50 = lock → backoff fires.
+    bet_inclusion_deadline = predecessor - 450 (backoff) - 50 (assembly) = pred - 500.
+    Final deadline = pred - 500 - 150 (one-way) = pred - 650 = lock - 700.
+    """
+    # Boundary case: total = lock - 700ms (= static fallback offset).
+    assert _deadline_at_gap(50) == 1_000_000 - 700
+
+
+def test_submit_deadline_gap_100_no_backoff():
+    """gap == 100ms: not within quantum of lock → no backoff.
+    Final = predecessor - 50 (assembly) - 150 (one-way) = pred - 200.
+    Total = lock - 100 - 200 = lock - 300.
+    """
+    assert _deadline_at_gap(100) == 1_000_000 - 300
+
+
+def test_submit_deadline_gap_150():
+    assert _deadline_at_gap(150) == 1_000_000 - 350
+
+
+def test_submit_deadline_gap_200():
+    assert _deadline_at_gap(200) == 1_000_000 - 400
+
+
+def test_submit_deadline_gap_250():
+    assert _deadline_at_gap(250) == 1_000_000 - 450
+
+
+def test_submit_deadline_gap_300():
+    assert _deadline_at_gap(300) == 1_000_000 - 500
+
+
+def test_submit_deadline_gap_350():
+    assert _deadline_at_gap(350) == 1_000_000 - 550
+
+
+def test_submit_deadline_gap_400():
+    assert _deadline_at_gap(400) == 1_000_000 - 600
+
+
+def test_submit_deadline_gap_450_max_no_backoff():
+    """gap == 450ms (full block): no backoff. Deadline = lock - 650."""
+    assert _deadline_at_gap(450) == 1_000_000 - 650
+
+
+def test_submit_deadline_boundary_at_exactly_quantum_msbacks_off():
+    """When predecessor + quantum >= lock_ms exactly, the backoff fires
+    (>= semantics, not >). Boundary case must be conservative."""
+    # gap = BSC_QUANTUM_MS = 50; pred + 50 = lock - 50 + 50 = lock, fires backoff.
+    assert _deadline_at_gap(_tc.BSC_QUANTUM_MS) == 1_000_000 - 700
+
+
+# --- Lorentz-fallback path in compute_dynamic_submit_deadline_ms ---
+
+def test_compute_dynamic_submit_deadline_returns_none_when_lorentz_inactive():
+    """Pre-Lorentz mode (or detection failed): dynamic path returns None
+    → engine falls back to static 700ms offset."""
+    p = _make_poller()
+    p._lorentz_active = False
+    p._anchor = AnchorState(block_number=1, milli_ts=1_000_000,
+                             observed_at_local_ms=int(time.time() * 1000))
+    assert p.compute_dynamic_submit_deadline_ms(lock_ms=1_003_600) is None
+
+
+def test_compute_dynamic_submit_deadline_returns_none_when_no_anchor():
+    """No anchor observed yet: dynamic returns None even if Lorentz active."""
+    p = _make_poller()
+    p._lorentz_active = True
+    p._anchor = None
+    assert p.compute_dynamic_submit_deadline_ms(lock_ms=1_003_600) is None
+
+
+def test_compute_dynamic_submit_deadline_active_and_anchor_present():
+    """Lorentz active + anchor present → returns the dynamic deadline."""
+    p = _make_poller()
+    p._lorentz_active = True
+    p._anchor = AnchorState(block_number=1, milli_ts=1_000_000,
+                             observed_at_local_ms=int(time.time() * 1000))
+    result = p.compute_dynamic_submit_deadline_ms(lock_ms=1_003_600)
+    assert result is not None
+    # Predecessor at 1_003_150 (per test_predict_predecessor_milli_ts above);
+    # gap = 1_003_600 - 1_003_150 = 450ms (no backoff); deadline = pred - 200 = 1_002_950.
+    assert result == 1_002_950
+
+
+# --- Watchdog: anomaly counters via _observe_block_for_watchdog_locked ---
+
+def test_watchdog_nominal_no_increment():
+    """Two consecutive blocks at exactly 450ms apart → no anomaly."""
+    p = _make_poller()
+    with p._lock:
+        p._observe_block_for_watchdog_locked(100, 1_000_000)
+        p._observe_block_for_watchdog_locked(101, 1_000_450)
+    counters = p.anomaly_counters()
+    assert counters["quantum_shift"] == 0
+    assert counters["slot_miss"] == 0
+    assert counters["advance"] == 0
+    assert counters["other"] == 0
+
+
+def test_watchdog_quantum_shift_counted():
+    """500ms delta → quantum_shift counter increments."""
+    p = _make_poller()
+    with p._lock:
+        p._observe_block_for_watchdog_locked(100, 1_000_000)
+        p._observe_block_for_watchdog_locked(101, 1_000_500)
+    counters = p.anomaly_counters()
+    assert counters["quantum_shift"] == 1
+    assert counters["slot_miss"] == 0
+    assert counters["advance"] == 0
+
+
+def test_watchdog_slot_miss_counted():
+    """900ms delta (single slot miss) → slot_miss counter increments."""
+    p = _make_poller()
+    with p._lock:
+        p._observe_block_for_watchdog_locked(100, 1_000_000)
+        p._observe_block_for_watchdog_locked(101, 1_000_900)
+    counters = p.anomaly_counters()
+    assert counters["slot_miss"] == 1
+    assert counters["quantum_shift"] == 0
+
+
+def test_watchdog_advance_raises_invariant_error():
+    """delta < 450ms → advance counter increments AND InvariantError is
+    raised. The "misses only delay, never advance" property is load-bearing
+    for Bundle 4's no-margin dynamic deadline math; an observed advance
+    event means Parlia consensus has changed and the bot's chain-time
+    arithmetic is broken. Fail-loud rather than silent incorrect operation.
+    """
+    p = _make_poller()
+    with p._lock:
+        p._observe_block_for_watchdog_locked(100, 1_000_000)
+        with pytest.raises(InvariantError, match="BSC_PARLIA_ADVANCE_DETECTED"):
+            p._observe_block_for_watchdog_locked(101, 1_000_400)  # 400ms delta!
+    # Counter still incremented before raise (diagnostic accuracy).
+    counters = p.anomaly_counters()
+    assert counters["advance"] == 1
+
+
+def test_watchdog_ignores_non_consecutive_blocks():
+    """Block skips (e.g. after a cursor clamp) should NOT count as slot misses."""
+    p = _make_poller()
+    with p._lock:
+        p._observe_block_for_watchdog_locked(100, 1_000_000)
+        # Skip 20 blocks (would compute as massive slot_miss if naive):
+        p._observe_block_for_watchdog_locked(120, 1_009_000)
+    counters = p.anomaly_counters()
+    # No anomaly recorded for the skip.
+    assert counters["slot_miss"] == 0
+    assert counters["advance"] == 0
+
+
+# --- Anchor monotonic update ---
+
+def test_anchor_update_monotonic_ignores_older_blocks():
+    """Older blocks (smaller block_number) must NOT overwrite the anchor."""
+    p = _make_poller()
+    block_newer = {"number": hex(101), "timestamp": hex(1_000_001),
+                   "mixHash": "0x" + "00" * 30 + "0064"}
+    block_older = {"number": hex(100), "timestamp": hex(1_000_000),
+                   "mixHash": "0x" + "00" * 30 + "0064"}
+    p._update_anchor_from_block(block_newer)
+    a1 = p.anchor_state()
+    p._update_anchor_from_block(block_older)
+    a2 = p.anchor_state()
+    assert a1 is not None and a2 is not None
+    assert a1.block_number == a2.block_number == 101
+
+
+def test_anchor_update_advances_on_newer_block():
+    """Newer block updates the anchor. Use a nominal 450ms delta so the
+    watchdog doesn't flag an advance event — the InvariantError raise
+    on delta < 450ms is tested separately."""
+    p = _make_poller()
+    block_a = {"number": hex(100), "timestamp": hex(1_000_000),
+               "mixHash": "0x" + "00" * 30 + "0064"}  # ms=100
+    p._update_anchor_from_block(block_a)
+    # block_b: same second, ms=550 → milli_ts delta = 450ms (nominal slot)
+    block_b = {"number": hex(101), "timestamp": hex(1_000_000),
+               "mixHash": "0x" + "00" * 30 + "0226"}  # 550ms
+    p._update_anchor_from_block(block_b)
+    a = p.anchor_state()
+    assert a is not None
+    assert a.block_number == 101
+    assert a.milli_ts == 1_000_000_000 + 550
+
+
+def test_anchor_update_silently_skips_malformed_block():
+    """Block-header dict without mixHash or with bad encoding → no update."""
+    p = _make_poller()
+    # First, set a valid anchor.
+    block_a = {"number": hex(100), "timestamp": hex(1_000_000),
+               "mixHash": "0x" + "00" * 30 + "0064"}
+    p._update_anchor_from_block(block_a)
+    a1 = p.anchor_state()
+    # Now feed garbage; anchor must NOT advance to block 101.
+    p._update_anchor_from_block({"number": hex(101)})  # missing fields
+    p._update_anchor_from_block({"number": hex(101), "timestamp": "bogus", "mixHash": "0x" + "00" * 32})
+    a2 = p.anchor_state()
+    assert a2.block_number == a1.block_number == 100
+
+
+# Note: Bundle 4 reviewer Y1 (staleness gate), Y2 (heartbeat hook), and
+# Y7 (advance WARN rate-limit) tests were removed per user follow-up
+# directive 2026-05-14:
+#   - Y1: dynamic deadline now computed unconditionally when Lorentz is
+#     active. The chain progresses at deterministic 450ms cadence, so
+#     anchor+k*450 is exact regardless of anchor age. Watchdog catches
+#     consensus changes via InvariantError on advance events.
+#   - Y2: removed; engine's _sleep_until_ts ticks heartbeat during all
+#     OTHER pre-lock waits, bracketing the 3.5s fine-phase window well
+#     inside the supervisor's threshold.
+#   - Y7: advance event now raises InvariantError immediately (see
+#     test_watchdog_advance_raises_invariant_error above) — no
+#     rate-limit needed because the bot halts on the first event.

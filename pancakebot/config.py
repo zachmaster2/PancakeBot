@@ -692,10 +692,21 @@ def load_app_config(path: str) -> AppConfig:
     # there. See timing_constants.py for the derivation formulas.
     from pancakebot import timing_constants as _tc
 
+    # Bundle 4 (2026-05-14): static fallback only. Used when the chain is
+    # pre-Lorentz OR ms-encoding detection fails. Live decision path on a
+    # post-Lorentz chain uses RpcPoller.compute_dynamic_submit_deadline_ms()
+    # for per-round prediction (typically 250-300ms tighter than this
+    # static value). Derivation breakdown:
+    #   BSC_QUANTUM_MS             (50)  — guard against 50ms quantum shift
+    #   BSC_BLOCK_TIME_MS          (450) — back off one full slot if needed
+    #   VALIDATOR_ASSEMBLY_WINDOW_MS (50) — validator's TX-list freeze window
+    #   BSC_BET_SUBMIT_ONE_WAY_MS  (150) — one-way RPC send to validator mempool
+    # = 700ms total (down from 750ms pre-Bundle-4).
     bet_submit_deadline_offset_ms = (
-        _tc.BSC_BET_SUBMIT_RTT_P95_MS
+        _tc.BSC_QUANTUM_MS
         + _tc.BSC_BLOCK_TIME_MS
-        + _tc.BET_SUBMIT_SAFETY_BUFFER_MS
+        + _tc.VALIDATOR_ASSEMBLY_WINDOW_MS
+        + _tc.BSC_BET_SUBMIT_ONE_WAY_MS
     )
     critical_path_wakeup_offset_ms = (
         bet_submit_deadline_offset_ms
