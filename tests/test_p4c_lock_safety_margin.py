@@ -66,21 +66,35 @@ def _write_cfg(tmp_path: Path, *, cutoff: int = 2, extra: str = "") -> Path:
 # ---------------------------------------------------------------------------
 
 def test_bet_submit_deadline_offset_derived_correctly(tmp_path):
+    """Bundle 4 (2026-05-14): derivation switched from
+    (BSC_BET_SUBMIT_RTT_P95_MS + BSC_BLOCK_TIME_MS + BET_SUBMIT_SAFETY_BUFFER_MS) = 750
+    to
+    (BSC_QUANTUM_MS + BSC_BLOCK_TIME_MS + VALIDATOR_ASSEMBLY_WINDOW_MS + BSC_BET_SUBMIT_ONE_WAY_MS) = 700.
+    The new constants reflect the BEP-520 ms-encoding awareness and the
+    correct one-way RPC framing (vs the round-trip overestimate). Used
+    only as static fallback; the live decision path uses
+    RpcPoller.compute_dynamic_submit_deadline_ms() per round.
+    """
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     expected = (
-        tc.BSC_BET_SUBMIT_RTT_P95_MS
+        tc.BSC_QUANTUM_MS
         + tc.BSC_BLOCK_TIME_MS
-        + tc.BET_SUBMIT_SAFETY_BUFFER_MS
+        + tc.VALIDATOR_ASSEMBLY_WINDOW_MS
+        + tc.BSC_BET_SUBMIT_ONE_WAY_MS
     )
     assert cfg.bet_submit_deadline_offset_ms == expected
-    assert cfg.bet_submit_deadline_offset_ms == 750  # locked snapshot
+    assert cfg.bet_submit_deadline_offset_ms == 700  # Bundle 4 locked snapshot
 
 
 def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
     """critical_path_wakeup_offset_ms is the SINGLE entry point for the
     bet-decision sequence. Inside the wake the engine sequences pool
     snapshot -> kline fetch -> signal compute -> bet submit; all the
-    operation-time constants roll up into the one wake offset."""
+    operation-time constants roll up into the one wake offset.
+
+    Bundle 4 (2026-05-14): 1095 -> 1045ms (50ms tighter), driven by the
+    bet_submit_deadline_offset_ms reduction from 750 -> 700ms.
+    """
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     expected = (
         cfg.bet_submit_deadline_offset_ms
@@ -89,7 +103,7 @@ def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
         + tc.POOL_READ_TIME_MS
     )
     assert cfg.critical_path_wakeup_offset_ms == expected
-    assert cfg.critical_path_wakeup_offset_ms == 1095  # locked snapshot
+    assert cfg.critical_path_wakeup_offset_ms == 1045  # Bundle 4 locked snapshot
 
 
 def test_bankroll_wakeup_offset_derived_correctly(tmp_path):
@@ -99,7 +113,7 @@ def test_bankroll_wakeup_offset_derived_correctly(tmp_path):
         + tc.BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS
     )
     assert cfg.bankroll_wakeup_offset_ms == expected
-    assert cfg.bankroll_wakeup_offset_ms == 6095  # locked snapshot
+    assert cfg.bankroll_wakeup_offset_ms == 6045  # Bundle 4 locked snapshot
 
 
 def test_ntp_sync_wakeup_offset_derived_correctly(tmp_path):
@@ -109,7 +123,7 @@ def test_ntp_sync_wakeup_offset_derived_correctly(tmp_path):
         + tc.NTP_WAKE_OFFSET_PRE_BANKROLL_MS
     )
     assert cfg.ntp_sync_wakeup_offset_ms == expected
-    assert cfg.ntp_sync_wakeup_offset_ms == 11095  # locked snapshot
+    assert cfg.ntp_sync_wakeup_offset_ms == 11045  # Bundle 4 locked snapshot
 
 
 def test_wake_chain_strictly_increasing(tmp_path):
@@ -146,11 +160,15 @@ def test_kline_fetch_wakeup_exceeds_cutoff_publish_budget_rejected(tmp_path):
 def test_canonical_cutoff_2_falls_back_to_p95_tier(tmp_path):
     """Strategy-canonical cutoff=2 lands in P95 tier (P99 budget too tight).
 
-    cutoff=2 (2000ms), kline_fetch fires at lock-1090ms (= critical_path
-    wake at lock-1095ms minus the 5ms pool snapshot), P95=700, P99=1300:
-      P99 budget = 2000 - 1300 = 700ms;  1090 > 700 -> P99 fails.
-      P95 budget = 2000 - 700  = 1300ms; 1090 <= 1300 -> P95 passes.
+    cutoff=2 (2000ms), kline_fetch fires at lock-(critical_path-5)ms
+    (= critical_path wake minus the 5ms pool snapshot), P95=700, P99=1300:
+      P99 budget = 2000 - 1300 = 700ms;  kline_fetch_offset > 700 -> P99 fails.
+      P95 budget = 2000 - 700  = 1300ms; kline_fetch_offset <= 1300 -> P95 passes.
     Expected tier: "P95".
+
+    Bundle 4 (2026-05-14): critical_path_wakeup_offset is now 1045 (was
+    1095); kline_fetch_offset is 1040 (was 1090). Both still in the same
+    [700, 1300] band, so the tier outcome is unchanged.
     """
     cfg = load_app_config(str(_write_cfg(tmp_path, cutoff=2)))
     assert cfg.kline_cutoff_seconds == 2
@@ -202,9 +220,11 @@ def test_pool_cutoff_too_small_for_rpc_completion_rejected(tmp_path):
     i.e., the final poll's actual completion time at empirical p99 RTT
     must arrive before critical_path with the safety cushion.
 
-    At pool_cutoff=2 (=2000ms): final_offset = 2000 - 500 - 600 - 200
-    = 700ms. final_offset - rtt_p99(10)=910 - safety=200 = -410ms, well
-    below critical_path = 1095ms -> InvariantError fires.
+    Bundle 4 (2026-05-14): BSC_BLOCK_TIME_MS=450 (was 500), so the math
+    shifts slightly but the invariant still fires for pool_cutoff=2.
+    At pool_cutoff=2 (=2000ms): final_offset = 2000 - 450 - 600 - 200
+    = 750ms. final_offset - rtt_p99(10)=910 - safety=200 = -360ms, well
+    below critical_path = 1045ms -> InvariantError fires.
     """
     extra = "pool_cutoff_seconds = 2"
     raised: Exception | None = None
@@ -354,28 +374,46 @@ def _guard_fires(*, now: float, lock_ts: float, deadline_ms: int) -> bool:
     return now >= lock_ts - deadline_seconds
 
 
-def test_guard_does_not_fire_at_wake_with_locked_constants():
+def test_guard_does_not_fire_at_wake_with_locked_constants(tmp_path):
     """Critical-path wake fires at lock - critical_path_wakeup_offset_ms.
     Guard fires at lock - bet_submit_deadline_offset_ms. Wake must be
     OUTSIDE the safety zone (critical_path_wakeup > bet_submit_deadline).
 
-    With locked constants: wake at lock-1095ms, guard at lock-750ms.
-    -1095 < -750 -> wake is BEFORE guard threshold -> wake doesn't fire guard.
+    Bundle 4 reviewer Y3: was hardcoded to 1095/750; now reads canonical
+    config values so the assertion tracks the derivation (currently
+    1045/700 post-Bundle 4).
     """
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
     lock_ts = 1_000_000.0
-    wake_at = lock_ts - 1095 / 1000.0
-    assert not _guard_fires(now=wake_at, lock_ts=lock_ts, deadline_ms=750)
+    wake_at = lock_ts - cfg.critical_path_wakeup_offset_ms / 1000.0
+    assert not _guard_fires(
+        now=wake_at, lock_ts=lock_ts,
+        deadline_ms=cfg.bet_submit_deadline_offset_ms,
+    )
 
 
-def test_guard_fires_at_p99_fetch_decision_ready():
+def test_guard_fires_at_p99_fetch_decision_ready(tmp_path):
     """At p99 fetch RTT, decision-ready is right at the safety margin
     boundary; guard fires (skips the round).
+
+    Bundle 4 reviewer Y3: pulls canonical offsets via load_app_config
+    rather than hardcoding pre-Bundle-4 1090/750 magic numbers.
     """
+    cfg = load_app_config(str(_write_cfg(tmp_path)))
     lock_ts = 1_000_000.0
-    # Decision-ready at p99 fetch = wake + fetch_p99 + compute = lock - 1090 + 363 + 50
-    decision_ready = lock_ts - (1090 - 363 - 50) / 1000.0  # = lock - 0.677s
-    # Guard at lock - 0.75. -0.677 >= -0.75 -> TRUE -> SKIP
-    assert _guard_fires(now=decision_ready, lock_ts=lock_ts, deadline_ms=750)
+    # Decision-ready = critical_path wake (lock - critical_path_wakeup)
+    #                 + pool_read + kline_fetch_p99 + signal_compute.
+    # Equivalent: lock - (critical_path - kline_fetch - signal_compute - pool_read)
+    # but critical_path - pool_read - signal_compute = kline_fetch_offset, so
+    # decision_ready = lock - kline_fetch_offset + kline_fetch_p99
+    kline_fetch_offset_ms = cfg.critical_path_wakeup_offset_ms - tc.POOL_READ_TIME_MS
+    decision_ready = lock_ts - (kline_fetch_offset_ms - 363 - tc.SIGNAL_COMPUTE_TIME_MS) / 1000.0
+    # At canonical Bundle 4 timing: decision_ready = lock - 0.627s; guard at
+    # lock - 0.700s. -0.627 >= -0.700 -> TRUE -> SKIP.
+    assert _guard_fires(
+        now=decision_ready, lock_ts=lock_ts,
+        deadline_ms=cfg.bet_submit_deadline_offset_ms,
+    )
 
 
 def test_guard_negative_offset_always_fires():

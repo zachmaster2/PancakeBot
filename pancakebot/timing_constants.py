@@ -17,9 +17,14 @@ value here must be updated co-locked with a new measurement date.
 
 Derivation chain (computed at config-load time in ``pancakebot/config.py``):
 
-    bet_submit_deadline_offset_ms  = (BSC_BET_SUBMIT_RTT_P95_MS
-                                      + BSC_BLOCK_TIME_MS
-                                      + BET_SUBMIT_SAFETY_BUFFER_MS)
+    bet_submit_deadline_offset_ms  = (BSC_QUANTUM_MS              # 50ms — quantum-shift buffer
+                                      + BSC_BLOCK_TIME_MS         # 450ms — one full slot back-off
+                                      + VALIDATOR_ASSEMBLY_WINDOW_MS  # 50ms — validator TX-list freeze
+                                      + BSC_BET_SUBMIT_ONE_WAY_MS)  # 150ms — one-way RPC submit
+    # = 700ms STATIC FALLBACK (Bundle 4 2026-05-14). Used when Lorentz ms-encoding
+    # is unavailable (pre-Lorentz chain or detection failed). Live decision path
+    # under Lorentz uses ``RpcPoller.compute_dynamic_submit_deadline_ms()`` for
+    # per-round prediction that's typically 250-300ms tighter than this fallback.
     critical_path_wakeup_offset_ms = (bet_submit_deadline_offset_ms
                                       + OKX_KLINE_FETCH_RTT_P95_MS
                                       + SIGNAL_COMPUTE_TIME_MS
@@ -147,28 +152,80 @@ SIGNAL_COMPUTE_TIME_MS: int = 50
 
 # --- BSC chain timing ------------------------------------------------------
 
-# Average BSC block production interval. Used for worst-case TX-inclusion
-# math: a TX broadcast at time T lands in the next block sometime within
-# [T, T + BSC_BLOCK_TIME_MS].
+# Exact post-Lorentz BSC block production interval. Verified 2026-05-13
+# (Bundle 4 reconnaissance): 4951/4951 consecutive-block transitions in a
+# 5000-block sample had delta=450ms exactly (machine-precision regularity).
+# 47/4999 transitions showed delta=500ms (50ms quantum-shift, see
+# BSC_QUANTUM_MS); 1/4999 was a 2000ms multi-slot miss. Zero transitions
+# < 450ms observed — i.e., misses can only DELAY the chain, never advance
+# it. This load-bearing property lets Bundle 4 ship with no safety margin
+# on the predict-by-block arithmetic.
 #
-# Source: research/p4c_bsc_block_probe.py n=200 consecutive blocks,
-#         2026-05-03. Mean inter-block delta = 0.452s. Conservative
-#         rounding to 500ms.
-# Last measured: 2026-05-03
-BSC_BLOCK_TIME_MS: int = 500
+# Source: ad-hoc Bundle 4 reconnaissance via eth_getBlockByNumber batches
+#         over blocks 98133347..98138346 (~37.5 min of chain), 2026-05-13.
+#         Mean=450.78ms, median=450, min=450, max=2000.
+# Prior value: 500ms (conservative rounding before Lorentz ms-encoding was
+#         empirically verified). Replaced 2026-05-14 (Bundle 4).
+# Last measured: 2026-05-13
+BSC_BLOCK_TIME_MS: int = 450
 
-# BSC RPC bet-TX submit RTT (eth_sendRawTransaction). EMPIRICALLY MEASURED
-# AS A LOWER BOUND via eth_blockNumber proxy (p99=57ms in
-# research/p4c_bsc_rpc_probe.py n=200). Production sendRawTransaction
-# involves mempool insertion and may have higher RTT than a cached
-# read. Use 200ms as a conservative interim estimate; revisit when a
-# dedicated sendRawTransaction probe is feasible.
+# BEP-520 millisecond-encoding quantum. Post-Lorentz BSC encodes block
+# milliseconds in mixHash[-2:] (uint16 big-endian) at 50ms granularity.
+# All observed ms values in the Bundle 4 sample fell on the {0, 50, 100,
+# ..., 950} grid with uniform distribution. Validator clocks deemed
+# accurate to 50ms; quantum-shift events (delta=500ms = block_time + 1
+# quantum) are 0.94% per block.
 #
-# Source: research/p4c_bsc_rpc_probe.py n=200, 2026-05-03 (lower bound).
-#         Production estimate: 200ms (no direct measurement; would
-#         require gas-spending probe to be precise).
+# Used by Bundle 4 dynamic deadline math: a predicted block boundary
+# within one quantum of lock_ms must back off one full block to absorb
+# the possibility of a quantum-shift pushing the predecessor across.
+#
+# Source: BEP-520 spec + empirical Bundle 4 reconnaissance 2026-05-13.
+# Last measured: 2026-05-13
+BSC_QUANTUM_MS: int = 50
+
+# Validator TX-list freeze window: time before block publication when
+# the in-turn validator stops accepting new TXs into the candidate
+# block. A bet TX that arrives at the validator's mempool LESS than
+# this window before the validator publishes will miss inclusion in
+# that block (and slip to the next slot, which is the lock block —
+# definite revert).
+#
+# Source: BSC Parlia consensus literature + community probes. Conservative
+#         50ms estimate; precise value is implementation-defined per
+#         validator and not directly measurable from RPC.
+# Last measured: 2026-05-13 (engineering judgment; not empirically probed)
+VALIDATOR_ASSEMBLY_WINDOW_MS: int = 50
+
+# One-way TCP submit time from this host to a BSC validator/RPC mempool.
+# Used in the dynamic deadline math: the bet TX must REACH the validator
+# mempool by ``predecessor_block.milli_ts - VALIDATOR_ASSEMBLY_WINDOW_MS``,
+# so the LOCAL deadline for ``eth_sendRawTransaction(...)`` is that minus
+# this one-way budget.
+#
+# TODO: real ``sendRawTransaction`` probe queued. Until then, 150ms is a
+# conservative interim estimate (about 75% of the prior round-trip
+# BSC_BET_SUBMIT_RTT_P95_MS=200ms estimate; the ack return path is the
+# other ~50ms but doesn't affect inclusion timing).
+#
+# Source: BSC_BET_SUBMIT_RTT_P95_MS (200ms RTT proxy) × ~0.75 one-way
+#         share. Placeholder.
+# Last measured: NOT YET PROBED (TODO: dedicated sendRawTransaction probe)
+BSC_BET_SUBMIT_ONE_WAY_MS: int = 150
+
+# DEPRECATED (Bundle 4 2026-05-14): replaced by BSC_BET_SUBMIT_ONE_WAY_MS
+# in the bet_submit_deadline_offset_ms derivation. Kept here for back-
+# reference (cited from older incident reports + research scripts).
+# This constant was the *round-trip* RTT (per ``prediction_contract.py:502-508``
+# bracketing of the ``send_raw_transaction()`` call), which overstates
+# the time needed for TX inclusion: only the one-way send + validator
+# mempool accept matters for inclusion; the txh ack returns AFTER.
+#
+# Source: research/p4c_bsc_rpc_probe.py n=200, 2026-05-03 (round-trip lower
+#         bound via eth_blockNumber proxy; p99=57ms). Production estimate
+#         200ms conservative.
 # Last measured: 2026-05-03 (proxy + estimate)
-BSC_BET_SUBMIT_RTT_P95_MS: int = 200
+BSC_BET_SUBMIT_RTT_P95_MS: int = 200  # DEPRECATED — see BSC_BET_SUBMIT_ONE_WAY_MS
 
 
 # --- RPC poll timing (Era 11: 2026-05-07 pivot) ---------------------------
@@ -435,14 +492,20 @@ NTP_WAKE_OFFSET_PRE_BANKROLL_MS: int = 5000
 # Last measured: 2026-05-03 (engineering judgment)
 POOL_READ_TIME_MS: int = 5
 
-# Headroom on the bet_submit_deadline_offset_ms derivation. Beyond
-# BSC_BET_SUBMIT_RTT_P95 + BSC_BLOCK_TIME, this absorbs second-order
-# variance in bet-TX submission (signing time, sign-to-send dispatch)
-# and any clock-jitter on the engine's timing-guard check.
+# DEPRECATED (Bundle 4 2026-05-14): no longer in the
+# bet_submit_deadline_offset_ms derivation. The pre-Bundle-4 derivation
+# used (BSC_BET_SUBMIT_RTT_P95_MS + BSC_BLOCK_TIME_MS + this safety
+# buffer) as a static slack against rounding slop. The new derivation
+# uses ms-precise per-block prediction, so this buffer is redundant
+# (any residual slop is bounded by BSC_QUANTUM_MS = 50ms, which the
+# new derivation accounts for explicitly).
+#
+# Kept here for back-reference and to avoid breaking imports in older
+# branches / scripts.
 #
 # Source: engineering judgment.
 # Last measured: 2026-05-03
-BET_SUBMIT_SAFETY_BUFFER_MS: int = 50
+BET_SUBMIT_SAFETY_BUFFER_MS: int = 50  # DEPRECATED — see derivation docstring
 
 
 

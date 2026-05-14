@@ -633,20 +633,41 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         # -- Critical-path wake --
         # Last pre-lock scheduled wake. Fires at lock_at -
-        # critical_path_wakeup_offset_ms (= ~1.095s before lock at
-        # canonical timing constants). Inside the wake the engine
+        # critical_path_wakeup_offset_ms (= ~1.045s before lock at
+        # canonical Bundle 4 timing). Inside the wake the engine
         # sequences: pool snapshot (in-memory, ~5ms) -> kline fetch +
         # signal compute (~340ms via gate.evaluate()) -> bet submit
-        # (~700ms BSC RTT + block budget). The bet-submit-deadline
-        # timing guard at lock_at - bet_submit_deadline_offset_ms
-        # gates the actual submission to abort late rounds.
+        # (Bundle 4 dynamic deadline, typically ~450ms before lock).
+        #
+        # Bundle 4 (2026-05-14): replaces the passive sleep with a
+        # serial 200ms-interval head-poll loop. Each poll updates the
+        # ms-precise chain anchor via mixHash decoding (BEP-520), so by
+        # the time critical-path fires the anchor is at most ~200ms
+        # stale (typically ~100ms). Fallback to passive sleep when no
+        # rpc_poller (backtest) or no anchor available.
         critical_path_wake_ts = (
             lock_ts_t - cfg.critical_path_wakeup_offset_ms / 1000.0
         )
-        _sleep_until_ts(
-            critical_path_wake_ts, reason="wait_for_critical_path",
-            epoch=current_epoch,
-        )
+        if cfg.rpc_poller is not None:
+            info("RUN", "LOOP", "SLEEP",
+                 msg=(f"Sleeping {int(critical_path_wake_ts - _utc_now())}s "
+                      f"(wait_for_critical_path, fine-phase head-poll active) "
+                      f"epoch={current_epoch}"))
+            # 200ms cadence (default) — half the 450ms block time, so each
+            # block is observed as "latest" for ≥ 2 polls. Engine's other
+            # _sleep_until_ts waits bracket this 3.5s window with frequent
+            # heartbeat ticks, so the fine-phase poller itself doesn't need
+            # a heartbeat hook.
+            fine_phase_n_polls = cfg.rpc_poller.fine_phase_head_poll(
+                deadline_s=critical_path_wake_ts,
+                now_fn=_utc_now,
+            )
+            del fine_phase_n_polls  # diagnostic only; could be logged if needed
+        else:
+            _sleep_until_ts(
+                critical_path_wake_ts, reason="wait_for_critical_path",
+                epoch=current_epoch,
+            )
 
         # Pool data from RPC poller's local store (Era 11; no RPC needed
         # at this point, the polls already fetched the data).
@@ -763,28 +784,54 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
-        # Step 11: Execution timing guard. Abort if wall-clock is within
-        # ``cfg.bet_submit_deadline_offset_ms`` of lock_at -- TX submitted
-        # that close to lock is unlikely to mine in time and would revert
-        # (gas burn). lock_ts_t is chain-anchored true UTC; compare via
-        # _utc_now() (skew-corrected). With local-only comparison + skew,
-        # the guard fires far too early in true UTC and the bot
-        # self-aborts almost every round.
+        # Step 11: Execution timing guard. Abort if wall-clock is past
+        # the bet-submit deadline -- TX submitted later than this is
+        # unlikely to mine in time and would revert (gas burn).
         #
+        # Bundle 4 (2026-05-14): two-track deadline.
+        #
+        #   1. Dynamic deadline (preferred, Lorentz-active chains): the
+        #      RpcPoller's chain anchor + BEP-520 ms-precise extrapolation
+        #      predicts the milli_ts of the block immediately before lock.
+        #      The deadline is that predicted block's start minus the
+        #      validator's TX-list freeze window (50ms) minus the one-way
+        #      RPC send time (150ms). Per-round dynamic, typically ~450ms
+        #      before lock (250-300ms tighter than the static fallback).
+        #
+        #   2. Static fallback (pre-Lorentz chains or detection failed):
+        #      ``cfg.bet_submit_deadline_offset_ms`` (=700ms post-Bundle-4
+        #      derivation, was 750ms). Used when the dynamic path returns
+        #      None.
+        #
+        # lock_ts_t is chain-anchored true UTC; comparisons use
+        # ``_utc_now() * 1000`` (skew-corrected ms) so a skewed local
+        # clock doesn't make the bot fire early.
+        lock_ms = int(lock_ts_t * 1000)
+        dynamic_deadline_ms: int | None = None
+        if cfg.rpc_poller is not None:
+            dynamic_deadline_ms = cfg.rpc_poller.compute_dynamic_submit_deadline_ms(lock_ms)
+        if dynamic_deadline_ms is not None:
+            deadline_ms = dynamic_deadline_ms
+            deadline_source = "dynamic"
+        else:
+            deadline_ms = lock_ms - cfg.bet_submit_deadline_offset_ms
+            deadline_source = "static"
         # Pre-bet R1 telemetry: log submit-offset (ms remaining before lock)
         # at this point so we can measure how much budget the post-fetch
         # path leaves for TX submission. Negative values would indicate
         # the fetch finished AFTER lock_at (definite revert in live).
-        bet_submit_offset_ms = (lock_ts_t - _utc_now()) * 1000.0
-        safety_margin_seconds = cfg.bet_submit_deadline_offset_ms / 1000.0
-        if _utc_now() >= lock_ts_t - safety_margin_seconds:
+        now_utc_ms = _utc_now() * 1000.0
+        bet_submit_offset_ms = lock_ms - now_utc_ms
+        margin_ms = lock_ms - deadline_ms
+        if now_utc_ms >= deadline_ms:
             info(
                 "BET",
                 "TIMING",
                 "ABORT",
                 epoch=current_epoch,
                 submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
-                margin_ms=cfg.bet_submit_deadline_offset_ms,
+                margin_ms=margin_ms,
+                source=deadline_source,
             )
             _record_dry_cycle_audit(
                 cfg,
@@ -822,13 +869,16 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # THIS many ms before lock"). In live mode this measures the actual
         # TX-broadcast timing; the receipt status logged later (Step 13)
         # tells us if the TX landed in time.
+        # Bundle 4: ``source`` indicates which deadline mode (dynamic from
+        # Lorentz anchor vs static fallback) drove the guard decision.
         info(
             "BET",
             "TIMING",
             "OFFSET",
             epoch=current_epoch,
             submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
-            margin_ms=cfg.bet_submit_deadline_offset_ms,
+            margin_ms=margin_ms,
+            source=deadline_source,
         )
 
         # Step 12: Submit bet.

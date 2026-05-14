@@ -499,6 +499,25 @@ class Web3PredictionContract:
         wait_receipt: bool,
         receipt_timeout_seconds: int,
     ) -> TxSubmitResult:
+        # Bundle 4 reviewer note (2026-05-14): the bracketing of
+        # ``send_raw_transaction(...)`` between ``t_tx_signed`` (line below)
+        # and ``t_tx_hash`` (below the try block) measures the FULL
+        # round-trip — request serialize → wire-out → RPC ingest +
+        # mempool insert → wire-back with txh → deserialize. Web3.py
+        # implements ``send_raw_transaction`` as a synchronous JSON-RPC
+        # POST that blocks until the server returns the transaction
+        # hash. There is no one-way path here.
+        #
+        # The TX is committed to the validator's mempool at the moment
+        # the RPC accepts it (estimated; un-probed — Bundle 4 reviewer
+        # Y8). Bundle 4 budgets ``BSC_BET_SUBMIT_ONE_WAY_MS=150`` as a
+        # conservative one-way estimate; a real ``sendRawTransaction``
+        # probe (TODO) could tighten this. The legacy
+        # ``BSC_BET_SUBMIT_RTT_P95_MS=200`` remains a round-trip estimate
+        # for back-reference but is deprecated in the deadline derivation
+        # — that constant overstates the inclusion-relevant cost by
+        # including the ack-return path, which is meaningful only for
+        # observability of the synchronous Web3.py call itself.
         signed = self._require_account().sign_transaction(tx)
         t_tx_signed = float(time.perf_counter() * 1000.0)
         try:
