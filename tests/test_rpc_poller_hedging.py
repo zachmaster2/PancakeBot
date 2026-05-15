@@ -66,19 +66,30 @@ def test_empty_endpoint_pool_raises():
         RpcPoller(interval_seconds=300, endpoint_pool=[])
 
 
-def test_default_hedged_endpoints_constant_is_six():
-    """Spec contract: 4 BSC-dataseed-family endpoints + publicnode +
-    bloXroute, in stable order. publicnode + bloXroute are kept in
-    the pool for distinct-provider failover when the bsc-dataseed*
-    family experiences correlated outages.
+def test_default_hedged_endpoints_constant_is_three():
+    """Spec contract: 3 endpoints, one per fault-domain family
+    (Bundle 6 trim, 2026-05-15):
+      - AWS EC2 us-east (AS14618):  bsc-dataseed1.binance.org
+      - AWS Global Accelerator (AS16509): bsc-dataseed1.defibit.io
+      - Cloudflare (AS13335): bsc-rpc.publicnode.com
+
+    Dropped from the prior 6-endpoint pool:
+      - bsc-dataseed3.binance.org  (identical IP pool to dataseed1)
+      - bsc-dataseed1.ninicoin.io  (same AWS GA family as defibit,
+                                    worst anchor p50 in that family)
+      - bsc.rpc.blxrbdn.com        (same AWS GA family, middling)
+
+    Per-endpoint probe stats (n=15, 2026-05-15) showed
+    bsc-dataseed1.binance.org is the only endpoint with batch p95
+    under the bot's 5s timeout — it's the load-bearing endpoint
+    in production. Family diversity preserved: AWS EC2 + AWS GA +
+    Cloudflare → cold-start burst load (~20 batches × N endpoints)
+    drops from ~120 to ~60 concurrent in-flight requests.
     """
-    assert len(DEFAULT_HEDGED_ENDPOINTS) == 6
-    assert DEFAULT_HEDGED_ENDPOINTS[0].endswith("defibit.io")
-    assert DEFAULT_HEDGED_ENDPOINTS[1].endswith("ninicoin.io")
-    assert "bsc-dataseed1.binance.org" in DEFAULT_HEDGED_ENDPOINTS[2]
-    assert "bsc-dataseed3.binance.org" in DEFAULT_HEDGED_ENDPOINTS[3]
-    assert "publicnode.com" in DEFAULT_HEDGED_ENDPOINTS[4]
-    assert "blxrbdn.com" in DEFAULT_HEDGED_ENDPOINTS[5]
+    assert len(DEFAULT_HEDGED_ENDPOINTS) == 3
+    assert "bsc-dataseed1.binance.org" in DEFAULT_HEDGED_ENDPOINTS[0]
+    assert "bsc-dataseed1.defibit.io" in DEFAULT_HEDGED_ENDPOINTS[1]
+    assert "bsc-rpc.publicnode.com" in DEFAULT_HEDGED_ENDPOINTS[2]
 
 
 # ---------------------------------------------------------------------------

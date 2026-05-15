@@ -80,27 +80,37 @@ _BET_BEAR_TOPIC = "0x0d8c1fe3e67ab767116a81f122b83c2557a8c2564019cb7c4f83de1aeb1
 # chronically (sustained timeouts, wrong-chain responses, etc.),
 # remove it from this list manually.
 #
-# Last measured 2026-05-08/10 (n=200 batch=20 from Track H respike +
-# 2026-05-10 pool-extension audit):
+# 3-endpoint pool (Bundle 6 trim, 2026-05-15): one endpoint per
+# fault domain. Per-endpoint probe (n=15 isolated calls, 6s spacing)
+# from research/probe_per_endpoint_isolated_2026_05_15.py:
 #
-#   bsc-dataseed1.defibit.io   p50=770ms  p99=2226ms  (BSC dataseed family)
-#   bsc-dataseed1.ninicoin.io  p50=802ms  p99=2179ms  (BSC dataseed family)
-#   bsc-dataseed1.binance.org  p50=828ms  p99=1797ms  (BSC dataseed family)
-#   bsc-dataseed3.binance.org  p50=898ms  p99=1290ms  (BSC dataseed family)
-#   bsc-rpc.publicnode.com     p50=938ms  p99=1842ms  (Allnodes, distinct)
-#   bsc.rpc.blxrbdn.com        p50~250ms  batch~430ms (bloXroute, distinct)
+#                                anchor p50 / p95     batch p50 / p95
+#   bsc-dataseed1.binance.org    30ms / 837ms         1914ms / 2717ms   (AS14618 AWS EC2)
+#   bsc-dataseed1.defibit.io     128ms / 1194ms       1496ms / 14760ms  (AS16509 AWS GA)
+#   bsc-rpc.publicnode.com       103ms / 822ms        2357ms / 10816ms  (AS13335 Cloudflare)
 #
-# Two distinct-provider endpoints (publicnode, bloXroute) hedge
-# against correlated outages on the bsc-dataseed-family infrastructure
-# (observed 2026-05-09/10: hours-long windows where ALL bsc-dataseed*
-# timed out simultaneously).
+# Dropped (Bundle 6 trim):
+#   - bsc-dataseed3.binance.org  identical IP pool to dataseed1 (same
+#                                AWS EC2 backend; pure redundancy)
+#   - bsc-dataseed1.ninicoin.io  same AS16509 family as defibit; worst
+#                                anchor p50 (525ms) in that family
+#   - bsc.rpc.blxrbdn.com        same AS16509 family as defibit;
+#                                middling on both metrics
+#
+# Rationale: 5 of the prior 6 endpoints were AWS-hosted (3 in AS16509,
+# 2 in AS14618). Cold-start burst (~20 batches × 6 endpoints = 120
+# concurrent in-flight connections) was triggering all-pool
+# HedgedAllFailed timeouts at the ~400-block-backlog scale (verified
+# at PID 2096 / PID 10656 spawns: 7 and 2 BATCH_FAILs respectively).
+# Trimming to one endpoint per ASN-family reduces concurrent in-flight
+# to ~60 and gives each AWS family 1× pool load instead of 2-3×.
+#
+# Fault diversity is preserved (or improved): AWS EC2 + AWS GA +
+# Cloudflare. If AWS us-east goes down entirely, publicnode remains.
 DEFAULT_HEDGED_ENDPOINTS: list[str] = [
-    "https://bsc-dataseed1.defibit.io",
-    "https://bsc-dataseed1.ninicoin.io",
     "https://bsc-dataseed1.binance.org",
-    "https://bsc-dataseed3.binance.org",
+    "https://bsc-dataseed1.defibit.io",
     "https://bsc-rpc.publicnode.com",
-    "https://bsc.rpc.blxrbdn.com",
 ]
 
 _USER_AGENT = "pancakebot-rpc-poller/1.0"

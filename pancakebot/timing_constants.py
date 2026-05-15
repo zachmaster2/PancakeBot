@@ -305,10 +305,25 @@ BSC_BET_SUBMIT_RTT_P95_MS: int = 200  # DEPRECATED — see BSC_BET_SUBMIT_ONE_WA
 # inter-call spacing, BOT STOPPED. 30/30 successes. The bot-stopped
 # measurement matters because the 2026-05-11 transport switch
 # (urllib3 PoolManager + fire-to-all) means production now hedges
-# across 6 endpoints; running the probe alongside the bot inflated
-# RTTs ~3.5x due to same-IP / Windows-TCP / urllib3-pool contention
-# between the two processes. The 1319ms is the bot's actual operating
-# value (no concurrent caller in production).
+# across the configured endpoints; running the probe alongside the
+# bot inflated RTTs ~3.5x due to same-IP / Windows-TCP / urllib3-pool
+# contention between the two processes. The 1319ms is the bot's
+# actual operating value (no concurrent caller in production).
+#
+# Bundle 6 caveat (2026-05-15): the 1319ms value was measured under
+# the prior 6-endpoint hedged pool (min-of-6 fastest-response wins).
+# Bundle 6 trimmed the pool to 3 endpoints (one per fault-domain
+# family — see DEFAULT_HEDGED_ENDPOINTS in chain/rpc_poller.py).
+# Under min-of-3, the operating p99 could rise modestly vs min-of-6,
+# but the per-endpoint probe (research/probe_per_endpoint_isolated_2026_05_15.py)
+# showed bsc-dataseed1.binance.org dominates: its single-endpoint
+# batch p95 is 2717ms, well below the 5s timeout, and it wins
+# production hedged races by a wide margin (23/40 in I3). The
+# downstream consumer (``_estimated_catchup_ms`` feasibility check)
+# absorbs modest under-measurement via the per-batch deadline check
+# and per-batch try/except in ``RpcPoller._poll_now``. If post-trim
+# cold-start observations show the estimate is too tight, re-measure
+# under the 3-endpoint pool.
 #
 # CAVEAT: n=30 is statistically thin for a P99 estimate (~2nd-highest
 # sample out of 30). The true population P99 could realistically sit
