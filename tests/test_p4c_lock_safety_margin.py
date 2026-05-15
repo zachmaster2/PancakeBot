@@ -116,21 +116,12 @@ def test_bankroll_wakeup_offset_derived_correctly(tmp_path):
     assert cfg.bankroll_wakeup_offset_ms == 6045  # Bundle 4 locked snapshot
 
 
-def test_ntp_sync_wakeup_offset_derived_correctly(tmp_path):
-    cfg = load_app_config(str(_write_cfg(tmp_path)))
-    expected = (
-        cfg.bankroll_wakeup_offset_ms
-        + tc.NTP_WAKE_OFFSET_PRE_BANKROLL_MS
-    )
-    assert cfg.ntp_sync_wakeup_offset_ms == expected
-    assert cfg.ntp_sync_wakeup_offset_ms == 11045  # Bundle 4 locked snapshot
-
-
 def test_wake_chain_strictly_increasing(tmp_path):
-    """Wake offsets must be ordered:
-    ntp_sync > bankroll > critical_path > bet_submit_deadline."""
+    """Bundle 5 v2 (2026-05-14): wake offsets must be ordered
+    bankroll > critical_path > bet_submit_deadline. The prior
+    ``ntp_sync_wakeup_offset_ms`` is retired alongside the
+    application-level NTP layer."""
     cfg = load_app_config(str(_write_cfg(tmp_path)))
-    assert cfg.ntp_sync_wakeup_offset_ms > cfg.bankroll_wakeup_offset_ms
     assert cfg.bankroll_wakeup_offset_ms > cfg.critical_path_wakeup_offset_ms
     assert cfg.critical_path_wakeup_offset_ms > cfg.bet_submit_deadline_offset_ms
 

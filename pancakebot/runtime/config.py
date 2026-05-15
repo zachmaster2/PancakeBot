@@ -33,13 +33,13 @@ class RuntimeConfig:
     # at config load; not user-tunable). All in milliseconds before lock_at.
     #
     # Chronological order (lock - X ms; bigger X = earlier in the round):
-    #   ntp_sync       (lock - 11.095s)
-    #   ramp_poll_1    (lock -  7.500s)   <-- Era 11 RPC poll (per-leg refactor 2026-05-12)
-    #   bankroll       (lock -  6.095s)
-    #   ramp_poll_2    (lock -  5.800s)   <-- Era 11 RPC poll (per-leg refactor 2026-05-12)
-    #   final_rpc_poll (lock -  4.700s)   <-- Era 11 RPC poll (per-leg refactor 2026-05-12)
-    #   critical_path  (lock -  1.095s)
-    #   bet_submit     (lock -  0.750s)   <-- timing-guard deadline
+    #   ramp_poll_1    (lock -  7.550s)   <-- Era 11 RPC poll (per-leg refactor 2026-05-12)
+    #   bankroll       (lock -  6.045s)
+    #   ramp_poll_2    (lock -  5.850s)   <-- Era 11 RPC poll (per-leg refactor 2026-05-12)
+    #   final_rpc_poll (lock -  4.750s)   <-- Era 11 RPC poll (per-leg refactor 2026-05-12)
+    #   anchor_poll    (lock -  1.300s)   <-- Bundle 5 v2 single anchor poll (200ms timeout)
+    #   critical_path  (lock -  1.045s)
+    #   bet_submit     (lock -  0.700s)   <-- timing-guard deadline (static fallback)
     #
     # The per-leg ramp intervals (RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS=1700,
     # RPC_RAMP_2_TO_FINAL_INTERVAL_MS=1100) are sized for each ramp's
@@ -49,20 +49,22 @@ class RuntimeConfig:
     # that was sized for a stale 30s-periodic-era batch=15 assumption.
     #
     # At canonical pool_cutoff=6 specifically: chronology is monotonic —
-    # ramp_2 (5.800s) naturally falls AFTER bankroll (6.095s). At larger
+    # ramp_2 (5.850s) naturally falls AFTER bankroll (6.045s). At larger
     # pool_cutoff values (≥7), final shifts earlier and ramp_2 may push
     # above bankroll's offset again; engine.py fires wakes in fixed code
     # order (ramp_1 → bankroll → ramp_2 → final) and _sleep_until_ts
     # returns immediately for past-due wakes, so runtime stays correct
     # but the wake order in wall-clock differs from the offset order.
     #
-    # ntp_sync_wake forces a fresh NTP query.
+    # Bundle 5 v2 (2026-05-14): the ``ntp_sync_wake`` (formerly at
+    # lock - 11.095s) is retired. The bot trusts the OS clock directly
+    # (W32Time tightening per README); no application-level NTP layer.
+    #
     # bankroll_wake refreshes wallet balance (live: BSC RPC; dry: in-memory).
     # ramp + final RPC polls catch up bet events from BSC via batched
     #   eth_getBlockReceipts so the critical_path snapshot is fresh.
     # critical_path_wake reads the local pool aggregate, runs the gate,
     #   and submits the bet.
-    ntp_sync_wakeup_offset_ms: int
     ramp_poll_1_wakeup_offset_ms: int
     ramp_poll_2_wakeup_offset_ms: int
     final_rpc_poll_wakeup_offset_ms: int

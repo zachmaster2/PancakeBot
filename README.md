@@ -77,9 +77,42 @@ var/
 
 1. Create `.env` with required env vars (see mode table above)
 2. Review `config.toml`
-3. Run `python run.py --sync` to fetch data
-4. Run `python run.py --backtest` to verify
-5. Run `python run.py --dry` for paper trading
+3. **Tighten Windows Time Service** — see [W32Time prerequisite](#w32time-prerequisite-dry--live-modes) below
+4. Run `python run.py --sync` to fetch data
+5. Run `python run.py --backtest` to verify
+6. Run `python run.py --dry` for paper trading
+
+### W32Time prerequisite (dry + live modes)
+
+The critical-path scheduling relies on the local OS clock being within
+a few milliseconds of true NTP. Windows Time Service (W32Time) defaults
+to a max poll interval of 1024s (~17 min), which lets the local clock
+drift up to ~270ms (P95) between syncs — too sloppy for the bot's
+sub-second timing budgets.
+
+Tighten the service to a 32s max poll interval. Run in an **elevated
+PowerShell** (Run as Administrator):
+
+```
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config" /v MaxPollInterval /t REG_DWORD /d 5 /f
+w32tm /config /update
+net stop w32time
+net start w32time
+```
+
+Verify with `w32tm /query /status` — the output should show
+`Poll Interval: 5 (32s)` (the 5 is `log2(32)`).
+
+The change persists across reboots. Backtest and sync modes do not
+require this (they are not timing-critical).
+
+**The bot has no application-level NTP layer.** The prior `NtpSync`
+(per-round NTP query that measured `local − ntp` and applied the
+offset inside `_utc_now()`) was retired in Bundle 5 v2 (2026-05-14)
+alongside the W32Time tightening. The OS clock — kept tight by
+W32Time — is now the sole source of truth. If you skip the W32Time
+step, the bot's sub-second bet-timing margins may be too tight; there
+is no in-app fallback.
 
 ## Architecture
 
@@ -98,8 +131,7 @@ from constants in `pancakebot/timing_constants.py`.
 
 | Wake | Anchor + offset | Activities |
 |---|---|---|
-| `wait_for_ntp_sync` | `lock_at - 11095ms` | Force a fresh NTP query; apply (local − ntp) offset to `_utc_now()` for the rest of the round so critical-path scheduling uses freshly-corrected clock |
-| `wait_for_bankroll` | `lock_at - 6095ms` | Refresh wallet balance: live mode = BSC RPC; dry mode = in-memory simulated bankroll. Feeds the risk gates and `decide_open_round` with fresh-truth |
+| `wait_for_bankroll` | `lock_at - 6045ms` | Refresh wallet balance: live mode = BSC RPC; dry mode = in-memory simulated bankroll. Feeds the risk gates and `decide_open_round` with fresh-truth |
 | `wait_for_critical_path` | `lock_at - 1095ms` | Single critical-path entry. Sequentially: pool snapshot from WSS (`pool_cutoff_seconds = 6` data horizon) → 3 parallel OKX `/history-candles` GETs (BTC/ETH/SOL) → signal compute → bet submit |
 | Pre-bet timing guard | `lock_at - 750ms` | Abort if decision-ready past the safety margin (TX would mine after lock) |
 | `wait_for_claim` | `close_at(prev_locked) + buffer_seconds + 5s` (≈ 35s post-close) | Sleep for previous round's settlement; claim winnings (live; receipt-waited with `claim_tx_receipt_timeout_seconds ≈ 35s`, revert/timeout fires Discord `CLAIM FAILED` alert) |

@@ -59,7 +59,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 import urllib3
 
@@ -273,31 +273,6 @@ def compute_submit_deadline_ms(
     return bet_inclusion_deadline - one_way_ms
 
 
-def detect_lorentz_active(block_a: dict, block_b: dict) -> bool:
-    """Heuristic Lorentz-active check against two consecutive blocks.
-
-    Pre-Lorentz blocks have mixHash all-zero (or the proof-of-work
-    legacy nonce, but BSC has been PoS throughout this code's history).
-    If BOTH sample blocks decode to ms == 0, we conservatively assume
-    pre-Lorentz and fall back to static timing.
-
-    A single ms == 0 block is plausible on a Lorentz chain (1 in 20 blocks
-    naturally lands on the 0 quantum); requiring two consecutive zeros
-    makes a false-negative (pre-Lorentz mistakenly labeled active)
-    impossible while keeping the false-positive (active chain mistakenly
-    labeled pre-Lorentz) probability at (1/20)^2 = 0.25% per detection.
-    Detection runs once at RpcPoller start, so a single bad sample
-    sticks for the session; consequence is the bot uses the conservative
-    700ms static fallback for the whole session — graceful degradation.
-    """
-    ms_a = compute_milli_ts(block_a)
-    ms_b = compute_milli_ts(block_b)
-    if ms_a is None or ms_b is None:
-        return False  # malformed encoding -> pre-Lorentz assumption
-    # ms_a / ms_b are full milli_ts values; extract the sub-second component.
-    return not ((ms_a % 1000) == 0 and (ms_b % 1000) == 0)
-
-
 class HedgedAllFailed(Exception):
     """Composite exception raised when every endpoint in a hedged
     fan-out fails. Carries the per-endpoint (endpoint, exception)
@@ -440,32 +415,6 @@ class RpcPoller:
         # Reset on epoch advance.
         self._catchup_infeasible_for_round: bool = False
 
-        # Bundle 4 (2026-05-14): BEP-520 ms-precise chain anchor for
-        # dynamic deadline math. Updated by every block-header parse
-        # (coarse-phase, piggybacked on existing batched fetches) AND
-        # by the fine-phase head poller (last ~2s before critical_path
-        # wake). Read by compute_dynamic_submit_deadline_ms() at submit
-        # time. Monotonic on block_number; older blocks ignored.
-        self._anchor: AnchorState | None = None
-
-        # Bundle 4: Lorentz ms-encoding active? Determined at first head
-        # fetch (see _detect_and_set_lorentz_active). When False, the
-        # dynamic deadline computation returns None and the engine falls
-        # back to the static bet_submit_deadline_offset_ms (700ms).
-        # Three-state: None (not yet checked), True (active), False
-        # (chain is pre-Lorentz, fall back).
-        self._lorentz_active: bool | None = None
-
-        # Bundle 4: watchdog counters for block-cadence anomalies.
-        # Incremented in-place (atomic int ops under GIL); flushed at
-        # round-end via stats / a one-line summary log.
-        self._anomaly_quantum_shift: int = 0      # delta = 500ms
-        self._anomaly_slot_miss: int = 0          # delta >= 900ms
-        self._anomaly_advance: int = 0            # delta < 450ms (would falsify the safety property — raises InvariantError)
-        self._anomaly_other: int = 0              # other unexpected deltas
-        self._last_observed_block_number: int = 0
-        self._last_observed_milli_ts: int = 0
-
         # True while a poll is actively fetching/processing blocks.
         # is_pool_ready returns False when this is set so the engine
         # cannot read a half-built pool aggregate. Set/cleared under
@@ -513,237 +462,69 @@ class RpcPoller:
             }
 
     # ------------------------------------------------------------------
-    # Bundle 4 (2026-05-14): BEP-520 ms-precise anchor + dynamic deadline
+    # Bundle 5 v2 (2026-05-14): single anchor poll on the per-round
+    # critical-path. Replaces the Bundle 4 continuous fine-phase poller
+    # + persistent anchor state + watchdog. The engine fires ONE
+    # ``fire_anchor_poll`` call per round; if it responds in the
+    # 200ms timeout window, the engine uses the fresh anchor to compute
+    # a dynamic critical-path wake and a dynamic bet-submit deadline.
+    # Otherwise the engine falls back to its static wake + static
+    # deadline. No persistent anchor state on RpcPoller — the anchor
+    # lives in engine-local scope for one round.
     # ------------------------------------------------------------------
 
-    def _update_anchor_from_block(self, block_dict: dict) -> None:
-        """Try to extract milli_ts from a block-header dict and update
-        the anchor if the block_number is newer than the current anchor.
-        Called from every block-header parse in ``_fetch_and_process_blocks``
-        (coarse-phase, no extra RPC) AND from ``fine_phase_head_poll``
-        (dedicated latest-block polls). Safe to call with any dict;
-        silently no-ops on malformed/missing fields.
+    def fire_anchor_poll(
+        self, *, timeout_s: float,
+    ) -> AnchorState | None:
+        """Single ``eth_getBlockByNumber('latest')`` call with a hard
+        timeout. Returns an ``AnchorState`` if the response arrived in
+        time AND decoded a valid BEP-520 ms-encoded mixHash; otherwise
+        ``None``.
 
-        Also dispatches the watchdog on every successful decode.
+        The bot's mainnet target is post-Lorentz, so ms-encoding is
+        expected. A None return signals either:
+          - RPC timeout / transport failure (network glitch, all hedged
+            endpoints stalled), OR
+          - The latest block's mixHash decoded to milli_ts that didn't
+            parse (malformed encoding — unexpected on a Lorentz chain
+            and would indicate an out-of-spec validator).
+
+        Either way, the engine treats None as "use the static fallback
+        for this round" — no per-session memory of the failure, no
+        retry. The next round fires a fresh anchor poll.
         """
-        bn_hex = block_dict.get("number")
+        # urllib3.PoolManager already imposes a per-request timeout via
+        # ``_rpc_call_single`` (uses ``RPC_HTTP_SINGLE_TIMEOUT_SECONDS``).
+        # We additionally enforce a tight ceiling via the hedged
+        # transport's own ``timeout_seconds``: the engine wants any
+        # response slower than ~200ms to count as "missed the window",
+        # not just "transport-level timeout".
+        try:
+            block = self._rpc_call_single_with_timeout(
+                "eth_getBlockByNumber", ["latest", False],
+                timeout_s=timeout_s,
+            )
+        except Exception as e:  # noqa: BLE001
+            info("RPC_POLL", "ANCHOR", "ERR",
+                 msg=f"fire_anchor_poll: {type(e).__name__}: {e}")
+            return None
+        if not isinstance(block, dict):
+            return None
+        bn_hex = block.get("number")
         if not isinstance(bn_hex, str):
-            return
+            return None
         try:
             bn = int(bn_hex, 16)
         except ValueError:
-            return
-        milli_ts = compute_milli_ts(block_dict)
-        if milli_ts is None:
-            return
-        with self._lock:
-            current_bn = self._anchor.block_number if self._anchor else -1
-            if bn <= current_bn:
-                return  # monotonic guard: ignore older / same blocks
-            self._anchor = AnchorState(
-                block_number=bn,
-                milli_ts=milli_ts,
-                observed_at_local_ms=int(time.time() * 1000),
-            )
-            # Watchdog: observe block-cadence anomaly if we have a prior obs
-            self._observe_block_for_watchdog_locked(bn, milli_ts)
-
-    def _observe_block_for_watchdog_locked(self, bn: int, milli_ts: int) -> None:
-        """Increment block-cadence anomaly counters. Caller MUST hold
-        ``self._lock``. Only meaningful for *consecutive* block_numbers;
-        skipped block ranges (e.g. epoch-boundary cursor clamp) are
-        ignored to avoid spurious slot_miss counts.
-        """
-        prev_bn = self._last_observed_block_number
-        prev_ms = self._last_observed_milli_ts
-        # Update last-observed state BEFORE any early return, so future
-        # observations chain correctly.
-        self._last_observed_block_number = bn
-        self._last_observed_milli_ts = milli_ts
-
-        if prev_bn <= 0 or bn != prev_bn + 1:
-            # First observation or non-consecutive block — no delta to compare.
-            return
-
-        delta = milli_ts - prev_ms
-        if delta == _tc.BSC_BLOCK_TIME_MS:
-            return  # nominal (~99% of blocks)
-        if delta == _tc.BSC_BLOCK_TIME_MS + _tc.BSC_QUANTUM_MS:
-            # 500ms — quantum-shift, NOT a miss. Log at info (rare,
-            # informational; no decision impact).
-            self._anomaly_quantum_shift += 1
-            return
-        if delta < _tc.BSC_BLOCK_TIME_MS:
-            # < 450ms — falsifies the "misses only delay, never advance"
-            # property that Bundle 4's no-margin dynamic deadline math
-            # depends on. If observed, BSC Parlia consensus has changed
-            # (BEP update? validator misbehavior?) and the bot's chain-time
-            # arithmetic is broken; continuing to bet on extrapolations
-            # the chain no longer honors would mean placing wrong bets.
-            # Fail-loud via InvariantError aligns with the bot's existing
-            # pattern for consensus-violation events: supervisor restarts
-            # + Discord alerts + operator investigation, instead of silent
-            # incorrect operation.
-            self._anomaly_advance += 1
-            raise InvariantError(
-                f"BSC_PARLIA_ADVANCE_DETECTED: block={bn} delta={delta}ms "
-                f"< BSC_BLOCK_TIME_MS={_tc.BSC_BLOCK_TIME_MS}ms — "
-                f"Parlia consensus may have changed; halt for investigation"
-            )
-        if delta >= 2 * _tc.BSC_BLOCK_TIME_MS:
-            # 900ms+ — at least 1 slot missed. Common in low-traffic
-            # periods or under network distress. Log at info (rare).
-            self._anomaly_slot_miss += 1
-            return
-        # Everything else (delta in (450, 500) or (500, 900) — should
-        # not occur with the 50ms-quantum encoding, but defensive).
-        self._anomaly_other += 1
-
-    def anchor_state(self) -> AnchorState | None:
-        """Snapshot of the current chain anchor. Returns None if no
-        block has been observed yet."""
-        with self._lock:
-            return self._anchor
-
-    def anomaly_counters(self) -> dict[str, int]:
-        """Snapshot of the watchdog counters. Cumulative since RpcPoller
-        construction; not reset between rounds."""
-        with self._lock:
-            return {
-                "quantum_shift": self._anomaly_quantum_shift,
-                "slot_miss": self._anomaly_slot_miss,
-                "advance": self._anomaly_advance,
-                "other": self._anomaly_other,
-            }
-
-    def compute_dynamic_submit_deadline_ms(self, lock_ms: int) -> int | None:
-        """Bundle 4 public API. Return the local-wallclock-ms deadline by
-        which ``contract.send_raw_transaction(...)`` must START so the bet
-        TX lands in the block immediately before lock.
-
-        Returns ``None`` only if:
-          - Lorentz ms-encoding hasn't been verified active yet
-            (``_lorentz_active`` is None or False), OR
-          - No anchor has been observed yet.
-
-        The dynamic extrapolation is computed UNCONDITIONALLY when Lorentz
-        is active and an anchor exists, regardless of anchor age:
-        ``anchor + k × BSC_BLOCK_TIME_MS`` is exact under the verified
-        "misses only delay, never advance" property. The watchdog
-        ``_observe_block_for_watchdog_locked`` raises ``InvariantError``
-        if that property is ever falsified by an observed advance event.
-
-        In any None case, the engine falls back to
-        ``cfg.bet_submit_deadline_offset_ms`` (700ms static).
-
-        On success: a Unix epoch ms value. Engine compares to
-        ``_utc_now() * 1000`` (skew-corrected) and aborts the bet if past.
-        """
-        with self._lock:
-            anchor = self._anchor
-            lorentz_active = self._lorentz_active
-        if not lorentz_active or anchor is None:
             return None
-        predecessor_ms = predict_predecessor_milli_ts(
-            anchor_milli_ts=anchor.milli_ts,
-            lock_ms=lock_ms,
+        milli_ts = compute_milli_ts(block)
+        if milli_ts is None:
+            return None
+        return AnchorState(
+            block_number=bn,
+            milli_ts=milli_ts,
+            observed_at_local_ms=int(time.time() * 1000),
         )
-        return compute_submit_deadline_ms(
-            predicted_predecessor_milli_ts=predecessor_ms,
-            lock_ms=lock_ms,
-        )
-
-    def fine_phase_head_poll(
-        self, *, deadline_s: float,
-        now_fn: Callable[[], float] = time.time,
-        interval_ms: int = 200,
-    ) -> int:
-        """Serial fine-phase polling of ``eth_getBlockByNumber('latest')``
-        until ``deadline_s`` (in whatever wallclock frame ``now_fn``
-        returns — caller should pass ``_utc_now`` for skew-corrected
-        comparison). Each successful response updates ``self._anchor``
-        via ``_update_anchor_from_block``.
-
-        Replaces the engine's ``_sleep_until_ts(critical_path_wake_ts)``
-        in the (final_rpc_poll, critical_path) gap. Loop interval is
-        wallclock-anchored (no drift): next_fire = next_fire + interval.
-
-        Returns the number of successful head fetches performed in the
-        window (for diagnostics).
-
-        Failures are logged at INFO and skipped — a transient RPC error
-        leaves the anchor at its last value. The dynamic deadline
-        extrapolation in ``compute_dynamic_submit_deadline_ms`` uses
-        exact ``BSC_BLOCK_TIME_MS`` arithmetic so anchor age does not
-        bias the prediction (under the load-bearing "misses only delay,
-        never advance" property which is enforced by the watchdog's
-        InvariantError on any observed advance event).
-
-        ``interval_ms`` default is 200ms — half the 450ms block time,
-        guaranteeing every block-window contains ≥ 2 polls (every block
-        will be observed as "latest" for ~450ms). At 500ms cadence ~11%
-        of intermediate blocks would be missed; 200ms is the right
-        guarantee tier.
-        """
-        next_fire_s = now_fn()
-        ok_count = 0
-        while True:
-            now_s = now_fn()
-            if now_s >= deadline_s:
-                break
-            if now_s < next_fire_s:
-                sleep_for = min(next_fire_s - now_s, deadline_s - now_s)
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
-                continue
-            try:
-                block = self._rpc_call_single(
-                    "eth_getBlockByNumber", ["latest", False],
-                )
-                if isinstance(block, dict):
-                    self._update_anchor_from_block(block)
-                    ok_count += 1
-            except Exception as e:  # noqa: BLE001
-                info("RPC_POLL", "FINE", "ERR",
-                     msg=f"head_fetch: {type(e).__name__}: {e}")
-            next_fire_s += interval_ms / 1000.0
-        return ok_count
-
-    def _detect_and_set_lorentz_active(self) -> None:
-        """One-time check at first successful head fetch: are 2 consecutive
-        recent blocks both encoding ms == 0? If so, treat the chain as
-        pre-Lorentz and lock in the static fallback for the session.
-        Idempotent — only runs while ``_lorentz_active`` is None.
-        """
-        with self._lock:
-            if self._lorentz_active is not None:
-                return
-        try:
-            head_block = self._rpc_call_single(
-                "eth_getBlockByNumber", ["latest", False],
-            )
-            if not isinstance(head_block, dict):
-                return
-            head_bn = int(head_block["number"], 16)
-            prev_block = self._rpc_call_single(
-                "eth_getBlockByNumber", [hex(head_bn - 1), False],
-            )
-            if not isinstance(prev_block, dict):
-                return
-        except Exception as e:  # noqa: BLE001
-            info("RPC_POLL", "LORTZ", "ERR",
-                 msg=f"detect_lorentz: {type(e).__name__}: {e}")
-            return
-        active = detect_lorentz_active(head_block, prev_block)
-        with self._lock:
-            self._lorentz_active = active
-        if active:
-            info("RPC_POLL", "LORTZ", "ACTIVE",
-                 msg=f"BEP-520 ms-encoding detected; dynamic deadline active")
-        else:
-            warn("RPC_POLL", "LORTZ", "FALLBACK",
-                 msg=("BEP-520 ms-encoding NOT detected (both recent blocks "
-                      "had ms==0); using static 700ms fallback for session"))
 
     def is_pool_ready(self, epoch: int | None = None) -> tuple[bool, str]:
         """Engine gate. Returns ``(True, "")`` when the bot can place a
@@ -892,11 +673,11 @@ class RpcPoller:
             # gates the engine away from acting on a half-built pool
             # aggregate during that window.
             self._initialize_cursor_from_head()
-            # Bundle 4 (2026-05-14): one-time check whether the chain has
-            # BEP-520 ms-encoding active. If yes, the dynamic deadline
-            # path activates; if no, the static 700ms fallback is used
-            # for the session. Adds 2 RPC calls at startup (negligible).
-            self._detect_and_set_lorentz_active()
+            # Bundle 5 v2 (2026-05-14): no session-level Lorentz check.
+            # The per-round ``fire_anchor_poll`` parses mixHash inline
+            # and returns None if decoding fails. A None return for a
+            # round means "use static fallback for this round" — no
+            # persistent state, no detection-failure mode.
         elif is_epoch_advance:
             # Round-aware cursor clamp + catch-up feasibility check.
             # Past rounds are archive-only — the bot only bets on the
@@ -1226,19 +1007,26 @@ class RpcPoller:
                     return
 
                 # delta_blocks: how many blocks since round_start.
-                # Bundle 4 (2026-05-14): BSC_BLOCK_TIME_MS is now 450 (was 500),
-                # matching the empirical post-Lorentz block interval exactly.
-                # Prior +20 safety margin compensated for the 500ms-vs-actual
-                # divisor bias (~10% under-estimate of blocks-elapsed); now
-                # that the divisor is exact, the bias is gone. Keep a small
-                # +5-block safety for general block-time variance (the chain
-                # might briefly miss slots and the round_start-to-now distance
-                # could end up off by 1-2 blocks). Over-fetched prev-round
-                # blocks are filtered by the epoch gate in _process_receipts.
+                # Bundle 5 v2 (2026-05-14): no forward safety margin. The
+                # post-Lorentz chain's empirical "misses only delay, never
+                # advance" property means actual blocks-elapsed is at most
+                # ``ceil((head_ts - round_start_ts) * 1000 / 450)`` — slot
+                # misses produce FEWER blocks than the nominal divisor
+                # predicts, never more. So ``round(...)`` is an upper bound
+                # (modulo ≤ 0.5 block of rounding noise); cursor at
+                # ``head - delta_blocks`` lands at or before
+                # round_start_block by construction. Any over-fetched
+                # pre-round blocks are filtered by the epoch gate in
+                # _process_receipts.
+                #
+                # Prior versions added +20 (compensating for the old 500ms
+                # divisor's ~10% under-count) and then +5 (over-defensive
+                # carryover after the divisor was made exact in Bundle 4).
+                # Q2 fix (2026-05-14, Bundle 5 v2): both are gone.
                 delta_blocks = round(
                     (head_ts - round_start_ts) * 1000
                     / _tc.BSC_BLOCK_TIME_MS
-                ) + 5
+                )
                 round_start_block = max(0, head - delta_blocks)
                 blocks_to_backfill = max(0, head - round_start_block + 1)
 
@@ -1592,54 +1380,40 @@ class RpcPoller:
             self._poll_lock.release()
 
     def _fetch_and_process_blocks(self, block_numbers: list[int]) -> None:
-        """Fetch eth_getBlockReceipts AND eth_getBlockByNumber (header
-        only, full_txs=False) for each block in a SINGLE batched HTTP
-        request, then process bet events + cache block timestamps.
+        """Fetch ``eth_getBlockReceipts`` for each block in a SINGLE
+        batched HTTP request, then process bet events.
 
-        Why bundle the header fetch into the same batch (Era 11 fix):
-        eth_getBlockReceipts does NOT include block.timestamp in its
-        response, but the engine needs block_ts to filter the pool
-        aggregate by pool_cutoff_seconds. The first implementation
-        called eth_getBlockByNumber lazily as a separate single HTTP
-        call PER BLOCK, which added ~150ms per block (= ~3000ms for a
-        20-block batch on top of the actual receipts batch). Bundling
-        both calls into the same batched JSON-RPC array means a single
-        HTTP roundtrip per batch covers both.
+        Bundle 5 v2 (2026-05-14): receipts-only backfill. Previously
+        (commit f02d736, 2026-05-08) we bundled ``eth_getBlockByNumber``
+        alongside each receipts call to populate ``_block_ts`` for the
+        pool_cutoff filter — but the I3 probe (2026-05-14, 20 samples
+        per shape) showed that doubling sub-calls per batch added ~1%
+        to per-batch RTT, vs the 2× speedup hoped for. The savings from
+        receipts-only batching come from halving JSON-RPC payload size,
+        not from halving sub-call count. Sub-call count is dominated by
+        per-batch fixed costs (TLS, urllib3 PoolManager contention,
+        rate-limit decisions).
+
+        Block timestamps for bet-containing blocks are resolved lazily
+        in ``_process_receipts_for_block`` via a single
+        ``eth_getBlockByNumber`` per bet-containing block. Bet rate is
+        sparse (~5-20 bets per 5-min round, ~1-3% of backfilled blocks),
+        so the lazy path fires ~1-3 single-RPCs per round at most,
+        off the critical path.
         """
         if not block_numbers:
             return
-        # Each block contributes TWO sub-calls: receipts + header.
-        # Sub-call layout: [recv(0), hdr(0), recv(1), hdr(1), ...].
-        calls: list[tuple[str, list]] = []
-        for bn in block_numbers:
-            calls.append(("eth_getBlockReceipts", [hex(bn)]))
-            calls.append(("eth_getBlockByNumber", [hex(bn), False]))
+        # Each block contributes ONE sub-call (receipts only).
+        calls: list[tuple[str, list]] = [
+            ("eth_getBlockReceipts", [hex(bn)]) for bn in block_numbers
+        ]
         results = self._rpc_batch(calls)
         if len(results) != len(calls):
             raise InvariantError(
                 f"rpc_batch_length_mismatch: expected={len(calls)} got={len(results)}"
             )
         for i, bn in enumerate(block_numbers):
-            receipts, recv_err = results[2 * i]
-            header, hdr_err = results[2 * i + 1]
-            # Cache block timestamp first; needed by _process_receipts
-            # so newly-stored bets have non-zero block_ts at insert time
-            # (avoids the lazy-resolve path inside get_pool).
-            if hdr_err is None and isinstance(header, dict):
-                ts_hex = header.get("timestamp")
-                if isinstance(ts_hex, str):
-                    try:
-                        ts = int(ts_hex, 16)
-                    except ValueError:
-                        ts = 0
-                    if ts > 0:
-                        with self._lock:
-                            self._block_ts[bn] = ts
-                # Bundle 4: piggyback anchor + watchdog update on this
-                # block-header parse. No extra RPC; uses the data we
-                # already fetched. Monotonic on block_number — older
-                # blocks ignored.
-                self._update_anchor_from_block(header)
+            receipts, recv_err = results[i]
             if recv_err is not None:
                 # Single-block error: skip; the next periodic/ramp poll
                 # will retry. Don't raise here because the rest of the
@@ -1652,7 +1426,18 @@ class RpcPoller:
     def _process_receipts_for_block(self, block_number: int, receipts: list[dict]) -> None:
         """Extract BetBull/BetBear events from a block's receipts and
         update the local pool state. Same dedup + epoch-gate behaviour
-        as the prior PoolEventWatcher._process_bet_event."""
+        as the prior PoolEventWatcher._process_bet_event.
+
+        Bundle 5 v2 (2026-05-14): when a bet log is detected, resolve
+        the block timestamp lazily via a single ``eth_getBlockByNumber``
+        call (cached in ``_block_ts``). The receipts-only backfill no
+        longer pre-populates ``_block_ts`` from a bundled header call,
+        so this lazy path is the canonical source of block_ts for the
+        pool_cutoff filter. Bet rate is sparse (~5-20 per round across
+        ~600 backfilled blocks); the single-RPC cost per bet-containing
+        block is off the critical path.
+        """
+        bet_logs: list[dict] = []
         for r in receipts:
             if not isinstance(r, dict):
                 continue
@@ -1663,48 +1448,83 @@ class RpcPoller:
                 if len(topics) < 3:
                     continue
                 topic0 = topics[0]
-                if topic0 == _BET_BULL_TOPIC:
-                    side = "Bull"
-                elif topic0 == _BET_BEAR_TOPIC:
-                    side = "Bear"
-                else:
-                    continue
-                try:
-                    epoch = int(topics[2], 16)
-                    amount_wei = int(log.get("data", "0x0"), 16)
-                    bn = int(log.get("blockNumber", "0x0"), 16)
-                except (ValueError, IndexError):
-                    continue
-                if amount_wei <= 0:
-                    continue
-                # Epoch gate
-                if self._current_epoch >= 0 and epoch not in (
-                    self._current_epoch, self._current_epoch + 1
-                ):
-                    continue
-                tx_hash = log.get("transactionHash", "")
-                log_idx = log.get("logIndex", "")
-                dedup_key = f"{tx_hash}:{log_idx}"
-                with self._lock:
-                    seen = self._seen_tx.setdefault(epoch, set())
-                    if dedup_key and dedup_key in seen:
-                        continue
-                    if dedup_key:
-                        seen.add(dedup_key)
-                    block_ts = self._block_ts.get(bn, 0)
-                    if epoch not in self._pools:
-                        self._pools[epoch] = _EpochPool()
-                    self._pools[epoch].bets.append(_Bet(
-                        epoch=epoch, side=side, amount_wei=amount_wei,
-                        block_number=bn, block_ts=block_ts,
-                    ))
-                    self._total_events += 1
+                if topic0 == _BET_BULL_TOPIC or topic0 == _BET_BEAR_TOPIC:
+                    bet_logs.append(log)
 
-        # Block timestamp is cached by _fetch_and_process_blocks BEFORE
-        # this call (the batched RPC includes eth_getBlockByNumber for
-        # every block alongside eth_getBlockReceipts). No per-block
-        # follow-up fetch needed; the get_pool() lazy-resolve path is
-        # the safety net for any block that wasn't in a batch.
+        if not bet_logs:
+            return  # no bets in this block — nothing to do
+
+        # Resolve block_ts ONCE for this block (cheaper than per-bet).
+        # Cache hit if a prior pass already resolved this block (e.g.,
+        # epoch_advance cache lookup); otherwise fire one RPC.
+        with self._lock:
+            cached_ts = self._block_ts.get(block_number, 0)
+        block_ts = cached_ts if cached_ts > 0 else self._resolve_block_ts(block_number)
+
+        for log in bet_logs:
+            topic0 = log.get("topics", [None])[0]
+            side = "Bull" if topic0 == _BET_BULL_TOPIC else "Bear"
+            try:
+                epoch = int(log["topics"][2], 16)
+                amount_wei = int(log.get("data", "0x0"), 16)
+                bn = int(log.get("blockNumber", "0x0"), 16)
+            except (ValueError, IndexError, KeyError):
+                continue
+            if amount_wei <= 0:
+                continue
+            # Epoch gate
+            if self._current_epoch >= 0 and epoch not in (
+                self._current_epoch, self._current_epoch + 1
+            ):
+                continue
+            tx_hash = log.get("transactionHash", "")
+            log_idx = log.get("logIndex", "")
+            dedup_key = f"{tx_hash}:{log_idx}"
+            with self._lock:
+                seen = self._seen_tx.setdefault(epoch, set())
+                if dedup_key and dedup_key in seen:
+                    continue
+                if dedup_key:
+                    seen.add(dedup_key)
+                if epoch not in self._pools:
+                    self._pools[epoch] = _EpochPool()
+                self._pools[epoch].bets.append(_Bet(
+                    epoch=epoch, side=side, amount_wei=amount_wei,
+                    block_number=bn, block_ts=block_ts,
+                ))
+                self._total_events += 1
+
+    def _resolve_block_ts(self, block_number: int) -> int:
+        """Best-effort lazy fetch of a block's timestamp via a single
+        ``eth_getBlockByNumber(hex(bn), false)`` call. Returns 0 on any
+        failure (transport error, malformed response). On success,
+        caches the result in ``_block_ts`` and returns the timestamp
+        in chain seconds.
+
+        Called from ``_process_receipts_for_block`` when a bet log is
+        detected. Sparse bet rate (~5-20 per round) means this fires
+        at most ~5-20 times per round, off the critical path.
+        """
+        try:
+            result = self._rpc_call_single(
+                "eth_getBlockByNumber", [hex(block_number), False],
+            )
+        except Exception:  # noqa: BLE001
+            return 0
+        if not isinstance(result, dict):
+            return 0
+        ts_hex = result.get("timestamp")
+        if not isinstance(ts_hex, str):
+            return 0
+        try:
+            ts = int(ts_hex, 16)
+        except ValueError:
+            return 0
+        if ts <= 0:
+            return 0
+        with self._lock:
+            self._block_ts[block_number] = ts
+        return ts
 
     # ------------------------------------------------------------------
     # Internal: HTTP RPC helpers (single + batched)
@@ -1735,7 +1555,7 @@ class RpcPoller:
             )
         return int(num_hex, 16), int(ts_hex, 16)
 
-    def _rpc_post(self, url: str, body: bytes, *, timeout_seconds: int) -> bytes:
+    def _rpc_post(self, url: str, body: bytes, *, timeout_seconds: float) -> bytes:
         """Single-endpoint HTTP POST via the shared urllib3 PoolManager.
         Returns the raw response body. Raises on transport-level failure
         (``urllib3.exceptions.HTTPError`` subclasses: TimeoutError,
@@ -1762,7 +1582,7 @@ class RpcPoller:
             )
         return resp.data
 
-    def _do_hedged_post(self, body: bytes, *, timeout_seconds: int) -> tuple[str, bytes]:
+    def _do_hedged_post(self, body: bytes, *, timeout_seconds: float) -> tuple[str, bytes]:
         """Hedged HTTP POST against every endpoint in the pool.
 
         Fires one request per endpoint in parallel; the first endpoint
@@ -1832,11 +1652,23 @@ class RpcPoller:
         error; returns the ``result`` field on success. Hedged across
         every endpoint in the pool; first success wins.
         """
+        return self._rpc_call_single_with_timeout(
+            method, params, timeout_s=float(_tc.RPC_HTTP_SINGLE_TIMEOUT_SECONDS),
+        )
+
+    def _rpc_call_single_with_timeout(
+        self, method: str, params: list, *, timeout_s: float,
+    ) -> Any:
+        """Single JSON-RPC call with an explicit timeout (seconds, may be
+        fractional). Hedged across every endpoint in the pool; first
+        success wins. Used by the Bundle 5 v2 anchor poll, which wants
+        a 200ms ceiling rather than the default 5s.
+        """
         body = json.dumps({
             "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
         }).encode()
         _ep, resp_bytes = self._do_hedged_post(
-            body, timeout_seconds=_tc.RPC_HTTP_SINGLE_TIMEOUT_SECONDS,
+            body, timeout_seconds=timeout_s,
         )
         payload = json.loads(resp_bytes)
         if "error" in payload:

@@ -334,7 +334,6 @@ class AppConfig:
     - ``bet_submit_deadline_offset_ms``
     - ``critical_path_wakeup_offset_ms``
     - ``bankroll_wakeup_offset_ms``
-    - ``ntp_sync_wakeup_offset_ms``
     - ``kline_publish_tier``: ``"P99"`` (strict, full-inclusion guarantee)
       or ``"P95"`` (operating budget; ~5% tail absorbed by streak counter).
       Selected by tier-ladder cross-validation: P99 first, P95 fallback.
@@ -352,7 +351,6 @@ class AppConfig:
     ramp_poll_1_wakeup_offset_ms: int
     ramp_poll_2_wakeup_offset_ms: int
     bankroll_wakeup_offset_ms: int
-    ntp_sync_wakeup_offset_ms: int
     kline_publish_tier: str
 
     # Other
@@ -718,10 +716,9 @@ def load_app_config(path: str) -> AppConfig:
         critical_path_wakeup_offset_ms
         + _tc.BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS
     )
-    ntp_sync_wakeup_offset_ms = (
-        bankroll_wakeup_offset_ms
-        + _tc.NTP_WAKE_OFFSET_PRE_BANKROLL_MS
-    )
+    # Bundle 5 v2 (2026-05-14): ``ntp_sync_wakeup_offset_ms`` retired.
+    # The bot trusts the OS clock directly (W32Time tightening per
+    # README); no application-level NTP wake is scheduled.
 
     # --- RPC poll wake schedule (Era 11: 2026-05-07 pivot; refactored 2026-05-12) ---
     # final_rpc_poll fires before the critical_path read; ramp_2 fires
@@ -824,24 +821,12 @@ def load_app_config(path: str) -> AppConfig:
             f"RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE drift."
         )
 
-    # ramp_poll_1 must be scheduled AFTER ntp_sync_wake (ramp_1 offset
-    # < ntp_sync offset) so the ntp-sync wake has its budget intact
-    # when it fires. At canonical pool_cutoff=6 this holds with margin
-    # (7500 < 11095), but a larger pool_cutoff combined with growth in
-    # the ramp interval constants could push ramp_1 above ntp_sync and
-    # silently degrade the schedule. Fail fast instead.
-    if ramp_poll_1_wakeup_offset_ms >= ntp_sync_wakeup_offset_ms:
-        raise InvariantError(
-            f"ramp_poll_1_before_ntp_sync: "
-            f"ramp_poll_1_wakeup={ramp_poll_1_wakeup_offset_ms}ms "
-            f">= ntp_sync_wakeup={ntp_sync_wakeup_offset_ms}ms. "
-            f"pool_cutoff_seconds={pool_cutoff_seconds}, "
-            f"RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS={_tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS}ms, "
-            f"RPC_RAMP_2_TO_FINAL_INTERVAL_MS={_tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS}ms. "
-            f"Either lower pool_cutoff_seconds or shrink the ramp "
-            f"interval constants — having ramp_1 fire before ntp_sync "
-            f"would scramble the round's wake ordering."
-        )
+    # Bundle 5 v2 (2026-05-14): the ``ramp_poll_1 < ntp_sync_wake``
+    # invariant is retired alongside the ntp_sync wake itself. ramp_1
+    # is now the first scheduled wake in the round; the next wake
+    # immediately after it is bankroll (lower offset = later). The
+    # bankroll wake's 5s budget vs ~50-200ms wallet RPC means the
+    # ramp_1 -> bankroll ordering is robust without an explicit check.
 
     # The kline fetch fires INSIDE the critical-path wake, after the
     # ~5ms pool snapshot. So the kline-fetch effective offset (= time
@@ -886,31 +871,8 @@ def load_app_config(path: str) -> AppConfig:
             f"Increase kline_cutoff_seconds or reduce wake offset."
         )
 
-    # Cross-validation: the NTP wake budget must comfortably exceed
-    # ``N_servers x NTP_QUERY_TIME_P99_MS + dispatch buffer`` so even a
-    # full rotation fall-through (every server's first query times out
-    # below the libntp timeout) lands before the bankroll wake fires.
-    # This is informational/defensive -- the literal 5000ms gap dwarfs
-    # the empirical worst case (3 x 102 = 306 ms 2026-05-06 probe), so
-    # the assertion would only fire if a future probe revision drove
-    # NTP_QUERY_TIME_P99_MS into the 1.5s+ range, which itself signals
-    # something has gone badly wrong with the public NTP pool. Keep the
-    # check as a tripwire for that scenario.
-    _N_SERVERS_DEFAULT = 3
-    _DISPATCH_BUFFER_MS = 200
-    _ntp_rotation_worst_case_ms = (
-        _N_SERVERS_DEFAULT * _tc.NTP_QUERY_TIME_P99_MS + _DISPATCH_BUFFER_MS
-    )
-    if _tc.NTP_WAKE_OFFSET_PRE_BANKROLL_MS < _ntp_rotation_worst_case_ms:
-        raise InvariantError(
-            f"config_ntp_wake_budget_below_rotation_worst_case: "
-            f"NTP_WAKE_OFFSET_PRE_BANKROLL_MS="
-            f"{_tc.NTP_WAKE_OFFSET_PRE_BANKROLL_MS}ms is below "
-            f"N_servers={_N_SERVERS_DEFAULT} x "
-            f"NTP_QUERY_TIME_P99_MS={_tc.NTP_QUERY_TIME_P99_MS}ms "
-            f"+ dispatch_buffer={_DISPATCH_BUFFER_MS}ms = "
-            f"{_ntp_rotation_worst_case_ms}ms"
-        )
+    # Bundle 5 v2 (2026-05-14): the NTP wake budget cross-validation
+    # is retired alongside the application-level NTP layer itself.
 
     # [dry]
     dry_initial_bankroll_bnb = _opt_float(dry_sec, "initial_bankroll_bnb", 50.0)
@@ -952,7 +914,6 @@ def load_app_config(path: str) -> AppConfig:
         ramp_poll_1_wakeup_offset_ms=ramp_poll_1_wakeup_offset_ms,
         ramp_poll_2_wakeup_offset_ms=ramp_poll_2_wakeup_offset_ms,
         bankroll_wakeup_offset_ms=bankroll_wakeup_offset_ms,
-        ntp_sync_wakeup_offset_ms=ntp_sync_wakeup_offset_ms,
         kline_publish_tier=kline_publish_tier,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_min_bet_only=live_min_bet_only,

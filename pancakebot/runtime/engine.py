@@ -28,7 +28,12 @@ from pancakebot.runtime.dry import (
     _record_dry_cycle_audit,
 )
 from pancakebot.runtime.live import claim_scan_cursor
-from pancakebot.runtime.ntp_sync import NtpSync
+from pancakebot.chain.rpc_poller import (
+    AnchorState,
+    compute_submit_deadline_ms,
+    predict_predecessor_milli_ts,
+)
+from pancakebot import timing_constants as _tc
 from pancakebot.runtime.process_health import write_heartbeat
 from pancakebot.strategy.momentum_pipeline import StrategyPipelineDecision
 from pancakebot.types import Round
@@ -51,51 +56,33 @@ _ONE_MINUTE_MS = 60_000
 
 # -- NTP clock sync ----------------------------------------------------------
 # The bot's scheduling uses chain-anchored timestamps (lock_at from BSC, in
-# true UTC) but wakes/compares against ``time.time()`` (local clock).
-# Local clocks drift between OS-NTP polls -- Windows Time Service refreshes
-# at ~1h intervals by default, and at 50 minutes since the last poll the
-# local clock is materially off from true UTC. Critical-path timing margins
-# are tight enough (sub-100ms) that the accumulated drift can flip a round's
-# bet decision (e.g. epoch 478372 in the 2026-05-04 soak was 40ms inside
-# the timing-guard margin).
+# Time source (Bundle 5 v2, 2026-05-14): the bot trusts the OS clock
+# directly. Previously the bot maintained its own per-round NTP query
+# (``NtpSync`` in ``pancakebot/runtime/ntp_sync.py``) that measured
+# ``(local - ntp)`` once per round and applied the correction inside
+# ``_utc_now()``. That layer was a workaround for Windows Time Service's
+# default 1024s poll cadence, which let the local clock drift up to
+# ~270ms (P95) between syncs — too sloppy for sub-second bet timing.
 #
-# Fix: query NTP directly each round at a pre-critical-path wake
-# (``ntp_sync_wake`` at lock - ~11.095s), cache the freshest measured
-# offset, and use ``_utc_now()`` everywhere we compare local time to a
-# chain-anchored value. Per-round freshness eliminates accumulated
-# OS-NTP-poll-interval drift; the wake's 5000ms budget dwarfs the
-# empirical NTP roundtrip worst case.
+# The W32Time prerequisite documented in README.md tightens
+# ``MaxPollInterval`` to 5 (= 32s), bringing residual drift well under
+# 10ms (P95). With that in place the application-level NTP layer is
+# redundant — ``time.time()`` is the authoritative truth source, and
+# ``_utc_now()`` is a thin alias preserved for readability at the
+# call sites that compare local time to chain-anchored values
+# (lock_at, cutoff_ts, claim_ts).
 #
-# Documented diagnosis: research/okx_lag_root_cause_clock_skew.md (the
-# original 2026-04-26 fix used OKX /public/time as the truth source via
-# Cristian's algorithm; that approach conflated network latency with clock
-# offset and was retired 2026-05-05 in favor of direct NTP).
-# Empirical NTP query cost: research/p4c_ntp_probe.py.
-_ntp_sync: NtpSync | None = None
-
-
-def _get_ntp_sync() -> NtpSync:
-    """Lazy singleton for the NTP sync manager. Construction is deferred
-    until first use so test harnesses that monkey-patch the module's
-    network primitives can swap in a fake before the singleton lands."""
-    global _ntp_sync
-    if _ntp_sync is None:
-        _ntp_sync = NtpSync()
-    return _ntp_sync
+# If the W32Time tightening is NOT applied, the bot's timing budgets
+# may be too tight; the operator is responsible for verifying via
+# ``w32tm /query /status`` (expected ``Poll Interval: 5``).
 
 
 def _utc_now() -> float:
-    """Best-effort estimate of the current NTP/UTC second.
-
-    Returns ``time.time() - ntp_offset`` where ``ntp_offset`` is the most
-    recent successful NTP measurement of (local - ntp). Falls back to
-    local ``time.time()`` when no NTP query has succeeded yet (initial
-    state, or pre-bootstrap). Caller code that compares local time
-    against a chain-anchored value (lock_at, cutoff_ts, claim_ts) MUST
-    use this instead of ``time.time()`` so the comparison is in
-    NTP/UTC frame.
-    """
-    return time.time() - _get_ntp_sync().current_offset()
+    """Current wallclock seconds. Trusts the OS clock (kept tight by
+    W32Time per the README setup steps). Preserved as a separate
+    function from ``time.time()`` so callers that compare local time
+    against chain-anchored values remain self-documenting."""
+    return time.time()
 
 
 def _kline_timing_get(gate, key: str) -> int | None:
@@ -208,7 +195,6 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
         msg=(
             f"timing config: kline_cutoff={cfg.cutoff_seconds}s "
             f"pool_cutoff={cfg.pool_cutoff_seconds}s "
-            f"ntp_sync_wakeup={cfg.ntp_sync_wakeup_offset_ms}ms "
             f"ramp_poll_1_wakeup={cfg.ramp_poll_1_wakeup_offset_ms}ms "
             f"bankroll_wakeup={cfg.bankroll_wakeup_offset_ms}ms "
             f"ramp_poll_2_wakeup={cfg.ramp_poll_2_wakeup_offset_ms}ms "
@@ -234,25 +220,13 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
 
     closed_state = _init_closed_state(cfg)
 
-    # Bootstrap NTP clock sync BEFORE the first round starts. The per-round
-    # ntp_sync_wake won't have fired yet; without bootstrap, the first
-    # iteration's _sleep_until_ts compares against an uncorrected local
-    # clock. Refuse to start if every server fails or the initial offset
-    # is unreasonably large -- broken NTP at startup is a clear operator-
-    # actionable failure (run w32tm /resync, check firewall, etc.).
-    info("CLOCK", "NTP", "BOOT", msg="bootstrapping NTP clock sync...")
-    _ntp = _get_ntp_sync()
-    if not _ntp.bootstrap():
-        raise InvariantError(
-            "ntp_bootstrap_failed: no NTP servers reachable at startup; "
-            "check network / firewall / w32tm /resync before retrying"
-        )
-    if abs(_ntp.current_offset()) > 1.0:
-        raise InvariantError(
-            f"ntp_bootstrap_offset_too_large: "
-            f"{_ntp.current_offset():+.3f}s exceeds 1.0s sanity bound; "
-            f"run w32tm /resync on host before retrying"
-        )
+    # Bundle 5 v2 (2026-05-14): no application-level NTP bootstrap. The
+    # bot trusts the OS clock (Windows Time Service kept tight via
+    # MaxPollInterval=5; see README "W32Time prerequisite"). The prior
+    # NtpSync bootstrap + per-round refresh was retired alongside the
+    # continuous fine-phase chain-anchor poll — both layers existed to
+    # paper over W32Time's default 1024s poll cadence; the W32Time
+    # tightening obviates them.
 
     bnbusd_price = _fetch_current_bnb_price_usd(cfg)
     if cfg.dry:
@@ -444,50 +418,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
 
-        # -- NTP sync wake --
-        # First of three pre-lock wakes. Fires at lock_at -
-        # ntp_sync_wakeup_offset_ms (= ~11.095s before lock at canonical
-        # timing constants). Forces a fresh NTP query so the freshest
-        # measured (local - ntp) offset is applied for the rest of the
-        # round's critical-path scheduling. Generously off the critical
-        # path: 5000ms wake budget vs. ~125ms NTP p99 query, so even a
-        # 3-server rotation fall-through (~306ms worst case) is fine.
-        ntp_sync_wake_ts = lock_ts_t - cfg.ntp_sync_wakeup_offset_ms / 1000.0
-        _sleep_until_ts(
-            ntp_sync_wake_ts,
-            reason="wait_for_ntp_sync",
-            epoch=current_epoch,
-        )
-        ntp = _get_ntp_sync()
-        ntp.force_resync()
-        if not ntp.is_healthy():
-            # NTP state stale: consecutive failures over the threshold OR
-            # last-good offset is too old. Skip rather than bet on a
-            # potentially-drifted clock; the next round's wake re-queries
-            # and may recover.
-            warn("RUN", "NTP", "UNHEALTHY",
-                 msg=(f"Skip epoch {current_epoch}: ntp_state_unhealthy "
-                      f"(consecutive_failures={ntp.consecutive_failures()}, "
-                      f"last_query_age={ntp.last_query_age_seconds():.0f}s)"))
-            _record_dry_cycle_audit(
-                cfg,
-                closed,
-                current_epoch=current_epoch,
-                locked_epoch=locked_epoch,
-                lock_ts=lock_ts_t,
-                cutoff_ts=cutoff_ts_t,
-                locked_price_bnbusd=bnbusd_price,
-                action="SKIP",
-                decision_stage="pipeline",
-                open_round=open_round,
-                bankroll_before_action_bnb=closed.simulated_bankroll_bnb or 0.0,
-                bankroll_after_action_bnb=closed.simulated_bankroll_bnb or 0.0,
-                skip_reason="ntp_state_unhealthy",
-            )
-            info("RUN", "ACT", "SKIP",
-                 msg=f"Skip epoch {current_epoch}: ntp_state_unhealthy")
-            _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
-            return
+        # Bundle 5 v2 (2026-05-14): the per-round NTP sync wake is gone.
+        # Previously the bot woke at ``lock - 11095ms`` to refresh its own
+        # ``(local - ntp)`` offset measurement. The W32Time prerequisite
+        # (MaxPollInterval=5, see README) keeps the OS clock within a
+        # few ms of NTP truth directly, so there is no application-level
+        # NTP layer to refresh. The first pre-lock wake is now
+        # ``wait_for_ramp_poll_1`` (= lock - 7550ms).
 
         # -- Ramp poll #1 (Era 11) --
         # All three polls (ramp_1, ramp_2, final) take a deadline_ms
@@ -631,43 +568,86 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             )
             cfg.rpc_poller.poll_final(deadline_ms=final_deadline_ms)
 
-        # -- Critical-path wake --
-        # Last pre-lock scheduled wake. Fires at lock_at -
-        # critical_path_wakeup_offset_ms (= ~1.045s before lock at
-        # canonical Bundle 4 timing). Inside the wake the engine
-        # sequences: pool snapshot (in-memory, ~5ms) -> kline fetch +
-        # signal compute (~340ms via gate.evaluate()) -> bet submit
-        # (Bundle 4 dynamic deadline, typically ~450ms before lock).
+        # -- Anchor poll + critical-path wake (Bundle 5 v2, 2026-05-14) --
         #
-        # Bundle 4 (2026-05-14): replaces the passive sleep with a
-        # serial 200ms-interval head-poll loop. Each poll updates the
-        # ms-precise chain anchor via mixHash decoding (BEP-520), so by
-        # the time critical-path fires the anchor is at most ~200ms
-        # stale (typically ~100ms). Fallback to passive sleep when no
-        # rpc_poller (backtest) or no anchor available.
-        critical_path_wake_ts = (
+        # Strategy:
+        # 1. Sleep to lock - ANCHOR_POLL_OFFSET_MS (= lock - 1300ms).
+        # 2. Fire ONE eth_getBlockByNumber('latest') with a 200ms timeout.
+        # 3. If response decodes to a valid BEP-520 anchor:
+        #    - Compute dynamic wake (predecessor.milli_ts - 557ms)
+        #    - Compute dynamic submit deadline (set aside for the bet
+        #      timing guard below).
+        #    - Use the dynamic wake (closer to lock than static).
+        # 4. If response is None (timeout / malformed):
+        #    - Fall back to static wake (= lock - critical_path_wakeup_offset_ms)
+        #      and static submit deadline (= lock - bet_submit_deadline_offset_ms).
+        # 5. Sleep until the resolved critical_path_wake_ts.
+        #
+        # The anchor lives only for THIS round; ``round_anchor`` is the
+        # engine-local handoff between the wake math and the later
+        # bet-submit deadline gate. No persistent anchor state on RpcPoller.
+        #
+        # Replaces Bundle 4's continuous fine-phase head poller (~15-18
+        # RPC calls per round) with one anchor poll per round.
+        lock_ms_int = int(round(lock_ts_t * 1000))
+        static_critical_path_wake_ts = (
             lock_ts_t - cfg.critical_path_wakeup_offset_ms / 1000.0
         )
+        round_anchor: AnchorState | None = None
+        critical_path_wake_ts = static_critical_path_wake_ts
+        critical_path_source = "static"
         if cfg.rpc_poller is not None:
-            info("RUN", "LOOP", "SLEEP",
-                 msg=(f"Sleeping {int(critical_path_wake_ts - _utc_now())}s "
-                      f"(wait_for_critical_path, fine-phase head-poll active) "
-                      f"epoch={current_epoch}"))
-            # 200ms cadence (default) — half the 450ms block time, so each
-            # block is observed as "latest" for ≥ 2 polls. Engine's other
-            # _sleep_until_ts waits bracket this 3.5s window with frequent
-            # heartbeat ticks, so the fine-phase poller itself doesn't need
-            # a heartbeat hook.
-            fine_phase_n_polls = cfg.rpc_poller.fine_phase_head_poll(
-                deadline_s=critical_path_wake_ts,
-                now_fn=_utc_now,
-            )
-            del fine_phase_n_polls  # diagnostic only; could be logged if needed
-        else:
+            anchor_poll_fire_ts = lock_ts_t - _tc.ANCHOR_POLL_OFFSET_MS / 1000.0
             _sleep_until_ts(
-                critical_path_wake_ts, reason="wait_for_critical_path",
+                anchor_poll_fire_ts,
+                reason="wait_for_anchor_poll",
                 epoch=current_epoch,
             )
+            round_anchor = cfg.rpc_poller.fire_anchor_poll(
+                timeout_s=_tc.ANCHOR_POLL_TIMEOUT_MS / 1000.0,
+            )
+            if round_anchor is not None:
+                predecessor_ms = predict_predecessor_milli_ts(
+                    anchor_milli_ts=round_anchor.milli_ts,
+                    lock_ms=lock_ms_int,
+                )
+                dynamic_wake_ms = predecessor_ms - (
+                    _tc.OKX_KLINE_FETCH_RTT_P99_MS
+                    + _tc.SIGNAL_COMPUTE_TIME_MS
+                    + _tc.POOL_READ_TIME_MS
+                    + _tc.BSC_BET_SUBMIT_ONE_WAY_MS
+                )
+                # The dynamic wake should be slightly AFTER the anchor poll
+                # response landed (which was lock - ~1100ms by design).
+                # Even at boundary-zone rounds dynamic_wake_ms >= lock-1057ms,
+                # i.e. >= anchor_poll_fire_ts + 200ms slack. Take it as-is.
+                critical_path_wake_ts = dynamic_wake_ms / 1000.0
+                critical_path_source = "dynamic"
+                _static_lead_ms = int(round(
+                    (lock_ts_t - static_critical_path_wake_ts) * 1000
+                ))
+                _dynamic_lead_ms = int(round(
+                    (lock_ts_t - critical_path_wake_ts) * 1000
+                ))
+                info("RUN", "LOOP", "OFFSET",
+                     msg=(f"critical_path source=dynamic "
+                          f"static_lead_ms={_static_lead_ms} "
+                          f"dynamic_lead_ms={_dynamic_lead_ms} "
+                          f"anchor_bn={round_anchor.block_number} "
+                          f"epoch={current_epoch}"))
+            else:
+                info("RUN", "LOOP", "OFFSET",
+                     msg=(f"critical_path source=static "
+                          f"(anchor poll timed out or malformed) "
+                          f"epoch={current_epoch}"))
+        info("RUN", "LOOP", "SLEEP",
+             msg=(f"Sleeping {int(critical_path_wake_ts - _utc_now())}s "
+                  f"(wait_for_critical_path, source={critical_path_source}) "
+                  f"epoch={current_epoch}"))
+        _sleep_until_ts(
+            critical_path_wake_ts, reason="wait_for_critical_path",
+            epoch=current_epoch,
+        )
 
         # Pool data from RPC poller's local store (Era 11; no RPC needed
         # at this point, the polls already fetched the data).
@@ -788,30 +768,32 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # the bet-submit deadline -- TX submitted later than this is
         # unlikely to mine in time and would revert (gas burn).
         #
-        # Bundle 4 (2026-05-14): two-track deadline.
+        # Bundle 5 v2 (2026-05-14): two-track deadline driven by the
+        # per-round anchor poll fired earlier at lock - 1300ms.
         #
-        #   1. Dynamic deadline (preferred, Lorentz-active chains): the
-        #      RpcPoller's chain anchor + BEP-520 ms-precise extrapolation
-        #      predicts the milli_ts of the block immediately before lock.
-        #      The deadline is that predicted block's start minus the
-        #      validator's TX-list freeze window (50ms) minus the one-way
-        #      RPC send time (150ms). Per-round dynamic, typically ~450ms
-        #      before lock (250-300ms tighter than the static fallback).
+        #   1. Dynamic deadline (preferred, anchor poll succeeded):
+        #      predict the predecessor block's milli_ts from the fresh
+        #      anchor via exact 450ms extrapolation, then walk back by
+        #      the validator's TX-list freeze window (50ms) + one-way
+        #      RPC send time (150ms). Quantum-shift guard inside
+        #      ``compute_submit_deadline_ms`` adds a block-time back-off
+        #      if the prediction lands within one quantum of lock.
         #
-        #   2. Static fallback (pre-Lorentz chains or detection failed):
+        #   2. Static fallback (anchor poll timed out / malformed):
         #      ``cfg.bet_submit_deadline_offset_ms`` (=700ms post-Bundle-4
-        #      derivation, was 750ms). Used when the dynamic path returns
-        #      None.
+        #      derivation).
         #
         # lock_ts_t is chain-anchored true UTC; comparisons use
         # ``_utc_now() * 1000`` (skew-corrected ms) so a skewed local
         # clock doesn't make the bot fire early.
         lock_ms = int(lock_ts_t * 1000)
-        dynamic_deadline_ms: int | None = None
-        if cfg.rpc_poller is not None:
-            dynamic_deadline_ms = cfg.rpc_poller.compute_dynamic_submit_deadline_ms(lock_ms)
-        if dynamic_deadline_ms is not None:
-            deadline_ms = dynamic_deadline_ms
+        if round_anchor is not None:
+            predecessor_ms = predict_predecessor_milli_ts(
+                anchor_milli_ts=round_anchor.milli_ts, lock_ms=lock_ms,
+            )
+            deadline_ms = compute_submit_deadline_ms(
+                predicted_predecessor_milli_ts=predecessor_ms, lock_ms=lock_ms,
+            )
             deadline_source = "dynamic"
         else:
             deadline_ms = lock_ms - cfg.bet_submit_deadline_offset_ms
