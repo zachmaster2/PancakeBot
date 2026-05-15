@@ -1,4 +1,4 @@
-"""Unit tests for RpcPoller (the Era 11 replacement for PoolEventWatcher).
+﻿"""Unit tests for RpcPoller (the Era 11 replacement for PoolEventWatcher).
 
 Covers:
 - Construction validates inputs.
@@ -1160,11 +1160,16 @@ def test_init_cursor_positions_at_round_start_minus_1_when_feasible():
     the CURRENT round only (head - delta_blocks_in_round - safety),
     NOT to a head-relative full-round lookback.
 
-    Bundle 4 (2026-05-14): BSC_BLOCK_TIME_MS divisor 500 → 450 (post-
-    Lorentz empirical), safety margin +20 → +5 (the prior 500ms-vs-actual
-    bias is gone now that divisor is exact). New expected cursor:
-    delta_blocks = round(10000/450) + 5 = 27, cursor = head - 27 - 1
-    = 99_972 (was 99_959 with old constants).
+    Bundle 5 v2 (2026-05-14): safety margin +5 → +0 (Q2 fix). The
+    post-Lorentz chain's empirical "misses only delay, never advance"
+    property means actual blocks-elapsed is at most
+    ``ceil((head_ts - round_start_ts) * 1000 / 450)`` — slot misses
+    produce fewer blocks than the divisor predicts, never more. So
+    ``round(...)`` is already an upper bound (modulo ≤ 0.5 block of
+    rounding noise) and cursor at ``head - delta_blocks`` lands at or
+    before round_start_block by construction. New expected cursor:
+    delta_blocks = round(10000/450) = 22, cursor = head - 22 - 1
+    = 99_977.
     """
     import time as _t
     p = _make_poller()
@@ -1182,11 +1187,11 @@ def test_init_cursor_positions_at_round_start_minus_1_when_feasible():
     # Cursor init must NOT flip _connected — that's the first-poll latch.
     assert p._connected is False
     assert p._cold_start_done.is_set() is False
-    # Bundle 4: 10s into round + 5 safety = round(10000/450)+5 = 27 blocks
-    # behind head -> cursor at head - 27 - 1 = 99_972.
-    assert p._last_polled_block_number == 99_972, (
+    # Bundle 5 v2: 10s into round = round(10000/450) = 22 blocks
+    # behind head -> cursor at head - 22 - 1 = 99_977.
+    assert p._last_polled_block_number == 99_977, (
         f"cursor positioned at {p._last_polled_block_number}; "
-        f"expected 99_972 (head-27-1 under Bundle 4 ms-precise math). "
+        f"expected 99_977 (head-22-1 under Bundle 5 v2 +0 safety math). "
         f">630 blocks back would indicate the head-relative full-round "
         f"lookback regression."
     )
@@ -1521,7 +1526,7 @@ def test_is_backfill_done_compat_shim():
 # Import the new module-level helpers for direct testing
 from pancakebot.chain.rpc_poller import (  # noqa: E402
     AnchorState, decode_mixhash_ms, compute_milli_ts,
-    detect_lorentz_active, predict_predecessor_milli_ts,
+    predict_predecessor_milli_ts,
     compute_submit_deadline_ms,
 )
 
@@ -1584,29 +1589,6 @@ def test_compute_milli_ts_returns_none_on_bad_input():
     assert compute_milli_ts({"timestamp": "0x1"}) is None  # missing mixHash
     assert compute_milli_ts({"mixHash": "0x" + "00" * 32}) is None  # missing timestamp
     assert compute_milli_ts({"timestamp": "0xZZ", "mixHash": "0x" + "00" * 32}) is None
-
-
-# --- detect_lorentz_active ---
-
-def test_detect_lorentz_active_true_when_either_has_ms():
-    """Two recent blocks with at least one non-zero ms encoding → active."""
-    block_a = {"timestamp": hex(1778712807), "mixHash": "0x" + "00" * 30 + "0352"}
-    block_b = {"timestamp": hex(1778712808), "mixHash": "0x" + "00" * 30 + "012c"}
-    assert detect_lorentz_active(block_a, block_b) is True
-
-
-def test_detect_lorentz_active_false_when_both_zero():
-    """Pre-Lorentz heuristic: both blocks with ms=0 → inactive."""
-    block_a = {"timestamp": hex(1778712807), "mixHash": "0x" + "00" * 32}
-    block_b = {"timestamp": hex(1778712808), "mixHash": "0x" + "00" * 32}
-    assert detect_lorentz_active(block_a, block_b) is False
-
-
-def test_detect_lorentz_active_false_when_malformed():
-    """Malformed mixHash (decode fails) → conservative pre-Lorentz assumption."""
-    block_a = {"timestamp": hex(1778712807), "mixHash": "garbage"}
-    block_b = {"timestamp": hex(1778712808), "mixHash": "0x" + "00" * 30 + "0352"}
-    assert detect_lorentz_active(block_a, block_b) is False
 
 
 # --- predict_predecessor_milli_ts ---
@@ -1698,167 +1680,173 @@ def test_submit_deadline_boundary_at_exactly_quantum_msbacks_off():
     assert _deadline_at_gap(_tc.BSC_QUANTUM_MS) == 1_000_000 - 700
 
 
-# --- Lorentz-fallback path in compute_dynamic_submit_deadline_ms ---
+# ---------------------------------------------------------------------------
+# Bundle 5 v2 (2026-05-14): per-round single anchor poll
+# ---------------------------------------------------------------------------
 
-def test_compute_dynamic_submit_deadline_returns_none_when_lorentz_inactive():
-    """Pre-Lorentz mode (or detection failed): dynamic path returns None
-    → engine falls back to static 700ms offset."""
+def test_fire_anchor_poll_returns_anchor_state_on_success(monkeypatch):
+    """Happy path: RPC returns a valid Lorentz-encoded block; fire_anchor_poll
+    decodes the mixHash and returns an AnchorState."""
     p = _make_poller()
-    p._lorentz_active = False
-    p._anchor = AnchorState(block_number=1, milli_ts=1_000_000,
-                             observed_at_local_ms=int(time.time() * 1000))
-    assert p.compute_dynamic_submit_deadline_ms(lock_ms=1_003_600) is None
+    block = {
+        "number": hex(98_000_000),
+        "timestamp": hex(1778712807),
+        "mixHash": "0x" + "00" * 30 + "0352",  # 850ms quantum
+    }
+    monkeypatch.setattr(
+        p, "_rpc_call_single_with_timeout",
+        lambda method, params, *, timeout_s: block,
+    )
+    anchor = p.fire_anchor_poll(timeout_s=0.200)
+    assert anchor is not None
+    assert anchor.block_number == 98_000_000
+    assert anchor.milli_ts == 1778712807 * 1000 + 850
 
 
-def test_compute_dynamic_submit_deadline_returns_none_when_no_anchor():
-    """No anchor observed yet: dynamic returns None even if Lorentz active."""
+def test_fire_anchor_poll_returns_none_on_rpc_error(monkeypatch):
+    """RPC raises (timeout, hedged-all-failed, transport error) → None."""
     p = _make_poller()
-    p._lorentz_active = True
-    p._anchor = None
-    assert p.compute_dynamic_submit_deadline_ms(lock_ms=1_003_600) is None
+
+    def _raise(method, params, *, timeout_s):
+        raise TimeoutError("hedged_timeout")
+
+    monkeypatch.setattr(p, "_rpc_call_single_with_timeout", _raise)
+    assert p.fire_anchor_poll(timeout_s=0.200) is None
 
 
-def test_compute_dynamic_submit_deadline_active_and_anchor_present():
-    """Lorentz active + anchor present → returns the dynamic deadline."""
+def test_fire_anchor_poll_returns_none_on_malformed_response(monkeypatch):
+    """Response is not a dict → None (defensive against bad RPC)."""
     p = _make_poller()
-    p._lorentz_active = True
-    p._anchor = AnchorState(block_number=1, milli_ts=1_000_000,
-                             observed_at_local_ms=int(time.time() * 1000))
-    result = p.compute_dynamic_submit_deadline_ms(lock_ms=1_003_600)
-    assert result is not None
-    # Predecessor at 1_003_150 (per test_predict_predecessor_milli_ts above);
-    # gap = 1_003_600 - 1_003_150 = 450ms (no backoff); deadline = pred - 200 = 1_002_950.
-    assert result == 1_002_950
+    monkeypatch.setattr(
+        p, "_rpc_call_single_with_timeout",
+        lambda method, params, *, timeout_s: "not_a_dict",
+    )
+    assert p.fire_anchor_poll(timeout_s=0.200) is None
 
 
-# --- Watchdog: anomaly counters via _observe_block_for_watchdog_locked ---
-
-def test_watchdog_nominal_no_increment():
-    """Two consecutive blocks at exactly 450ms apart → no anomaly."""
+def test_fire_anchor_poll_returns_none_on_missing_number(monkeypatch):
+    """Response dict missing 'number' field → None."""
     p = _make_poller()
-    with p._lock:
-        p._observe_block_for_watchdog_locked(100, 1_000_000)
-        p._observe_block_for_watchdog_locked(101, 1_000_450)
-    counters = p.anomaly_counters()
-    assert counters["quantum_shift"] == 0
-    assert counters["slot_miss"] == 0
-    assert counters["advance"] == 0
-    assert counters["other"] == 0
+    monkeypatch.setattr(
+        p, "_rpc_call_single_with_timeout",
+        lambda method, params, *, timeout_s: {
+            "timestamp": hex(1778712807),
+            "mixHash": "0x" + "00" * 30 + "0352",
+        },
+    )
+    assert p.fire_anchor_poll(timeout_s=0.200) is None
 
 
-def test_watchdog_quantum_shift_counted():
-    """500ms delta → quantum_shift counter increments."""
+def test_fire_anchor_poll_returns_none_on_unparseable_milli_ts(monkeypatch):
+    """compute_milli_ts returns None (malformed mixHash or timestamp) → None."""
     p = _make_poller()
-    with p._lock:
-        p._observe_block_for_watchdog_locked(100, 1_000_000)
-        p._observe_block_for_watchdog_locked(101, 1_000_500)
-    counters = p.anomaly_counters()
-    assert counters["quantum_shift"] == 1
-    assert counters["slot_miss"] == 0
-    assert counters["advance"] == 0
+    monkeypatch.setattr(
+        p, "_rpc_call_single_with_timeout",
+        lambda method, params, *, timeout_s: {
+            "number": hex(98_000_000),
+            "timestamp": "0xZZ",  # bad hex → compute_milli_ts None
+            "mixHash": "0x" + "00" * 32,
+        },
+    )
+    assert p.fire_anchor_poll(timeout_s=0.200) is None
 
 
-def test_watchdog_slot_miss_counted():
-    """900ms delta (single slot miss) → slot_miss counter increments."""
+def test_fire_anchor_poll_passes_timeout_through(monkeypatch):
+    """The timeout_s argument must reach _rpc_call_single_with_timeout."""
     p = _make_poller()
-    with p._lock:
-        p._observe_block_for_watchdog_locked(100, 1_000_000)
-        p._observe_block_for_watchdog_locked(101, 1_000_900)
-    counters = p.anomaly_counters()
-    assert counters["slot_miss"] == 1
-    assert counters["quantum_shift"] == 0
+    captured: dict = {}
+
+    def _capture(method, params, *, timeout_s):
+        captured["method"] = method
+        captured["params"] = params
+        captured["timeout_s"] = timeout_s
+        return {
+            "number": hex(1),
+            "timestamp": hex(1778712807),
+            "mixHash": "0x" + "00" * 30 + "0352",
+        }
+
+    monkeypatch.setattr(p, "_rpc_call_single_with_timeout", _capture)
+    p.fire_anchor_poll(timeout_s=0.200)
+    assert captured["timeout_s"] == 0.200
+    assert captured["method"] == "eth_getBlockByNumber"
+    assert captured["params"] == ["latest", False]
 
 
-def test_watchdog_advance_raises_invariant_error():
-    """delta < 450ms → advance counter increments AND InvariantError is
-    raised. The "misses only delay, never advance" property is load-bearing
-    for Bundle 4's no-margin dynamic deadline math; an observed advance
-    event means Parlia consensus has changed and the bot's chain-time
-    arithmetic is broken. Fail-loud rather than silent incorrect operation.
-    """
+# ---------------------------------------------------------------------------
+# Bundle 5 v2 (2026-05-14): receipts-only batch shape
+# ---------------------------------------------------------------------------
+
+def test_fetch_and_process_blocks_sends_receipts_only_batch(monkeypatch):
+    """_fetch_and_process_blocks must build a JSON-RPC batch of ONLY
+    eth_getBlockReceipts calls (no eth_getBlockByNumber per block).
+    Catches accidental re-introduction of the bundled header fetch."""
     p = _make_poller()
-    with p._lock:
-        p._observe_block_for_watchdog_locked(100, 1_000_000)
-        with pytest.raises(InvariantError, match="BSC_PARLIA_ADVANCE_DETECTED"):
-            p._observe_block_for_watchdog_locked(101, 1_000_400)  # 400ms delta!
-    # Counter still incremented before raise (diagnostic accuracy).
-    counters = p.anomaly_counters()
-    assert counters["advance"] == 1
+    captured_calls: list = []
+
+    def _capture(calls):
+        captured_calls.extend(calls)
+        return [([], None) for _ in calls]
+
+    monkeypatch.setattr(p, "_rpc_batch", _capture)
+    p._fetch_and_process_blocks([100, 101, 102])
+    assert len(captured_calls) == 3
+    for method, params in captured_calls:
+        assert method == "eth_getBlockReceipts"
+        assert len(params) == 1
+    assert not any(m == "eth_getBlockByNumber" for m, _ in captured_calls)
 
 
-def test_watchdog_ignores_non_consecutive_blocks():
-    """Block skips (e.g. after a cursor clamp) should NOT count as slot misses."""
+def test_fetch_and_process_blocks_empty_input_no_rpc(monkeypatch):
+    """Empty block list → no RPC call fired."""
     p = _make_poller()
-    with p._lock:
-        p._observe_block_for_watchdog_locked(100, 1_000_000)
-        # Skip 20 blocks (would compute as massive slot_miss if naive):
-        p._observe_block_for_watchdog_locked(120, 1_009_000)
-    counters = p.anomaly_counters()
-    # No anomaly recorded for the skip.
-    assert counters["slot_miss"] == 0
-    assert counters["advance"] == 0
+    rpc_calls = 0
+
+    def _track(calls):
+        nonlocal rpc_calls
+        rpc_calls += 1
+        return []
+
+    monkeypatch.setattr(p, "_rpc_batch", _track)
+    p._fetch_and_process_blocks([])
+    assert rpc_calls == 0
 
 
-# --- Anchor monotonic update ---
+# ---------------------------------------------------------------------------
+# Bundle 5 v2 (2026-05-14): lazy block_ts resolution for bet-containing blocks
+# ---------------------------------------------------------------------------
 
-def test_anchor_update_monotonic_ignores_older_blocks():
-    """Older blocks (smaller block_number) must NOT overwrite the anchor."""
+def test_resolve_block_ts_caches_result_on_success(monkeypatch):
+    """A successful header fetch caches the timestamp in _block_ts."""
     p = _make_poller()
-    block_newer = {"number": hex(101), "timestamp": hex(1_000_001),
-                   "mixHash": "0x" + "00" * 30 + "0064"}
-    block_older = {"number": hex(100), "timestamp": hex(1_000_000),
-                   "mixHash": "0x" + "00" * 30 + "0064"}
-    p._update_anchor_from_block(block_newer)
-    a1 = p.anchor_state()
-    p._update_anchor_from_block(block_older)
-    a2 = p.anchor_state()
-    assert a1 is not None and a2 is not None
-    assert a1.block_number == a2.block_number == 101
+    monkeypatch.setattr(
+        p, "_rpc_call_single",
+        lambda method, params: {"timestamp": hex(1778712807)},
+    )
+    assert p._resolve_block_ts(100) == 1778712807
+    assert p._block_ts.get(100) == 1778712807
 
 
-def test_anchor_update_advances_on_newer_block():
-    """Newer block updates the anchor. Use a nominal 450ms delta so the
-    watchdog doesn't flag an advance event — the InvariantError raise
-    on delta < 450ms is tested separately."""
+def test_resolve_block_ts_returns_zero_on_rpc_error(monkeypatch):
+    """RPC raises → return 0, no cache write."""
     p = _make_poller()
-    block_a = {"number": hex(100), "timestamp": hex(1_000_000),
-               "mixHash": "0x" + "00" * 30 + "0064"}  # ms=100
-    p._update_anchor_from_block(block_a)
-    # block_b: same second, ms=550 → milli_ts delta = 450ms (nominal slot)
-    block_b = {"number": hex(101), "timestamp": hex(1_000_000),
-               "mixHash": "0x" + "00" * 30 + "0226"}  # 550ms
-    p._update_anchor_from_block(block_b)
-    a = p.anchor_state()
-    assert a is not None
-    assert a.block_number == 101
-    assert a.milli_ts == 1_000_000_000 + 550
+
+    def _raise(method, params):
+        raise RuntimeError("rpc failed")
+
+    monkeypatch.setattr(p, "_rpc_call_single", _raise)
+    assert p._resolve_block_ts(100) == 0
+    assert 100 not in p._block_ts
 
 
-def test_anchor_update_silently_skips_malformed_block():
-    """Block-header dict without mixHash or with bad encoding → no update."""
+def test_resolve_block_ts_returns_zero_on_malformed_response(monkeypatch):
+    """Response is not a dict or has bad timestamp → 0, no cache write."""
     p = _make_poller()
-    # First, set a valid anchor.
-    block_a = {"number": hex(100), "timestamp": hex(1_000_000),
-               "mixHash": "0x" + "00" * 30 + "0064"}
-    p._update_anchor_from_block(block_a)
-    a1 = p.anchor_state()
-    # Now feed garbage; anchor must NOT advance to block 101.
-    p._update_anchor_from_block({"number": hex(101)})  # missing fields
-    p._update_anchor_from_block({"number": hex(101), "timestamp": "bogus", "mixHash": "0x" + "00" * 32})
-    a2 = p.anchor_state()
-    assert a2.block_number == a1.block_number == 100
+    monkeypatch.setattr(p, "_rpc_call_single", lambda method, params: "not_a_dict")
+    assert p._resolve_block_ts(100) == 0
+    monkeypatch.setattr(p, "_rpc_call_single",
+                        lambda method, params: {"timestamp": "0xZZ"})
+    assert p._resolve_block_ts(101) == 0
+    assert 101 not in p._block_ts
 
 
-# Note: Bundle 4 reviewer Y1 (staleness gate), Y2 (heartbeat hook), and
-# Y7 (advance WARN rate-limit) tests were removed per user follow-up
-# directive 2026-05-14:
-#   - Y1: dynamic deadline now computed unconditionally when Lorentz is
-#     active. The chain progresses at deterministic 450ms cadence, so
-#     anchor+k*450 is exact regardless of anchor age. Watchdog catches
-#     consensus changes via InvariantError on advance events.
-#   - Y2: removed; engine's _sleep_until_ts ticks heartbeat during all
-#     OTHER pre-lock waits, bracketing the 3.5s fine-phase window well
-#     inside the supervisor's threshold.
-#   - Y7: advance event now raises InvariantError immediately (see
-#     test_watchdog_advance_raises_invariant_error above) — no
-#     rate-limit needed because the bot halts on the first event.

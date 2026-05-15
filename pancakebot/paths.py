@@ -37,6 +37,11 @@ DRY_HEARTBEAT_PATH = "var/dry/heartbeat.json"
 DRY_CRASH_PATH = "var/dry/crash.json"
 DRY_PID_PATH = "var/dry/bot.pid"
 
+# RotatingFileHandler sink (Bundle 5 2026-05-14). The runtime mirrors
+# every ``pancakebot.log`` line into this file via a Python ``logging``
+# handler. Stdout writer is preserved. 25MB rotation × 7 backups.
+DRY_RUNTIME_LOG_PATH = "var/dry/runtime.log"
+
 # -- Live mode --
 LIVE_BANKROLL_HISTORY_PATH = "var/live/bankroll_history.jsonl"
 LIVE_CLAIM_CURSOR_PATH = "var/live/claim_cursor.txt"
@@ -47,6 +52,10 @@ LIVE_TRADES_PATH = "var/live/trades.csv"
 LIVE_HEARTBEAT_PATH = "var/live/heartbeat.json"
 LIVE_CRASH_PATH = "var/live/crash.json"
 LIVE_PID_PATH = "var/live/bot.pid"
+
+# RotatingFileHandler sink (Bundle 5 2026-05-14). Live mirror of the dry
+# runtime log path; see DRY_RUNTIME_LOG_PATH for rationale.
+LIVE_RUNTIME_LOG_PATH = "var/live/runtime.log"
 
 # -- Backtest mode --
 BACKTEST_TRADES_PATH = "var/backtest/trades.csv"

@@ -25,7 +25,7 @@ from pancakebot.runtime.config import RuntimeConfig
 from pancakebot.runtime import engine
 from pancakebot.market_data.sync import sync_runtime_market_data
 from pancakebot.util import InvariantError
-from pancakebot.log import info
+from pancakebot.log import configure_file_logging, info
 from pancakebot.chain.rpc_poller import RpcPoller, DEFAULT_HEDGED_ENDPOINTS
 from pancakebot import paths
 
@@ -81,7 +81,6 @@ def run_from_config(
             contract=None,
             wallet_address="",
             cutoff_seconds=cfg.kline_cutoff_seconds,
-            ntp_sync_wakeup_offset_ms=cfg.ntp_sync_wakeup_offset_ms,
             bankroll_wakeup_offset_ms=cfg.bankroll_wakeup_offset_ms,
             critical_path_wakeup_offset_ms=cfg.critical_path_wakeup_offset_ms,
             bet_submit_deadline_offset_ms=cfg.bet_submit_deadline_offset_ms,
@@ -148,6 +147,16 @@ def run_from_config(
     # Dry or live mode -- both need RPC, live also needs private key.
     load_env()
     private_key = require_env("BSC_WALLET_PRIVATE_KEY") if live else ""
+
+    # Bundle 5 2026-05-14: persist every structured log line to a
+    # rotating file under ``var/{mode}/runtime.log``. The stdout writer
+    # (consumed by the Windows pythonw redirect into the supervisor's
+    # stdout capture) is preserved; the file sink is purely additive
+    # and survives a crash that takes the stdout consumer down with it.
+    _runtime_log_path = (
+        paths.DRY_RUNTIME_LOG_PATH if dry else paths.LIVE_RUNTIME_LOG_PATH
+    )
+    configure_file_logging(_runtime_log_path)
     rpc_url = choose_rpc_url(
         RPC_URLS,
         expected_chain_id=int(EXPECTED_CHAIN_ID),
@@ -224,7 +233,6 @@ def run_from_config(
         contract=contract,
         wallet_address=contract.wallet_address,
         cutoff_seconds=cfg.kline_cutoff_seconds,
-        ntp_sync_wakeup_offset_ms=cfg.ntp_sync_wakeup_offset_ms,
         ramp_poll_1_wakeup_offset_ms=cfg.ramp_poll_1_wakeup_offset_ms,
         ramp_poll_2_wakeup_offset_ms=cfg.ramp_poll_2_wakeup_offset_ms,
         final_rpc_poll_wakeup_offset_ms=cfg.final_rpc_poll_wakeup_offset_ms,
