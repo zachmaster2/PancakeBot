@@ -29,7 +29,7 @@ from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
 
-_BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
+_RETRY_BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
 
 
 @dataclass(slots=True)
@@ -399,7 +399,7 @@ def _fetch_wallet_balance_bnb_with_retries(
     cfg: RuntimeConfig,
     reason: str,
 ) -> float:
-    for delay_seconds in _BACKOFF_SECONDS:
+    for delay_seconds in _RETRY_BACKOFF_SECONDS:
         try:
             return float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
         except TransientRpcError as e:
@@ -702,7 +702,7 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
         tracker = PersistedBankrollTracker(
             path=Path(_paths.DRY_BANKROLL_HISTORY_PATH),
             initial_bankroll=bankroll_state.simulated_bankroll_bnb,
-            window_days=cfg.strategy.risk.window_days,
+            drawdown_peak_window_days=cfg.strategy.risk.drawdown_peak_window_days,
         )
         strategy_pipeline.set_bankroll_tracker(tracker)
         closed.dry_bets_by_epoch = _load_dry_bets(_paths.DRY_PENDING_BETS_PATH)
@@ -734,7 +734,7 @@ def _build_momentum_pipeline(*, cfg: RuntimeConfig) -> MomentumOnlyPipeline:
         config=gate_config,
         strategy_config=cfg.strategy,
         gate=cfg.momentum_gate,
-        cutoff_seconds=cfg.cutoff_seconds,
+        kline_cutoff_seconds=cfg.kline_cutoff_seconds,
         min_bet_amount_bnb=cfg.min_bet_amount_bnb,
         treasury_fee_fraction=cfg.treasury_fee_fraction,
     )

@@ -27,7 +27,7 @@ class RuntimeConfig:
     wallet_address: str
 
     # Feature cutoff
-    cutoff_seconds: int
+    kline_cutoff_seconds: int
 
     # Pre-lock wake schedule (all DERIVED from pancakebot/timing_constants.py
     # at config load; not user-tunable). All in milliseconds before lock_at.
@@ -65,15 +65,15 @@ class RuntimeConfig:
     #   eth_getBlockReceipts so the critical_path snapshot is fresh.
     # critical_path_wake reads the local pool aggregate, runs the gate,
     #   and submits the bet.
-    ramp_poll_1_wakeup_offset_ms: int
-    ramp_poll_2_wakeup_offset_ms: int
-    final_rpc_poll_wakeup_offset_ms: int
-    bankroll_wakeup_offset_ms: int
-    critical_path_wakeup_offset_ms: int
-    bet_submit_deadline_offset_ms: int
+    ramp_poll_1_wakeup_offset_before_lock_ms: int
+    ramp_poll_2_wakeup_offset_before_lock_ms: int
+    final_rpc_poll_wakeup_offset_before_lock_ms: int
+    bankroll_wakeup_offset_before_lock_ms: int
+    critical_path_wakeup_offset_before_lock_ms: int
+    bet_submit_deadline_offset_before_lock_ms: int
 
     # Receipt timeouts for ``contract.bet_*_timed`` and ``contract.claim``
-    # (DERIVED at runtime from ``buffer_seconds + claim_check_padding_seconds``,
+    # (DERIVED at runtime from ``round_close_buffer_seconds + claim_check_padding_seconds``,
     # ≈35s on canonical chain constants). Both share the same derivation:
     # how long ``wait_for_transaction_receipt`` polls before raising
     # TimeExhausted. Sized so a slow mempool inclusion is still caught
@@ -93,7 +93,7 @@ class RuntimeConfig:
     # User-tunable. Streak counter for OKX transient failures; bot
     # crashes (-> supervisor restart + Discord alert) after this many
     # consecutive `kline_fetch_transient_failure` rounds.
-    max_consecutive_fetch_failures: int
+    max_consecutive_kline_fetch_failures: int
 
     # User-tunable. Pool cutoff: only bets with on-chain block_timestamp
     # < lock_at - pool_cutoff_seconds are counted in the pool aggregate.
@@ -105,8 +105,8 @@ class RuntimeConfig:
     # Protocol constants (from chain via contract_constants.json)
     min_bet_amount_bnb: float
     treasury_fee_fraction: float
-    interval_seconds: int
-    buffer_seconds: int
+    round_interval_seconds: int
+    round_close_buffer_seconds: int
 
     # Dry-mode initial bankroll
     dry_initial_bankroll_bnb: float | None
@@ -115,7 +115,7 @@ class RuntimeConfig:
     dry: bool
 
     # Live: clamp all bet sizes to contract minimum for safe testing
-    live_min_bet_only: bool
+    live_clamp_bet_to_contract_minimum: bool
 
     # Fresh start: archive existing dry state before starting
     dry_fresh_start: bool

@@ -11,7 +11,7 @@ parameterised via ``RetryPolicy``:
 - ``RETRY_NONE``: single attempt, no retry (used by the per-round live-
   decision gate). Retry on the live path adds 2.5s+ wall-clock that
   always pushes decision past lock_at, contributing zero bet-placement
-  value. The gate's ``max_consecutive_fetch_failures`` streak counter
+  value. The gate's ``max_consecutive_kline_fetch_failures`` streak counter
   (in MomentumGateConfig) handles transient-failure escalation.
 
 Returns oldest-first list of ``[ts_ms, open, high, low, close, volume]``
@@ -58,8 +58,8 @@ from pancakebot.util import InvariantError, TransientOkxError
 
 _OKX_BASE_URL = "https://www.okx.com"
 
-_JITTER_MIN = 0.5
-_JITTER_MAX = 1.5
+_RETRY_JITTER_MIN_FRACTION = 0.5
+_RETRY_JITTER_MAX_FRACTION = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +176,7 @@ RETRY_SYNC = RetryPolicy(max_attempts=5, backoff_seconds=(2.0, 4.0, 8.0, 16.0))
 # pushes decision past lock_at (2.5s+ backoff > pre-lock budget), where
 # the engine's timing guard would skip anyway -- so retry just adds
 # wall-clock + rate-budget cost for no operational benefit. The gate's
-# ``max_consecutive_fetch_failures`` streak counter (configured per
+# ``max_consecutive_kline_fetch_failures`` streak counter (configured per
 # MomentumGateConfig) handles escalation: N consecutive -> bot crashes
 # with InvariantError -> supervisor restart + Discord alert.
 RETRY_NONE = RetryPolicy(max_attempts=1, backoff_seconds=())
@@ -252,7 +252,7 @@ class OkxClient:
         Default ``connections=3`` matches the live decision-path gate's
         3-symbol concurrent fetch (BTC/ETH/SOL), so every parallel
         request finds a pre-established TLS connection. If BNB fetch is
-        re-enabled in ``MomentumGate._SYMBOLS_FETCHED``, bump this default
+        re-enabled in ``MomentumGate._OKX_SYMBOLS_FETCHED``, bump this default
         back to 4 in the same change.
 
         Per-round freshness: BEFORE filling the pool, close the existing
@@ -565,7 +565,7 @@ class OkxClient:
                     f"class={cls.value} detail={detail}"
                 )
             base_delay = retry_policy.backoff_seconds[attempt]
-            delay = base_delay * random.uniform(_JITTER_MIN, _JITTER_MAX)
+            delay = base_delay * random.uniform(_RETRY_JITTER_MIN_FRACTION, _RETRY_JITTER_MAX_FRACTION)
             warn("NET", "OKX", "RETRY",
                  attempt=attempt + 1, delay_s=f"{delay:.2f}",
                  endpoint="history-candles", symbol=symbol,

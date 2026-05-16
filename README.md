@@ -134,7 +134,7 @@ from constants in `pancakebot/timing_constants.py`.
 | `wait_for_bankroll` | `lock_at - 6045ms` | Refresh wallet balance: live mode = BSC RPC; dry mode = in-memory simulated bankroll. Feeds the risk gates and `decide_open_round` with fresh-truth |
 | `wait_for_critical_path` | `lock_at - 1095ms` | Single critical-path entry. Sequentially: pool snapshot from WSS (`pool_cutoff_seconds = 6` data horizon) → 3 parallel OKX `/history-candles` GETs (BTC/ETH/SOL) → signal compute → bet submit |
 | Pre-bet timing guard | `lock_at - 750ms` | Abort if decision-ready past the safety margin (TX would mine after lock) |
-| `wait_for_claim` | `close_at(prev_locked) + buffer_seconds + 5s` (≈ 35s post-close) | Sleep for previous round's settlement; claim winnings (live; receipt-waited with `claim_tx_receipt_timeout_seconds ≈ 35s`, revert/timeout fires Discord `CLAIM FAILED` alert) |
+| `wait_for_claim` | `close_at(prev_locked) + round_close_buffer_seconds + 5s` (≈ 35s post-close) | Sleep for previous round's settlement; claim winnings (live; receipt-waited with `claim_tx_receipt_timeout_seconds ≈ 35s`, revert/timeout fires Discord `CLAIM FAILED` alert) |
 
 ### Configurable knobs (`config.toml [runtime]`)
 
@@ -147,7 +147,7 @@ from constants in `pancakebot/timing_constants.py`.
   Cross-validated at load:
   `pool_read_wakeup_offset_ms <= pool_cutoff_seconds * 1000 -
   WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS`.
-- `max_consecutive_fetch_failures = 5` — streak counter before bot
+- `max_consecutive_kline_fetch_failures = 5` — streak counter before bot
   crashes (supervisor restart + Discord alert).
 
 ### Empirical constants

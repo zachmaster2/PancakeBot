@@ -17,14 +17,14 @@ Driver semantics:
 A FoldSpec is a dict with keys:
 
     name          : str                      # output sub-path
-    cutoff_seconds: int                      # 1, 2, ...
+    kline_cutoff_seconds: int                      # 1, 2, ...
     epoch_start   : int | None
     epoch_end     : int | None
     strategy_overrides : dict (optional)     # nested-dict shape, see config.load_strategy_config_from_dict
     plot          : bool (optional, default False)  # generate equity_curves.png
 
 The driver computes a unified kline-load extent that covers every
-spec's ``(cutoff_seconds, max_lookback)`` pair, then for each spec
+spec's ``(kline_cutoff_seconds, max_lookback)`` pair, then for each spec
 slices the loaded array to that spec's exact window before running the
 fold. Per-fold output (``trades.csv``, ``summary.json``) lands under
 ``<output_base_dir>/<name>/``.
@@ -58,7 +58,7 @@ from pancakebot.config import (
     _DEFAULT_STRATEGY,
     load_strategy_config_from_dict,
 )
-from pancakebot.constants import GAS_COST_BET_BNB, POOL_CUTOFF_SECONDS
+from pancakebot.constants import BACKTEST_GAS_COST_BET_BNB, POOL_CUTOFF_SECONDS
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.settlement import settle_bet_against_closed_round
 from pancakebot.strategy.momentum_gate import MomentumGateConfig
@@ -84,7 +84,7 @@ _EXT_CLOSED_ROUNDS_PATH = REPO_ROOT / _paths.EXTENDED_CLOSED_ROUNDS_PATH
 @dataclass(frozen=True)
 class FoldSpec:
     name: str
-    cutoff_seconds: int
+    kline_cutoff_seconds: int
     epoch_start: int | None
     epoch_end: int | None
     strategy_overrides: dict[str, Any] = field(default_factory=dict)
@@ -132,8 +132,8 @@ def _compute_load_extent(
     max_endpoints: list[int] = []
     for spec, sc in resolved:
         ml = max(sc.gate.mtf_lookbacks)
-        cutoffs.append(spec.cutoff_seconds)
-        max_endpoints.append(spec.cutoff_seconds + ml + 1)
+        cutoffs.append(spec.kline_cutoff_seconds)
+        max_endpoints.append(spec.kline_cutoff_seconds + ml + 1)
     earliest_offset = max(max_endpoints)
     latest_offset = min(c + 1 for c in cutoffs)
     load_count = earliest_offset - latest_offset + 1
@@ -205,17 +205,17 @@ def _load_klines_unified(
 def _slice_per_entry(
     kl_unified: list[list],
     *,
-    cutoff_seconds: int,
+    kline_cutoff_seconds: int,
     max_lookback: int,
     earliest_offset: int,
 ) -> list[list]:
     """Extract the per-entry window from the unified loaded array.
 
-    end_idx = earliest_offset - cutoff_seconds  (exclusive end)
+    end_idx = earliest_offset - kline_cutoff_seconds  (exclusive end)
     start_idx = end_idx - (max_lookback + 1)
     Returns exactly (max_lookback + 1) candles.
     """
-    end_idx = earliest_offset - cutoff_seconds
+    end_idx = earliest_offset - kline_cutoff_seconds
     start_idx = end_idx - (max_lookback + 1)
     return kl_unified[start_idx:end_idx]
 
@@ -297,21 +297,21 @@ def run_fold(
     # no copy. The slice itself returns a new outer list per record.
     btc_klines = {
         ep: _slice_per_entry(
-            kl, cutoff_seconds=spec.cutoff_seconds,
+            kl, kline_cutoff_seconds=spec.kline_cutoff_seconds,
             max_lookback=max_lookback, earliest_offset=earliest_offset,
         )
         for ep, kl in btc_unified.items()
     }
     eth_klines = {
         ep: _slice_per_entry(
-            kl, cutoff_seconds=spec.cutoff_seconds,
+            kl, kline_cutoff_seconds=spec.kline_cutoff_seconds,
             max_lookback=max_lookback, earliest_offset=earliest_offset,
         )
         for ep, kl in eth_unified.items()
     }
     sol_klines = {
         ep: _slice_per_entry(
-            kl, cutoff_seconds=spec.cutoff_seconds,
+            kl, kline_cutoff_seconds=spec.kline_cutoff_seconds,
             max_lookback=max_lookback, earliest_offset=earliest_offset,
         )
         for ep, kl in sol_unified.items()
@@ -324,20 +324,20 @@ def run_fold(
         btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT",
         sol_symbol="SOL-USDT",
-        cutoff_seconds=spec.cutoff_seconds,
+        kline_cutoff_seconds=spec.kline_cutoff_seconds,
         mtf_lookbacks=strategy_cfg.gate.mtf_lookbacks,
-        mtf_threshold=strategy_cfg.gate.mtf_threshold,
+        mtf_min_return_threshold=strategy_cfg.gate.mtf_min_return_threshold,
     )
     bankroll_tracker = InMemoryBankrollTracker(
         initial_bankroll=initial_bankroll_bnb,
-        window_days=strategy_cfg.risk.window_days,
-        peak_mode=strategy_cfg.risk.dd_peak_mode,
+        drawdown_peak_window_days=strategy_cfg.risk.drawdown_peak_window_days,
+        peak_mode=strategy_cfg.risk.drawdown_peak_mode,
     )
     pipeline = MomentumOnlyPipeline(
         config=gate_config,
         strategy_config=strategy_cfg,
         gate=None,
-        cutoff_seconds=spec.cutoff_seconds,
+        kline_cutoff_seconds=spec.kline_cutoff_seconds,
         min_bet_amount_bnb=min_bet_amount_bnb,
         treasury_fee_fraction=treasury_fee_fraction,
         bankroll_tracker=bankroll_tracker,
@@ -373,7 +373,7 @@ def run_fold(
                 if bet_side not in ("Bull", "Bear"):
                     raise InvariantError("backtest_bet_side_invalid")
 
-                bankroll -= decision.bet_size_bnb + GAS_COST_BET_BNB
+                bankroll -= decision.bet_size_bnb + BACKTEST_GAS_COST_BET_BNB
                 outcome = settle_bet_against_closed_round(
                     bet_bnb=decision.bet_size_bnb,
                     bet_side=bet_side,
@@ -381,7 +381,7 @@ def run_fold(
                     treasury_fee_fraction=treasury_fee_fraction,
                 )
                 bankroll += outcome.credit_bnb
-                profit = outcome.credit_bnb - decision.bet_size_bnb - GAS_COST_BET_BNB
+                profit = outcome.credit_bnb - decision.bet_size_bnb - BACKTEST_GAS_COST_BET_BNB
 
                 stats.num_bets += 1
                 if bet_side == "Bull":
@@ -428,7 +428,7 @@ def run_fold(
 
     skip_detail = dict(sorted(stats.skip_counts_by_reason.items(), key=lambda x: -x[1]))
     summary = {
-        "simulation_size": total_rounds,
+        "backtest_round_count": total_rounds,
         "first_epoch": first_epoch,
         "last_epoch": last_epoch,
         "initial_bankroll_bnb": initial_bankroll_bnb,
@@ -578,7 +578,7 @@ def run_experiment(
     summaries: list[dict[str, Any]] = []
     for spec, strategy_cfg in resolved:
         t_fold = time.perf_counter()
-        print(f"\nfold {spec.name} cutoff={spec.cutoff_seconds} "
+        print(f"\nfold {spec.name} cutoff={spec.kline_cutoff_seconds} "
               f"epochs=[{spec.epoch_start}..{spec.epoch_end}]", flush=True)
         summary = run_fold(
             spec=spec,
@@ -606,7 +606,7 @@ def run_experiment(
 def _spec_from_dict(d: dict[str, Any]) -> FoldSpec:
     return FoldSpec(
         name=str(d["name"]),
-        cutoff_seconds=int(d["cutoff_seconds"]),
+        kline_cutoff_seconds=int(d["kline_cutoff_seconds"]),
         epoch_start=d.get("epoch_start"),
         epoch_end=d.get("epoch_end"),
         strategy_overrides=d.get("strategy_overrides", {}) or {},

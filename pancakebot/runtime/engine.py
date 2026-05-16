@@ -9,9 +9,9 @@ from pathlib import Path
 
 from pancakebot.constants import (
     BNB_WEI,
-    GAS_LIMIT_BET,
-    GAS_LIMIT_CLAIM,
-    GAS_COST_BET_BNB,
+    BACKTEST_GAS_LIMIT_BET,
+    BACKTEST_GAS_LIMIT_CLAIM,
+    BACKTEST_GAS_COST_BET_BNB,
 )
 from pancakebot.util import InvariantError, TransientRpcError
 from pancakebot.log import info, warn
@@ -40,15 +40,15 @@ from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
 # Extra cushion added to the claim wake time, on top of the chain's
-# ``buffer_seconds`` settlement window. Total claim-wake time =
-# ``close_at(claim_epoch) + buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS``
+# ``round_close_buffer_seconds`` settlement window. Total claim-wake time =
+# ``close_at(claim_epoch) + round_close_buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS``
 # (NOT relative to lock_at -- the bot only claims after the round closes
-# and the keeper has had ``buffer_seconds`` to call settleRound). The
+# and the keeper has had ``round_close_buffer_seconds`` to call settleRound). The
 # padding absorbs alignment retries near RPC boundaries.
-_CLAIM_CHECK_PADDING_SECONDS = 5
+_CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS = 5
 
 _CLAIM_BATCH_SIZE = 10
-_BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
+_RETRY_BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
 _ONE_MINUTE_MS = 60_000
@@ -193,14 +193,14 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
     info(
         "CORE", "RUN", "TIMING",
         msg=(
-            f"timing config: kline_cutoff={cfg.cutoff_seconds}s "
+            f"timing config: kline_cutoff={cfg.kline_cutoff_seconds}s "
             f"pool_cutoff={cfg.pool_cutoff_seconds}s "
-            f"ramp_poll_1_wakeup={cfg.ramp_poll_1_wakeup_offset_ms}ms "
-            f"bankroll_wakeup={cfg.bankroll_wakeup_offset_ms}ms "
-            f"ramp_poll_2_wakeup={cfg.ramp_poll_2_wakeup_offset_ms}ms "
-            f"final_rpc_poll_wakeup={cfg.final_rpc_poll_wakeup_offset_ms}ms "
-            f"critical_path_wakeup={cfg.critical_path_wakeup_offset_ms}ms "
-            f"bet_submit_deadline={cfg.bet_submit_deadline_offset_ms}ms "
+            f"ramp_poll_1_wakeup={cfg.ramp_poll_1_wakeup_offset_before_lock_ms}ms "
+            f"bankroll_wakeup={cfg.bankroll_wakeup_offset_before_lock_ms}ms "
+            f"ramp_poll_2_wakeup={cfg.ramp_poll_2_wakeup_offset_before_lock_ms}ms "
+            f"final_rpc_poll_wakeup={cfg.final_rpc_poll_wakeup_offset_before_lock_ms}ms "
+            f"critical_path_wakeup={cfg.critical_path_wakeup_offset_before_lock_ms}ms "
+            f"bet_submit_deadline={cfg.bet_submit_deadline_offset_before_lock_ms}ms "
             f"bet_tx_receipt_timeout={cfg.bet_tx_receipt_timeout_seconds}s "
             f"claim_tx_receipt_timeout={cfg.claim_tx_receipt_timeout_seconds}s "
             f"kline_publish_tier={tier_msg}"
@@ -253,7 +253,7 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         tracker = PersistedBankrollTracker(
             path=Path(_paths.LIVE_BANKROLL_HISTORY_PATH),
             initial_bankroll=bankroll_bnb,
-            window_days=cfg.strategy.risk.window_days,
+            drawdown_peak_window_days=cfg.strategy.risk.drawdown_peak_window_days,
         )
         closed_state.strategy_pipeline.set_bankroll_tracker(tracker)
     info(
@@ -353,11 +353,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     locked_epoch=locked_epoch,
                     current_epoch=current_epoch,
                     now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
-                    buffer_seconds=cfg.buffer_seconds,
+                    round_close_buffer_seconds=cfg.round_close_buffer_seconds,
                     page_size=100,
-                    gas_limit=GAS_LIMIT_CLAIM,
+                    gas_limit=BACKTEST_GAS_LIMIT_CLAIM,
                     claim_batch_size=_CLAIM_BATCH_SIZE,
-                    min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
+                    min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + BACKTEST_GAS_COST_BET_BNB,
                     claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
                 )
 
@@ -384,8 +384,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if lock_ts_t <= 0:
             raise InvariantError("lock_ts_t_invalid")
 
-        # Step 5: cutoff_ts(t) = lock_ts(t) - cutoff_seconds.
-        cutoff_ts_t = lock_ts_t - cfg.cutoff_seconds
+        # Step 5: cutoff_ts(t) = lock_ts(t) - kline_cutoff_seconds.
+        cutoff_ts_t = lock_ts_t - cfg.kline_cutoff_seconds
 
         # Open-round handle. Iteration-stable since _open_round comes from
         # the handshake at the top of this iteration; epoch state is not
@@ -410,7 +410,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # lock_at) IS the close_at of ``prev_locked_epoch`` (= epoch T-2).
         # Claim wake fires at: close_at(prev) + buffer + padding.
         prev_close_ts = locked_round.lock_at  # = close_at(prev_locked_epoch)
-        claim_ts = prev_close_ts + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
+        claim_ts = prev_close_ts + cfg.round_close_buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
         # claim_ts and cutoff_ts_t are both chain-anchored true UTC; compare
         # against NTP-corrected _utc_now() so a drifted local clock doesn't
         # make us miss the wake-for-claim window.
@@ -432,7 +432,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # log SUB_W=6.
         # First of three RPC polls that ramp the local pool aggregate
         # toward the critical_path snapshot. Fires at lock_at -
-        # ramp_poll_1_wakeup_offset_ms (= ~7.500s before lock at canonical
+        # ramp_poll_1_wakeup_offset_before_lock_ms (= ~7.500s before lock at canonical
         # pool_cutoff=6 per the per-leg refactor 2026-05-12). Catches
         # blocks since the last periodic poll. deadline_ms = gap to
         # ramp_2 - safety; on RTT-exceeds-deadline the poll marks
@@ -441,7 +441,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # has flagged the round.
         if cfg.rpc_poller is not None:
             ramp_poll_1_wake_ts = (
-                lock_ts_t - cfg.ramp_poll_1_wakeup_offset_ms / 1000.0
+                lock_ts_t - cfg.ramp_poll_1_wakeup_offset_before_lock_ms / 1000.0
             )
             _sleep_until_ts(
                 ramp_poll_1_wake_ts,
@@ -450,8 +450,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             )
             ramp_1_deadline_ms = max(
                 0,
-                cfg.ramp_poll_1_wakeup_offset_ms
-                - cfg.ramp_poll_2_wakeup_offset_ms
+                cfg.ramp_poll_1_wakeup_offset_before_lock_ms
+                - cfg.ramp_poll_2_wakeup_offset_before_lock_ms
                 - 200,  # safety
             )
             cfg.rpc_poller.poll_ramp(deadline_ms=ramp_1_deadline_ms)
@@ -463,7 +463,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Generously off the critical path: 5000ms wake budget. On
         # live RPC error, SKIP the iteration with risk_bankroll_stale
         # rather than betting on stale value.
-        bankroll_wake_ts = lock_ts_t - cfg.bankroll_wakeup_offset_ms / 1000.0
+        bankroll_wake_ts = lock_ts_t - cfg.bankroll_wakeup_offset_before_lock_ms / 1000.0
         _sleep_until_ts(
             bankroll_wake_ts,
             reason="wait_for_bankroll",
@@ -523,13 +523,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         # -- Ramp poll #2 (Era 11) --
         # Second RPC poll. Fires at lock_at -
-        # ramp_poll_2_wakeup_offset_ms (= ~5.800s at canonical
+        # ramp_poll_2_wakeup_offset_before_lock_ms (= ~5.800s at canonical
         # pool_cutoff=6 per the per-leg refactor 2026-05-12; naturally
         # falls after bankroll completes). Bridges
         # ramp_1 -> final. deadline_ms = gap to final_poll - safety.
         if cfg.rpc_poller is not None:
             ramp_poll_2_wake_ts = (
-                lock_ts_t - cfg.ramp_poll_2_wakeup_offset_ms / 1000.0
+                lock_ts_t - cfg.ramp_poll_2_wakeup_offset_before_lock_ms / 1000.0
             )
             _sleep_until_ts(
                 ramp_poll_2_wake_ts,
@@ -538,22 +538,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             )
             ramp_2_deadline_ms = max(
                 0,
-                cfg.ramp_poll_2_wakeup_offset_ms
-                - cfg.final_rpc_poll_wakeup_offset_ms
+                cfg.ramp_poll_2_wakeup_offset_before_lock_ms
+                - cfg.final_rpc_poll_wakeup_offset_before_lock_ms
                 - 200,  # safety
             )
             cfg.rpc_poller.poll_ramp(deadline_ms=ramp_2_deadline_ms)
 
         # -- Final RPC poll (Era 11) --
         # Last RPC poll before critical_path reads the pool snapshot.
-        # Fires at lock_at - final_rpc_poll_wakeup_offset_ms (= ~4.7s
+        # Fires at lock_at - final_rpc_poll_wakeup_offset_before_lock_ms (= ~4.7s
         # at canonical pool_cutoff=6 post 2026-05-12 refactor; was ~3.79s
         # before lock). Catches blocks since ramp_2. deadline_ms = gap
         # to critical_path - safety. Same skip-on-too-slow contract as
         # ramp polls.
         if cfg.rpc_poller is not None:
             final_rpc_poll_wake_ts = (
-                lock_ts_t - cfg.final_rpc_poll_wakeup_offset_ms / 1000.0
+                lock_ts_t - cfg.final_rpc_poll_wakeup_offset_before_lock_ms / 1000.0
             )
             _sleep_until_ts(
                 final_rpc_poll_wake_ts,
@@ -562,8 +562,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             )
             final_deadline_ms = max(
                 0,
-                cfg.final_rpc_poll_wakeup_offset_ms
-                - cfg.critical_path_wakeup_offset_ms
+                cfg.final_rpc_poll_wakeup_offset_before_lock_ms
+                - cfg.critical_path_wakeup_offset_before_lock_ms
                 - 200,  # safety
             )
             cfg.rpc_poller.poll_final(deadline_ms=final_deadline_ms)
@@ -571,7 +571,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # -- Anchor poll + critical-path wake (Bundle 5 v2, 2026-05-14) --
         #
         # Strategy:
-        # 1. Sleep to lock - ANCHOR_POLL_OFFSET_MS (= lock - 1300ms).
+        # 1. Sleep to lock - ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS (= lock - 1300ms).
         # 2. Fire ONE eth_getBlockByNumber('latest') with a 200ms timeout.
         # 3. If response decodes to a valid BEP-520 anchor:
         #    - Compute dynamic wake (predecessor.milli_ts - 557ms)
@@ -579,8 +579,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         #      timing guard below).
         #    - Use the dynamic wake (closer to lock than static).
         # 4. If response is None (timeout / malformed):
-        #    - Fall back to static wake (= lock - critical_path_wakeup_offset_ms)
-        #      and static submit deadline (= lock - bet_submit_deadline_offset_ms).
+        #    - Fall back to static wake (= lock - critical_path_wakeup_offset_before_lock_ms)
+        #      and static submit deadline (= lock - bet_submit_deadline_offset_before_lock_ms).
         # 5. Sleep until the resolved critical_path_wake_ts.
         #
         # The anchor lives only for THIS round; ``round_anchor`` is the
@@ -591,13 +591,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # RPC calls per round) with one anchor poll per round.
         lock_ms_int = int(round(lock_ts_t * 1000))
         static_critical_path_wake_ts = (
-            lock_ts_t - cfg.critical_path_wakeup_offset_ms / 1000.0
+            lock_ts_t - cfg.critical_path_wakeup_offset_before_lock_ms / 1000.0
         )
         round_anchor: AnchorState | None = None
         critical_path_wake_ts = static_critical_path_wake_ts
         critical_path_source = "static"
         if cfg.rpc_poller is not None:
-            anchor_poll_fire_ts = lock_ts_t - _tc.ANCHOR_POLL_OFFSET_MS / 1000.0
+            anchor_poll_fire_ts = lock_ts_t - _tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS / 1000.0
             _sleep_until_ts(
                 anchor_poll_fire_ts,
                 reason="wait_for_anchor_poll",
@@ -613,7 +613,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 )
                 dynamic_wake_ms = predecessor_ms - (
                     _tc.OKX_KLINE_FETCH_RTT_P99_MS
-                    + _tc.SIGNAL_COMPUTE_TIME_MS
+                    + _tc.MOMENTUM_GATE_COMPUTE_TIME_MS
                     + _tc.POOL_READ_TIME_MS
                     + _tc.BSC_BET_SUBMIT_ONE_WAY_MS
                 )
@@ -702,14 +702,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             # polling, pool=0 just means the round genuinely had no
             # bets above the filter at cutoff time; it's no longer a
             # silent-stall signal. The strategy's gate handles
-            # zero-pool rounds via min_pool_bnb.
+            # zero-pool rounds via min_pool_bnb_at_cutoff.
 
         # Step 8: Decide. Gate fires 3 parallel OKX /history-candles
-        # GETs (BTC/ETH/SOL; BNB disabled, see MomentumGate._SYMBOLS_FETCHED)
+        # GETs (BTC/ETH/SOL; BNB disabled, see MomentumGate._OKX_SYMBOLS_FETCHED)
         # + computes signal off the returned 1s arrays. Runs sequentially
         # after the in-memory pool snapshot above; both share the single
         # critical_path_wake. The kline fetch effectively starts at
-        # lock_at - (critical_path_wakeup_offset_ms - POOL_READ_TIME_MS)
+        # lock_at - (critical_path_wakeup_offset_before_lock_ms - POOL_READ_TIME_MS)
         # ~= lock - 1090ms.
         t_features_start_ms = _mono_ms()
         pred_p_final = 0.5
@@ -780,7 +780,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         #      if the prediction lands within one quantum of lock.
         #
         #   2. Static fallback (anchor poll timed out / malformed):
-        #      ``cfg.bet_submit_deadline_offset_ms`` (=700ms post-Bundle-4
+        #      ``cfg.bet_submit_deadline_offset_before_lock_ms`` (=700ms post-Bundle-4
         #      derivation).
         #
         # lock_ts_t is chain-anchored true UTC; comparisons use
@@ -796,7 +796,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             )
             deadline_source = "dynamic"
         else:
-            deadline_ms = lock_ms - cfg.bet_submit_deadline_offset_ms
+            deadline_ms = lock_ms - cfg.bet_submit_deadline_offset_before_lock_ms
             deadline_source = "static"
         # Pre-bet R1 telemetry: log submit-offset (ms remaining before lock)
         # at this point so we can measure how much budget the post-fetch
@@ -871,15 +871,15 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if computed_amount_wei <= 0:
             raise InvariantError("bet_amount_wei_nonpositive")
 
-        # Live safety: if min_bet_only is set, clamp the submitted amount to
+        # Live safety: if clamp_bet_to_contract_minimum is set, clamp the submitted amount to
         # the contract minimum.  All strategy logic runs normally; only the
         # on-chain bet size is reduced.  Audit logs record both sizes.
         amount_wei = computed_amount_wei
-        if not cfg.dry and cfg.live_min_bet_only:
+        if not cfg.dry and cfg.live_clamp_bet_to_contract_minimum:
             min_wei = int(round(cfg.min_bet_amount_bnb * BNB_WEI))
             amount_wei = min_wei
             info("RUN", "ACT", "CLAMP",
-                 msg=f"min_bet_only: clamping {computed_amount_wei / BNB_WEI:.4f} -> {amount_wei / BNB_WEI:.4f} BNB")
+                 msg=f"clamp_bet_to_contract_minimum: clamping {computed_amount_wei / BNB_WEI:.4f} -> {amount_wei / BNB_WEI:.4f} BNB")
 
         tx_submit = None
         if not cfg.dry:
@@ -888,7 +888,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 tx_submit = cfg.contract.bet_bull_timed(
                     epoch=current_epoch,
                     amount_wei=amount_wei,
-                    gas_limit=GAS_LIMIT_BET,
+                    gas_limit=BACKTEST_GAS_LIMIT_BET,
                     gas_price_wei=gas_price_wei,
                     wait_receipt=True,
                     receipt_timeout_seconds=cfg.bet_tx_receipt_timeout_seconds,
@@ -897,7 +897,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 tx_submit = cfg.contract.bet_bear_timed(
                     epoch=current_epoch,
                     amount_wei=amount_wei,
-                    gas_limit=GAS_LIMIT_BET,
+                    gas_limit=BACKTEST_GAS_LIMIT_BET,
                     gas_price_wei=gas_price_wei,
                     wait_receipt=True,
                     receipt_timeout_seconds=cfg.bet_tx_receipt_timeout_seconds,
@@ -976,7 +976,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 raise InvariantError("dry_bankroll_uninitialized")
 
             bankroll_before_bet = closed.simulated_bankroll_bnb
-            closed.simulated_bankroll_bnb -= amount_bnb + GAS_COST_BET_BNB
+            closed.simulated_bankroll_bnb -= amount_bnb + BACKTEST_GAS_COST_BET_BNB
             bankroll_after_bet = closed.simulated_bankroll_bnb
 
             info(
@@ -1048,7 +1048,7 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
     where open_rd is the raw RoundData for the open epoch (reusable for
     pool amounts and lock_ts, avoiding duplicate RPC calls).
     """
-    for idx, delay_seconds in enumerate([0] + list(_BACKOFF_SECONDS)):
+    for idx, delay_seconds in enumerate([0] + list(_RETRY_BACKOFF_SECONDS)):
         if delay_seconds > 0:
             sleep_seconds(delay_seconds)
         try:
@@ -1103,7 +1103,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     if close_ts <= 0:
         raise InvariantError("close_ts_invalid")
 
-    claim_ts = close_ts + cfg.buffer_seconds + _CLAIM_CHECK_PADDING_SECONDS
+    claim_ts = close_ts + cfg.round_close_buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
     _sleep_until_ts(claim_ts, reason="wait_for_claim", epoch=claim_epoch)
 
     # Epoch handshake to refresh round state (both modes).
@@ -1119,11 +1119,11 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
             locked_epoch=locked_round2.epoch,
             current_epoch=current_epoch2,
             now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
-            buffer_seconds=cfg.buffer_seconds,
+            round_close_buffer_seconds=cfg.round_close_buffer_seconds,
             page_size=100,
-            gas_limit=GAS_LIMIT_CLAIM,
+            gas_limit=BACKTEST_GAS_LIMIT_CLAIM,
             claim_batch_size=_CLAIM_BATCH_SIZE,
-            min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + GAS_COST_BET_BNB,
+            min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + BACKTEST_GAS_COST_BET_BNB,
             claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
         )
 

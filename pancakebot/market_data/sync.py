@@ -65,13 +65,13 @@ def sync_runtime_market_data(
     round_store: ClosedRoundsStore,
     okx_client: OkxClient,
 ) -> SyncSummary:
-    cache_n = int(cfg.backtest.simulation_size)
+    cache_n = int(cfg.backtest.backtest_round_count)
 
     info(
         "CORE",
         "SYNC",
         "START",
-        msg=f"Sync setup: simulation_size={int(cfg.backtest.simulation_size)} closed_cache_needed={int(cache_n)}",
+        msg=f"Sync setup: backtest_round_count={int(cfg.backtest.backtest_round_count)} closed_cache_needed={int(cache_n)}",
     )
 
     # Phase 1: Sync closed rounds from The Graph.
@@ -418,7 +418,7 @@ def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient) -> list[dict]
 def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient) -> dict:
     """Fetch 1s klines for a single round via the canonical primitive.
 
-    Window is anchored to ``lock_at`` only — strategy-side ``cutoff_seconds``
+    Window is anchored to ``lock_at`` only — strategy-side ``kline_cutoff_seconds``
     does NOT enter the fetch math. Produces records bit-identical to the
     2026-04-26 rebuild's on-disk shape:
       newest open_ts = lock_at_ms - 2_000

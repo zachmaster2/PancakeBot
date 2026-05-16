@@ -13,7 +13,7 @@ The poller has three trigger paths:
 1. **Cursor initialization** — synchronous; runs on first
    ``set_round_phase()`` call (``_initialize_cursor_from_head``).
    One ``eth_getBlockByNumber(latest)`` RPC to derive the in-round
-   ``round_start_block`` from ``lock_at - interval_seconds``, sets
+   ``round_start_block`` from ``lock_at - round_interval_seconds``, sets
    the cursor, returns. Bundle 2 (2026-05-13) replaced the prior
    synchronous backfill (30-90s engine block) with this fast path;
    the actual catch-up runs via the periodic daemon's first tick.
@@ -40,7 +40,7 @@ Public interface mirrors ``PoolEventWatcher`` where feasible
 ``is_pool_ready``) so the engine call sites are minimally affected.
 
 **Endpoint hedging (fire-to-all-pool, 2026-05-11)**: every JSON-RPC
-call fires in parallel to ALL endpoints in ``DEFAULT_HEDGED_ENDPOINTS``
+call fires in parallel to ALL endpoints in ``READ_PATH_HEDGED_ENDPOINTS``
 via a shared ``ThreadPoolExecutor``. The first successful response
 wins; the rest are abandoned. There is no endpoint selection logic,
 no per-endpoint health tracking, no fan-out knob — if an endpoint
@@ -107,7 +107,7 @@ _BET_BEAR_TOPIC = "0x0d8c1fe3e67ab767116a81f122b83c2557a8c2564019cb7c4f83de1aeb1
 #
 # Fault diversity is preserved (or improved): AWS EC2 + AWS GA +
 # Cloudflare. If AWS us-east goes down entirely, publicnode remains.
-DEFAULT_HEDGED_ENDPOINTS: list[str] = [
+READ_PATH_HEDGED_ENDPOINTS: list[str] = [
     "https://bsc-dataseed1.binance.org",
     "https://bsc-dataseed1.defibit.io",
     "https://bsc-rpc.publicnode.com",
@@ -313,30 +313,30 @@ class RpcPoller:
     def __init__(
         self,
         *,
-        interval_seconds: int,
+        round_interval_seconds: int,
         endpoint_pool: list[str],
         contract_address: str = PREDICTION_V2_CONTRACT_ADDRESS,
         periodic_poll_interval_s: int = _tc.RPC_PERIODIC_POLL_INTERVAL_SECONDS,
-        batch_size: int = _tc.RPC_BATCH_BLOCK_RECEIPTS_LIMIT,
-        ramp_poll_1_wakeup_offset_ms: int = 7500,
+        batch_size: int = _tc.RPC_BATCH_MAX_BLOCKS,
+        ramp_poll_1_wakeup_offset_before_lock_ms: int = 7500,
     ) -> None:
-        if interval_seconds <= 0:
-            raise InvariantError("interval_seconds_nonpositive")
+        if round_interval_seconds <= 0:
+            raise InvariantError("round_interval_seconds_nonpositive")
         if periodic_poll_interval_s <= 0:
             raise InvariantError("periodic_poll_interval_nonpositive")
-        if batch_size <= 0 or batch_size > _tc.RPC_BATCH_BLOCK_RECEIPTS_LIMIT:
+        if batch_size <= 0 or batch_size > _tc.RPC_BATCH_MAX_BLOCKS:
             raise InvariantError(
                 f"batch_size_out_of_range: {batch_size} "
-                f"(max {_tc.RPC_BATCH_BLOCK_RECEIPTS_LIMIT})"
+                f"(max {_tc.RPC_BATCH_MAX_BLOCKS})"
             )
-        if ramp_poll_1_wakeup_offset_ms <= 0:
+        if ramp_poll_1_wakeup_offset_before_lock_ms <= 0:
             raise InvariantError("ramp_poll_1_wakeup_offset_ms_nonpositive")
 
         pool = list(endpoint_pool)
         if not pool:
             raise InvariantError("endpoint_pool_empty")
 
-        self._interval_seconds = int(interval_seconds)
+        self._interval_seconds = int(round_interval_seconds)
         self._endpoint_pool: list[str] = pool
 
         # ThreadPoolExecutor for parallel fan-out across the full pool.
@@ -381,7 +381,7 @@ class RpcPoller:
         # would otherwise land inside the (lock - ramp_1_offset, lock]
         # ramp/final window and race the engine-driven polls for the
         # non-blocking _poll_lock.
-        self._ramp_poll_1_wakeup_offset_ms = int(ramp_poll_1_wakeup_offset_ms)
+        self._ramp_poll_1_wakeup_offset_ms = int(ramp_poll_1_wakeup_offset_before_lock_ms)
 
         self._lock = threading.Lock()
 
@@ -882,7 +882,7 @@ class RpcPoller:
     def _available_catchup_ms(self, time_until_lock_ms: int) -> int:
         """Time available for catch-up, with the same safety buffer
         the deadline-driven polls use."""
-        return max(0, time_until_lock_ms - _tc.RPC_POLL_FINAL_SAFETY_BUFFER_MS)
+        return max(0, time_until_lock_ms - _tc.RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS)
 
     def _is_catchup_infeasible(self, *, blocks_behind: int, lock_at: int) -> bool:
         """Return True if estimated catch-up wallclock exceeds the time
@@ -957,7 +957,7 @@ class RpcPoller:
         correct cursor.
 
         Round-aware: round_start_block is derived from
-        ``lock_at - interval_seconds``, NOT from a head-relative
+        ``lock_at - round_interval_seconds``, NOT from a head-relative
         full-round lookback. Past-round blocks are archive-only and
         never bet on, so seeking earlier is wasted.
 
@@ -983,7 +983,7 @@ class RpcPoller:
             try:
                 # eth_getBlockByNumber('latest') returns head_number AND
                 # head_timestamp in one call — both needed to derive
-                # round_start_block from lock_at - interval_seconds.
+                # round_start_block from lock_at - round_interval_seconds.
                 try:
                     head, head_ts = self._rpc_eth_get_latest_block_header()
                 except Exception as e:  # noqa: BLE001
@@ -1089,7 +1089,7 @@ class RpcPoller:
 
         Refactored 2026-05-12 from a pure wall-clock 8s tick to a
         lock-anchored cadence: ticks land at round_open + k*period for
-        k=1..(interval_seconds//period − 1), aligned fresh to each
+        k=1..(round_interval_seconds//period − 1), aligned fresh to each
         round's lock_at. Solves the INFEAS spam pattern observed in
         the 1h soak (Event 2: late-round periodic firing at lock−1.13s
         with 7-block lag → math returned est=1319ms > avail=930ms →
@@ -1111,7 +1111,7 @@ class RpcPoller:
             window exits the loop within ``period`` seconds.
 
         State B — steady (``now < _lock_at``): anchor cadence to
-            ``round_open = _lock_at − interval_seconds``. Compute the
+            ``round_open = _lock_at − round_interval_seconds``. Compute the
             next anchored tick ``next_at = round_open + k * period``
             for smallest k>=1 such that ``next_at > now``. If
             ``next_at`` would land inside the ramp/final window

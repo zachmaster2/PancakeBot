@@ -16,8 +16,8 @@ _DEFAULT_PATH = Path(_paths.CONTRACT_CONSTANTS_PATH)
 class ContractConstants:
     min_bet_amount_bnb: float
     treasury_fee_fraction: float
-    interval_seconds: int
-    buffer_seconds: int
+    round_interval_seconds: int
+    round_close_buffer_seconds: int
 
 
 def load_contract_constants(*, path: Path | None = None) -> ContractConstants:
@@ -36,8 +36,8 @@ def load_contract_constants(*, path: Path | None = None) -> ContractConstants:
     try:
         min_bet_amount_bnb = float(obj["min_bet_amount_bnb"])
         treasury_fee_fraction = float(obj["treasury_fee_fraction"])
-        interval_seconds = int(obj["interval_seconds"])
-        buffer_seconds = int(obj["buffer_seconds"])
+        round_interval_seconds = int(obj["round_interval_seconds"])
+        round_close_buffer_seconds = int(obj["round_close_buffer_seconds"])
     except Exception as e:
         raise InvariantError(f"contract_constants_cache_missing_fields: err={e}") from e
 
@@ -45,16 +45,16 @@ def load_contract_constants(*, path: Path | None = None) -> ContractConstants:
         raise InvariantError("contract_constants_min_bet_nonpositive")
     if not (0.0 <= treasury_fee_fraction < 1.0):
         raise InvariantError("contract_constants_treasury_fee_out_of_range")
-    if interval_seconds <= 0:
+    if round_interval_seconds <= 0:
         raise InvariantError("contract_constants_interval_nonpositive")
-    if buffer_seconds < 0:
+    if round_close_buffer_seconds < 0:
         raise InvariantError("contract_constants_buffer_negative")
 
     return ContractConstants(
         min_bet_amount_bnb=min_bet_amount_bnb,
         treasury_fee_fraction=treasury_fee_fraction,
-        interval_seconds=interval_seconds,
-        buffer_seconds=buffer_seconds,
+        round_interval_seconds=round_interval_seconds,
+        round_close_buffer_seconds=round_close_buffer_seconds,
     )
 
 
@@ -65,8 +65,8 @@ def save_contract_constants(*, constants: ContractConstants, path: Path | None =
     payload = {
         "min_bet_amount_bnb": constants.min_bet_amount_bnb,
         "treasury_fee_fraction": constants.treasury_fee_fraction,
-        "interval_seconds": constants.interval_seconds,
-        "buffer_seconds": constants.buffer_seconds,
+        "round_interval_seconds": constants.round_interval_seconds,
+        "round_close_buffer_seconds": constants.round_close_buffer_seconds,
     }
     cache_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     return cache_path

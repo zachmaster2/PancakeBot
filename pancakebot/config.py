@@ -32,16 +32,16 @@ def require_env(name: str) -> str:
 class BacktestConfig:
     """Backtest configuration."""
 
-    simulation_size: int
+    backtest_round_count: int
     initial_bankroll_bnb: float
     epoch_start: int | None = None
     epoch_end: int | None = None
 
     def validate(self) -> None:
-        if not isinstance(self.simulation_size, int):
-            raise InvariantError("backtest_simulation_size_not_int")
-        if self.simulation_size <= 0:
-            raise InvariantError("backtest_simulation_size_must_be_positive")
+        if not isinstance(self.backtest_round_count, int):
+            raise InvariantError("backtest_round_count_not_int")
+        if self.backtest_round_count <= 0:
+            raise InvariantError("backtest_round_count_must_be_positive")
 
         if not isinstance(self.initial_bankroll_bnb, (int, float)):
             raise InvariantError("backtest_initial_bankroll_bnb_not_number")
@@ -66,8 +66,8 @@ class BacktestConfig:
 @dataclass(frozen=True, slots=True)
 class PoolFilterConfig:
     """Pool-admission filters applied before any signal evaluation."""
-    min_pool_bnb: float
-    min_payout: float
+    min_pool_bnb_at_cutoff: float
+    min_payout_multiple_at_cutoff: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,12 +75,12 @@ class BtcPrimaryThresholdConfig:
     """BTC primary small-pool admission threshold (large pools use gate threshold).
 
     For pools >= ``pool_size_boundary_bnb`` the gate's
-    ``GateConfig.mtf_threshold`` is the binding constraint (it already
+    ``GateConfig.mtf_min_return_threshold`` is the binding constraint (it already
     fired). For pools below, signal_strength must additionally exceed
-    ``small_pool`` (a stricter cutoff that excludes weak signals on
+    ``small_pool_min_signal_strength`` (a stricter cutoff that excludes weak signals on
     small / dilution-prone pools).
     """
-    small_pool: float
+    small_pool_min_signal_strength: float
     pool_size_boundary_bnb: float
 
 
@@ -88,15 +88,15 @@ class BtcPrimaryThresholdConfig:
 class BtcPrimarySizingConfig:
     """BTC primary bet sizing.
 
-    - base_fraction: starting fraction-of-pool stake.
-    - sizing_slope: gain on signal_strength; final frac =
-      base_fraction + sizing_slope * signal_strength, capped at max_frac.
-    - max_frac: hard cap on the computed pool fraction, applied
+    - base_pool_fraction: starting fraction-of-pool stake.
+    - pool_fraction_slope: gain on signal_strength; final frac =
+      base_pool_fraction + pool_fraction_slope * signal_strength, capped at max_pool_fraction.
+    - max_pool_fraction: hard cap on the computed pool fraction, applied
       before per-bet absolute caps (in RiskConfig).
     """
-    base_fraction: float
-    sizing_slope: float
-    max_frac: float
+    base_pool_fraction: float
+    pool_fraction_slope: float
+    max_pool_fraction: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,13 +108,13 @@ class BtcPrimaryConfig:
 @dataclass(frozen=True, slots=True)
 class EthSolFallbackSignalConfig:
     """ETH+SOL fallback signal (fires when BTC primary is silent)."""
-    min_strength: float
+    min_signal_strength: float
 
 
 @dataclass(frozen=True, slots=True)
 class EthSolFallbackSizingConfig:
     """ETH+SOL fallback bet sizing. (max_bet_bnb moved to RiskConfig.)"""
-    base_fraction: float
+    base_pool_fraction: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +130,7 @@ class GateConfig:
     - mtf_lookbacks: tuple of integer-second lookbacks; all must agree
       in direction for the gate to fire. Default (3, 7, 15) — 3-second,
       7-second, 15-second returns.
-    - mtf_threshold: minimum min(|return|) across the lookbacks for
+    - mtf_min_return_threshold: minimum min(|return|) across the lookbacks for
       the gate to fire. The pipeline may apply a stricter pool-adaptive
       threshold via BtcPrimaryThresholdConfig.
 
@@ -138,14 +138,14 @@ class GateConfig:
     pancakebot/strategy/momentum_gate.py.
     """
     mtf_lookbacks: tuple[int, ...]
-    mtf_threshold: float
+    mtf_min_return_threshold: float
 
 
 @dataclass(frozen=True, slots=True)
 class Tier2SizingConfig:
     """Cross-regime sizing knobs.
 
-    - eth_sol_sizing_weight: coefficient applied to BOTH ETH and SOL
+    - eth_sol_signal_weight: coefficient applied to BOTH ETH and SOL
       signal strengths in the BTC-primary confirmation boost AND in the
       regime-2 (ETH+SOL-only) effective-strength composition.
       Symmetric by design (collapsed from former separate eth/sol
@@ -164,9 +164,9 @@ class Tier2SizingConfig:
         hardcoded with slope=1.0 (the default). The "payout at cutoff"
         signal was misleading because settlement-time payout differs.
       - eth_sizing_weight / sol_sizing_weight: collapsed into the single
-        symmetric eth_sol_sizing_weight above.
+        symmetric eth_sol_signal_weight above.
     """
-    eth_sol_sizing_weight: float
+    eth_sol_signal_weight: float
     min_bet_threshold_bnb: float
 
 
@@ -174,29 +174,29 @@ class Tier2SizingConfig:
 class RiskConfig:
     """Risk controls applied by MomentumOnlyPipeline when a BankrollTracker is active.
 
-    - max_bet_frac_of_bankroll: stake <= this fraction of current bankroll.
-    - min_bankroll_bnb: skip all bets while bankroll < this.
-    - max_drawdown_frac_from_peak: fire cooldown when (peak-current)/peak >= this.
+    - max_bet_fraction_of_bankroll: stake <= this fraction of current bankroll.
+    - min_bankroll_bnb_to_bet: skip all bets while bankroll < this.
+    - max_drawdown_fraction_from_peak: fire cooldown when (peak-current)/peak >= this.
       Set to 1.0 to disable the circuit breaker.
     - cooldown_rounds: number of rounds to pause after drawdown breaker fires.
-    - window_days: rolling window (days) for the drawdown-from-peak calculation
-      when ``dd_peak_mode == "rolling_7d"``.
-    - dd_peak_mode: peak-tracking semantics for the drawdown breaker.
-      ``"rolling_7d"`` (default) uses a rolling window of ``window_days``.
+    - drawdown_peak_window_days: rolling window (days) for the drawdown-from-peak calculation
+      when ``drawdown_peak_mode == "rolling_7d"``.
+    - drawdown_peak_mode: peak-tracking semantics for the drawdown breaker.
+      ``"rolling_7d"`` (default) uses a rolling window of ``drawdown_peak_window_days``.
       ``"absolute_ratchet"`` uses an absolute-since-launch peak that
       monotonically only goes up — catches slow drains the rolling
       window misses.
     - max_bet_bnb_btc_primary: absolute BNB cap for BTC primary bets.
     - max_bet_bnb_eth_sol_fallback: absolute BNB cap for regime-2 ETH+SOL bets.
     """
-    max_bet_frac_of_bankroll: float
-    min_bankroll_bnb: float
-    max_drawdown_frac_from_peak: float
+    max_bet_fraction_of_bankroll: float
+    min_bankroll_bnb_to_bet: float
+    max_drawdown_fraction_from_peak: float
     cooldown_rounds: int
-    window_days: int
+    drawdown_peak_window_days: int
     max_bet_bnb_btc_primary: float
     max_bet_bnb_eth_sol_fallback: float
-    dd_peak_mode: str = "rolling_7d"
+    drawdown_peak_mode: str = "rolling_7d"
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,61 +211,61 @@ class StrategyConfig:
     def validate(self) -> None:
         """Assert invariants; raise InvariantError on any violation."""
         pf = self.pool_filter
-        if pf.min_pool_bnb <= 0.0:
-            raise InvariantError("strategy_pool_filter_min_pool_bnb_must_be_positive")
-        if pf.min_payout < 1.0:
-            raise InvariantError("strategy_pool_filter_min_payout_must_be_at_least_1")
+        if pf.min_pool_bnb_at_cutoff <= 0.0:
+            raise InvariantError("strategy_pool_filter_min_pool_bnb_at_cutoff_must_be_positive")
+        if pf.min_payout_multiple_at_cutoff < 1.0:
+            raise InvariantError("strategy_pool_filter_min_payout_multiple_at_cutoff_must_be_at_least_1")
 
         g = self.gate
         if not g.mtf_lookbacks:
             raise InvariantError("strategy_gate_mtf_lookbacks_must_be_non_empty")
         if any(not isinstance(lb, int) or lb <= 0 for lb in g.mtf_lookbacks):
             raise InvariantError("strategy_gate_mtf_lookbacks_must_be_positive_ints")
-        if g.mtf_threshold <= 0.0:
-            raise InvariantError("strategy_gate_mtf_threshold_must_be_positive")
+        if g.mtf_min_return_threshold <= 0.0:
+            raise InvariantError("strategy_gate_mtf_min_return_threshold_must_be_positive")
 
         bt = self.btc_primary.threshold
-        if bt.small_pool <= 0.0:
-            raise InvariantError("strategy_btc_primary_threshold_small_pool_must_be_positive")
+        if bt.small_pool_min_signal_strength <= 0.0:
+            raise InvariantError("strategy_btc_primary_threshold_small_pool_min_signal_strength_must_be_positive")
         if bt.pool_size_boundary_bnb <= 0.0:
             raise InvariantError("strategy_btc_primary_threshold_pool_size_boundary_bnb_must_be_positive")
 
         bs = self.btc_primary.sizing
-        if not (0.0 < bs.base_fraction < 1.0):
-            raise InvariantError("strategy_btc_primary_sizing_base_fraction_out_of_range")
-        if bs.sizing_slope < 0.0:
+        if not (0.0 < bs.base_pool_fraction < 1.0):
+            raise InvariantError("strategy_btc_primary_sizing_base_pool_fraction_out_of_range")
+        if bs.pool_fraction_slope < 0.0:
             raise InvariantError("strategy_btc_primary_sizing_slope_must_be_non_negative")
-        if not (0.0 < bs.max_frac <= 1.0):
-            raise InvariantError("strategy_btc_primary_sizing_max_frac_out_of_range")
+        if not (0.0 < bs.max_pool_fraction <= 1.0):
+            raise InvariantError("strategy_btc_primary_sizing_max_pool_fraction_out_of_range")
 
         es = self.eth_sol_fallback.signal
-        if es.min_strength <= 0.0:
-            raise InvariantError("strategy_eth_sol_fallback_signal_min_strength_must_be_positive")
+        if es.min_signal_strength <= 0.0:
+            raise InvariantError("strategy_eth_sol_fallback_signal_min_signal_strength_must_be_positive")
 
         ez = self.eth_sol_fallback.sizing
-        if not (0.0 < ez.base_fraction < 1.0):
-            raise InvariantError("strategy_eth_sol_fallback_sizing_base_fraction_out_of_range")
+        if not (0.0 < ez.base_pool_fraction < 1.0):
+            raise InvariantError("strategy_eth_sol_fallback_sizing_base_pool_fraction_out_of_range")
 
         t2 = self.tier2_sizing
-        if t2.eth_sol_sizing_weight < 0.0:
-            raise InvariantError("strategy_tier2_sizing_eth_sol_sizing_weight_must_be_non_negative")
+        if t2.eth_sol_signal_weight < 0.0:
+            raise InvariantError("strategy_tier2_sizing_eth_sol_signal_weight_must_be_non_negative")
         if t2.min_bet_threshold_bnb < 0.0:
             raise InvariantError("strategy_tier2_sizing_min_bet_threshold_bnb_must_be_non_negative")
 
         rk = self.risk
-        if not (0.0 < rk.max_bet_frac_of_bankroll <= 1.0):
-            raise InvariantError("strategy_risk_max_bet_frac_of_bankroll_out_of_range")
-        if rk.min_bankroll_bnb < 0.0:
-            raise InvariantError("strategy_risk_min_bankroll_bnb_must_be_non_negative")
-        if not (0.0 < rk.max_drawdown_frac_from_peak <= 1.0):
-            raise InvariantError("strategy_risk_max_drawdown_frac_from_peak_out_of_range")
+        if not (0.0 < rk.max_bet_fraction_of_bankroll <= 1.0):
+            raise InvariantError("strategy_risk_max_bet_fraction_of_bankroll_out_of_range")
+        if rk.min_bankroll_bnb_to_bet < 0.0:
+            raise InvariantError("strategy_risk_min_bankroll_bnb_to_bet_must_be_non_negative")
+        if not (0.0 < rk.max_drawdown_fraction_from_peak <= 1.0):
+            raise InvariantError("strategy_risk_max_drawdown_fraction_from_peak_out_of_range")
         if rk.cooldown_rounds < 0:
             raise InvariantError("strategy_risk_cooldown_rounds_must_be_non_negative")
-        if rk.window_days <= 0:
-            raise InvariantError("strategy_risk_window_days_must_be_positive")
-        if rk.dd_peak_mode not in ("rolling_7d", "absolute_ratchet"):
+        if rk.drawdown_peak_window_days <= 0:
+            raise InvariantError("strategy_risk_drawdown_peak_window_days_must_be_positive")
+        if rk.drawdown_peak_mode not in ("rolling_7d", "absolute_ratchet"):
             raise InvariantError(
-                f"strategy_risk_dd_peak_mode_invalid: {rk.dd_peak_mode!r} "
+                f"strategy_risk_drawdown_peak_mode_invalid: {rk.drawdown_peak_mode!r} "
                 "(expected 'rolling_7d' or 'absolute_ratchet')"
             )
         if rk.max_bet_bnb_btc_primary <= 0.0:
@@ -278,39 +278,39 @@ class StrategyConfig:
 # pancakebot/strategy/momentum_pipeline.py, so a config.toml without any
 # [strategy.*] sections reproduces the pre-refactor behavior exactly.
 _DEFAULT_STRATEGY = StrategyConfig(
-    pool_filter=PoolFilterConfig(min_pool_bnb=1.5, min_payout=1.5),
+    pool_filter=PoolFilterConfig(min_pool_bnb_at_cutoff=1.5, min_payout_multiple_at_cutoff=1.5),
     gate=GateConfig(
         mtf_lookbacks=(3, 7, 15),
-        mtf_threshold=0.0001,
+        mtf_min_return_threshold=0.0001,
     ),
     btc_primary=BtcPrimaryConfig(
         threshold=BtcPrimaryThresholdConfig(
-            small_pool=0.0002,
+            small_pool_min_signal_strength=0.0002,
             pool_size_boundary_bnb=3.0,
         ),
         sizing=BtcPrimarySizingConfig(
-            base_fraction=0.04,
-            sizing_slope=100.0,
-            max_frac=0.30,
+            base_pool_fraction=0.04,
+            pool_fraction_slope=100.0,
+            max_pool_fraction=0.30,
         ),
     ),
     eth_sol_fallback=EthSolFallbackConfig(
-        signal=EthSolFallbackSignalConfig(min_strength=0.00015),
-        sizing=EthSolFallbackSizingConfig(base_fraction=0.02),
+        signal=EthSolFallbackSignalConfig(min_signal_strength=0.00015),
+        sizing=EthSolFallbackSizingConfig(base_pool_fraction=0.02),
     ),
     tier2_sizing=Tier2SizingConfig(
-        eth_sol_sizing_weight=0.3,
+        eth_sol_signal_weight=0.3,
         min_bet_threshold_bnb=0.01,
     ),
     risk=RiskConfig(
-        max_bet_frac_of_bankroll=0.05,
-        min_bankroll_bnb=0.20,
-        max_drawdown_frac_from_peak=0.15,
+        max_bet_fraction_of_bankroll=0.05,
+        min_bankroll_bnb_to_bet=0.20,
+        max_drawdown_fraction_from_peak=0.15,
         cooldown_rounds=72,
-        window_days=7,
+        drawdown_peak_window_days=7,
         max_bet_bnb_btc_primary=2.0,
         max_bet_bnb_eth_sol_fallback=0.5,
-        dd_peak_mode="rolling_7d",
+        drawdown_peak_mode="rolling_7d",
     ),
 )
 
@@ -326,14 +326,14 @@ class AppConfig:
       consumes candles closing at-or-before lock_at - this).
     - ``pool_cutoff_seconds``: data horizon for the pool aggregate (only
       bets with block_ts < lock_at - this are counted).
-    - ``max_consecutive_fetch_failures``: streak counter before the bot
+    - ``max_consecutive_kline_fetch_failures``: streak counter before the bot
       crashes with InvariantError + supervisor restart.
 
     Derived (computed at config-load time from
     ``pancakebot/timing_constants.py``; not user-tunable):
-    - ``bet_submit_deadline_offset_ms``
-    - ``critical_path_wakeup_offset_ms``
-    - ``bankroll_wakeup_offset_ms``
+    - ``bet_submit_deadline_offset_before_lock_ms``
+    - ``critical_path_wakeup_offset_before_lock_ms``
+    - ``bankroll_wakeup_offset_before_lock_ms``
     - ``kline_publish_tier``: ``"P99"`` (strict, full-inclusion guarantee)
       or ``"P95"`` (operating budget; ~5% tail absorbed by streak counter).
       Selected by tier-ladder cross-validation: P99 first, P95 fallback.
@@ -342,21 +342,21 @@ class AppConfig:
     # User-tunable
     kline_cutoff_seconds: int
     pool_cutoff_seconds: int
-    max_consecutive_fetch_failures: int
+    max_consecutive_kline_fetch_failures: int
 
     # Derived (from timing_constants.py at load time)
-    bet_submit_deadline_offset_ms: int
-    critical_path_wakeup_offset_ms: int
-    final_rpc_poll_wakeup_offset_ms: int
-    ramp_poll_1_wakeup_offset_ms: int
-    ramp_poll_2_wakeup_offset_ms: int
-    bankroll_wakeup_offset_ms: int
+    bet_submit_deadline_offset_before_lock_ms: int
+    critical_path_wakeup_offset_before_lock_ms: int
+    final_rpc_poll_wakeup_offset_before_lock_ms: int
+    ramp_poll_1_wakeup_offset_before_lock_ms: int
+    ramp_poll_2_wakeup_offset_before_lock_ms: int
+    bankroll_wakeup_offset_before_lock_ms: int
     kline_publish_tier: str
 
     # Other
     dry_initial_bankroll_bnb: float
-    live_min_bet_only: bool
-    backtest_simulation_size: int
+    live_clamp_bet_to_contract_minimum: bool
+    backtest_round_count: int
     backtest_initial_bankroll_bnb: float
 
     # Full BacktestConfig with validation (kept as inner dataclass).
@@ -518,66 +518,66 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
     d = _DEFAULT_STRATEGY
     cfg = StrategyConfig(
         pool_filter=PoolFilterConfig(
-            min_pool_bnb=_opt_float(pf_sec, "min_pool_bnb", d.pool_filter.min_pool_bnb),
-            min_payout=_opt_float(pf_sec, "min_payout", d.pool_filter.min_payout),
+            min_pool_bnb_at_cutoff=_opt_float(pf_sec, "min_pool_bnb_at_cutoff", d.pool_filter.min_pool_bnb_at_cutoff),
+            min_payout_multiple_at_cutoff=_opt_float(pf_sec, "min_payout_multiple_at_cutoff", d.pool_filter.min_payout_multiple_at_cutoff),
         ),
         gate=GateConfig(
             mtf_lookbacks=_opt_int_tuple(gate_sec, "mtf_lookbacks", d.gate.mtf_lookbacks),
-            mtf_threshold=_opt_float(gate_sec, "mtf_threshold", d.gate.mtf_threshold),
+            mtf_min_return_threshold=_opt_float(gate_sec, "mtf_min_return_threshold", d.gate.mtf_min_return_threshold),
         ),
         btc_primary=BtcPrimaryConfig(
             threshold=BtcPrimaryThresholdConfig(
-                small_pool=_opt_float(btc_thresh_sec, "small_pool", d.btc_primary.threshold.small_pool),
+                small_pool_min_signal_strength=_opt_float(btc_thresh_sec, "small_pool_min_signal_strength", d.btc_primary.threshold.small_pool_min_signal_strength),
                 pool_size_boundary_bnb=_opt_float(
                     btc_thresh_sec, "pool_size_boundary_bnb",
                     d.btc_primary.threshold.pool_size_boundary_bnb,
                 ),
             ),
             sizing=BtcPrimarySizingConfig(
-                base_fraction=_opt_float(btc_sizing_sec, "base_fraction", d.btc_primary.sizing.base_fraction),
-                sizing_slope=_opt_float(btc_sizing_sec, "sizing_slope", d.btc_primary.sizing.sizing_slope),
-                max_frac=_opt_float(btc_sizing_sec, "max_frac", d.btc_primary.sizing.max_frac),
+                base_pool_fraction=_opt_float(btc_sizing_sec, "base_pool_fraction", d.btc_primary.sizing.base_pool_fraction),
+                pool_fraction_slope=_opt_float(btc_sizing_sec, "pool_fraction_slope", d.btc_primary.sizing.pool_fraction_slope),
+                max_pool_fraction=_opt_float(btc_sizing_sec, "max_pool_fraction", d.btc_primary.sizing.max_pool_fraction),
             ),
         ),
         eth_sol_fallback=EthSolFallbackConfig(
             signal=EthSolFallbackSignalConfig(
-                min_strength=_opt_float(
-                    es_signal_sec, "min_strength",
-                    d.eth_sol_fallback.signal.min_strength,
+                min_signal_strength=_opt_float(
+                    es_signal_sec, "min_signal_strength",
+                    d.eth_sol_fallback.signal.min_signal_strength,
                 ),
             ),
             sizing=EthSolFallbackSizingConfig(
-                base_fraction=_opt_float(
-                    es_sizing_sec, "base_fraction",
-                    d.eth_sol_fallback.sizing.base_fraction,
+                base_pool_fraction=_opt_float(
+                    es_sizing_sec, "base_pool_fraction",
+                    d.eth_sol_fallback.sizing.base_pool_fraction,
                 ),
             ),
         ),
         tier2_sizing=Tier2SizingConfig(
-            eth_sol_sizing_weight=_opt_float(
-                t2_sec, "eth_sol_sizing_weight", d.tier2_sizing.eth_sol_sizing_weight,
+            eth_sol_signal_weight=_opt_float(
+                t2_sec, "eth_sol_signal_weight", d.tier2_sizing.eth_sol_signal_weight,
             ),
             min_bet_threshold_bnb=_opt_float(
                 t2_sec, "min_bet_threshold_bnb", d.tier2_sizing.min_bet_threshold_bnb,
             ),
         ),
         risk=RiskConfig(
-            max_bet_frac_of_bankroll=_opt_float(
-                risk_sec, "max_bet_frac_of_bankroll",
-                d.risk.max_bet_frac_of_bankroll,
+            max_bet_fraction_of_bankroll=_opt_float(
+                risk_sec, "max_bet_fraction_of_bankroll",
+                d.risk.max_bet_fraction_of_bankroll,
             ),
-            min_bankroll_bnb=_opt_float(
-                risk_sec, "min_bankroll_bnb", d.risk.min_bankroll_bnb,
+            min_bankroll_bnb_to_bet=_opt_float(
+                risk_sec, "min_bankroll_bnb_to_bet", d.risk.min_bankroll_bnb_to_bet,
             ),
-            max_drawdown_frac_from_peak=_opt_float(
-                risk_sec, "max_drawdown_frac_from_peak",
-                d.risk.max_drawdown_frac_from_peak,
+            max_drawdown_fraction_from_peak=_opt_float(
+                risk_sec, "max_drawdown_fraction_from_peak",
+                d.risk.max_drawdown_fraction_from_peak,
             ),
             cooldown_rounds=_opt_int(
                 risk_sec, "cooldown_rounds", d.risk.cooldown_rounds,
             ),
-            window_days=_opt_int(
-                risk_sec, "window_days", d.risk.window_days,
+            drawdown_peak_window_days=_opt_int(
+                risk_sec, "drawdown_peak_window_days", d.risk.drawdown_peak_window_days,
             ),
             max_bet_bnb_btc_primary=_opt_float(
                 risk_sec, "max_bet_bnb_btc_primary",
@@ -587,8 +587,8 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
                 risk_sec, "max_bet_bnb_eth_sol_fallback",
                 d.risk.max_bet_bnb_eth_sol_fallback,
             ),
-            dd_peak_mode=_opt_str(
-                risk_sec, "dd_peak_mode", d.risk.dd_peak_mode,
+            drawdown_peak_mode=_opt_str(
+                risk_sec, "drawdown_peak_mode", d.risk.drawdown_peak_mode,
             ),
         ),
     )
@@ -670,17 +670,17 @@ def load_app_config(path: str) -> AppConfig:
             f"got={pool_cutoff_seconds} valid=[1..30]"
         )
 
-    # ``max_consecutive_fetch_failures``: streak counter for OKX
+    # ``max_consecutive_kline_fetch_failures``: streak counter for OKX
     # transient failures on the live decision path. After this many in a
     # row, the gate raises InvariantError -> bot crashes -> supervisor
     # restart + Discord alert.
-    max_consecutive_fetch_failures = _opt_int(
-        runtime, "max_consecutive_fetch_failures", 5,
+    max_consecutive_kline_fetch_failures = _opt_int(
+        runtime, "max_consecutive_kline_fetch_failures", 5,
     )
-    if not (1 <= max_consecutive_fetch_failures <= 100):
+    if not (1 <= max_consecutive_kline_fetch_failures <= 100):
         raise InvariantError(
             f"runtime_max_consecutive_fetch_failures_out_of_range: "
-            f"got={max_consecutive_fetch_failures} valid=[1..100]"
+            f"got={max_consecutive_kline_fetch_failures} valid=[1..100]"
         )
 
     # --- Derived timing constants (NOT user-tunable) ---
@@ -700,21 +700,21 @@ def load_app_config(path: str) -> AppConfig:
     #   VALIDATOR_ASSEMBLY_WINDOW_MS (50) — validator's TX-list freeze window
     #   BSC_BET_SUBMIT_ONE_WAY_MS  (150) — one-way RPC send to validator mempool
     # = 700ms total (down from 750ms pre-Bundle-4).
-    bet_submit_deadline_offset_ms = (
+    bet_submit_deadline_offset_before_lock_ms = (
         _tc.BSC_QUANTUM_MS
         + _tc.BSC_BLOCK_TIME_MS
         + _tc.VALIDATOR_ASSEMBLY_WINDOW_MS
         + _tc.BSC_BET_SUBMIT_ONE_WAY_MS
     )
-    critical_path_wakeup_offset_ms = (
-        bet_submit_deadline_offset_ms
+    critical_path_wakeup_offset_before_lock_ms = (
+        bet_submit_deadline_offset_before_lock_ms
         + _tc.OKX_KLINE_FETCH_RTT_P95_MS
-        + _tc.SIGNAL_COMPUTE_TIME_MS
+        + _tc.MOMENTUM_GATE_COMPUTE_TIME_MS
         + _tc.POOL_READ_TIME_MS
     )
-    bankroll_wakeup_offset_ms = (
-        critical_path_wakeup_offset_ms
-        + _tc.BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS
+    bankroll_wakeup_offset_before_lock_ms = (
+        critical_path_wakeup_offset_before_lock_ms
+        + _tc.BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS
     )
     # Bundle 5 v2 (2026-05-14): ``ntp_sync_wakeup_offset_ms`` retired.
     # The bot trusts the OS clock directly (W32Time tightening per
@@ -727,7 +727,7 @@ def load_app_config(path: str) -> AppConfig:
     #
     # Refactor rationale (2026-05-12): the prior derivation subtracted
     # ``rpc_rtt_p99_for_batch(EXPECTED_FINAL_POLL_BATCH_SIZE)`` from
-    # ``final_rpc_poll_wakeup_offset_ms``. As measured RTT grew, the
+    # ``final_rpc_poll_wakeup_offset_before_lock_ms``. As measured RTT grew, the
     # final-poll wake fired LATER (smaller offset = closer to lock),
     # leaving LESS time to complete the poll — opposite of the desired
     # direction. The ramp_1/ramp_2 derivations had the same RTT
@@ -751,18 +751,18 @@ def load_app_config(path: str) -> AppConfig:
     # uniform RPC_RAMP_POLL_INTERVAL_MS=1500 it replaced was sized for a
     # stale batch=15 assumption and under-provisioned ramp_1 while
     # over-provisioning ramp_2/final.
-    final_rpc_poll_wakeup_offset_ms = (
+    final_rpc_poll_wakeup_offset_before_lock_ms = (
         pool_cutoff_seconds * 1000
         - _tc.BSC_BLOCK_TIME_MS
         - _tc.RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
-        - _tc.RPC_POLL_FINAL_SAFETY_BUFFER_MS
+        - _tc.RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS
     )
-    ramp_poll_2_wakeup_offset_ms = (
-        final_rpc_poll_wakeup_offset_ms
+    ramp_poll_2_wakeup_offset_before_lock_ms = (
+        final_rpc_poll_wakeup_offset_before_lock_ms
         + _tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS
     )
-    ramp_poll_1_wakeup_offset_ms = (
-        ramp_poll_2_wakeup_offset_ms
+    ramp_poll_1_wakeup_offset_before_lock_ms = (
+        ramp_poll_2_wakeup_offset_before_lock_ms
         + _tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS
     )
 
@@ -774,18 +774,18 @@ def load_app_config(path: str) -> AppConfig:
     # rtt_p99 table value has grown past what the budget can absorb.
     _final_poll_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_FINAL_POLL_BATCH_SIZE)
     _final_poll_completion_offset = (
-        final_rpc_poll_wakeup_offset_ms
+        final_rpc_poll_wakeup_offset_before_lock_ms
         - _final_poll_rtt
         - _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
     )
-    if _final_poll_completion_offset < critical_path_wakeup_offset_ms:
+    if _final_poll_completion_offset < critical_path_wakeup_offset_before_lock_ms:
         raise InvariantError(
             f"final_rpc_poll_rtt_budget_insufficient: "
-            f"final_rpc_poll_wakeup={final_rpc_poll_wakeup_offset_ms}ms "
+            f"final_rpc_poll_wakeup={final_rpc_poll_wakeup_offset_before_lock_ms}ms "
             f"- rtt_p99({_tc.EXPECTED_FINAL_POLL_BATCH_SIZE})={_final_poll_rtt}ms "
             f"- safety={_tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS}ms "
             f"= {_final_poll_completion_offset}ms "
-            f"< critical_path={critical_path_wakeup_offset_ms}ms. "
+            f"< critical_path={critical_path_wakeup_offset_before_lock_ms}ms. "
             f"pool_cutoff_seconds={pool_cutoff_seconds}. Either raise "
             f"pool_cutoff_seconds or investigate RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE."
         )
@@ -833,7 +833,7 @@ def load_app_config(path: str) -> AppConfig:
     # until lock when the GETs go out) is the critical-path wake offset
     # minus POOL_READ_TIME_MS.
     kline_fetch_offset_within_critical_ms = (
-        critical_path_wakeup_offset_ms - _tc.POOL_READ_TIME_MS
+        critical_path_wakeup_offset_before_lock_ms - _tc.POOL_READ_TIME_MS
     )
 
     # Tier-based publish-delay validation: prefer strict P99
@@ -880,12 +880,12 @@ def load_app_config(path: str) -> AppConfig:
         raise InvariantError("dry_initial_bankroll_bnb_must_be_positive")
 
     # [live]
-    live_min_bet_only = _opt_bool(live_sec, "min_bet_only", True)
+    live_clamp_bet_to_contract_minimum = _opt_bool(live_sec, "clamp_bet_to_contract_minimum", True)
 
     # [backtest]
-    simulation_size = _opt_int(backtest_sec, "simulation_size", 5000)
-    if simulation_size <= 0:
-        raise InvariantError("backtest_simulation_size_must_be_positive")
+    backtest_round_count = _opt_int(backtest_sec, "backtest_round_count", 5000)
+    if backtest_round_count <= 0:
+        raise InvariantError("backtest_round_count_must_be_positive")
 
     bt_bankroll = _opt_float(backtest_sec, "initial_bankroll_bnb", 50.0)
     if bt_bankroll <= 0.0:
@@ -895,7 +895,7 @@ def load_app_config(path: str) -> AppConfig:
     epoch_end = _opt_int_or_none(backtest_sec, "epoch_end")
 
     backtest_cfg = BacktestConfig(
-        simulation_size=simulation_size,
+        backtest_round_count=backtest_round_count,
         initial_bankroll_bnb=bt_bankroll,
         epoch_start=epoch_start,
         epoch_end=epoch_end,
@@ -907,17 +907,17 @@ def load_app_config(path: str) -> AppConfig:
     return AppConfig(
         kline_cutoff_seconds=kline_cutoff_seconds,
         pool_cutoff_seconds=pool_cutoff_seconds,
-        max_consecutive_fetch_failures=max_consecutive_fetch_failures,
-        bet_submit_deadline_offset_ms=bet_submit_deadline_offset_ms,
-        critical_path_wakeup_offset_ms=critical_path_wakeup_offset_ms,
-        final_rpc_poll_wakeup_offset_ms=final_rpc_poll_wakeup_offset_ms,
-        ramp_poll_1_wakeup_offset_ms=ramp_poll_1_wakeup_offset_ms,
-        ramp_poll_2_wakeup_offset_ms=ramp_poll_2_wakeup_offset_ms,
-        bankroll_wakeup_offset_ms=bankroll_wakeup_offset_ms,
+        max_consecutive_kline_fetch_failures=max_consecutive_kline_fetch_failures,
+        bet_submit_deadline_offset_before_lock_ms=bet_submit_deadline_offset_before_lock_ms,
+        critical_path_wakeup_offset_before_lock_ms=critical_path_wakeup_offset_before_lock_ms,
+        final_rpc_poll_wakeup_offset_before_lock_ms=final_rpc_poll_wakeup_offset_before_lock_ms,
+        ramp_poll_1_wakeup_offset_before_lock_ms=ramp_poll_1_wakeup_offset_before_lock_ms,
+        ramp_poll_2_wakeup_offset_before_lock_ms=ramp_poll_2_wakeup_offset_before_lock_ms,
+        bankroll_wakeup_offset_before_lock_ms=bankroll_wakeup_offset_before_lock_ms,
         kline_publish_tier=kline_publish_tier,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
-        live_min_bet_only=live_min_bet_only,
-        backtest_simulation_size=simulation_size,
+        live_clamp_bet_to_contract_minimum=live_clamp_bet_to_contract_minimum,
+        backtest_round_count=backtest_round_count,
         backtest_initial_bankroll_bnb=bt_bankroll,
         backtest=backtest_cfg,
         strategy=strategy_cfg,

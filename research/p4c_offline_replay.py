@@ -15,7 +15,7 @@ Disagreement metric:
 
 Constraints respected:
   - Gate's data horizon: ``newest_open_ms = lock_at - cutoff*1000 - 1000``
-    means data through ``lock_at - cutoff_seconds`` only. Re-using
+    means data through ``lock_at - kline_cutoff_seconds`` only. Re-using
     ``MomentumGate.evaluate`` ensures bit-identical horizon enforcement.
   - Throttle: 1s sleep between epochs to avoid OKX rate-budget contention
     with the running live bot in a different process.
@@ -45,7 +45,7 @@ from pancakebot.strategy.momentum_gate import (  # noqa: E402
     MomentumGate,
     MomentumGateConfig,
 )
-from pancakebot.constants import RPC_URLS, EXPECTED_CHAIN_ID, RPC_TIMEOUT_SECONDS  # noqa: E402
+from pancakebot.constants import WRITE_PATH_RPC_URLS, EXPECTED_CHAIN_ID, WRITE_PATH_RPC_TIMEOUT_SECONDS  # noqa: E402
 from pancakebot import paths as _paths  # noqa: E402
 from pancakebot.chain.rpc_pool import choose_rpc_url  # noqa: E402
 
@@ -54,13 +54,13 @@ def main(epoch_start: int, epoch_end_inclusive: int) -> int:
     cfg = load_app_config(str(_REPO_ROOT / "config.toml"))
 
     rpc_url = choose_rpc_url(
-        RPC_URLS,
+        WRITE_PATH_RPC_URLS,
         expected_chain_id=int(EXPECTED_CHAIN_ID),
-        timeout_seconds=int(RPC_TIMEOUT_SECONDS),
+        timeout_seconds=int(WRITE_PATH_RPC_TIMEOUT_SECONDS),
     )
     contract = Web3PredictionContract(Web3ContractConfig(
         rpc_url=rpc_url,
-        rpc_urls=tuple(RPC_URLS),
+        rpc_urls=tuple(WRITE_PATH_RPC_URLS),
         abi_json_path=_paths.ABI_JSON_PATH,
         private_key="",
     ))
@@ -73,18 +73,18 @@ def main(epoch_start: int, epoch_end_inclusive: int) -> int:
         btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT",
         sol_symbol="SOL-USDT",
-        cutoff_seconds=cfg.kline_cutoff_seconds,
+        kline_cutoff_seconds=cfg.kline_cutoff_seconds,
         mtf_lookbacks=cfg.strategy.gate.mtf_lookbacks,
-        mtf_threshold=cfg.strategy.gate.mtf_threshold,
+        mtf_min_return_threshold=cfg.strategy.gate.mtf_min_return_threshold,
     )
     gate = MomentumGate(config=momentum_gate_cfg, okx_client=okx_client)
 
-    r2_min_strength = cfg.strategy.eth_sol_fallback.signal.min_strength
+    r2_min_strength = cfg.strategy.eth_sol_fallback.signal.min_signal_strength
 
     print(f"# p4c offline-replay over epochs [{epoch_start}..{epoch_end_inclusive}]")
     print(f"# config: cutoff={cfg.kline_cutoff_seconds}s "
           f"lookbacks={cfg.strategy.gate.mtf_lookbacks} "
-          f"btc_threshold={cfg.strategy.gate.mtf_threshold} "
+          f"btc_threshold={cfg.strategy.gate.mtf_min_return_threshold} "
           f"r2_min_strength={r2_min_strength}")
     print()
     header = f"{'epoch':>8} {'btc_sig':>8} {'eth_sig':>8} {'eth_str':>10} {'sol_sig':>8} {'sol_str':>10} {'r2_str':>10} {'r2?':>4} {'final':>16}"

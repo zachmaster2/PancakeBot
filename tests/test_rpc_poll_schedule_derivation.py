@@ -1,8 +1,8 @@
 """Code-invariant tests for the RPC-poll wake schedule derivation.
 
 The derivation chain in pancakebot/config.py computes
-final_rpc_poll_wakeup_offset_ms, ramp_poll_2_wakeup_offset_ms, and
-ramp_poll_1_wakeup_offset_ms from pool_cutoff_seconds + the
+final_rpc_poll_wakeup_offset_before_lock_ms, ramp_poll_2_wakeup_offset_before_lock_ms, and
+ramp_poll_1_wakeup_offset_before_lock_ms from pool_cutoff_seconds + the
 empirical timing constants. These tests pin invariants the formula
 must satisfy across the canonical pool_cutoff range.
 
@@ -34,37 +34,38 @@ def _derive_schedule(pool_cutoff_seconds: int) -> dict[str, int]:
     invariant (validates the chosen offset can absorb the actual
     p99 + safety), not in the wake-time derivation itself.
     """
-    bet_submit_deadline_offset_ms = (
-        _tc.BSC_BET_SUBMIT_RTT_P95_MS
+    bet_submit_deadline_offset_before_lock_ms = (
+        _tc.BSC_QUANTUM_MS
         + _tc.BSC_BLOCK_TIME_MS
-        + _tc.BET_SUBMIT_SAFETY_BUFFER_MS
+        + _tc.VALIDATOR_ASSEMBLY_WINDOW_MS
+        + _tc.BSC_BET_SUBMIT_ONE_WAY_MS
     )
-    critical_path_wakeup_offset_ms = (
-        bet_submit_deadline_offset_ms
+    critical_path_wakeup_offset_before_lock_ms = (
+        bet_submit_deadline_offset_before_lock_ms
         + _tc.OKX_KLINE_FETCH_RTT_P95_MS
-        + _tc.SIGNAL_COMPUTE_TIME_MS
+        + _tc.MOMENTUM_GATE_COMPUTE_TIME_MS
         + _tc.POOL_READ_TIME_MS
     )
-    final_rpc_poll_wakeup_offset_ms = (
+    final_rpc_poll_wakeup_offset_before_lock_ms = (
         pool_cutoff_seconds * 1000
         - _tc.BSC_BLOCK_TIME_MS
         - _tc.RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
-        - _tc.RPC_POLL_FINAL_SAFETY_BUFFER_MS
+        - _tc.RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS
     )
-    ramp_poll_2_wakeup_offset_ms = (
-        final_rpc_poll_wakeup_offset_ms
+    ramp_poll_2_wakeup_offset_before_lock_ms = (
+        final_rpc_poll_wakeup_offset_before_lock_ms
         + _tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS
     )
-    ramp_poll_1_wakeup_offset_ms = (
-        ramp_poll_2_wakeup_offset_ms
+    ramp_poll_1_wakeup_offset_before_lock_ms = (
+        ramp_poll_2_wakeup_offset_before_lock_ms
         + _tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS
     )
     return {
-        "bet_submit": bet_submit_deadline_offset_ms,
-        "critical_path": critical_path_wakeup_offset_ms,
-        "final": final_rpc_poll_wakeup_offset_ms,
-        "ramp_2": ramp_poll_2_wakeup_offset_ms,
-        "ramp_1": ramp_poll_1_wakeup_offset_ms,
+        "bet_submit": bet_submit_deadline_offset_before_lock_ms,
+        "critical_path": critical_path_wakeup_offset_before_lock_ms,
+        "final": final_rpc_poll_wakeup_offset_before_lock_ms,
+        "ramp_2": ramp_poll_2_wakeup_offset_before_lock_ms,
+        "ramp_1": ramp_poll_1_wakeup_offset_before_lock_ms,
     }
 
 

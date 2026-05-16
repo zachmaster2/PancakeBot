@@ -48,50 +48,50 @@ from pancakebot.types import Round  # noqa: E402
 def _make_strategy_config() -> StrategyConfig:
     """Canonical strategy config used by the pipeline tests."""
     return StrategyConfig(
-        pool_filter=PoolFilterConfig(min_pool_bnb=1.5, min_payout=1.5),
-        gate=GateConfig(mtf_lookbacks=(3, 7, 15), mtf_threshold=0.0001),
+        pool_filter=PoolFilterConfig(min_pool_bnb_at_cutoff=1.5, min_payout_multiple_at_cutoff=1.5),
+        gate=GateConfig(mtf_lookbacks=(3, 7, 15), mtf_min_return_threshold=0.0001),
         btc_primary=BtcPrimaryConfig(
             threshold=BtcPrimaryThresholdConfig(
-                small_pool=0.0002, pool_size_boundary_bnb=3.0,
+                small_pool_min_signal_strength=0.0002, pool_size_boundary_bnb=3.0,
             ),
             sizing=BtcPrimarySizingConfig(
-                base_fraction=0.04, sizing_slope=100.0, max_frac=0.30,
+                base_pool_fraction=0.04, pool_fraction_slope=100.0, max_pool_fraction=0.30,
             ),
         ),
         eth_sol_fallback=EthSolFallbackConfig(
-            signal=EthSolFallbackSignalConfig(min_strength=0.00015),
-            sizing=EthSolFallbackSizingConfig(base_fraction=0.02),
+            signal=EthSolFallbackSignalConfig(min_signal_strength=0.00015),
+            sizing=EthSolFallbackSizingConfig(base_pool_fraction=0.02),
         ),
         tier2_sizing=Tier2SizingConfig(
-            eth_sol_sizing_weight=0.3, min_bet_threshold_bnb=0.01,
+            eth_sol_signal_weight=0.3, min_bet_threshold_bnb=0.01,
         ),
         risk=RiskConfig(
-            max_bet_frac_of_bankroll=0.05, min_bankroll_bnb=0.20,
-            max_drawdown_frac_from_peak=0.15, cooldown_rounds=72,
-            window_days=7, max_bet_bnb_btc_primary=2.0,
-            max_bet_bnb_eth_sol_fallback=0.5, dd_peak_mode="rolling_7d",
+            max_bet_fraction_of_bankroll=0.05, min_bankroll_bnb_to_bet=0.20,
+            max_drawdown_fraction_from_peak=0.15, cooldown_rounds=72,
+            drawdown_peak_window_days=7, max_bet_bnb_btc_primary=2.0,
+            max_bet_bnb_eth_sol_fallback=0.5, drawdown_peak_mode="rolling_7d",
         ),
     )
 
 
 def _make_pipeline(gate_mock) -> MomentumOnlyPipeline:
-    """Pipeline with a mock gate. cutoff_seconds=2, canonical strategy."""
+    """Pipeline with a mock gate. kline_cutoff_seconds=2, canonical strategy."""
     cfg = MomentumGateConfig(
         enabled=True,
         bnb_symbol="BNB-USDT",
         btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT",
         sol_symbol="SOL-USDT",
-        cutoff_seconds=2,
+        kline_cutoff_seconds=2,
         mtf_lookbacks=(3, 7, 15),
-        mtf_threshold=0.0001,
-        max_consecutive_fetch_failures=5,
+        mtf_min_return_threshold=0.0001,
+        max_consecutive_kline_fetch_failures=5,
     )
     return MomentumOnlyPipeline(
         config=cfg,
         strategy_config=_make_strategy_config(),
         gate=gate_mock,
-        cutoff_seconds=2,
+        kline_cutoff_seconds=2,
         min_bet_amount_bnb=0.001,
         treasury_fee_fraction=0.03,
     )
@@ -207,14 +207,14 @@ def test_pipeline_does_not_propagate_skip_reason_when_signal_fires():
         signal="Bear",
         tier="multi_tf",
         skip_reason=None,  # canonical: skip_reason is None when signal fires
-        signal_strength=0.0003,  # above small_pool 0.0002
+        signal_strength=0.0003,  # above small_pool_min_signal_strength 0.0002
         eth_signal=None,
         eth_signal_strength=0.0,
         sol_signal=None,
         sol_signal_strength=0.0,
     )
     pipeline = _make_pipeline(gate)
-    # Pool large enough to exit small_pool path AND pass min_pool / payout
+    # Pool large enough to exit small_pool_min_signal_strength path AND pass min_pool / payout
     decision = pipeline.decide_open_round(
         round_t=_make_round(),
         pool_bull_bnb=1.0,    # OUR side (Bear is bear; bull is the OTHER side)

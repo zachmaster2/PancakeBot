@@ -17,11 +17,11 @@ initial_bankroll_bnb = 5.0
 # Override all computed bet sizes to the contract minimum.
 # All strategy logic still runs normally -- signal, sizing, filters -- but the
 # actual submitted amount is clamped to minBetAmount for safe testing.
-min_bet_only = true
+clamp_bet_to_contract_minimum = true
 
 [backtest]
 # Number of most recent rounds to replay. Also controls how many rounds --sync fetches.
-simulation_size = 35000
+backtest_round_count = 35000
 initial_bankroll_bnb = 50.0
 
 # ================================================================
@@ -35,38 +35,38 @@ initial_bankroll_bnb = 50.0
 # ================================================================
 
 [strategy.pool_filter]
-min_pool_bnb = 1.5
-min_payout = 1.5
+min_pool_bnb_at_cutoff = 1.5
+min_payout_multiple_at_cutoff = 1.5
 
 [strategy.gate]
 # Multi-TF momentum gate: all lookbacks must agree in direction and
-# min(|return|) must exceed mtf_threshold for the gate to fire.
+# min(|return|) must exceed mtf_min_return_threshold for the gate to fire.
 # Previously module constants in momentum_gate.py.
 mtf_lookbacks = [3, 7, 15]
-mtf_threshold = 0.0001
+mtf_min_return_threshold = 0.0001
 
 [strategy.btc_primary.threshold]
-# Small-pool admission: signal_strength must exceed small_pool when the
+# Small-pool admission: signal_strength must exceed small_pool_min_signal_strength when the
 # pool is below pool_size_boundary_bnb (large pools rely on the gate's
-# mtf_threshold). Removed key 'large_pool' was equal to mtf_threshold by
+# mtf_min_return_threshold). Removed key 'large_pool' was equal to mtf_min_return_threshold by
 # construction (dead-by-equality).
-small_pool = 0.0002
+small_pool_min_signal_strength = 0.0002
 pool_size_boundary_bnb = 3.0
 
 [strategy.btc_primary.sizing]
-# base_fraction: starting pool fraction for the bet.
-# sizing_slope: gain on signal_strength (frac = base + slope * strength).
-# max_frac: hard cap on the resulting fraction.
-# sizing_slope and max_frac were previously module constants in momentum_pipeline.py.
-base_fraction = 0.04
-sizing_slope = 100.0
-max_frac = 0.30
+# base_pool_fraction: starting pool fraction for the bet.
+# pool_fraction_slope: gain on signal_strength (frac = base + slope * strength).
+# max_pool_fraction: hard cap on the resulting fraction.
+# pool_fraction_slope and max_pool_fraction were previously module constants in momentum_pipeline.py.
+base_pool_fraction = 0.04
+pool_fraction_slope = 100.0
+max_pool_fraction = 0.30
 
 [strategy.eth_sol_fallback.signal]
-min_strength = 0.00015
+min_signal_strength = 0.00015
 
 [strategy.eth_sol_fallback.sizing]
-base_fraction = 0.02
+base_pool_fraction = 0.02
 
 [strategy.tier2_sizing]
 # Symmetric weight applied to BOTH ETH and SOL signal strengths in the
@@ -74,7 +74,7 @@ base_fraction = 0.02
 # composition. Collapsed from former separate eth_sizing_weight /
 # sol_sizing_weight (always identical in practice).
 # Removed knob: payout_slope (hardcoded slope=1.0 in code now).
-eth_sol_sizing_weight = 0.3
+eth_sol_signal_weight = 0.3
 
 # Lower bound applied at the end of _compute_bet_size:
 # max(min_bet_threshold_bnb, min(cap_bnb, bet)). Distinct from the
@@ -92,11 +92,11 @@ min_bet_threshold_bnb = 0.01
 # bankroll in a ~5k-round post-peak drawdown regime). These defaults ARE
 # binding on the full backtest -- accepted PnL reduction buys insurance
 # against catastrophic drawdown for small initial bankrolls.
-max_bet_frac_of_bankroll = 0.05        # bet <= 5% of current bankroll
-min_bankroll_bnb = 0.20                # pause all bets while bankroll < this
-max_drawdown_frac_from_peak = 0.15     # 1.0 = disabled; fires in normal regimes
+max_bet_fraction_of_bankroll = 0.05        # bet <= 5% of current bankroll
+min_bankroll_bnb_to_bet = 0.20                # pause all bets while bankroll < this
+max_drawdown_fraction_from_peak = 0.15     # 1.0 = disabled; fires in normal regimes
 cooldown_rounds = 72                   # 6 hours at 5-min rounds
-window_days = 7                        # rolling window for peak calculation
+drawdown_peak_window_days = 7                        # rolling window for peak calculation
 # Absolute per-bet BNB caps (formerly under btc_primary.sizing / eth_sol_fallback.sizing).
 max_bet_bnb_btc_primary = 2.0          # hard cap on BTC primary stake
 max_bet_bnb_eth_sol_fallback = 0.5     # hard cap on ETH+SOL regime-2 stake

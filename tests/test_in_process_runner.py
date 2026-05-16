@@ -69,7 +69,17 @@ _EXPECTED_5FOLD_TOTAL_PNL = 50.4953
 _EXPECTED_HOLDOUT_PNL = 0.2282
 _EXPECTED_HOLDOUT_BETS = 9
 _EXPECTED_HOLDOUT_WINS = 6
-_EXPECTED_5FOLD_HASH = "9eec23adceca7fbbe44cfae5245dfc83"
+# 2026-05-16 rename pass: this hash was previously
+# ``9eec23adceca7fbbe44cfae5245dfc83``. It changed to
+# ``be2f746be32defb1008ef45538e92179`` because a backtest summary dict
+# key was renamed (the "round count" field; old name dropped per the
+# rename-pass audit catalog Bucket A). The bet/win/pnl VALUES in the
+# summary are bit-identical to the prior baseline — confirmed by the
+# per-fold assertions below which check bets, wins, and PnL
+# explicitly. Only a JSON key name changed, hence the new hash. If
+# THIS hash drifts again without an explicit dict-key rename, that
+# IS a real behavior change.
+_EXPECTED_5FOLD_HASH = "be2f746be32defb1008ef45538e92179"
 
 _RUN_LABEL = "in_process_baseline_verification"
 
@@ -87,7 +97,7 @@ def _build_spec(output_base_dir: Path) -> list[FoldSpec]:
     for fold in _FOLDS + [_HOLDOUT]:
         out.append(FoldSpec(
             name=f"{_RUN_LABEL}/{fold['name']}",
-            cutoff_seconds=2,
+            kline_cutoff_seconds=2,
             epoch_start=fold["epoch_start"],
             epoch_end=fold["epoch_end"],
             strategy_overrides={},  # all defaults — canonical baseline

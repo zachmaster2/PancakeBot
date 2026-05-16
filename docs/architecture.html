@@ -603,17 +603,17 @@
       <div class="loop-step">
         <div class="ls-title">Bankroll Wake</div>
         <div class="ls-desc">Refresh wallet balance: live mode = BSC RPC call (~50-200ms p99); dry mode = in-memory simulated bankroll. Feeds the risk gates and decide_open_round with fresh-truth right before the bet decision. 5s wake budget covers any plausible RPC stall.</div>
-        <div class="ls-time">lock_at &minus; bankroll_wakeup_offset_ms &rarr; ~6.10s before lock</div>
+        <div class="ls-time">lock_at &minus; bankroll_wakeup_offset_before_lock_ms &rarr; ~6.10s before lock</div>
       </div>
       <div class="loop-step data">
         <div class="ls-title">Critical-path Wake</div>
-        <div class="ls-desc">Single critical-path entry. Sequentially: read pool aggregate from WSS subscriber (BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds, in-memory ~5ms) &rarr; fire 3 parallel OKX /history-candles GETs (BTC/ETH/SOL; BNB disabled, see MomentumGate._SYMBOLS_FETCHED) &rarr; compute multi-TF signal + sizing. The bet-submit deadline gate at lock_at &minus; bet_submit_deadline_offset_ms gates the actual TX submission below.</div>
-        <div class="ls-time">lock_at &minus; critical_path_wakeup_offset_ms &rarr; ~1.10s before lock</div>
+        <div class="ls-desc">Single critical-path entry. Sequentially: read pool aggregate from WSS subscriber (BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds, in-memory ~5ms) &rarr; fire 3 parallel OKX /history-candles GETs (BTC/ETH/SOL; BNB disabled, see MomentumGate._OKX_SYMBOLS_FETCHED) &rarr; compute multi-TF signal + sizing. The bet-submit deadline gate at lock_at &minus; bet_submit_deadline_offset_before_lock_ms gates the actual TX submission below.</div>
+        <div class="ls-time">lock_at &minus; critical_path_wakeup_offset_before_lock_ms &rarr; ~1.10s before lock</div>
       </div>
       <div class="loop-step action">
         <div class="ls-title">Timing Guard + Execute</div>
-        <div class="ls-desc">Abort if decision-ready is within bet_submit_deadline_offset_ms of lock_at (TX submitted that close would land after lock and revert). Otherwise submit bet (receipt-waited with <code>bet_tx_receipt_timeout_seconds &asymp; 35s</code>). Live mode: clamp to min bet when <code>min_bet_only=true</code>.</div>
-        <div class="ls-time">lock_at &minus; bet_submit_deadline_offset_ms &rarr; ~750ms before lock</div>
+        <div class="ls-desc">Abort if decision-ready is within bet_submit_deadline_offset_before_lock_ms of lock_at (TX submitted that close would land after lock and revert). Otherwise submit bet (receipt-waited with <code>bet_tx_receipt_timeout_seconds &asymp; 35s</code>). Live mode: clamp to min bet when <code>clamp_bet_to_contract_minimum=true</code>.</div>
+        <div class="ls-time">lock_at &minus; bet_submit_deadline_offset_before_lock_ms &rarr; ~750ms before lock</div>
       </div>
       <div class="loop-step settle">
         <div class="ls-title">Claim Wake</div>
@@ -622,7 +622,7 @@
       </div>
     </div>
     <div class="loop-note" style="margin-top: 12px; font-size: 0.9em;">
-      All wake offsets derive from empirical constants in <code>pancakebot/timing_constants.py</code>; not user-tunable. User-tunable knobs in <code>config.toml [runtime]</code>: <code>kline_cutoff_seconds</code>, <code>pool_cutoff_seconds</code>, <code>max_consecutive_fetch_failures</code>.
+      All wake offsets derive from empirical constants in <code>pancakebot/timing_constants.py</code>; not user-tunable. User-tunable knobs in <code>config.toml [runtime]</code>: <code>kline_cutoff_seconds</code>, <code>pool_cutoff_seconds</code>, <code>max_consecutive_kline_fetch_failures</code>.
     </div>
   </div>
 
@@ -633,7 +633,7 @@
       <div class="mode-card live">
         <div class="mode-flag">--live</div>
         <h3>Live Mode</h3>
-        <p>Real-time trading with real BNB. Requires <code>BSC_WALLET_PRIVATE_KEY</code>. <code>min_bet_only</code> clamps sizes for safe testing.</p>
+        <p>Real-time trading with real BNB. Requires <code>BSC_WALLET_PRIVATE_KEY</code>. <code>clamp_bet_to_contract_minimum</code> clamps sizes for safe testing.</p>
       </div>
       <div class="mode-card dry">
         <div class="mode-flag">--dry</div>

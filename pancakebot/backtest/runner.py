@@ -13,7 +13,7 @@ from pathlib import Path
 
 from pancakebot import paths as _paths
 from pancakebot.config import BacktestConfig
-from pancakebot.constants import GAS_COST_BET_BNB
+from pancakebot.constants import BACKTEST_GAS_COST_BET_BNB
 from pancakebot.util import InvariantError
 from pancakebot.log import info
 from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline
@@ -82,23 +82,23 @@ def _load_all_rounds(runtime_cfg, *, include_failed: bool = False) -> list[Round
 def _load_klines_from(
     path: Path,
     *,
-    cutoff_seconds: int,
+    kline_cutoff_seconds: int,
     candle_count: int,
     extended_path: Path | None = None,
 ) -> dict[int, list[list]]:
     """Load pre-fetched 1s kline arrays from a JSONL file, pre-sliced to the
-    exact window the strategy will read for the given (cutoff_seconds, candle_count).
+    exact window the strategy will read for the given (kline_cutoff_seconds, candle_count).
 
     Stored records hold 300 candles per round, oldest-first, with
     open_ts = lock_at - 301 .. lock_at - 2 seconds. The strategy at a given
-    cutoff_seconds reads the ``candle_count`` candles whose open_ts is in
-    ``[lock_at - cutoff_seconds - candle_count, lock_at - cutoff_seconds - 1]``,
-    i.e. the last ``candle_count`` candles ending ``(cutoff_seconds - 1)``
+    kline_cutoff_seconds reads the ``candle_count`` candles whose open_ts is in
+    ``[lock_at - kline_cutoff_seconds - candle_count, lock_at - kline_cutoff_seconds - 1]``,
+    i.e. the last ``candle_count`` candles ending ``(kline_cutoff_seconds - 1)``
     seconds before the most recent stored candle.
 
     Slice math (negative indexing into the stored list):
-      start = -(cutoff_seconds + candle_count - 1)
-      end   = -(cutoff_seconds - 1)   if cutoff_seconds >= 2 else None
+      start = -(kline_cutoff_seconds + candle_count - 1)
+      end   = -(kline_cutoff_seconds - 1)   if kline_cutoff_seconds >= 2 else None
 
     Memory-bounded by construction: streams the file line-by-line (no
     ``path.read_text()`` materialising the whole 645 MB BTC file as a
@@ -111,8 +111,8 @@ def _load_klines_from(
     """
     if not path.exists() and (extended_path is None or not extended_path.exists()):
         return {}
-    start_neg = -(cutoff_seconds + candle_count - 1)
-    end_neg: int | None = None if cutoff_seconds == 1 else -(cutoff_seconds - 1)
+    start_neg = -(kline_cutoff_seconds + candle_count - 1)
+    end_neg: int | None = None if kline_cutoff_seconds == 1 else -(kline_cutoff_seconds - 1)
     result: dict[int, list[list]] = {}
 
     def _ingest(p: Path) -> None:
@@ -164,7 +164,7 @@ def run_backtest(
     """
     backtest_cfg.validate()
 
-    simulation_size = backtest_cfg.simulation_size
+    backtest_round_count = backtest_cfg.backtest_round_count
     initial_bankroll_bnb = backtest_cfg.initial_bankroll_bnb
 
     info("BACK", "SETUP", "START", msg="Loading closed rounds and klines")
@@ -198,10 +198,10 @@ def run_backtest(
                 f"backtest_no_rounds_in_epoch_range: start={epoch_start} end={epoch_end}"
             )
     else:
-        sim_rounds = all_rounds[-simulation_size:]
-        if len(sim_rounds) < simulation_size:
+        sim_rounds = all_rounds[-backtest_round_count:]
+        if len(sim_rounds) < backtest_round_count:
             raise InvariantError(
-                f"backtest_insufficient_rounds: need={simulation_size} have={len(sim_rounds)}"
+                f"backtest_insufficient_rounds: need={backtest_round_count} have={len(sim_rounds)}"
             )
 
     first_epoch = sim_rounds[0].epoch
@@ -234,12 +234,12 @@ def run_backtest(
     # plus the anchor candle.
     _gc = runtime_cfg.strategy.gate
     _candle_count = max(_gc.mtf_lookbacks) + 1
-    _cs = int(runtime_cfg.cutoff_seconds)
+    _cs = int(runtime_cfg.kline_cutoff_seconds)
     _ext_btc = _EXT_BTC_KLINES_PATH if use_extended_data else None
     _ext_eth = _EXT_ETH_KLINES_PATH if use_extended_data else None
     _ext_sol = _EXT_SOL_KLINES_PATH if use_extended_data else None
     btc_klines = _load_klines_from(
-        _BTC_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count,
+        _BTC_KLINES_PATH, kline_cutoff_seconds=_cs, candle_count=_candle_count,
         extended_path=_ext_btc,
     )
     if btc_klines:
@@ -248,7 +248,7 @@ def run_backtest(
                  f"(cutoff={_cs}, candle_count={_candle_count})")
     eth_klines = (
         _load_klines_from(
-            _ETH_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count,
+            _ETH_KLINES_PATH, kline_cutoff_seconds=_cs, candle_count=_candle_count,
             extended_path=_ext_eth,
         )
         if _ETH_KLINES_PATH.exists() or (_ext_eth is not None and _ext_eth.exists()) else {}
@@ -257,7 +257,7 @@ def run_backtest(
         info("BACK", "SETUP", "ETH_KL", msg=f"Loaded ETH 1s klines for {len(eth_klines)} epochs")
     sol_klines = (
         _load_klines_from(
-            _SOL_KLINES_PATH, cutoff_seconds=_cs, candle_count=_candle_count,
+            _SOL_KLINES_PATH, kline_cutoff_seconds=_cs, candle_count=_candle_count,
             extended_path=_ext_sol,
         )
         if _SOL_KLINES_PATH.exists() or (_ext_sol is not None and _ext_sol.exists()) else {}
@@ -271,13 +271,13 @@ def run_backtest(
     gate_config: MomentumGateConfig = runtime_cfg.momentum_gate_config  # type: ignore[assignment]
     bankroll_tracker = InMemoryBankrollTracker(
         initial_bankroll=initial_bankroll_bnb,
-        window_days=runtime_cfg.strategy.risk.window_days,
+        drawdown_peak_window_days=runtime_cfg.strategy.risk.drawdown_peak_window_days,
     )
     pipeline = MomentumOnlyPipeline(
         config=gate_config,
         strategy_config=runtime_cfg.strategy,
         gate=None,
-        cutoff_seconds=runtime_cfg.cutoff_seconds,
+        kline_cutoff_seconds=runtime_cfg.kline_cutoff_seconds,
         min_bet_amount_bnb=runtime_cfg.min_bet_amount_bnb,
         treasury_fee_fraction=runtime_cfg.treasury_fee_fraction,
         bankroll_tracker=bankroll_tracker,
@@ -320,7 +320,7 @@ def run_backtest(
                 if bet_side not in ("Bull", "Bear"):
                     raise InvariantError("backtest_bet_side_invalid")
 
-                bankroll -= decision.bet_size_bnb + GAS_COST_BET_BNB
+                bankroll -= decision.bet_size_bnb + BACKTEST_GAS_COST_BET_BNB
                 outcome = settle_bet_against_closed_round(
                     bet_bnb=decision.bet_size_bnb,
                     bet_side=bet_side,
@@ -328,7 +328,7 @@ def run_backtest(
                     treasury_fee_fraction=runtime_cfg.treasury_fee_fraction,
                 )
                 bankroll += outcome.credit_bnb
-                profit = outcome.credit_bnb - decision.bet_size_bnb - GAS_COST_BET_BNB
+                profit = outcome.credit_bnb - decision.bet_size_bnb - BACKTEST_GAS_COST_BET_BNB
 
                 stats.num_bets += 1
                 if bet_side == "Bull":
@@ -401,7 +401,7 @@ def run_backtest(
 
     skip_detail = dict(sorted(stats.skip_counts_by_reason.items(), key=lambda x: -x[1]))
     summary = {
-        "simulation_size": total_rounds,
+        "backtest_round_count": total_rounds,
         "first_epoch": first_epoch,
         "last_epoch": last_epoch,
         "initial_bankroll_bnb": initial_bankroll_bnb,

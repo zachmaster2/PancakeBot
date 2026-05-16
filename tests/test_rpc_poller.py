@@ -33,7 +33,7 @@ from pancakebot.util import InvariantError  # noqa: E402
 def _make_poller() -> RpcPoller:
     """Construct a poller with default args + lightweight endpoint_pool."""
     return RpcPoller(
-        interval_seconds=300,
+        round_interval_seconds=300,
         endpoint_pool=["https://test.example.com"],
     )
 
@@ -49,16 +49,16 @@ def test_construct_default_params():
 
 
 def test_construct_invalid_interval_raises():
-    with pytest.raises(InvariantError, match="interval_seconds"):
-        RpcPoller(interval_seconds=0, endpoint_pool=["https://x"])
-    with pytest.raises(InvariantError, match="interval_seconds"):
-        RpcPoller(interval_seconds=-1, endpoint_pool=["https://x"])
+    with pytest.raises(InvariantError, match="round_interval_seconds"):
+        RpcPoller(round_interval_seconds=0, endpoint_pool=["https://x"])
+    with pytest.raises(InvariantError, match="round_interval_seconds"):
+        RpcPoller(round_interval_seconds=-1, endpoint_pool=["https://x"])
 
 
 def test_construct_invalid_periodic_interval_raises():
     with pytest.raises(InvariantError, match="periodic_poll_interval"):
         RpcPoller(
-            interval_seconds=300,
+            round_interval_seconds=300,
             endpoint_pool=["https://x"],
             periodic_poll_interval_s=0,
         )
@@ -68,15 +68,15 @@ def test_construct_batch_size_too_large_raises():
     from pancakebot import timing_constants as _tc
     with pytest.raises(InvariantError, match="batch_size_out_of_range"):
         RpcPoller(
-            interval_seconds=300,
+            round_interval_seconds=300,
             endpoint_pool=["https://x"],
-            batch_size=_tc.RPC_BATCH_BLOCK_RECEIPTS_LIMIT + 1,
+            batch_size=_tc.RPC_BATCH_MAX_BLOCKS + 1,
         )
 
 
 def test_construct_empty_rpc_urls_raises():
     with pytest.raises(InvariantError, match="endpoint_pool_empty"):
-        RpcPoller(interval_seconds=300, endpoint_pool=[])
+        RpcPoller(round_interval_seconds=300, endpoint_pool=[])
 
 
 # ---------------------------------------------------------------------------
@@ -622,9 +622,9 @@ def _make_anchored_poller() -> RpcPoller:
     """Poller with default canonical ramp_poll_1 offset (7500ms) and
     interval=300s for periodic-loop math tests."""
     return RpcPoller(
-        interval_seconds=300,
+        round_interval_seconds=300,
         endpoint_pool=["https://test.example.com"],
-        ramp_poll_1_wakeup_offset_ms=7500,
+        ramp_poll_1_wakeup_offset_before_lock_ms=7500,
     )
 
 
@@ -727,7 +727,7 @@ def test_periodic_timeout_state_b_exact_boundary_suspends():
     tick exists, but a future change to either constant could produce
     one. Construct a config where it does and pin the >= behavior.
 
-    Construction: ``ramp_poll_1_wakeup_offset_ms=200_000`` (200s) →
+    Construction: ``ramp_poll_1_wakeup_offset_before_lock_ms=200_000`` (200s) →
     ``ramp_window_start = lock_at − 200``. With ``round_open = 0``,
     ``period = 8``, ticks land at 8, 16, ..., 800. The 800 tick
     falls EXACTLY on the ramp_window_start boundary at lock_at=1000.
@@ -735,9 +735,9 @@ def test_periodic_timeout_state_b_exact_boundary_suspends():
     racing ramp_1. With ``>=`` predicate, it suspends.
     """
     p = RpcPoller(
-        interval_seconds=1000,
+        round_interval_seconds=1000,
         endpoint_pool=["https://test.example.com"],
-        ramp_poll_1_wakeup_offset_ms=200_000,
+        ramp_poll_1_wakeup_offset_before_lock_ms=200_000,
     )
     lock_at = 1000
     # next-tick math at now=795: k = max(1, 795//8 + 1) = 100;

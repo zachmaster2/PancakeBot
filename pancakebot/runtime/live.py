@@ -104,7 +104,7 @@ def claim_scan_cursor(
     locked_epoch: int,
     current_epoch: int,
     now_ts: int,
-    buffer_seconds: int,
+    round_close_buffer_seconds: int,
     page_size: int = _PAGE_SIZE_DEFAULT,
     gas_limit: int = 300_000,
     claim_batch_size: int = 10,
@@ -269,7 +269,7 @@ def claim_scan_cursor(
         if e == locked_epoch or e == current_epoch:
             break
         cts = close_ts_map.get(e)
-        if cts is not None and now_ts - cts < buffer_seconds:
+        if cts is not None and now_ts - cts < round_close_buffer_seconds:
             break
         scannable.append(e)
     scanned = len(scannable)

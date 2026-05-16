@@ -27,7 +27,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from pancakebot.chain.rpc_poller import (  # noqa: E402
-    DEFAULT_HEDGED_ENDPOINTS,
+    READ_PATH_HEDGED_ENDPOINTS,
     HedgedAllFailed,
     RpcPoller,
 )
@@ -40,7 +40,7 @@ from pancakebot.util import InvariantError  # noqa: E402
 
 def _make_poller(*, endpoint_pool: list[str] | None = None) -> RpcPoller:
     return RpcPoller(
-        interval_seconds=300,
+        round_interval_seconds=300,
         endpoint_pool=endpoint_pool or ["https://test.example.com"],
     )
 
@@ -63,7 +63,7 @@ def _make_responder(*, response: bytes, sleep_s: float = 0.0,
 
 def test_empty_endpoint_pool_raises():
     with pytest.raises(InvariantError, match="endpoint_pool_empty"):
-        RpcPoller(interval_seconds=300, endpoint_pool=[])
+        RpcPoller(round_interval_seconds=300, endpoint_pool=[])
 
 
 def test_default_hedged_endpoints_constant_is_three():
@@ -86,10 +86,10 @@ def test_default_hedged_endpoints_constant_is_three():
     Cloudflare → cold-start burst load (~20 batches × N endpoints)
     drops from ~120 to ~60 concurrent in-flight requests.
     """
-    assert len(DEFAULT_HEDGED_ENDPOINTS) == 3
-    assert "bsc-dataseed1.binance.org" in DEFAULT_HEDGED_ENDPOINTS[0]
-    assert "bsc-dataseed1.defibit.io" in DEFAULT_HEDGED_ENDPOINTS[1]
-    assert "bsc-rpc.publicnode.com" in DEFAULT_HEDGED_ENDPOINTS[2]
+    assert len(READ_PATH_HEDGED_ENDPOINTS) == 3
+    assert "bsc-dataseed1.binance.org" in READ_PATH_HEDGED_ENDPOINTS[0]
+    assert "bsc-dataseed1.defibit.io" in READ_PATH_HEDGED_ENDPOINTS[1]
+    assert "bsc-rpc.publicnode.com" in READ_PATH_HEDGED_ENDPOINTS[2]
 
 
 # ---------------------------------------------------------------------------
