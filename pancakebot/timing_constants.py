@@ -248,14 +248,22 @@ VALIDATOR_ASSEMBLY_WINDOW_MS: int = 50
 # so the LOCAL deadline for ``eth_sendRawTransaction(...)`` is that minus
 # this one-way budget.
 #
-# TODO: real ``sendRawTransaction`` probe queued. Until then, 150ms is a
-# conservative interim estimate (about 75% of the prior round-trip
-# BSC_BET_SUBMIT_RTT_P95_MS=200ms estimate; the ack return path is the
-# other ~50ms but doesn't affect inclusion timing).
+# Empirically validated 2026-05-16 via probe:
+# ``research/probe_send_raw_transaction_rtt.py --mode full`` ran 100
+# self-transfer TXs from the production wallet via the primary write-
+# path RPC ``bsc-dataseed1.defibit.io``. 100/100 sent, 100/100 included
+# within 30s. Round-trip RTT: p50=37ms, p95=188ms, p99=277ms, max=277ms.
+# One-way ≈ RTT/2 + propagation; the 50ms-quantum cover for p99/2 (139ms)
+# is 150ms with 11ms safety margin. Lowering to 100ms would cover p95/2
+# but leave ~1-2% of TXs arriving slightly past the dynamic submit
+# deadline (clean BET TIMING ABORT, but lost bet opportunity); the
+# critical-path budget gain (50ms = ~5% of static-wake budget) is not
+# worth the asymmetric cost.
 #
-# Source: BSC_BET_SUBMIT_RTT_P95_MS (200ms RTT proxy) × ~0.75 one-way
-#         share. Placeholder.
-# Last measured: NOT YET PROBED (TODO: dedicated sendRawTransaction probe)
+# Source: research/probe_send_raw_transaction_rtt.py n=100, 2026-05-16.
+#         Full distribution + reasoning in
+#         var/strategy_review/send_raw_tx_probe.md.
+# Last measured: 2026-05-16
 BSC_BET_SUBMIT_ONE_WAY_MS: int = 150
 
 # DEPRECATED (Bundle 4 2026-05-14): replaced by BSC_BET_SUBMIT_ONE_WAY_MS
