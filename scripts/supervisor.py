@@ -672,6 +672,15 @@ def _build_discord_message(
     elif status == "UNINSTRUMENTED":
         lines.append("note: legacy bot pre-Phase-2a still running")
 
+    if escalation == "SPAWN_FAILED":
+        spawn_err = fields.get("spawn_error")
+        if isinstance(spawn_err, str) and spawn_err:
+            lines.append(f"spawn_error: `{spawn_err}`")
+        lines.append(
+            "note: supervisor failed to spawn a replacement bot; "
+            "manual intervention required"
+        )
+
     return "\n".join(lines)
 
 
@@ -1041,6 +1050,7 @@ def main(argv: list[str] | None = None) -> int:
     escalation: str | None = None
     new_pid_from_restart: int | None = None
     suppressed_fast = False
+    spawn_failed_detail: str | None = None
     if args.restart and status in _RESTART_STATES:
         restart_result = _do_restart(
             mode=args.mode,
@@ -1058,21 +1068,47 @@ def main(argv: list[str] | None = None) -> int:
             escalation = "SUPPRESSED_FAST_CRASHLOOP"
         elif action_taken == "SLOW_CRASHLOOP_WARNING":
             escalation = "SLOW_CRASHLOOP_WARNING"
+        elif action_taken == "SPAWN_FAILED":
+            # Spawn failure is a hard problem; route through the regular
+            # mode-channel alert path with SPAWN_FAILED as the escalation tag
+            # (separate cooldown bucket + distinct headline).
+            escalation = "SPAWN_FAILED"
+            detail = restart_result.get("detail")
+            if isinstance(detail, str):
+                spawn_failed_detail = detail
 
     # -- Phase 2c: Discord alert (opt-in) --
     alert_outcome: str | None = None
     if args.alert:
-        # Escalated actions force an alert even if the underlying classification
-        # wouldn't normally trigger one (though it always will here, since
-        # STALE/CRASHED/DOWN are both _RESTART_STATES and _ALERT_STATES).
-        if status in _ALERT_STATES or escalation is not None:
-            alert_outcome = _maybe_send_discord(
-                mode=args.mode,
-                status=status,
-                fields=fields,
-                art=art,
-                escalation=escalation,
-            )
+        # New policy (2026-05-16): a supervisor-initiated restart that
+        # succeeded cleanly is the supervisor doing its job — not a
+        # problem. Suppress the routine DOWN/STALE/CRASHED alert when
+        # we just restarted successfully with no escalation. We still
+        # alert on:
+        #   - SUPPRESSED_FAST_CRASHLOOP / SLOW_CRASHLOOP_WARNING (escalation)
+        #   - SPAWN_FAILED (also via escalation tag; routes to mode channel)
+        #   - STALE / CRASHED / UNINSTRUMENTED (when no restart fired)
+        #   - DOWN when args.restart is off (operator-only safety net)
+        routine_restart = (
+            args.restart
+            and action_taken == "RESTARTED"
+            and escalation is None
+        )
+        if routine_restart:
+            alert_outcome = "SUPPRESSED_ROUTINE_RESTART"
+        else:
+            # Decorate fields with the spawn-failure detail so the
+            # Discord message body includes the error reason.
+            if spawn_failed_detail is not None:
+                fields["spawn_error"] = spawn_failed_detail
+            if status in _ALERT_STATES or escalation is not None:
+                alert_outcome = _maybe_send_discord(
+                    mode=args.mode,
+                    status=status,
+                    fields=fields,
+                    art=art,
+                    escalation=escalation,
+                )
 
     # Decorate the single supervisor.log line with action + alert details.
     if action_taken is not None:
