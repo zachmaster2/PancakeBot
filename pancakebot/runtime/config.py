@@ -73,7 +73,7 @@ class RuntimeConfig:
     bet_submit_deadline_offset_before_lock_ms: int
 
     # Receipt timeouts for ``contract.bet_*_timed`` and ``contract.claim``
-    # (DERIVED at runtime from ``round_close_buffer_seconds + claim_check_padding_seconds``,
+    # (DERIVED at runtime from ``buffer_seconds + claim_check_padding_seconds``,
     # ≈35s on canonical chain constants). Both share the same derivation:
     # how long ``wait_for_transaction_receipt`` polls before raising
     # TimeExhausted. Sized so a slow mempool inclusion is still caught
@@ -105,8 +105,8 @@ class RuntimeConfig:
     # Protocol constants (from chain via contract_constants.json)
     min_bet_amount_bnb: float
     treasury_fee_fraction: float
-    round_interval_seconds: int
-    round_close_buffer_seconds: int
+    interval_seconds: int
+    buffer_seconds: int
 
     # Dry-mode initial bankroll
     dry_initial_bankroll_bnb: float | None

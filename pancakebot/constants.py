@@ -11,7 +11,7 @@ PREDICTION_V2_CONTRACT_ADDRESS = "0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA"
 # The contract's treasury fee is expressed in basis points (bps).
 TREASURY_FEE_DIVISOR = 10_000
 
-# Protocol constants (treasury_fee, min_bet, round_interval_seconds, round_close_buffer_seconds)
+# Protocol constants (treasury_fee, min_bet, interval_seconds, buffer_seconds)
 # are synced from chain by --sync and cached in var/contract_constants.json.
 # See pancakebot/market_data/contract_constants.py.
 

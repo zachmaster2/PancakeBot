@@ -41,10 +41,10 @@ from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
 # Extra cushion added to the claim wake time, on top of the chain's
-# ``round_close_buffer_seconds`` settlement window. Total claim-wake time =
-# ``close_at(claim_epoch) + round_close_buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS``
+# ``buffer_seconds`` settlement window. Total claim-wake time =
+# ``close_at(claim_epoch) + buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS``
 # (NOT relative to lock_at -- the bot only claims after the round closes
-# and the keeper has had ``round_close_buffer_seconds`` to call settleRound). The
+# and the keeper has had ``buffer_seconds`` to call settleRound). The
 # padding absorbs alignment retries near RPC boundaries.
 _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS = 5
 
@@ -352,7 +352,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     locked_epoch=locked_epoch,
                     current_epoch=current_epoch,
                     now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
-                    round_close_buffer_seconds=cfg.round_close_buffer_seconds,
+                    buffer_seconds=cfg.buffer_seconds,
                     page_size=100,
                     gas_limit=BACKTEST_GAS_LIMIT_CLAIM,
                     claim_batch_size=_CLAIM_BATCH_SIZE,
@@ -409,7 +409,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # lock_at) IS the close_at of ``prev_locked_epoch`` (= epoch T-2).
         # Claim wake fires at: close_at(prev) + buffer + padding.
         prev_close_ts = locked_round.lock_at  # = close_at(prev_locked_epoch)
-        claim_ts = prev_close_ts + cfg.round_close_buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
+        claim_ts = prev_close_ts + cfg.buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
         # claim_ts and cutoff_ts_t are both chain-anchored true UTC; compare
         # against NTP-corrected _utc_now() so a drifted local clock doesn't
         # make us miss the wake-for-claim window.
@@ -1102,7 +1102,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     if close_ts <= 0:
         raise InvariantError("close_ts_invalid")
 
-    claim_ts = close_ts + cfg.round_close_buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
+    claim_ts = close_ts + cfg.buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
     _sleep_until_ts(claim_ts, reason="wait_for_claim", epoch=claim_epoch)
 
     # Epoch handshake to refresh round state (both modes).
@@ -1118,7 +1118,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
             locked_epoch=locked_round2.epoch,
             current_epoch=current_epoch2,
             now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
-            round_close_buffer_seconds=cfg.round_close_buffer_seconds,
+            buffer_seconds=cfg.buffer_seconds,
             page_size=100,
             gas_limit=BACKTEST_GAS_LIMIT_CLAIM,
             claim_batch_size=_CLAIM_BATCH_SIZE,

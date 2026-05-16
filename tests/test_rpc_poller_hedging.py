@@ -40,7 +40,7 @@ from pancakebot.util import InvariantError  # noqa: E402
 
 def _make_poller(*, endpoint_pool: list[str] | None = None) -> RpcPoller:
     return RpcPoller(
-        round_interval_seconds=300,
+        interval_seconds=300,
         endpoint_pool=endpoint_pool or ["https://test.example.com"],
     )
 
@@ -63,7 +63,7 @@ def _make_responder(*, response: bytes, sleep_s: float = 0.0,
 
 def test_empty_endpoint_pool_raises():
     with pytest.raises(InvariantError, match="endpoint_pool_empty"):
-        RpcPoller(round_interval_seconds=300, endpoint_pool=[])
+        RpcPoller(interval_seconds=300, endpoint_pool=[])
 
 
 def test_default_hedged_endpoints_constant_is_three():
