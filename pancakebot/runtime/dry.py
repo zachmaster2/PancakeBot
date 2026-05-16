@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pancakebot import paths as _paths
+from pancakebot.constants import RETRY_BACKOFF_SECONDS
 from pancakebot.util import InvariantError, TransientRpcError
 from pancakebot.log import info
 from pancakebot.util import bankroll_suffix, usd_suffix
@@ -27,9 +28,6 @@ from pancakebot.settlement import settle_from_round_data
 from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
-
-
-_RETRY_BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
 
 
 @dataclass(slots=True)
@@ -399,7 +397,7 @@ def _fetch_wallet_balance_bnb_with_retries(
     cfg: RuntimeConfig,
     reason: str,
 ) -> float:
-    for delay_seconds in _RETRY_BACKOFF_SECONDS:
+    for delay_seconds in RETRY_BACKOFF_SECONDS:
         try:
             return float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
         except TransientRpcError as e:
@@ -735,6 +733,7 @@ def _build_momentum_pipeline(*, cfg: RuntimeConfig) -> MomentumOnlyPipeline:
         strategy_config=cfg.strategy,
         gate=cfg.momentum_gate,
         kline_cutoff_seconds=cfg.kline_cutoff_seconds,
+        pool_cutoff_seconds=cfg.pool_cutoff_seconds,
         min_bet_amount_bnb=cfg.min_bet_amount_bnb,
         treasury_fee_fraction=cfg.treasury_fee_fraction,
     )

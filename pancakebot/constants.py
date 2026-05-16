@@ -15,11 +15,6 @@ TREASURY_FEE_DIVISOR = 10_000
 # are synced from chain by --sync and cached in var/contract_constants.json.
 # See pancakebot/market_data/contract_constants.py.
 
-# Pool cutoff: only use bets with created_at < lock_at - POOL_CUTOFF_SECONDS.
-# Bets placed this many seconds before lock are guaranteed to have propagated
-# to our node by decision time, ensuring consistency between live and backtest.
-POOL_CUTOFF_SECONDS = 6
-
 # --- RPC (hardcoded list; failover is handled by RPC chooser) ---
 
 WRITE_PATH_RPC_URLS: list[str] = [
@@ -59,3 +54,7 @@ BACKTEST_GAS_LIMIT_CLAIM = 250_000
 # Deterministic gas costs (BNB). These are costs, not limits.
 BACKTEST_GAS_COST_BET_BNB = float(BACKTEST_GAS_LIMIT_BET) * float(BACKTEST_GAS_PRICE_WEI) / float(BNB_WEI)
 BACKTEST_GAS_COST_CLAIM_BNB = float(BACKTEST_GAS_LIMIT_CLAIM) * float(BACKTEST_GAS_PRICE_WEI) / float(BNB_WEI)
+
+# --- Runtime retry ---
+
+RETRY_BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked

@@ -278,6 +278,7 @@ def run_backtest(
         strategy_config=runtime_cfg.strategy,
         gate=None,
         kline_cutoff_seconds=runtime_cfg.kline_cutoff_seconds,
+        pool_cutoff_seconds=runtime_cfg.pool_cutoff_seconds,
         min_bet_amount_bnb=runtime_cfg.min_bet_amount_bnb,
         treasury_fee_fraction=runtime_cfg.treasury_fee_fraction,
         bankroll_tracker=bankroll_tracker,

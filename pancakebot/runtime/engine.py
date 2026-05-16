@@ -12,6 +12,7 @@ from pancakebot.constants import (
     BACKTEST_GAS_LIMIT_BET,
     BACKTEST_GAS_LIMIT_CLAIM,
     BACKTEST_GAS_COST_BET_BNB,
+    RETRY_BACKOFF_SECONDS,
 )
 from pancakebot.util import InvariantError, TransientRpcError
 from pancakebot.log import info, warn
@@ -48,10 +49,8 @@ from time import sleep as sleep_seconds
 _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS = 5
 
 _CLAIM_BATCH_SIZE = 10
-_RETRY_BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
 
 _TRANSIENT_NETWORK_DELAY_SECONDS = 10
-_ONE_MINUTE_MS = 60_000
 
 
 # -- NTP clock sync ----------------------------------------------------------
@@ -1048,7 +1047,7 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
     where open_rd is the raw RoundData for the open epoch (reusable for
     pool amounts and lock_ts, avoiding duplicate RPC calls).
     """
-    for idx, delay_seconds in enumerate([0] + list(_RETRY_BACKOFF_SECONDS)):
+    for idx, delay_seconds in enumerate([0] + list(RETRY_BACKOFF_SECONDS)):
         if delay_seconds > 0:
             sleep_seconds(delay_seconds)
         try:
