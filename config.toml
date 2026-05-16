@@ -9,6 +9,17 @@
 # (the cutoff is fixed by strategy; the offsets adjust around it).
 kline_cutoff_seconds = 2
 
+# Pool aggregate horizon: only on-chain bets with block_ts < lock_at -
+# pool_cutoff_seconds are counted into the cutoff-pool used by the
+# strategy. The RPC poll schedule (ramp_1, ramp_2, final) is derived
+# from this. Canonical value: 6.
+pool_cutoff_seconds = 6
+
+# Streak counter on the live decision path. After this many consecutive
+# OKX kline fetch failures the gate raises InvariantError, the bot
+# crashes, and the supervisor restarts + fires a Discord alert.
+max_consecutive_kline_fetch_failures = 5
+
 [dry]
 # Starting bankroll for fresh dry runs (ignored when continuing from existing state)
 initial_bankroll_bnb = 5.0
@@ -23,6 +34,10 @@ clamp_bet_to_contract_minimum = true
 # Number of most recent rounds to replay. Also controls how many rounds --sync fetches.
 backtest_round_count = 35000
 initial_bankroll_bnb = 50.0
+# Optional epoch slicing. Both default to None (whole window). Uncomment
+# to bound the backtest to a specific epoch range.
+# epoch_start = 1234567   # inclusive lower bound
+# epoch_end = 7654321     # inclusive upper bound
 
 # ================================================================
 # Strategy configuration
@@ -97,6 +112,7 @@ min_bankroll_bnb_to_bet = 0.20                # pause all bets while bankroll < 
 max_drawdown_fraction_from_peak = 0.15     # 1.0 = disabled; fires in normal regimes
 cooldown_rounds = 72                   # 6 hours at 5-min rounds
 drawdown_peak_window_days = 7                        # rolling window for peak calculation
+drawdown_peak_mode = "rolling_7d"      # peak-tracking semantics; alt: "absolute_ratchet" (monotonic since-launch peak)
 # Absolute per-bet BNB caps (formerly under btc_primary.sizing / eth_sol_fallback.sizing).
 max_bet_bnb_btc_primary = 2.0          # hard cap on BTC primary stake
 max_bet_bnb_eth_sol_fallback = 0.5     # hard cap on ETH+SOL regime-2 stake
