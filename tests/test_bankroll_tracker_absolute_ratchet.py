@@ -25,13 +25,13 @@ _FAR_FUTURE_START = 2_000_000_000  # past the canonical floor; arbitrary
 
 def _make_tracker_absolute(initial: float = 50.0) -> InMemoryBankrollTracker:
     return InMemoryBankrollTracker(
-        initial_bankroll=initial, window_days=7, peak_mode="absolute_ratchet",
+        initial_bankroll=initial, drawdown_peak_window_days=7, peak_mode="absolute_ratchet",
     )
 
 
 def _make_tracker_rolling(initial: float = 50.0) -> InMemoryBankrollTracker:
     return InMemoryBankrollTracker(
-        initial_bankroll=initial, window_days=7, peak_mode="rolling_7d",
+        initial_bankroll=initial, drawdown_peak_window_days=7, peak_mode="rolling_7d",
     )
 
 
@@ -114,7 +114,7 @@ def test_rolling_mode_unaffected_by_absolute_peak_field():
 
 def test_default_peak_mode_is_rolling():
     """Default peak_mode (no kwarg) must be rolling_7d for backward compat."""
-    t = InMemoryBankrollTracker(initial_bankroll=50.0, window_days=7)
+    t = InMemoryBankrollTracker(initial_bankroll=50.0, drawdown_peak_window_days=7)
     # Climb then drop, drop should reduce window peak after entries leave window.
     # We won't simulate that here; just confirm that the mode field defaults right.
     assert getattr(t, "_peak_mode") == "rolling_7d"
@@ -125,7 +125,7 @@ def test_default_peak_mode_is_rolling():
 def test_invalid_peak_mode_raises():
     with pytest.raises(InvariantError) as exc_info:
         InMemoryBankrollTracker(
-            initial_bankroll=50.0, window_days=7, peak_mode="bogus_mode",
+            initial_bankroll=50.0, drawdown_peak_window_days=7, peak_mode="bogus_mode",
         )
     assert "peak_mode_invalid" in str(exc_info.value)
 
@@ -134,7 +134,7 @@ def test_absolute_ratchet_drawdown_above_threshold_on_slow_drain():
     """End-to-end demonstration: slow drain that the rolling-7d misses, the
     absolute-ratchet catches.
 
-    Simulate a slow drain spanning > window_days. The rolling-7d peak follows
+    Simulate a slow drain spanning > drawdown_peak_window_days. The rolling-7d peak follows
     the decline downward; the absolute peak remembers the launch high.
     """
     DAY = 86400

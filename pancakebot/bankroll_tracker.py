@@ -8,7 +8,7 @@ circuit breaker, fractional bet cap). Two implementations:
   to a JSONL file and persists pause state to a sibling JSON file.
 
 Window semantics: ``peak_bankroll(as_of_start_at)`` returns the max bankroll over
-entries with ``start_at >= as_of_start_at - window_days * 86400``. The most-recent
+entries with ``start_at >= as_of_start_at - drawdown_peak_window_days * 86400``. The most-recent
 entry with ``start_at < window_start`` is preserved as a boundary (so the
 "entering-window" bankroll is always part of the peak candidates).
 
@@ -81,12 +81,12 @@ class InMemoryBankrollTracker(BankrollTracker):
 
     ``peak_mode`` controls drawdown-from-peak semantics:
       - ``"rolling_7d"`` (default, canonical-preserving): uses a rolling
-        ``window_days`` window. Entries older than the window are pruned;
+        ``drawdown_peak_window_days`` window. Entries older than the window are pruned;
         peak is max over remaining entries plus the most-recent boundary.
       - ``"absolute_ratchet"``: peak is monotonically
         non-decreasing across the entire run, initialized to ``initial_bankroll``.
         Catches slow drains the rolling window misses (extension-cohort regime).
-        ``window_days`` is ignored for peak calc but still controls entry pruning
+        ``drawdown_peak_window_days`` is ignored for peak calc but still controls entry pruning
         of the underlying deque (entries are not used by peak under this mode).
     """
 
@@ -99,12 +99,12 @@ class InMemoryBankrollTracker(BankrollTracker):
         self,
         *,
         initial_bankroll: float,
-        window_days: int,
+        drawdown_peak_window_days: int,
         peak_mode: str = "rolling_7d",
     ) -> None:
         if initial_bankroll <= 0.0:
             raise InvariantError("bankroll_tracker_initial_bankroll_not_positive")
-        if window_days <= 0:
+        if drawdown_peak_window_days <= 0:
             raise InvariantError("bankroll_tracker_window_days_not_positive")
         if peak_mode not in ("rolling_7d", "absolute_ratchet"):
             raise InvariantError(
@@ -112,7 +112,7 @@ class InMemoryBankrollTracker(BankrollTracker):
                 "(expected 'rolling_7d' or 'absolute_ratchet')"
             )
         self._entries: deque[_Entry] = deque()
-        self._window_days = int(window_days)
+        self._window_days = int(drawdown_peak_window_days)
         self._cooldown: int = 0
         self._triggered_at: int | None = None
         # Seeded lazily on first record_settlement when we know a real start_at;
@@ -232,12 +232,12 @@ class PersistedBankrollTracker(InMemoryBankrollTracker):
         *,
         path: Path,
         initial_bankroll: float,
-        window_days: int,
+        drawdown_peak_window_days: int,
         peak_mode: str = "rolling_7d",
     ) -> None:
         super().__init__(
             initial_bankroll=initial_bankroll,
-            window_days=window_days,
+            drawdown_peak_window_days=drawdown_peak_window_days,
             peak_mode=peak_mode,
         )
         self._history_path = Path(path)

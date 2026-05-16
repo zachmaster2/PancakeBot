@@ -1,13 +1,13 @@
 """Multi-timeframe momentum gate over OKX 1s klines for BTC with independent ETH/SOL signals.
 
 Requires BTC multi-TF returns (configured via ``GateConfig.mtf_lookbacks``)
-to all agree in direction and exceed ``GateConfig.mtf_threshold``, and emits
+to all agree in direction and exceed ``GateConfig.mtf_min_return_threshold``, and emits
 independent ETH and SOL multi-TF directions plus confirmation strengths for
 use by the pipeline's sizing and regime-2 logic.
 
 Live data path: per-round parallel REST fetch of BTC/ETH/SOL/BNB
 ``/history-candles`` windows. The window is sized to exactly what the
-strategy consumes: cutoff-aware (newest = ``lock_at - cutoff_seconds*1000
+strategy consumes: cutoff-aware (newest = ``lock_at - kline_cutoff_seconds*1000
 - 1000``) and lookback-aware (``max_lookback + 1`` candles), so a default
 cutoff=2 + lookbacks=(3,7,15) fetches the 16-candle window
 ``[lock_at - 18_000, lock_at - 3_000]`` rather than the prior cutoff-blind
@@ -47,8 +47,8 @@ from pancakebot.util import InvariantError, TransientOkxError
 
 
 # Streak counter limit is configured per-instance via
-# ``MomentumGateConfig.max_consecutive_fetch_failures`` (threaded from
-# ``cfg.max_consecutive_fetch_failures`` at config load). The constant
+# ``MomentumGateConfig.max_consecutive_kline_fetch_failures`` (threaded from
+# ``cfg.max_consecutive_kline_fetch_failures`` at config load). The constant
 # below is the canonical default + the value used by tests that don't
 # construct a custom MomentumGateConfig.
 #
@@ -65,31 +65,31 @@ _MAX_CONSECUTIVE_FETCH_FAILURES = 5
 # To re-enable: add "bnb" back to this tuple, restore the "bnb" entry
 # in the symbols dict in evaluate(), bump _executor max_workers to 4,
 # and reinstate the _bnb_arr extraction below the validation block.
-_SYMBOLS_FETCHED = ("btc", "eth", "sol")
+_OKX_SYMBOLS_FETCHED = ("btc", "eth", "sol")
 
 
 @dataclass(frozen=True, slots=True)
 class MomentumGateConfig:
     """Live/dry-mode gate configuration.
 
-    The ``mtf_lookbacks`` / ``mtf_threshold`` carry the per-strategy
-    multi-TF parameters. ``cutoff_seconds`` defines the data window the
-    gate consumes (cutoff_ts_ms = lock_at_ms - cutoff_seconds*1000) and
+    The ``mtf_lookbacks`` / ``mtf_min_return_threshold`` carry the per-strategy
+    multi-TF parameters. ``kline_cutoff_seconds`` defines the data window the
+    gate consumes (cutoff_ts_ms = lock_at_ms - kline_cutoff_seconds*1000) and
     is the sole source of truth for the strategy-side cutoff. ``candle_count``
     is derived from ``mtf_lookbacks`` at gate-construction time.
 
-    ``max_consecutive_fetch_failures`` is the streak counter: after this
+    ``max_consecutive_kline_fetch_failures`` is the streak counter: after this
     many consecutive ``kline_fetch_transient_failure`` rounds, the gate
     raises InvariantError -> bot crashes -> supervisor restart + Discord
-    alert. Threaded from ``cfg.max_consecutive_fetch_failures``.
+    alert. Threaded from ``cfg.max_consecutive_kline_fetch_failures``.
     """
     enabled: bool
     bnb_symbol: str          # "BNB-USDT"
     btc_symbol: str          # "BTC-USDT"
-    cutoff_seconds: int
+    kline_cutoff_seconds: int
     mtf_lookbacks: tuple[int, ...]
-    mtf_threshold: float
-    max_consecutive_fetch_failures: int = 5
+    mtf_min_return_threshold: float
+    max_consecutive_kline_fetch_failures: int = 5
     eth_symbol: str = "ETH-USDT"
     sol_symbol: str = "SOL-USDT"
 
@@ -118,7 +118,7 @@ class MomentumGate:
     The wake-time offset is set by the engine via
     ``RuntimeConfig.kline_fetch_wakeup_offset_ms``; the gate consumes
     ``lock_at_ms``. BNB fetch is currently disabled (see
-    ``_SYMBOLS_FETCHED`` for re-enable instructions).
+    ``_OKX_SYMBOLS_FETCHED`` for re-enable instructions).
 
     Error handling:
     - Any ``InvariantError`` from any symbol → reraise (bot crashes →
@@ -130,7 +130,7 @@ class MomentumGate:
       and skip the round with reason ``kline_fetch_transient_failure``.
       Increments ``_consecutive_fetch_failures``; reset to 0 on a fully
       successful 3-symbol fetch.
-    - Streak >= ``MomentumGateConfig.max_consecutive_fetch_failures`` →
+    - Streak >= ``MomentumGateConfig.max_consecutive_kline_fetch_failures`` →
       escalate to ``InvariantError("kline_fetch_failure_streak_max_reached: ...")``.
     """
 
@@ -158,7 +158,7 @@ class MomentumGate:
         # ThreadPoolExecutor lives for the gate's lifetime so we don't pay
         # thread-spawn cost every round. max_workers=3 -- one per symbol
         # (BTC + ETH + SOL). Bump to 4 if BNB is re-enabled in
-        # _SYMBOLS_FETCHED.
+        # _OKX_SYMBOLS_FETCHED.
         self._executor = ThreadPoolExecutor(
             max_workers=3, thread_name_prefix="kline-fetch",
         )
@@ -177,11 +177,11 @@ class MomentumGate:
         ``lock_at_ms`` is the round's lock_at in milliseconds (from
         ``int(round_t.lock_at) * 1000``). The fetch window is sized to
         exactly what the strategy consumes:
-            newest_open_ms = lock_at_ms - cutoff_seconds*1000 - 1000
+            newest_open_ms = lock_at_ms - kline_cutoff_seconds*1000 - 1000
             oldest_open_ms = newest_open_ms - max(mtf_lookbacks) * 1000
             expected_count = max(mtf_lookbacks) + 1
         The newest candle (``open_ts == newest_open_ms``) closes at
-        ``lock_at - cutoff_seconds`` -- one second before the strategy's
+        ``lock_at - kline_cutoff_seconds`` -- one second before the strategy's
         cutoff filter at ``open_ts >= cutoff_ts_ms`` would drop it.
         Requesting one less candle than the cutoff-blind window prevents
         OKX from being asked for a candle it hasn't published yet at
@@ -194,7 +194,7 @@ class MomentumGate:
         - ``signal=None`` + ``skip_reason="kline_fetch_transient_failure"``
           on any subset of 3-symbol transient failures
         - raises InvariantError on any contract violation OR on
-          ``max_consecutive_fetch_failures`` consecutive transient rounds
+          ``max_consecutive_kline_fetch_failures`` consecutive transient rounds
         """
         if not self._cfg.enabled:
             return MomentumGateResult(
@@ -208,9 +208,9 @@ class MomentumGate:
         # line 255 with the fetched durations. (Y2 fix 2026-05-12.)
         self.last_fetch_timing = None
 
-        cutoff_ts_ms = lock_at_ms - self._cfg.cutoff_seconds * 1000
+        cutoff_ts_ms = lock_at_ms - self._cfg.kline_cutoff_seconds * 1000
         max_lookback = max(self._cfg.mtf_lookbacks)
-        newest_open_ms = lock_at_ms - self._cfg.cutoff_seconds * 1000 - 1000
+        newest_open_ms = lock_at_ms - self._cfg.kline_cutoff_seconds * 1000 - 1000
         oldest_open_ms = newest_open_ms - max_lookback * 1000
 
         # ----- Parallel REST fetch (3 symbols) -----
@@ -218,12 +218,12 @@ class MomentumGate:
         # ThreadPoolExecutor + okx_rate_acquire share the global token-bucket
         # budget (capacity 8, refill 8/s) -- a 3-symbol burst once per round
         # fits inside the bucket and fires with no FIFO stagger. BNB is
-        # currently disabled (see _SYMBOLS_FETCHED for re-enable steps).
+        # currently disabled (see _OKX_SYMBOLS_FETCHED for re-enable steps).
         symbols = {
             "btc": self._cfg.btc_symbol,
             "eth": self._cfg.eth_symbol,
             "sol": self._cfg.sol_symbol,
-            # "bnb": self._cfg.bnb_symbol,  # disabled; see _SYMBOLS_FETCHED.
+            # "bnb": self._cfg.bnb_symbol,  # disabled; see _OKX_SYMBOLS_FETCHED.
         }
         futures = {
             self._executor.submit(
@@ -239,7 +239,7 @@ class MomentumGate:
                 # trip the boundary check into a false InvariantError.
                 send_before_bound=True,
             ): sym_short
-            for sym_short in _SYMBOLS_FETCHED
+            for sym_short in _OKX_SYMBOLS_FETCHED
         }
 
         results: dict[str, list[list]] = {}
@@ -290,13 +290,13 @@ class MomentumGate:
                     msg=f"reason={e}",
                 )
             self._consecutive_fetch_failures += 1
-            if self._consecutive_fetch_failures >= self._cfg.max_consecutive_fetch_failures:
+            if self._consecutive_fetch_failures >= self._cfg.max_consecutive_kline_fetch_failures:
                 # Capture the latest detail for the fail-loud message.
                 latest_sym, latest_err = transient_errors[-1]
                 raise InvariantError(
                     f"kline_fetch_failure_streak_max_reached: "
                     f"streak={self._consecutive_fetch_failures} "
-                    f"max={self._cfg.max_consecutive_fetch_failures} "
+                    f"max={self._cfg.max_consecutive_kline_fetch_failures} "
                     f"latest={latest_sym}={latest_err}"
                 )
             return self._skip("kline_fetch_transient_failure")
@@ -310,7 +310,7 @@ class MomentumGate:
         btc_arr = results["btc"]
         eth_arr = results["eth"]
         sol_arr = results["sol"]
-        # BNB fetch disabled; see _SYMBOLS_FETCHED at module top for the
+        # BNB fetch disabled; see _OKX_SYMBOLS_FETCHED at module top for the
         # rationale + re-enable steps. To re-enable, uncomment the bnb
         # entry in the symbols dict above and add `_bnb_arr = results["bnb"]`
         # back here.
@@ -341,7 +341,7 @@ class MomentumGate:
         return _compute_signal(
             btc_closes, eth_closes, sol_closes,
             mtf_lookbacks=self._cfg.mtf_lookbacks,
-            mtf_threshold=self._cfg.mtf_threshold,
+            mtf_min_return_threshold=self._cfg.mtf_min_return_threshold,
         )
 
     def shutdown(self) -> None:
@@ -394,7 +394,7 @@ def compute_signal_from_klines(
     cutoff_ms: int,
     *,
     mtf_lookbacks: tuple[int, ...],
-    mtf_threshold: float,
+    mtf_min_return_threshold: float,
     candle_count: int,
     eth_klines: list[list] | None = None,
     sol_klines: list[list] | None = None,
@@ -426,7 +426,7 @@ def compute_signal_from_klines(
     return _compute_signal(
         btc_closes, eth_closes, sol_closes,
         mtf_lookbacks=mtf_lookbacks,
-        mtf_threshold=mtf_threshold,
+        mtf_min_return_threshold=mtf_min_return_threshold,
     )
 
 
@@ -455,12 +455,12 @@ def _compute_signal(
     sol_closes: list[float] | None = None,
     *,
     mtf_lookbacks: tuple[int, ...],
-    mtf_threshold: float,
+    mtf_min_return_threshold: float,
 ) -> MomentumGateResult:
     """Core signal logic shared by live and backtest paths.
 
     Multi-TF BTC: all lookbacks must agree in direction and min(|return|)
-    must exceed *mtf_threshold*.
+    must exceed *mtf_min_return_threshold*.
 
     ETH/SOL confirmation: if ETH or SOL multi-TF also fires in the same
     direction, their confirmation strengths are set for sizing boost.
@@ -492,7 +492,7 @@ def _compute_signal(
         return _no_btc_result("gate_no_signal")
 
     min_abs = min(abs(r) for r in returns)
-    if min_abs < mtf_threshold:
+    if min_abs < mtf_min_return_threshold:
         return _no_btc_result("gate_no_signal")
 
     direction = "Bull" if returns[0] > 0 else "Bear"

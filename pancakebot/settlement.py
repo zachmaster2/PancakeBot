@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pancakebot.constants import BNB_WEI, GAS_COST_CLAIM_BNB
+from pancakebot.constants import BNB_WEI, BACKTEST_GAS_COST_CLAIM_BNB
 from pancakebot.types import Round
 from pancakebot.pool_amounts import compute_pool_amounts_wei
 from pancakebot.util import InvariantError
@@ -38,14 +38,14 @@ def settle_from_round_data(
         raise InvariantError("settle_bet_side_invalid")
 
     if not oracle_called:
-        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
+        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - BACKTEST_GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
     if close_price_usd > lock_price_usd:
         winner_u = "BULL"
     elif close_price_usd < lock_price_usd:
         winner_u = "BEAR"
     else:
-        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
+        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - BACKTEST_GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
     if winner_u != bet_side_u:
         return SettlementResult(outcome="loss", credit_bnb=0.0, payout_multiple_after_fee=0.0)
@@ -60,10 +60,10 @@ def settle_from_round_data(
 
     denom = bull_after if bet_side_u == "BULL" else bear_after
     if denom <= 0.0 or total_after <= 0.0:
-        return SettlementResult(outcome="win", credit_bnb=-GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
+        return SettlementResult(outcome="win", credit_bnb=-BACKTEST_GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
     mult = (total_after * (1.0 - treasury_fee_fraction)) / denom
-    credit = bet_bnb * mult - GAS_COST_CLAIM_BNB
+    credit = bet_bnb * mult - BACKTEST_GAS_COST_CLAIM_BNB
     return SettlementResult(outcome="win", credit_bnb=credit, payout_multiple_after_fee=mult)
 
 
@@ -90,8 +90,8 @@ def settle_bet_against_closed_round(
     Convention:
       - Bet principal and bet gas are paid at bet-time (outside this function).
       - This function returns the net credit applied at claim-time:
-          - WIN: bet_bnb * payout_multiple_after_fee - GAS_COST_CLAIM_BNB
-          - REFUND (failed): bet_bnb - GAS_COST_CLAIM_BNB
+          - WIN: bet_bnb * payout_multiple_after_fee - BACKTEST_GAS_COST_CLAIM_BNB
+          - REFUND (failed): bet_bnb - BACKTEST_GAS_COST_CLAIM_BNB
           - LOSS: 0.0
 
     Important (impact-aware):
@@ -111,7 +111,7 @@ def settle_bet_against_closed_round(
     # Failed rounds must be handled BEFORE the position check: on-chain-failed
     # rounds have position=None (no winner), and all bets are refunded in full.
     if round_closed.failed:
-        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
+        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - BACKTEST_GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
     if round_closed.position is None:
         raise InvariantError("settle_round_not_closed")
@@ -137,8 +137,8 @@ def settle_bet_against_closed_round(
 
     denom = bull_after if bet_side_u == "BULL" else bear_after
     if denom <= 0.0 or total_after <= 0.0:
-        return SettlementResult(outcome="win", credit_bnb=-GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
+        return SettlementResult(outcome="win", credit_bnb=-BACKTEST_GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
 
     mult = (total_after * (1.0 - treasury_fee_fraction)) / denom
-    credit = bet_bnb * mult - GAS_COST_CLAIM_BNB
+    credit = bet_bnb * mult - BACKTEST_GAS_COST_CLAIM_BNB
     return SettlementResult(outcome="win", credit_bnb=credit, payout_multiple_after_fee=mult)

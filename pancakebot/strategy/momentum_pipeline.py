@@ -51,27 +51,27 @@ def _compute_bet_size(
     our_side_bnb: float,
     base_frac: float,
     cap_bnb: float,
-    sizing_slope: float,
-    max_frac: float,
+    pool_fraction_slope: float,
+    max_pool_fraction: float,
     treasury_fee_fraction: float,
     min_bet_threshold_bnb: float,
     current_bankroll: float | None = None,
-    max_bet_frac_of_bankroll: float = 1.0,
+    max_bet_fraction_of_bankroll: float = 1.0,
 ) -> float:
     """Continuous adaptive sizing with payout-proportional boost + bankroll cap.
 
-    1. Signal-strength sizing: frac = base_frac + sizing_slope * signal_strength
+    1. Signal-strength sizing: frac = base_frac + pool_fraction_slope * signal_strength
     2. Payout boost (hardcoded slope=1.0 since 2026-04-26 lean&clean):
        payout = pool * (1 - treasury_fee_fraction) / our_side
        payout_mult = max(0.5, payout - 1.0)   # = max(0.5, 1.0 + (payout - 2.0))
-       frac = min(frac * payout_mult, max_frac)
+       frac = min(frac * payout_mult, max_pool_fraction)
     3. bet = pool_bnb * frac
     4. Bankroll cap (when current_bankroll is not None): bet <=
-       max_bet_frac_of_bankroll * current_bankroll.
+       max_bet_fraction_of_bankroll * current_bankroll.
     5. Absolute BNB cap (cap_bnb), then floor by min_bet_threshold_bnb.
 
     base_frac, cap_bnb are per-regime (btc_primary or eth_sol_fallback).
-    sizing_slope, max_frac come from BtcPrimarySizingConfig (apply uniformly
+    pool_fraction_slope, max_pool_fraction come from BtcPrimarySizingConfig (apply uniformly
     to both regimes). treasury_fee_fraction comes from on-chain contract
     constants (matched to the settlement code path). min_bet_threshold_bnb
     comes from Tier2SizingConfig. current_bankroll defaults to None
@@ -89,20 +89,20 @@ def _compute_bet_size(
     if pool_bnb <= 0:
         return 0.0
 
-    frac = min(base_frac + sizing_slope * signal_strength, max_frac)
+    frac = min(base_frac + pool_fraction_slope * signal_strength, max_pool_fraction)
 
     # Payout-proportional boost: bet more when our side has high payout.
     # Equivalent to the old payout_slope=1.0 default: max(0.5, 1.0 + (payout - 2.0)).
     if our_side_bnb > 0:
         payout = pool_bnb * (1.0 - treasury_fee_fraction) / our_side_bnb
         payout_mult = max(0.5, payout - 1.0)
-        frac = min(frac * payout_mult, max_frac)
+        frac = min(frac * payout_mult, max_pool_fraction)
 
     bet = pool_bnb * frac
 
     # Bankroll cap (risk control). When current_bankroll is None, no-op.
     if current_bankroll is not None and current_bankroll > 0:
-        bet = min(bet, max_bet_frac_of_bankroll * current_bankroll)
+        bet = min(bet, max_bet_fraction_of_bankroll * current_bankroll)
 
     return max(min_bet_threshold_bnb, min(cap_bnb, bet))
 
@@ -120,7 +120,7 @@ class MomentumOnlyPipeline:
         config: MomentumGateConfig,
         strategy_config: StrategyConfig,
         gate: MomentumGate | None,
-        cutoff_seconds: int,
+        kline_cutoff_seconds: int,
         min_bet_amount_bnb: float,
         treasury_fee_fraction: float,
         bankroll_tracker: BankrollTracker | None = None,
@@ -128,7 +128,7 @@ class MomentumOnlyPipeline:
         self._cfg = config
         self._strategy = strategy_config
         self._gate = gate
-        self._cutoff_seconds = int(cutoff_seconds)
+        self._cutoff_seconds = int(kline_cutoff_seconds)
         self._min_bet_amount_bnb = float(min_bet_amount_bnb)
         self._treasury_fee_fraction = float(treasury_fee_fraction)
         self._last_settled_epoch: int | None = None
@@ -142,7 +142,7 @@ class MomentumOnlyPipeline:
         # Risk tracker: None disables risk checks (backward-compatible). When
         # present, decide_open_round runs pre-signal gates (min_bankroll,
         # cooldown, drawdown-from-peak) and _compute_bet_size applies the
-        # max_bet_frac_of_bankroll cap. Callers record settlements via
+        # max_bet_fraction_of_bankroll cap. Callers record settlements via
         # pipeline.record_settlement(bankroll, start_at).
         self._bankroll_tracker: BankrollTracker | None = bankroll_tracker
 
@@ -235,13 +235,13 @@ class MomentumOnlyPipeline:
                 return self._skip("risk_cooldown_active")
             # Check 2: bankroll below minimum -- skip without firing cooldown.
             current = self._bankroll_tracker.current_bankroll()
-            if current < risk.min_bankroll_bnb:
+            if current < risk.min_bankroll_bnb_to_bet:
                 return self._skip("risk_bankroll_below_min")
             # Check 3: drawdown from peak. If >= threshold, fire cooldown.
             peak = self._bankroll_tracker.peak_bankroll(start_at)
             if peak > 0:
                 dd_frac = (peak - current) / peak
-                if dd_frac >= risk.max_drawdown_frac_from_peak:
+                if dd_frac >= risk.max_drawdown_fraction_from_peak:
                     self._bankroll_tracker.set_paused(risk.cooldown_rounds, start_at)
                     return self._skip("risk_drawdown_breaker_fired")
 
@@ -268,16 +268,16 @@ class MomentumOnlyPipeline:
         signal_dir = None
         effective_strength = 0.0
         is_regime2 = False
-        t2_w = self._strategy.tier2_sizing.eth_sol_sizing_weight
+        t2_w = self._strategy.tier2_sizing.eth_sol_signal_weight
 
         if result.signal is not None:
             # Primary: BTC multi-TF fires
             # Pool-adaptive admission: small-pool stricter threshold
-            # (large pools rely on the gate's mtf_threshold which already fired).
+            # (large pools rely on the gate's mtf_min_return_threshold which already fired).
             bt = self._strategy.btc_primary.threshold
             small_pool_ok = (
                 pool_total >= bt.pool_size_boundary_bnb
-                or result.signal_strength >= bt.small_pool
+                or result.signal_strength >= bt.small_pool_min_signal_strength
             )
             if small_pool_ok:
                 signal_dir = result.signal
@@ -293,7 +293,7 @@ class MomentumOnlyPipeline:
                     and result.sol_signal is not None
                     and result.eth_signal == result.sol_signal):
                 r2_str = min(result.eth_signal_strength, result.sol_signal_strength)
-                if r2_str >= self._strategy.eth_sol_fallback.signal.min_strength:
+                if r2_str >= self._strategy.eth_sol_fallback.signal.min_signal_strength:
                     signal_dir = result.eth_signal
                     effective_strength = (
                         result.eth_signal_strength * t2_w
@@ -311,7 +311,7 @@ class MomentumOnlyPipeline:
             return self._skip(result.skip_reason or "gate_no_signal")
 
         # Pool filter: skip if visible pool is too small (dilution kills edge).
-        if pool_total < self._strategy.pool_filter.min_pool_bnb:
+        if pool_total < self._strategy.pool_filter.min_pool_bnb_at_cutoff:
             return self._skip("pool_below_minimum")
 
         our_side = pool_bull_bnb if signal_dir == "Bull" else pool_bear_bnb
@@ -319,7 +319,7 @@ class MomentumOnlyPipeline:
         # Payout floor: skip if payout on our side is too low.
         if our_side > 0 and pool_total > 0:
             payout = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
-            if payout < self._strategy.pool_filter.min_payout:
+            if payout < self._strategy.pool_filter.min_payout_multiple_at_cutoff:
                 return self._skip("payout_below_floor")
 
         # Bankroll for the bankroll cap kwarg (None when no tracker -> cap disabled).
@@ -327,7 +327,7 @@ class MomentumOnlyPipeline:
             self._bankroll_tracker.current_bankroll()
             if self._bankroll_tracker is not None else None
         )
-        br_cap_frac = self._strategy.risk.max_bet_frac_of_bankroll
+        br_cap_frac = self._strategy.risk.max_bet_fraction_of_bankroll
         bt_sz = self._strategy.btc_primary.sizing
         t2 = self._strategy.tier2_sizing
 
@@ -337,28 +337,28 @@ class MomentumOnlyPipeline:
                 signal_strength=effective_strength,
                 pool_bnb=pool_total,
                 our_side_bnb=our_side,
-                base_frac=es_sizing.base_fraction,
+                base_frac=es_sizing.base_pool_fraction,
                 cap_bnb=self._strategy.risk.max_bet_bnb_eth_sol_fallback,
-                sizing_slope=bt_sz.sizing_slope,
-                max_frac=bt_sz.max_frac,
+                pool_fraction_slope=bt_sz.pool_fraction_slope,
+                max_pool_fraction=bt_sz.max_pool_fraction,
                 treasury_fee_fraction=self._treasury_fee_fraction,
                 min_bet_threshold_bnb=t2.min_bet_threshold_bnb,
                 current_bankroll=br_current,
-                max_bet_frac_of_bankroll=br_cap_frac,
+                max_bet_fraction_of_bankroll=br_cap_frac,
             )
         else:
             bet_size = _compute_bet_size(
                 signal_strength=effective_strength,
                 pool_bnb=pool_total,
                 our_side_bnb=our_side,
-                base_frac=bt_sz.base_fraction,
+                base_frac=bt_sz.base_pool_fraction,
                 cap_bnb=self._strategy.risk.max_bet_bnb_btc_primary,
-                sizing_slope=bt_sz.sizing_slope,
-                max_frac=bt_sz.max_frac,
+                pool_fraction_slope=bt_sz.pool_fraction_slope,
+                max_pool_fraction=bt_sz.max_pool_fraction,
                 treasury_fee_fraction=self._treasury_fee_fraction,
                 min_bet_threshold_bnb=t2.min_bet_threshold_bnb,
                 current_bankroll=br_current,
-                max_bet_frac_of_bankroll=br_cap_frac,
+                max_bet_fraction_of_bankroll=br_cap_frac,
             )
 
         if bet_size < self._min_bet_amount_bnb:
@@ -389,7 +389,7 @@ class MomentumOnlyPipeline:
         return compute_signal_from_klines(
             btc_klines, cutoff_ts_ms,
             mtf_lookbacks=gate.mtf_lookbacks,
-            mtf_threshold=gate.mtf_threshold,
+            mtf_min_return_threshold=gate.mtf_min_return_threshold,
             candle_count=self._candle_count,
             eth_klines=eth_klines, sol_klines=sol_klines,
         )

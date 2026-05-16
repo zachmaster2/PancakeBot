@@ -2,7 +2,7 @@
 
 The gate fires 3 parallel ``OkxClient.kline_fetch_window`` calls
 (BTC/ETH/SOL) and aggregates results by exception class. BNB fetch
-is currently disabled (see ``MomentumGate._SYMBOLS_FETCHED`` for
+is currently disabled (see ``MomentumGate._OKX_SYMBOLS_FETCHED`` for
 re-enable steps).
 
 Behavior under test:
@@ -50,7 +50,7 @@ _LOCK_AT_MS = 1_777_007_708_000  # arbitrary recent lock_at, in ms
 _CUTOFF_SECONDS = 2
 
 
-def _make_gate(*, cutoff_seconds: int = _CUTOFF_SECONDS, mtf_lookbacks=(3, 7, 15)):
+def _make_gate(*, kline_cutoff_seconds: int = _CUTOFF_SECONDS, mtf_lookbacks=(3, 7, 15)):
     """Build a gate whose okx client is a MagicMock. Returns (gate, fake_client)."""
     cfg = MomentumGateConfig(
         enabled=True,
@@ -58,9 +58,9 @@ def _make_gate(*, cutoff_seconds: int = _CUTOFF_SECONDS, mtf_lookbacks=(3, 7, 15
         btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT",
         sol_symbol="SOL-USDT",
-        cutoff_seconds=cutoff_seconds,
+        kline_cutoff_seconds=kline_cutoff_seconds,
         mtf_lookbacks=mtf_lookbacks,
-        mtf_threshold=0.0001,
+        mtf_min_return_threshold=0.0001,
     )
     fake_client = mock.MagicMock()
     gate = MomentumGate(config=cfg, okx_client=fake_client)
@@ -70,7 +70,7 @@ def _make_gate(*, cutoff_seconds: int = _CUTOFF_SECONDS, mtf_lookbacks=(3, 7, 15
 def _flat_klines(
     *,
     lock_at_ms: int,
-    cutoff_seconds: int = _CUTOFF_SECONDS,
+    kline_cutoff_seconds: int = _CUTOFF_SECONDS,
     candle_count: int = 16,
     base_close: float = 100.0,
 ) -> list[list]:
@@ -81,7 +81,7 @@ def _flat_klines(
         newest = lock_at - cutoff*1000 - 1000
         oldest = newest - (candle_count - 1) * 1000
     """
-    newest = lock_at_ms - cutoff_seconds * 1000 - 1000
+    newest = lock_at_ms - kline_cutoff_seconds * 1000 - 1000
     oldest = newest - (candle_count - 1) * 1000
     return [
         [oldest + i * 1000, base_close, base_close, base_close, base_close, 1.0]
@@ -92,12 +92,12 @@ def _flat_klines(
 def _trending_klines(
     *,
     lock_at_ms: int,
-    cutoff_seconds: int = _CUTOFF_SECONDS,
+    kline_cutoff_seconds: int = _CUTOFF_SECONDS,
     candle_count: int = 16,
     slope: float = 0.0001,
 ) -> list[list]:
     """Build an exact-sized window with monotonic upward price drift to fire BTC Bull."""
-    newest = lock_at_ms - cutoff_seconds * 1000 - 1000
+    newest = lock_at_ms - kline_cutoff_seconds * 1000 - 1000
     oldest = newest - (candle_count - 1) * 1000
     base = 100.0
     return [
@@ -151,7 +151,7 @@ def _capture_warns():
 
 def test_evaluate_fetches_three_symbols_in_parallel():
     """All 3 symbols (BTC/ETH/SOL) hit OKX in a single round. BNB is
-    currently disabled in MomentumGate._SYMBOLS_FETCHED."""
+    currently disabled in MomentumGate._OKX_SYMBOLS_FETCHED."""
     gate, fake_client = _make_gate()
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS),
@@ -168,9 +168,9 @@ def test_evaluate_window_is_cutoff_and_lookback_aware():
     max(lookbacks)*1000, count = max(lookbacks) + 1. Verifies the 2026-04-27
     fix that prevents requesting candles OKX hasn't published yet."""
     for cs in (1, 2, 5, 30):
-        gate, fake_client = _make_gate(cutoff_seconds=cs)
+        gate, fake_client = _make_gate(kline_cutoff_seconds=cs)
         fake_client.kline_fetch_window.side_effect = _make_router(
-            ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS, cutoff_seconds=cs),
+            ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS, kline_cutoff_seconds=cs),
         )
         gate.evaluate(lock_at_ms=_LOCK_AT_MS)
         expected_newest = _LOCK_AT_MS - cs * 1000 - 1000
@@ -198,10 +198,10 @@ def test_evaluate_window_respects_non_default_lookbacks():
     configured lookbacks rather than hardcoded constants."""
     lb = (5, 20, 60)
     cs = 2
-    gate, fake_client = _make_gate(cutoff_seconds=cs, mtf_lookbacks=lb)
+    gate, fake_client = _make_gate(kline_cutoff_seconds=cs, mtf_lookbacks=lb)
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=_flat_klines(
-            lock_at_ms=_LOCK_AT_MS, cutoff_seconds=cs, candle_count=61,
+            lock_at_ms=_LOCK_AT_MS, kline_cutoff_seconds=cs, candle_count=61,
         ),
     )
     gate.evaluate(lock_at_ms=_LOCK_AT_MS)
@@ -498,9 +498,9 @@ def test_evaluate_returns_no_signal_when_disabled():
         enabled=False,
         bnb_symbol="BNB-USDT",
         btc_symbol="BTC-USDT",
-        cutoff_seconds=2,
+        kline_cutoff_seconds=2,
         mtf_lookbacks=(3, 7, 15),
-        mtf_threshold=0.0001,
+        mtf_min_return_threshold=0.0001,
     )
     fake_client = mock.MagicMock()
     gate = MomentumGate(config=cfg, okx_client=fake_client)

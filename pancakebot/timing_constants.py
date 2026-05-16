@@ -17,7 +17,7 @@ value here must be updated co-locked with a new measurement date.
 
 Derivation chain (computed at config-load time in ``pancakebot/config.py``):
 
-    bet_submit_deadline_offset_ms  = (BSC_QUANTUM_MS              # 50ms — quantum-shift buffer
+    bet_submit_deadline_offset_before_lock_ms  = (BSC_QUANTUM_MS              # 50ms — quantum-shift buffer
                                       + BSC_BLOCK_TIME_MS         # 450ms — one full slot back-off
                                       + VALIDATOR_ASSEMBLY_WINDOW_MS  # 50ms — validator TX-list freeze
                                       + BSC_BET_SUBMIT_ONE_WAY_MS)  # 150ms — one-way RPC submit
@@ -25,21 +25,21 @@ Derivation chain (computed at config-load time in ``pancakebot/config.py``):
     # is unavailable (pre-Lorentz chain or detection failed). Live decision path
     # under Lorentz uses ``RpcPoller.compute_dynamic_submit_deadline_ms()`` for
     # per-round prediction that's typically 250-300ms tighter than this fallback.
-    critical_path_wakeup_offset_ms = (bet_submit_deadline_offset_ms
+    critical_path_wakeup_offset_before_lock_ms = (bet_submit_deadline_offset_before_lock_ms
                                       + OKX_KLINE_FETCH_RTT_P95_MS
-                                      + SIGNAL_COMPUTE_TIME_MS
+                                      + MOMENTUM_GATE_COMPUTE_TIME_MS
                                       + POOL_READ_TIME_MS)
-    final_rpc_poll_wakeup_offset_ms = (
+    final_rpc_poll_wakeup_offset_before_lock_ms = (
         pool_cutoff_seconds * 1000
         - BSC_BLOCK_TIME_MS
         - RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
-        - RPC_POLL_FINAL_SAFETY_BUFFER_MS)
-    ramp_poll_2_wakeup_offset_ms   = (final_rpc_poll_wakeup_offset_ms
+        - RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS)
+    ramp_poll_2_wakeup_offset_before_lock_ms   = (final_rpc_poll_wakeup_offset_before_lock_ms
                                       + RPC_RAMP_2_TO_FINAL_INTERVAL_MS)
-    ramp_poll_1_wakeup_offset_ms   = (ramp_poll_2_wakeup_offset_ms
+    ramp_poll_1_wakeup_offset_before_lock_ms   = (ramp_poll_2_wakeup_offset_before_lock_ms
                                       + RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS)
-    bankroll_wakeup_offset_ms      = (critical_path_wakeup_offset_ms
-                                      + BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS)
+    bankroll_wakeup_offset_before_lock_ms      = (critical_path_wakeup_offset_before_lock_ms
+                                      + BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS)
 
 Inside the critical-path wake the engine sequences pool snapshot ->
 kline fetch -> signal compute -> bet submit. The 5ms POOL_READ_TIME_MS
@@ -47,7 +47,7 @@ is a cushion for the in-memory pool aggregate read; it does NOT need
 its own wake (the prior architecture used a separate pool_read_wake
 5ms ahead of kline_fetch_wake, which conceptually overstated as
 "two scheduled events" what is really sequential operation time).
-A single ``critical_path_wakeup_offset_ms`` keeps the wake schedule
+A single ``critical_path_wakeup_offset_before_lock_ms`` keeps the wake schedule
 honest about what's a scheduled event vs what's intra-wake sequencing.
 
 The bankroll wake offset above the critical path is deliberately a
@@ -55,7 +55,7 @@ LITERAL 5-second gap rather than derived from tightly measured query
 budgets. Non-critical-path wakes are sized for robustness against
 environmental drift (network spikes, Windows update kicks, OKX RPC
 pauses) — a 5s gap dwarfs every observed worst case (~50-200ms wallet
-RPC). See ``BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS`` for the rationale.
+RPC). See ``BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS`` for the rationale.
 
 Bundle 5 v2 (2026-05-14): the prior ``ntp_sync_wakeup_offset_ms`` is
 retired. The bot trusts the OS clock directly (Windows Time Service
@@ -67,18 +67,18 @@ Cross-validations enforced at config load. The CUTOFFS are fixed
 inputs (set by strategy / data-horizon requirements); the OFFSETS
 must fit within the cutoff windows.
 
-    (critical_path_wakeup_offset_ms - POOL_READ_TIME_MS)
+    (critical_path_wakeup_offset_before_lock_ms - POOL_READ_TIME_MS)
         <= (kline_cutoff_seconds * 1000 - OKX_KLINE_PUBLISH_DELAY_P95_MS)
         (the kline fetch fires inside the critical path AFTER the pool
-        snapshot, i.e. at lock - (critical_path_wakeup_offset_ms -
+        snapshot, i.e. at lock - (critical_path_wakeup_offset_before_lock_ms -
         POOL_READ_TIME_MS); the cutoff candle has typically been
         published by then; rare publish-delay tail misses are
         absorbed by the streak counter)
 
-    (final_rpc_poll_wakeup_offset_ms
+    (final_rpc_poll_wakeup_offset_before_lock_ms
         - rpc_rtt_p99_for_batch(EXPECTED_FINAL_POLL_BATCH_SIZE)
         - RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-        >= critical_path_wakeup_offset_ms)
+        >= critical_path_wakeup_offset_before_lock_ms)
         (the final RPC poll must fire AND complete (at empirical p99
         RTT) before the critical-path wake reads the pool snapshot;
         pool_cutoff_seconds too small OR an upward drift in
@@ -137,9 +137,9 @@ OKX_KLINE_PUBLISH_DELAY_P99_MS: int = 1300
 OKX_KLINE_FETCH_RTT_P95_MS: int = 290
 
 # Same fetch, p99 measurement. Used by the Bundle 5 (2026-05-14) dynamic
-# critical_path_wakeup_offset_ms: ``RpcPoller.compute_dynamic_critical_path_wake_ts()``
+# critical_path_wakeup_offset_before_lock_ms: ``RpcPoller.compute_dynamic_critical_path_wake_ts()``
 # walks back from the predicted predecessor block by
-#   (OKX_KLINE_FETCH_RTT_P99_MS + SIGNAL_COMPUTE_TIME_MS
+#   (OKX_KLINE_FETCH_RTT_P99_MS + MOMENTUM_GATE_COMPUTE_TIME_MS
 #    + POOL_READ_TIME_MS + BSC_BET_SUBMIT_ONE_WAY_MS)
 # = 352 + 50 + 5 + 150 = 557ms.
 #
@@ -168,12 +168,12 @@ OKX_KLINE_FETCH_RTT_P99_MS: int = 352
 #         pancakebot/strategy/momentum_gate.py:415-... (numpy diff/sum
 #         over 16-row arrays, no I/O).
 # Last measured: 2026-05-03 (engineering judgment, not empirical probe)
-SIGNAL_COMPUTE_TIME_MS: int = 50
+MOMENTUM_GATE_COMPUTE_TIME_MS: int = 50
 
 
 # --- Bundle 5 v2 anchor poll (2026-05-14) ---------------------------------
 
-# Single anchor poll fires at lock - ANCHOR_POLL_OFFSET_MS. The response
+# Single anchor poll fires at lock - ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS. The response
 # is awaited for at most ANCHOR_POLL_TIMEOUT_MS. If the response arrives
 # in time, the engine extracts BEP-520 mixHash to get a fresh ms-precise
 # chain anchor, then computes a dynamic critical-path wake (typically
@@ -191,7 +191,7 @@ SIGNAL_COMPUTE_TIME_MS: int = 50
 # - Anchor lifetime is one round: no persistent state on RpcPoller. The
 #   engine stores the AnchorState in a local variable and passes it to
 #   the wake + deadline math.
-ANCHOR_POLL_OFFSET_MS: int = 1300
+ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS: int = 1300
 ANCHOR_POLL_TIMEOUT_MS: int = 200
 
 
@@ -266,21 +266,6 @@ VALIDATOR_ASSEMBLY_WINDOW_MS: int = 50
 # Last measured: 2026-05-16
 BSC_BET_SUBMIT_ONE_WAY_MS: int = 150
 
-# DEPRECATED (Bundle 4 2026-05-14): replaced by BSC_BET_SUBMIT_ONE_WAY_MS
-# in the bet_submit_deadline_offset_ms derivation. Kept here for back-
-# reference (cited from older incident reports + research scripts).
-# This constant was the *round-trip* RTT (per ``prediction_contract.py:502-508``
-# bracketing of the ``send_raw_transaction()`` call), which overstates
-# the time needed for TX inclusion: only the one-way send + validator
-# mempool accept matters for inclusion; the txh ack returns AFTER.
-#
-# Source: research/p4c_bsc_rpc_probe.py n=200, 2026-05-03 (round-trip lower
-#         bound via eth_blockNumber proxy; p99=57ms). Production estimate
-#         200ms conservative.
-# Last measured: 2026-05-03 (proxy + estimate)
-BSC_BET_SUBMIT_RTT_P95_MS: int = 200  # DEPRECATED — see BSC_BET_SUBMIT_ONE_WAY_MS
-
-
 # --- RPC poll timing (Era 11: 2026-05-07 pivot) ---------------------------
 #
 # Replaces the WSS-subscription pool watcher with deterministic
@@ -321,7 +306,7 @@ BSC_BET_SUBMIT_RTT_P95_MS: int = 200  # DEPRECATED — see BSC_BET_SUBMIT_ONE_WA
 # Bundle 6 caveat (2026-05-15): the 1319ms value was measured under
 # the prior 6-endpoint hedged pool (min-of-6 fastest-response wins).
 # Bundle 6 trimmed the pool to 3 endpoints (one per fault-domain
-# family — see DEFAULT_HEDGED_ENDPOINTS in chain/rpc_poller.py).
+# family — see READ_PATH_HEDGED_ENDPOINTS in chain/rpc_poller.py).
 # Under min-of-3, the operating p99 could rise modestly vs min-of-6,
 # but the per-endpoint probe (research/probe_per_endpoint_isolated_2026_05_15.py)
 # showed bsc-dataseed1.binance.org dominates: its single-endpoint
@@ -364,10 +349,10 @@ RPC_BLOCK_AVAILABILITY_DELAY_P99_MS: int = 600
 # 20 is the operating cap for both deadline-driven polls and cold-start
 # (a larger batch is fine for cold-start latency-wise but giving it the
 # same cap simplifies the implementation).
-RPC_BATCH_BLOCK_RECEIPTS_LIMIT: int = 20
+RPC_BATCH_MAX_BLOCKS: int = 20
 
 # Per-request HTTP timeout for batched JSON-RPC (eth_getBlockReceipts +
-# eth_getBlockByNumber bundles, batch_size <= RPC_BATCH_BLOCK_RECEIPTS_LIMIT).
+# eth_getBlockByNumber bundles, batch_size <= RPC_BATCH_MAX_BLOCKS).
 # 5s detects unreachable-endpoint scenarios fast while staying well above
 # the empirical p99 single-batch RTT (RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE:
 # batch=20 -> 1319ms fire-to-all, 2026-05-11). Was 30s; reduced 2026-05-08
@@ -392,7 +377,7 @@ RPC_PERIODIC_POLL_INTERVAL_SECONDS: int = 8
 
 # Final-poll wake derivation safety cushion (cross-RPC variance the
 # spike didn't capture, etc.). Engineering judgment.
-RPC_POLL_FINAL_SAFETY_BUFFER_MS: int = 200
+RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS: int = 200
 
 # Per-poll deadline cushion — if a poll's RTT exceeds (next_wake_offset
 # - this), the poll is marked stale (logged, _last_poll_too_slow=True
@@ -411,7 +396,7 @@ RPC_POLL_DEADLINE_SAFETY_BUFFER_MS: int = 200
 #
 #   ramp_1: catches up since the last periodic poll. Worst case = one
 #           periodic interval (8s) at BSC 0.45s blocks ≈ 17.8 blocks
-#           → batch=20 (clamped at RPC_BATCH_BLOCK_RECEIPTS_LIMIT).
+#           → batch=20 (clamped at RPC_BATCH_MAX_BLOCKS).
 #           Needs rtt_p99(20)=1319ms + safety + margin → 1700ms.
 #   ramp_2: catches up since ramp_1 cursor advance. Wall gap is
 #           bounded by RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS plus bankroll
@@ -434,7 +419,7 @@ RPC_RAMP_2_TO_FINAL_INTERVAL_MS: int = 1100
 #
 #   ramp_1: catches up since last periodic poll. Worst case = full
 #           periodic interval (8s) → ~17.8 blocks → batch=20 (clamped at
-#           RPC_BATCH_BLOCK_RECEIPTS_LIMIT).
+#           RPC_BATCH_MAX_BLOCKS).
 #   ramp_2: catches up since ramp_1 cursor advance (1.7-2s wall gap) →
 #           ~4 blocks → batch=5.
 #   final:  catches up since ramp_2 cursor advance (1.1s wall gap) →
@@ -498,7 +483,7 @@ def rpc_rtt_p99_for_batch(batch_size: int) -> int:
 # --- Non-critical-path wake gaps ------------------------------------------
 
 # Gap between bankroll_wake and the critical_path entry. The bankroll
-# wake fires at critical_path_wakeup_offset_ms + this offset
+# wake fires at critical_path_wakeup_offset_before_lock_ms + this offset
 # (= ~lock-6.045s); the engine uses the budget to read live wallet
 # balance via BSC RPC (~50-200ms p99) or, in dry mode, the in-memory
 # simulated bankroll (sub-ms). 5s is deliberately generous: it covers
@@ -510,7 +495,7 @@ def rpc_rtt_p99_for_batch(batch_size: int) -> int:
 # bets on time. If it drifts to 6s the cross-validation gate in
 # config.py fires and the operator notices before production breaks.
 # Last measured: 2026-05-06
-BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS: int = 5000
+BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS: int = 5000
 
 # Bundle 5 v2 (2026-05-14): ``NTP_QUERY_TIME_P99_MS`` and
 # ``NTP_WAKE_OFFSET_PRE_BANKROLL_MS`` are retired alongside the
@@ -528,23 +513,6 @@ BANKROLL_WAKE_OFFSET_PRE_CRITICAL_MS: int = 5000
 # Source: code inspection of pool_watcher.PoolEventWatcher.get_pool.
 # Last measured: 2026-05-03 (engineering judgment)
 POOL_READ_TIME_MS: int = 5
-
-# DEPRECATED (Bundle 4 2026-05-14): no longer in the
-# bet_submit_deadline_offset_ms derivation. The pre-Bundle-4 derivation
-# used (BSC_BET_SUBMIT_RTT_P95_MS + BSC_BLOCK_TIME_MS + this safety
-# buffer) as a static slack against rounding slop. The new derivation
-# uses ms-precise per-block prediction, so this buffer is redundant
-# (any residual slop is bounded by BSC_QUANTUM_MS = 50ms, which the
-# new derivation accounts for explicitly).
-#
-# Kept here for back-reference and to avoid breaking imports in older
-# branches / scripts.
-#
-# Source: engineering judgment.
-# Last measured: 2026-05-03
-BET_SUBMIT_SAFETY_BUFFER_MS: int = 50  # DEPRECATED — see derivation docstring
-
-
 
 # --- Module-load sanity checks --------------------------------------------
 

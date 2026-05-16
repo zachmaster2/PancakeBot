@@ -370,7 +370,7 @@ class GraphClient:
 
     def _parse_round(self, r: dict[str, Any], *, state: RoundState, bets: list[Bet]) -> Round:
         from pancakebot.market_data.contract_constants import load_contract_constants
-        interval_seconds = load_contract_constants().interval_seconds
+        round_interval_seconds = load_contract_constants().round_interval_seconds
 
         epoch = self._parse_int(r.get("epoch"), "round.epoch")
         start_at = self._parse_int(r.get("startAt"), "round.startAt")
@@ -386,7 +386,7 @@ class GraphClient:
             return Round(
                 epoch=epoch,
                 start_at=start_at,
-                lock_at=start_at + interval_seconds,
+                lock_at=start_at + round_interval_seconds,
                 lock_price=None,
                 close_price=None,
                 position=None,
@@ -401,7 +401,7 @@ class GraphClient:
             return Round(
                 epoch=epoch,
                 start_at=start_at,
-                lock_at=start_at + interval_seconds,
+                lock_at=start_at + round_interval_seconds,
                 lock_price=lock_price_f,
                 close_price=None,
                 position=None,
@@ -426,7 +426,7 @@ class GraphClient:
             return Round(
                 epoch=epoch,
                 start_at=start_at,
-                lock_at=start_at + interval_seconds,
+                lock_at=start_at + round_interval_seconds,
                 lock_price=lock_price_failed,
                 close_price=None,
                 position=None,
@@ -447,7 +447,7 @@ class GraphClient:
         return Round(
             epoch=epoch,
             start_at=start_at,
-            lock_at=start_at + interval_seconds,
+            lock_at=start_at + round_interval_seconds,
             lock_price=lock_price_closed,
             close_price=close_price_closed,
             position=pos,

@@ -46,7 +46,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware  # BSC is a POA chain
-from pancakebot.constants import EXPECTED_CHAIN_ID, RPC_URLS, BNB_WEI
+from pancakebot.constants import EXPECTED_CHAIN_ID, WRITE_PATH_RPC_URLS, BNB_WEI
 from pancakebot.config import load_env, require_env
 
 
@@ -96,7 +96,7 @@ def _now_ms() -> float:
 
 def _build_w3() -> Web3:
     """Build Web3 client matching production primary RPC."""
-    primary_url = RPC_URLS[0]
+    primary_url = WRITE_PATH_RPC_URLS[0]
     w3 = Web3(Web3.HTTPProvider(primary_url, request_kwargs={"timeout": 30}))
     # BSC is a POA chain (extraData >32 bytes). Without this middleware,
     # get_block() raises ExtraDataLengthError.
@@ -138,7 +138,7 @@ def _preflight(w3: Web3, account) -> dict:
         "gas_price_wei": gas_price_wei,
         "gas_price_gwei": gas_price_gwei,
         "starting_nonce": nonce,
-        "primary_rpc": RPC_URLS[0],
+        "primary_rpc": WRITE_PATH_RPC_URLS[0],
     }
 
 

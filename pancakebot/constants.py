@@ -11,7 +11,7 @@ PREDICTION_V2_CONTRACT_ADDRESS = "0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA"
 # The contract's treasury fee is expressed in basis points (bps).
 TREASURY_FEE_DIVISOR = 10_000
 
-# Protocol constants (treasury_fee, min_bet, interval_seconds, buffer_seconds)
+# Protocol constants (treasury_fee, min_bet, round_interval_seconds, round_close_buffer_seconds)
 # are synced from chain by --sync and cached in var/contract_constants.json.
 # See pancakebot/market_data/contract_constants.py.
 
@@ -22,13 +22,13 @@ POOL_CUTOFF_SECONDS = 6
 
 # --- RPC (hardcoded list; failover is handled by RPC chooser) ---
 
-RPC_URLS: list[str] = [
+WRITE_PATH_RPC_URLS: list[str] = [
     "https://bsc-dataseed1.defibit.io",
     "https://bsc-dataseed2.defibit.io",
     "https://bsc-dataseed3.defibit.io",
 ]
 
-RPC_TIMEOUT_SECONDS = 20
+WRITE_PATH_RPC_TIMEOUT_SECONDS = 20
 
 # --- The Graph (gateway + subgraph id) ---
 
@@ -50,12 +50,12 @@ BNB_WEI = 1_000_000_000_000_000_000
 
 # Deterministic gas *cost* accounting used for EV/backtest/dry bankroll.
 # Runtime transaction submission still uses on-chain gas suggestions.
-GAS_PRICE_WEI = 1_000_000_000
+BACKTEST_GAS_PRICE_WEI = 1_000_000_000
 
 # Deterministic gas limits (used for cost accounting; may also be used as tx gas limits).
-GAS_LIMIT_BET = 200_000
-GAS_LIMIT_CLAIM = 250_000
+BACKTEST_GAS_LIMIT_BET = 200_000
+BACKTEST_GAS_LIMIT_CLAIM = 250_000
 
 # Deterministic gas costs (BNB). These are costs, not limits.
-GAS_COST_BET_BNB = float(GAS_LIMIT_BET) * float(GAS_PRICE_WEI) / float(BNB_WEI)
-GAS_COST_CLAIM_BNB = float(GAS_LIMIT_CLAIM) * float(GAS_PRICE_WEI) / float(BNB_WEI)
+BACKTEST_GAS_COST_BET_BNB = float(BACKTEST_GAS_LIMIT_BET) * float(BACKTEST_GAS_PRICE_WEI) / float(BNB_WEI)
+BACKTEST_GAS_COST_CLAIM_BNB = float(BACKTEST_GAS_LIMIT_CLAIM) * float(BACKTEST_GAS_PRICE_WEI) / float(BNB_WEI)

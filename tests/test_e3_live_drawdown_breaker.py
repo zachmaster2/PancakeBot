@@ -47,7 +47,7 @@ def _evaluate_risk_gate(
     tracker: InMemoryBankrollTracker,
     *,
     start_at: int,
-    max_drawdown_frac_from_peak: float,
+    max_drawdown_fraction_from_peak: float,
     cooldown_rounds: int,
 ) -> str:
     """Mirror momentum_pipeline.py:228-246 risk-check block.
@@ -61,7 +61,7 @@ def _evaluate_risk_gate(
     peak = tracker.peak_bankroll(start_at)
     if peak > 0:
         dd_frac = (peak - current) / peak
-        if dd_frac >= max_drawdown_frac_from_peak:
+        if dd_frac >= max_drawdown_fraction_from_peak:
             tracker.set_paused(cooldown_rounds, start_at)
             return "risk_drawdown_breaker_fired"
     return "ok"
@@ -78,7 +78,7 @@ def test_fast_drawdown_fires_at_threshold():
     cooldown_rounds = 72
     tracker = InMemoryBankrollTracker(
         initial_bankroll=initial,
-        window_days=7,
+        drawdown_peak_window_days=7,
         peak_mode="rolling_7d",
     )
 
@@ -87,7 +87,7 @@ def test_fast_drawdown_fires_at_threshold():
     verdict = _evaluate_risk_gate(
         tracker,
         start_at=_BASE_START,
-        max_drawdown_frac_from_peak=threshold,
+        max_drawdown_fraction_from_peak=threshold,
         cooldown_rounds=cooldown_rounds,
     )
     assert verdict == "ok", f"round 0 (at peak): expected ok, got {verdict}"
@@ -101,7 +101,7 @@ def test_fast_drawdown_fires_at_threshold():
         verdict = _evaluate_risk_gate(
             tracker,
             start_at=sa,
-            max_drawdown_frac_from_peak=threshold,
+            max_drawdown_fraction_from_peak=threshold,
             cooldown_rounds=cooldown_rounds,
         )
         assert verdict == "ok", (
@@ -120,7 +120,7 @@ def test_fast_drawdown_fires_at_threshold():
     verdict = _evaluate_risk_gate(
         tracker,
         start_at=sa,
-        max_drawdown_frac_from_peak=threshold,
+        max_drawdown_fraction_from_peak=threshold,
         cooldown_rounds=cooldown_rounds,
     )
     assert verdict == "risk_drawdown_breaker_fired", (
@@ -138,7 +138,7 @@ def test_fast_drawdown_does_not_fire_at_14_999_pct():
     initial = 100.0
     threshold = 0.15
     tracker = InMemoryBankrollTracker(
-        initial_bankroll=initial, window_days=7, peak_mode="rolling_7d",
+        initial_bankroll=initial, drawdown_peak_window_days=7, peak_mode="rolling_7d",
     )
     tracker.record_settlement(bankroll=100.0, start_at=_BASE_START)
     # 85.001 BNB -> dd_frac = 0.14999 -- one tick below threshold.
@@ -147,7 +147,7 @@ def test_fast_drawdown_does_not_fire_at_14_999_pct():
     verdict = _evaluate_risk_gate(
         tracker,
         start_at=sa,
-        max_drawdown_frac_from_peak=threshold,
+        max_drawdown_fraction_from_peak=threshold,
         cooldown_rounds=72,
     )
     assert verdict == "ok", (
@@ -162,7 +162,7 @@ def test_fast_drawdown_cooldown_ticks_then_resumes():
     threshold = 0.15
     cooldown_rounds = 5  # short cooldown so the test is fast
     tracker = InMemoryBankrollTracker(
-        initial_bankroll=initial, window_days=7, peak_mode="rolling_7d",
+        initial_bankroll=initial, drawdown_peak_window_days=7, peak_mode="rolling_7d",
     )
 
     # Climb to peak then crash to fire the breaker.
@@ -172,7 +172,7 @@ def test_fast_drawdown_cooldown_ticks_then_resumes():
     verdict = _evaluate_risk_gate(
         tracker,
         start_at=crash_at,
-        max_drawdown_frac_from_peak=threshold,
+        max_drawdown_fraction_from_peak=threshold,
         cooldown_rounds=cooldown_rounds,
     )
     assert verdict == "risk_drawdown_breaker_fired"
@@ -184,7 +184,7 @@ def test_fast_drawdown_cooldown_ticks_then_resumes():
         verdict = _evaluate_risk_gate(
             tracker,
             start_at=sa,
-            max_drawdown_frac_from_peak=threshold,
+            max_drawdown_fraction_from_peak=threshold,
             cooldown_rounds=cooldown_rounds,
         )
         assert verdict == "risk_cooldown_active", (
@@ -200,7 +200,7 @@ def test_fast_drawdown_cooldown_ticks_then_resumes():
     verdict = _evaluate_risk_gate(
         tracker,
         start_at=sa,
-        max_drawdown_frac_from_peak=threshold,
+        max_drawdown_fraction_from_peak=threshold,
         cooldown_rounds=cooldown_rounds,
     )
     assert verdict == "ok", (
@@ -211,9 +211,9 @@ def test_fast_drawdown_cooldown_ticks_then_resumes():
 
 
 def test_fast_drawdown_breaker_disabled_when_threshold_one():
-    """Sanity: max_drawdown_frac_from_peak=1.0 disables the breaker entirely."""
+    """Sanity: max_drawdown_fraction_from_peak=1.0 disables the breaker entirely."""
     tracker = InMemoryBankrollTracker(
-        initial_bankroll=100.0, window_days=7, peak_mode="rolling_7d",
+        initial_bankroll=100.0, drawdown_peak_window_days=7, peak_mode="rolling_7d",
     )
     tracker.record_settlement(bankroll=100.0, start_at=_BASE_START)
     # Drop to near-zero. Even this should NOT fire when threshold = 1.0.
@@ -222,7 +222,7 @@ def test_fast_drawdown_breaker_disabled_when_threshold_one():
     verdict = _evaluate_risk_gate(
         tracker,
         start_at=sa,
-        max_drawdown_frac_from_peak=1.0,
+        max_drawdown_fraction_from_peak=1.0,
         cooldown_rounds=72,
     )
     # dd_frac = 0.995, threshold = 1.0, so dd_frac < threshold -> ok.
@@ -236,7 +236,7 @@ def test_fast_drawdown_breaker_disabled_when_threshold_one():
 def test_idempotency_same_value_same_start_at_dedup():
     """Same (start_at, bankroll) called twice -> dedup, no double-count."""
     tracker = InMemoryBankrollTracker(
-        initial_bankroll=100.0, window_days=7, peak_mode="rolling_7d",
+        initial_bankroll=100.0, drawdown_peak_window_days=7, peak_mode="rolling_7d",
     )
     tracker.record_settlement(bankroll=100.0, start_at=_BASE_START)
     n_after_first = len(tracker._entries)
@@ -252,7 +252,7 @@ def test_idempotency_same_value_same_start_at_dedup():
 def test_idempotency_within_tolerance_same_start_at_dedup():
     """Float-tolerance dedup: 1e-13 difference must still dedup (line 138 < 1e-12)."""
     tracker = InMemoryBankrollTracker(
-        initial_bankroll=100.0, window_days=7, peak_mode="rolling_7d",
+        initial_bankroll=100.0, drawdown_peak_window_days=7, peak_mode="rolling_7d",
     )
     tracker.record_settlement(bankroll=100.0, start_at=_BASE_START)
     n_before = len(tracker._entries)
@@ -269,7 +269,7 @@ def test_idempotency_different_value_same_start_at_both_stored():
     produce two distinct entries. ``current_bankroll`` returns the last write.
     """
     tracker = InMemoryBankrollTracker(
-        initial_bankroll=100.0, window_days=7, peak_mode="rolling_7d",
+        initial_bankroll=100.0, drawdown_peak_window_days=7, peak_mode="rolling_7d",
     )
     tracker.record_settlement(bankroll=100.0, start_at=_BASE_START)
     n_after_seed = len(tracker._entries)
@@ -295,7 +295,7 @@ def test_idempotency_does_not_falsely_fire_breaker_on_retry():
     threshold = 0.15
     cooldown_rounds = 72
     tracker = InMemoryBankrollTracker(
-        initial_bankroll=100.0, window_days=7, peak_mode="rolling_7d",
+        initial_bankroll=100.0, drawdown_peak_window_days=7, peak_mode="rolling_7d",
     )
     tracker.record_settlement(bankroll=100.0, start_at=_BASE_START)
     crash_at = _BASE_START + _ROUND_SECONDS
@@ -303,7 +303,7 @@ def test_idempotency_does_not_falsely_fire_breaker_on_retry():
     verdict = _evaluate_risk_gate(
         tracker,
         start_at=crash_at,
-        max_drawdown_frac_from_peak=threshold,
+        max_drawdown_fraction_from_peak=threshold,
         cooldown_rounds=cooldown_rounds,
     )
     assert verdict == "risk_drawdown_breaker_fired"
@@ -333,7 +333,7 @@ def test_idempotency_seeded_init_entry_is_dedup_safe():
     must not append a third entry (dedup against the seed).
     """
     tracker = InMemoryBankrollTracker(
-        initial_bankroll=100.0, window_days=7, peak_mode="rolling_7d",
+        initial_bankroll=100.0, drawdown_peak_window_days=7, peak_mode="rolling_7d",
     )
     # First call seeds an init entry AND appends a settlement entry IF the
     # value differs from initial. Same value -> only the init entry exists.

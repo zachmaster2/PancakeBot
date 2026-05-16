@@ -24,15 +24,15 @@ def test_warmup_default_connections_matches_gate_symbol_count():
     """Default ``connections`` matches the live decision-path gate's
     concurrent-fetch symbol count, so every parallel request finds a
     pre-established TLS connection. With BNB currently disabled in
-    ``MomentumGate._SYMBOLS_FETCHED``, the gate fetches 3 symbols
+    ``MomentumGate._OKX_SYMBOLS_FETCHED``, the gate fetches 3 symbols
     (BTC/ETH/SOL) and the warmup default is 3."""
-    from pancakebot.strategy.momentum_gate import _SYMBOLS_FETCHED
+    from pancakebot.strategy.momentum_gate import _OKX_SYMBOLS_FETCHED
     sig = inspect.signature(OkxClient.warmup)
     default = sig.parameters["connections"].default
-    expected = len(_SYMBOLS_FETCHED)
+    expected = len(_OKX_SYMBOLS_FETCHED)
     assert default == expected, (
         f"OkxClient.warmup() default connections must equal the gate's "
-        f"_SYMBOLS_FETCHED count ({expected}); got {default}"
+        f"_OKX_SYMBOLS_FETCHED count ({expected}); got {default}"
     )
 
 

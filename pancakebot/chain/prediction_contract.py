@@ -242,11 +242,11 @@ class Web3PredictionContract:
         fee_bps = int(self._rpc_call(op="treasury_fee_rate", fn=lambda: self._contract.functions.treasuryFee().call()))
         return float(fee_bps) / float(TREASURY_FEE_DIVISOR)
 
-    def interval_seconds(self) -> int:
-        return int(self._rpc_call(op="interval_seconds", fn=lambda: self._contract.functions.intervalSeconds().call()))
+    def round_interval_seconds(self) -> int:
+        return int(self._rpc_call(op="round_interval_seconds", fn=lambda: self._contract.functions.intervalSeconds().call()))
 
-    def buffer_seconds(self) -> int:
-        return int(self._rpc_call(op="buffer_seconds", fn=lambda: self._contract.functions.bufferSeconds().call()))
+    def round_close_buffer_seconds(self) -> int:
+        return int(self._rpc_call(op="round_close_buffer_seconds", fn=lambda: self._contract.functions.bufferSeconds().call()))
 
     def lock_ts(self, epoch: int) -> int:
         r = self._rpc_call(op="lock_ts", fn=lambda: self._contract.functions.rounds(int(epoch)).call())
@@ -509,15 +509,12 @@ class Web3PredictionContract:
         # hash. There is no one-way path here.
         #
         # The TX is committed to the validator's mempool at the moment
-        # the RPC accepts it (estimated; un-probed — Bundle 4 reviewer
-        # Y8). Bundle 4 budgets ``BSC_BET_SUBMIT_ONE_WAY_MS=150`` as a
-        # conservative one-way estimate; a real ``sendRawTransaction``
-        # probe (TODO) could tighten this. The legacy
-        # ``BSC_BET_SUBMIT_RTT_P95_MS=200`` remains a round-trip estimate
-        # for back-reference but is deprecated in the deadline derivation
-        # — that constant overstates the inclusion-relevant cost by
-        # including the ack-return path, which is meaningful only for
-        # observability of the synchronous Web3.py call itself.
+        # the RPC accepts it. Bundle 4 budgets ``BSC_BET_SUBMIT_ONE_WAY_MS=150``
+        # for that one-way path — empirically validated 2026-05-16 against
+        # the production write-path RPC (p99 RTT 277ms → 139ms one-way,
+        # 150ms covers p99 with 11ms safety margin). See
+        # var/strategy_review/send_raw_tx_probe.md for the full
+        # distribution.
         signed = self._require_account().sign_transaction(tx)
         t_tx_signed = float(time.perf_counter() * 1000.0)
         try:
