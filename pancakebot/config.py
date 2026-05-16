@@ -616,6 +616,109 @@ def load_strategy_config_from_dict(d: dict[str, Any]) -> StrategyConfig:
     return load_strategy_config(wrapped)
 
 
+# -- Strict-mode schema -------------------------------------------------------
+#
+# Allow-list of every recognized section and its keys. Walked by
+# ``_validate_strict_schema`` after parsing the TOML; any key or section
+# not listed here raises InvariantError with a difflib-based "did you
+# mean" suggestion. The dataclass fields above ARE the truth — keep this
+# table in sync when adding/removing knobs.
+
+_CONFIG_SCHEMA: dict[str, set[str]] = {
+    "runtime": {
+        "kline_cutoff_seconds",
+        "pool_cutoff_seconds",
+        "max_consecutive_kline_fetch_failures",
+    },
+    "dry": {"initial_bankroll_bnb"},
+    "live": {"clamp_bet_to_contract_minimum"},
+    "backtest": {
+        "backtest_round_count",
+        "initial_bankroll_bnb",
+        "epoch_start",
+        "epoch_end",
+    },
+    "strategy": set(),
+    "strategy.pool_filter": {
+        "min_pool_bnb_at_cutoff",
+        "min_payout_multiple_at_cutoff",
+    },
+    "strategy.gate": {"mtf_lookbacks", "mtf_min_return_threshold"},
+    "strategy.btc_primary": set(),
+    "strategy.btc_primary.threshold": {
+        "small_pool_min_signal_strength",
+        "pool_size_boundary_bnb",
+    },
+    "strategy.btc_primary.sizing": {
+        "base_pool_fraction",
+        "pool_fraction_slope",
+        "max_pool_fraction",
+    },
+    "strategy.eth_sol_fallback": set(),
+    "strategy.eth_sol_fallback.signal": {"min_signal_strength"},
+    "strategy.eth_sol_fallback.sizing": {"base_pool_fraction"},
+    "strategy.tier2_sizing": {
+        "eth_sol_signal_weight",
+        "min_bet_threshold_bnb",
+    },
+    "strategy.risk": {
+        "max_bet_fraction_of_bankroll",
+        "min_bankroll_bnb_to_bet",
+        "max_drawdown_fraction_from_peak",
+        "cooldown_rounds",
+        "drawdown_peak_window_days",
+        "max_bet_bnb_btc_primary",
+        "max_bet_bnb_eth_sol_fallback",
+        "drawdown_peak_mode",
+    },
+}
+
+
+def _suggest(name: str, candidates) -> str:
+    """Return a ' (did you mean X?)' fragment, or '' if no close match."""
+    import difflib
+    matches = difflib.get_close_matches(name, list(candidates), n=1, cutoff=0.6)
+    return f" (did you mean {matches[0]!r}?)" if matches else ""
+
+
+def _validate_strict_schema(raw: dict, schema: dict[str, set[str]]) -> None:
+    """Walk ``raw`` (parsed TOML root) and raise on any key/section not in
+    ``schema``. Suggests a close match via difflib when one exists.
+
+    Sections are paths like ``"strategy.risk"``; keys are leaf names.
+    Anything in ``raw`` that doesn't match the schema is a config error —
+    typo'd renamed key, stale knob from a removed feature, or section
+    misplaced under the wrong parent.
+    """
+    # Top-level: every key must be a known section (we have no top-level
+    # scalars in this schema).
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            sug = _suggest(k, [p for p in schema if "." not in p])
+            raise InvariantError(
+                f"config_unknown_top_level_key: {k!r}"
+                f" (expected a section header){sug}"
+            )
+        _validate_strict_section(k, v, schema)
+
+
+def _validate_strict_section(path: str, section: dict, schema: dict[str, set[str]]) -> None:
+    if path not in schema:
+        sug = _suggest(path, schema.keys())
+        raise InvariantError(f"config_unknown_section: [{path}]{sug}")
+    valid_keys = schema[path]
+    for k, v in section.items():
+        sub_path = f"{path}.{k}"
+        if isinstance(v, dict):
+            _validate_strict_section(sub_path, v, schema)
+        else:
+            if k not in valid_keys:
+                sug = _suggest(k, valid_keys)
+                raise InvariantError(
+                    f"config_unknown_key: {k!r} in [{path}]{sug}"
+                )
+
+
 # -- Main loader --------------------------------------------------------------
 
 def load_app_config(path: str) -> AppConfig:
@@ -630,6 +733,12 @@ def load_app_config(path: str) -> AppConfig:
 
     if not isinstance(raw, dict):
         raise InvariantError("config_root_not_dict")
+
+    # Fail-fast on unknown keys/sections before per-field reads. The
+    # loader's _opt_* helpers silently ignore unrecognized keys; this
+    # check is the safety floor that catches typos, stale renames, and
+    # operator-side misconfigurations that would otherwise go unnoticed.
+    _validate_strict_schema(raw, _CONFIG_SCHEMA)
 
     runtime = raw.get("runtime", {})
     dry_sec = raw.get("dry", {})

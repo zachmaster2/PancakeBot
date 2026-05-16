@@ -75,6 +75,95 @@ def test_kline_cutoff_seconds_rejects_out_of_range(tmp_path, cutoff):
     assert "kline_cutoff_seconds_out_of_range" in str(raised)
 
 
+# ---------------------------------------------------------------------------
+# Strict-mode schema validation
+# ---------------------------------------------------------------------------
+
+_FULL_TOML = """
+[runtime]
+kline_cutoff_seconds = 2
+
+[dry]
+initial_bankroll_bnb = 50.0
+
+[live]
+clamp_bet_to_contract_minimum = true
+
+[backtest]
+backtest_round_count = 1000
+initial_bankroll_bnb = 50.0
+"""
+
+
+def _write_full_cfg(tmp_path: Path, extra: str = "") -> Path:
+    p = tmp_path / "config.toml"
+    p.write_text(_FULL_TOML + extra, encoding="utf-8")
+    return p
+
+
+def test_strict_mode_rejects_unknown_key_in_known_section(tmp_path):
+    cfg_path = _write_full_cfg(tmp_path, "\n[strategy.risk]\nbogus_key_xyz = 999\n")
+    with pytest.raises(InvariantError, match=r"config_unknown_key:.*bogus_key_xyz.*\[strategy\.risk\]"):
+        load_app_config(str(cfg_path))
+
+
+def test_strict_mode_rejects_unknown_section(tmp_path):
+    cfg_path = _write_full_cfg(tmp_path, "\n[strategy.unknown_section]\nfoo = 1\n")
+    with pytest.raises(InvariantError, match=r"config_unknown_section:.*strategy\.unknown_section"):
+        load_app_config(str(cfg_path))
+
+
+def test_strict_mode_suggests_close_typo_for_key(tmp_path):
+    # ``windows_days`` is one char off from ``drawdown_peak_window_days`` --
+    # well, far off actually. Try a closer typo.
+    cfg_path = _write_full_cfg(tmp_path, "\n[strategy.risk]\ndrawdown_peak_window_dayz = 7\n")
+    raised: Exception | None = None
+    try:
+        load_app_config(str(cfg_path))
+    except InvariantError as e:
+        raised = e
+    assert raised is not None
+    assert "did you mean" in str(raised)
+    assert "drawdown_peak_window_days" in str(raised)
+
+
+def test_strict_mode_suggests_close_typo_for_section(tmp_path):
+    cfg_path = _write_full_cfg(tmp_path, "\n[strategy.rsk]\ncooldown_rounds = 1\n")
+    raised: Exception | None = None
+    try:
+        load_app_config(str(cfg_path))
+    except InvariantError as e:
+        raised = e
+    assert raised is not None
+    assert "did you mean" in str(raised)
+    assert "strategy.risk" in str(raised)
+
+
+def test_strict_mode_accepts_canonical_operator_config():
+    """The in-repo config.toml at repo root must always pass strict mode.
+
+    This is the canonical example operators copy from; if it ever drifts
+    out of the schema, the loader is broken before any operator ever
+    sees their own config.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    cfg = load_app_config(str(repo_root / "config.toml"))
+    assert cfg.kline_cutoff_seconds == 2
+
+
+def test_strict_mode_rejects_top_level_scalar(tmp_path):
+    """Top-level scalars (keys before any [section] header) are rejected.
+
+    TOML scopes scalars to the most-recent section, so the bogus scalar
+    must appear BEFORE the first section header to actually be a
+    top-level key.
+    """
+    p = tmp_path / "config.toml"
+    p.write_text("bogus_top_scalar = 42\n" + _FULL_TOML, encoding="utf-8")
+    with pytest.raises(InvariantError, match=r"config_unknown_top_level_key"):
+        load_app_config(str(p))
+
+
 def _run_all() -> int:
     """Standalone runner (parametrize unrolled manually)."""
     failed = 0
