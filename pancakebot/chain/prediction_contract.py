@@ -242,11 +242,11 @@ class Web3PredictionContract:
         fee_bps = int(self._rpc_call(op="treasury_fee_rate", fn=lambda: self._contract.functions.treasuryFee().call()))
         return float(fee_bps) / float(TREASURY_FEE_DIVISOR)
 
-    def round_interval_seconds(self) -> int:
-        return int(self._rpc_call(op="round_interval_seconds", fn=lambda: self._contract.functions.intervalSeconds().call()))
+    def interval_seconds(self) -> int:
+        return int(self._rpc_call(op="interval_seconds", fn=lambda: self._contract.functions.intervalSeconds().call()))
 
-    def round_close_buffer_seconds(self) -> int:
-        return int(self._rpc_call(op="round_close_buffer_seconds", fn=lambda: self._contract.functions.bufferSeconds().call()))
+    def buffer_seconds(self) -> int:
+        return int(self._rpc_call(op="buffer_seconds", fn=lambda: self._contract.functions.bufferSeconds().call()))
 
     def lock_ts(self, epoch: int) -> int:
         r = self._rpc_call(op="lock_ts", fn=lambda: self._contract.functions.rounds(int(epoch)).call())

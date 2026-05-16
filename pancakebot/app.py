@@ -68,12 +68,12 @@ def run_from_config(
         round_store = ClosedRoundsStore(paths.CLOSED_ROUNDS_PATH)
         # noinspection PyTypeChecker
         backtest_cfg: BacktestConfig = cfg.backtest
-        # Receipt timeouts derived from chain-loaded round_close_buffer_seconds +
+        # Receipt timeouts derived from chain-loaded buffer_seconds +
         # _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS (≈35s on canonical chain constants).
         # Both bet and claim TX receipts share this timeout sizing.
         from pancakebot.runtime.engine import _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
         _bt_receipt_timeout = (
-            int(cc.round_close_buffer_seconds) + int(_CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS)
+            int(cc.buffer_seconds) + int(_CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS)
         )
         # noinspection PyTypeChecker
         runtime_cfg = RuntimeConfig(
@@ -98,8 +98,8 @@ def run_from_config(
             dry_no_archive=False,
             min_bet_amount_bnb=cc.min_bet_amount_bnb,
             treasury_fee_fraction=cc.treasury_fee_fraction,
-            round_interval_seconds=cc.round_interval_seconds,
-            round_close_buffer_seconds=cc.round_close_buffer_seconds,
+            interval_seconds=cc.interval_seconds,
+            buffer_seconds=cc.buffer_seconds,
             strategy=cfg.strategy,
         )
         run_backtest(
@@ -173,14 +173,14 @@ def run_from_config(
 
     treasury_fee_fraction = contract.treasury_fee_rate()
     min_bet_amount_bnb = float(contract.min_bet_amount()) / float(BNB_WEI)
-    round_interval_seconds = contract.round_interval_seconds()
-    round_close_buffer_seconds = contract.round_close_buffer_seconds()
+    interval_seconds = contract.interval_seconds()
+    buffer_seconds = contract.buffer_seconds()
     save_contract_constants(
         constants=ContractConstants(
             min_bet_amount_bnb=min_bet_amount_bnb,
             treasury_fee_fraction=treasury_fee_fraction,
-            round_interval_seconds=round_interval_seconds,
-            round_close_buffer_seconds=round_close_buffer_seconds,
+            interval_seconds=interval_seconds,
+            buffer_seconds=buffer_seconds,
         )
     )
 
@@ -214,18 +214,18 @@ def run_from_config(
     # — if an endpoint misbehaves, remove it from the constant. See
     # var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md.
     rpc_poller = RpcPoller(
-        round_interval_seconds=round_interval_seconds,
+        interval_seconds=interval_seconds,
         endpoint_pool=READ_PATH_HEDGED_ENDPOINTS,
         ramp_poll_1_wakeup_offset_before_lock_ms=cfg.ramp_poll_1_wakeup_offset_before_lock_ms,
     )
     rpc_poller.start()
 
-    # Receipt timeouts derived from chain-loaded round_close_buffer_seconds +
+    # Receipt timeouts derived from chain-loaded buffer_seconds +
     # _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS (≈35s on canonical chain constants).
     # Both bet and claim TX receipts share this timeout sizing.
     from pancakebot.runtime.engine import _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
     _runtime_receipt_timeout = (
-        int(round_close_buffer_seconds) + int(_CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS)
+        int(buffer_seconds) + int(_CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS)
     )
 
     runtime_cfg = RuntimeConfig(
@@ -252,8 +252,8 @@ def run_from_config(
         dry_no_archive=no_archive,
         min_bet_amount_bnb=float(min_bet_amount_bnb),
         treasury_fee_fraction=treasury_fee_fraction,
-        round_interval_seconds=round_interval_seconds,
-        round_close_buffer_seconds=round_close_buffer_seconds,
+        interval_seconds=interval_seconds,
+        buffer_seconds=buffer_seconds,
         strategy=cfg.strategy,
         momentum_gate=momentum_gate,
         rpc_poller=rpc_poller,

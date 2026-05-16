@@ -13,7 +13,7 @@ The poller has three trigger paths:
 1. **Cursor initialization** — synchronous; runs on first
    ``set_round_phase()`` call (``_initialize_cursor_from_head``).
    One ``eth_getBlockByNumber(latest)`` RPC to derive the in-round
-   ``round_start_block`` from ``lock_at - round_interval_seconds``, sets
+   ``round_start_block`` from ``lock_at - interval_seconds``, sets
    the cursor, returns. Bundle 2 (2026-05-13) replaced the prior
    synchronous backfill (30-90s engine block) with this fast path;
    the actual catch-up runs via the periodic daemon's first tick.
@@ -313,15 +313,15 @@ class RpcPoller:
     def __init__(
         self,
         *,
-        round_interval_seconds: int,
+        interval_seconds: int,
         endpoint_pool: list[str],
         contract_address: str = PREDICTION_V2_CONTRACT_ADDRESS,
         periodic_poll_interval_s: int = _tc.RPC_PERIODIC_POLL_INTERVAL_SECONDS,
         batch_size: int = _tc.RPC_BATCH_MAX_BLOCKS,
         ramp_poll_1_wakeup_offset_before_lock_ms: int = 7500,
     ) -> None:
-        if round_interval_seconds <= 0:
-            raise InvariantError("round_interval_seconds_nonpositive")
+        if interval_seconds <= 0:
+            raise InvariantError("interval_seconds_nonpositive")
         if periodic_poll_interval_s <= 0:
             raise InvariantError("periodic_poll_interval_nonpositive")
         if batch_size <= 0 or batch_size > _tc.RPC_BATCH_MAX_BLOCKS:
@@ -336,7 +336,7 @@ class RpcPoller:
         if not pool:
             raise InvariantError("endpoint_pool_empty")
 
-        self._interval_seconds = int(round_interval_seconds)
+        self._interval_seconds = int(interval_seconds)
         self._endpoint_pool: list[str] = pool
 
         # ThreadPoolExecutor for parallel fan-out across the full pool.
@@ -957,7 +957,7 @@ class RpcPoller:
         correct cursor.
 
         Round-aware: round_start_block is derived from
-        ``lock_at - round_interval_seconds``, NOT from a head-relative
+        ``lock_at - interval_seconds``, NOT from a head-relative
         full-round lookback. Past-round blocks are archive-only and
         never bet on, so seeking earlier is wasted.
 
@@ -983,7 +983,7 @@ class RpcPoller:
             try:
                 # eth_getBlockByNumber('latest') returns head_number AND
                 # head_timestamp in one call — both needed to derive
-                # round_start_block from lock_at - round_interval_seconds.
+                # round_start_block from lock_at - interval_seconds.
                 try:
                     head, head_ts = self._rpc_eth_get_latest_block_header()
                 except Exception as e:  # noqa: BLE001
@@ -1089,7 +1089,7 @@ class RpcPoller:
 
         Refactored 2026-05-12 from a pure wall-clock 8s tick to a
         lock-anchored cadence: ticks land at round_open + k*period for
-        k=1..(round_interval_seconds//period − 1), aligned fresh to each
+        k=1..(interval_seconds//period − 1), aligned fresh to each
         round's lock_at. Solves the INFEAS spam pattern observed in
         the 1h soak (Event 2: late-round periodic firing at lock−1.13s
         with 7-block lag → math returned est=1319ms > avail=930ms →
@@ -1111,7 +1111,7 @@ class RpcPoller:
             window exits the loop within ``period`` seconds.
 
         State B — steady (``now < _lock_at``): anchor cadence to
-            ``round_open = _lock_at − round_interval_seconds``. Compute the
+            ``round_open = _lock_at − interval_seconds``. Compute the
             next anchored tick ``next_at = round_open + k * period``
             for smallest k>=1 such that ``next_at > now``. If
             ``next_at`` would land inside the ramp/final window
