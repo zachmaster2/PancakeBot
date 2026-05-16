@@ -121,6 +121,7 @@ class MomentumOnlyPipeline:
         strategy_config: StrategyConfig,
         gate: MomentumGate | None,
         kline_cutoff_seconds: int,
+        pool_cutoff_seconds: int,
         min_bet_amount_bnb: float,
         treasury_fee_fraction: float,
         bankroll_tracker: BankrollTracker | None = None,
@@ -129,6 +130,7 @@ class MomentumOnlyPipeline:
         self._strategy = strategy_config
         self._gate = gate
         self._cutoff_seconds = int(kline_cutoff_seconds)
+        self._pool_cutoff_seconds = int(pool_cutoff_seconds)
         self._min_bet_amount_bnb = float(min_bet_amount_bnb)
         self._treasury_fee_fraction = float(treasury_fee_fraction)
         self._last_settled_epoch: int | None = None
@@ -259,8 +261,7 @@ class MomentumOnlyPipeline:
             )
             # Compute pools from round bets if not provided externally.
             if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
-                from pancakebot.constants import POOL_CUTOFF_SECONDS
-                pool_cutoff_ts = lock_at - POOL_CUTOFF_SECONDS
+                pool_cutoff_ts = lock_at - self._pool_cutoff_seconds
                 pool_bull_bnb, pool_bear_bnb = _pools_from_bets(round_t, pool_cutoff_ts)
         pool_total = pool_bull_bnb + pool_bear_bnb
 
@@ -418,7 +419,7 @@ class MomentumOnlyPipeline:
 def _pools_from_bets(round_t: Round, cutoff_ts: int) -> tuple[float, float]:
     """Compute bull/bear pool BNB from bets placed strictly before cutoff_ts.
 
-    Uses cutoff_ts (lock_at - POOL_CUTOFF_SECONDS) to match what the live
+    Uses cutoff_ts (lock_at - pool_cutoff_seconds) to match what the live
     bot sees.  Strict < avoids boundary ambiguity between The Graph's
     createdAt and BSC block timestamps.
     """

@@ -58,7 +58,7 @@ from pancakebot.config import (
     _DEFAULT_STRATEGY,
     load_strategy_config_from_dict,
 )
-from pancakebot.constants import BACKTEST_GAS_COST_BET_BNB, POOL_CUTOFF_SECONDS
+from pancakebot.constants import BACKTEST_GAS_COST_BET_BNB
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.settlement import settle_bet_against_closed_round
 from pancakebot.strategy.momentum_gate import MomentumGateConfig
@@ -89,6 +89,7 @@ class FoldSpec:
     epoch_end: int | None
     strategy_overrides: dict[str, Any] = field(default_factory=dict)
     plot: bool = False
+    pool_cutoff_seconds: int = 6
 
 
 # ---------- one-time load ----------
@@ -338,6 +339,7 @@ def run_fold(
         strategy_config=strategy_cfg,
         gate=None,
         kline_cutoff_seconds=spec.kline_cutoff_seconds,
+        pool_cutoff_seconds=spec.pool_cutoff_seconds,
         min_bet_amount_bnb=min_bet_amount_bnb,
         treasury_fee_fraction=treasury_fee_fraction,
         bankroll_tracker=bankroll_tracker,

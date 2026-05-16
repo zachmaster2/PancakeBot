@@ -28,7 +28,7 @@ initial_bankroll_bnb = 50.0
 # Strategy configuration
 #
 # IMPORTANT: All pool-related settings refer to the CUTOFF POOL
-# (the partial pool observed at lock_at - POOL_CUTOFF_SECONDS,
+# (the partial pool observed at lock_at - pool_cutoff_seconds,
 # ~6s before lock), NOT the final pool at settlement. The live bot
 # only observes pool growth up to this cutoff to maintain
 # deterministic decision-making.

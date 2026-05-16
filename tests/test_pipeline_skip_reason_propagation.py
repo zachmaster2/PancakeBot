@@ -92,6 +92,7 @@ def _make_pipeline(gate_mock) -> MomentumOnlyPipeline:
         strategy_config=_make_strategy_config(),
         gate=gate_mock,
         kline_cutoff_seconds=2,
+        pool_cutoff_seconds=6,
         min_bet_amount_bnb=0.001,
         treasury_fee_fraction=0.03,
     )
