@@ -52,7 +52,7 @@ from typing import Callable
 
 import requests
 
-from pancakebot.log import error, info, warn
+from pancakebot.log import info, warn
 from pancakebot.util import InvariantError, TransientOkxError
 
 
@@ -566,9 +566,27 @@ class OkxClient:
             last_class = cls
             is_last = (attempt == retry_policy.max_attempts - 1)
             if is_last:
-                error("NET", "OKX", "EXHAUST",
-                      attempts=attempt + 1, endpoint="history-candles",
-                      symbol=symbol, error_class=cls.value, error_detail=detail)
+                # Caller (gate WARN, sync handler) renders the
+                # operator-facing log line from the structured exception
+                # fields. okx_client is data-plane only -- no EXHAUST log
+                # here.
+                #
+                # ``received_count`` is computed for INSUFFICIENT cases so
+                # the caller can show ``received=N requested=M``. We do
+                # NOT additionally compute which boundary is missing: in
+                # practice OKX only ever shorts us at the newest end
+                # (publish-delay tail) and supporting hypothetical
+                # middle-gap / oldest-missing cases is overengineering.
+                received_count: int | None = None
+                if response_received and cls == _OkxErrorClass.INSUFFICIENT:
+                    try:
+                        body = resp.json()
+                    except (ValueError, json.JSONDecodeError):
+                        body = None
+                    if isinstance(body, dict):
+                        data = body.get("data")
+                        if isinstance(data, list):
+                            received_count = len(data)
                 raise TransientOkxError(
                     f"kline_fetch_exhausted: symbol={symbol} "
                     f"class={cls.value} detail={detail}",
@@ -580,6 +598,8 @@ class OkxClient:
                     # but it is not a meaningful OKX RTT for downstream
                     # publish-delay-tail analysis.
                     rtt_ms=rtt_ms if response_received else None,
+                    received_count=received_count,
+                    requested_count=expected_count,
                 )
             base_delay = retry_policy.backoff_seconds[attempt]
             delay = base_delay * random.uniform(_RETRY_JITTER_MIN_FRACTION, _RETRY_JITTER_MAX_FRACTION)

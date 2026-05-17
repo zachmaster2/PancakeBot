@@ -126,7 +126,7 @@ class MomentumGate:
       (length/contiguity/boundary violation) and should never silently
       skip.
     - Any ``TransientOkxError`` (any subset of symbols) → emit one
-      ``warn("GATE", sym.upper(), "FETCH_FAIL", ...)`` per failed symbol
+      ``warn("GATE", "KLINE", "PARTIAL", symbol=..., ...)`` per failed symbol
       and skip the round with reason ``kline_fetch_transient_failure``.
       Increments ``_consecutive_fetch_failures``; reset to 0 on a fully
       successful 3-symbol fetch.
@@ -346,12 +346,86 @@ class MomentumGate:
         # ----- Error handling: TransientOkxError (any subset) -----
         if transient_errors:
             for sym_short, e in transient_errors:
-                # Per-symbol detail goes into a warn log so the operator
-                # reconciles the generic skip with the warn-cluster around it.
-                warn(
-                    "GATE", sym_short.upper(), "FETCH_FAIL",
-                    msg=f"reason={e}",
-                )
+                # Single operator-facing log line per failed symbol with
+                # conditional fields driven by the exception's structured
+                # data. okx_client no longer emits EXHAUST (data-plane
+                # only); this is the sole surface for the failure.
+                #
+                # Field ordering (by operator triage importance):
+                #   symbol -> reason -> received -> requested -> bar
+                #   -> error_detail (only when not derivable from counts)
+                #
+                # Reason taxonomy:
+                #   okx_publish_delay -- response received with partial
+                #     data (insufficient class + got_N detail). In
+                #     practice OKX only ever shorts us at the newest end
+                #     (publish-delay tail); we don't verify position
+                #     because middle-gap / oldest-missing cases don't
+                #     occur empirically.
+                #   partial_response  -- bytes received but error / non-
+                #     data response (HTTP 429, OKX error code, JSON
+                #     parse failure, etc.). The error_detail field
+                #     carries the underlying class so the operator can
+                #     distinguish rate limit from server error.
+                #   okx_unreachable   -- no response received at all
+                #     (rtt_ms is None; pre-response failure: DNS,
+                #     connect refused, pre-bytes timeout). error_detail
+                #     carries the exception class name.
+                received = getattr(e, "received_count", None)
+                requested = getattr(e, "requested_count", None)
+                error_detail = getattr(e, "error_detail", None)
+                rtt_ms = getattr(e, "rtt_ms", None)
+
+                if (
+                    error_detail is not None
+                    and error_detail.startswith("got_")
+                    and received is not None
+                    and requested is not None
+                    and received < requested
+                ):
+                    reason = "okx_publish_delay"
+                elif rtt_ms is not None:
+                    reason = "partial_response"
+                else:
+                    reason = "okx_unreachable"
+
+                # Build the fields dict in deterministic operator-triage
+                # order. Python dict insertion order is preserved by
+                # log.py's _fmt_fields, so kwargs land in the log line
+                # in the same order they're inserted here.
+                fields: dict[str, object] = {
+                    "symbol": getattr(self._cfg, f"{sym_short}_symbol"),
+                    "reason": reason,
+                }
+                # received + requested are emitted as a pair: both make
+                # sense together (count comparison), neither alone adds
+                # value. okx_client only populates received_count for
+                # INSUFFICIENT cases (response was parsed as a data
+                # array); HTTP 429 / OKX-code / pre-response failures
+                # leave received_count None, in which case we skip
+                # both numeric fields.
+                if received is not None and requested is not None:
+                    fields["received"] = received
+                    fields["requested"] = requested
+                fields["bar"] = "1s"
+                # error_detail: include only when it carries information
+                # NOT derivable from received/requested. The got_N_expected_M
+                # and empty_data shapes are pure count-restatements; drop
+                # them. Everything else (http_*, okx_code_*, ConnectionError,
+                # etc.) is operator-meaningful classification context.
+                if (
+                    error_detail is not None
+                    and not error_detail.startswith("got_")
+                    and error_detail != "empty_data"
+                ):
+                    fields["error_detail"] = error_detail
+
+                # SUB is the subsystem identifier ("KLINE", not the
+                # symbol value -- the symbol lives in the kv tail as
+                # ``symbol=BTC-USDT``). EVENT is ``PARTIAL`` (the kline
+                # context is already conveyed by SUB; ``KLINE_PARTIAL``
+                # would be redundant).
+                warn("GATE", "KLINE", "PARTIAL", **fields)
             self._consecutive_fetch_failures += 1
             if self._consecutive_fetch_failures >= self._cfg.max_consecutive_kline_fetch_failures:
                 # Capture the latest detail for the fail-loud message.

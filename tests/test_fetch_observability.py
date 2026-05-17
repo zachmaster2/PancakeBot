@@ -1,9 +1,11 @@
 """Tests for the 2026-05-17 fetch-observability additions.
 
-Three layers verified:
+Four layers verified:
 
-1. ``TransientOkxError`` carries ``error_class`` + ``error_detail``
-   structured fields (backwards compatible with bare construction).
+1. ``TransientOkxError`` carries structured fields (error_class,
+   error_detail, rtt_ms, received_count, requested_count,
+   missing_position) -- all optional, backwards compatible with bare
+   construction.
 
 2. ``MomentumGate.last_fetch_results`` is populated after evaluate(),
    producing one entry per attempted symbol in the agreed format
@@ -15,6 +17,13 @@ Three layers verified:
    ``btc_fetch_result``, ``eth_fetch_result``, ``sol_fetch_result``)
    and ``record_cycle_audit`` propagates them faithfully, including
    the ``"not_fetched"`` default when the gate didn't run.
+
+4. ``PARTIAL`` log line (gate + sync) uses SUB=``KLINE`` (subsystem
+   identifier) with the symbol value in the kv tail as ``symbol=BTC-USDT``.
+   Field order: ``symbol -> reason -> received -> requested -> bar
+   -> error_detail (conditional)``. Reason ``okx_publish_delay`` fires
+   on partial-data responses; ``partial_response`` on non-data errors
+   with bytes received; ``okx_unreachable`` on pre-response failures.
 
 Run:
     python -m pytest tests/test_fetch_observability.py -v
@@ -455,3 +464,222 @@ def test_record_cycle_audit_defaults_when_not_fetched(tmp_path):
     assert rows[0]["btc_fetch_result"] == "not_fetched"
     assert rows[0]["eth_fetch_result"] == "not_fetched"
     assert rows[0]["sol_fetch_result"] == "not_fetched"
+
+
+# ---------------------------------------------------------------------------
+# (4) okx_client received_count computation + gate KLINE PARTIAL emission
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock
+
+from pancakebot.market_data.okx_client import OkxClient, RetryPolicy  # noqa: E402
+
+
+def _make_okx_client_with_response(response_payload: dict) -> tuple[OkxClient, MagicMock]:
+    """Build an OkxClient whose session.get returns a canned response."""
+    client = OkxClient(timeout_seconds=5.0)
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = response_payload
+    client._session = MagicMock()
+    client._session.get.return_value = fake_resp
+    return client, fake_resp
+
+
+def _candle_row(ts_ms: int) -> list:
+    """OKX returns newest-first; rows shape: [ts_ms, o, h, l, c, v, ...]."""
+    return [str(ts_ms), "100", "100", "100", "100", "1"]
+
+
+def test_okx_client_carries_received_and_requested_counts_on_insufficient():
+    """INSUFFICIENT response (got fewer rows than expected) surfaces both
+    ``received_count`` and ``requested_count`` on the raised exception.
+    Boundary position (newest vs oldest vs middle) is NOT computed --
+    OKX only ever shorts us at the tail in practice and supporting
+    hypothetical middle-gap / oldest-missing cases is overengineering.
+    """
+    requested_count = 16
+    oldest = 1_700_000_000_000
+    newest = oldest + (requested_count - 1) * 1000
+    rows = [_candle_row(newest - 1000 - i * 1000) for i in range(requested_count - 1)]
+    client, _ = _make_okx_client_with_response({"code": "0", "data": rows})
+    raised: TransientOkxError | None = None
+    try:
+        client.kline_fetch_window(
+            symbol="BTC-USDT",
+            oldest_open_ms=oldest,
+            newest_open_ms_inclusive=newest,
+            retry_policy=RetryPolicy(max_attempts=1, backoff_seconds=()),
+        )
+    except TransientOkxError as e:
+        raised = e
+    assert raised is not None
+    assert raised.received_count == 15
+    assert raised.requested_count == 16
+    # ``missing_position`` is intentionally not a field anymore.
+    assert not hasattr(raised, "missing_position")
+
+
+def test_gate_kline_part_publish_delay_reason_and_field_order(monkeypatch):
+    """Partial response (insufficient + got_N): reason=okx_publish_delay.
+    Field order in the log line is: symbol, reason, received, requested,
+    bar. error_detail is OMITTED because ``got_15_expected_16`` is pure
+    count-restatement (derivable from received/requested)."""
+    from pancakebot import log as log_module
+
+    gate = _make_gate()
+
+    def stub(*, symbol, **kwargs):
+        if symbol == "BTC-USDT":
+            raise TransientOkxError(
+                "kline_fetch_exhausted: symbol=BTC-USDT class=insufficient "
+                "detail=got_15_expected_16",
+                error_class="insufficient",
+                error_detail="got_15_expected_16",
+                rtt_ms=287,
+                received_count=15,
+                requested_count=16,
+            )
+        return _stub_kline_window_full(None, symbol=symbol, **kwargs)
+
+    monkeypatch.setattr(gate._client, "kline_fetch_window", stub)
+
+    warn_calls: list[dict] = []
+
+    def fake_emit(level, sys_name, sub, event, *, msg=None, **fields):
+        if event == "PARTIAL":
+            warn_calls.append({"sub": sub, "fields": dict(fields)})
+
+    monkeypatch.setattr(log_module, "_emit", fake_emit)
+
+    lock_at_ms = 1_700_000_000_000
+    gate.evaluate(lock_at_ms=lock_at_ms)
+
+    assert len(warn_calls) == 1
+    fields = warn_calls[0]["fields"]
+    # SUB is the subsystem identifier ("KLINE"), NOT the symbol value.
+    # The symbol surfaces in the kv tail as ``symbol=BTC-USDT``.
+    assert warn_calls[0]["sub"] == "KLINE"
+    # Reason: high-confidence publish_delay (partial-data response,
+    # detail starts with "got_").
+    assert fields["reason"] == "okx_publish_delay"
+    assert fields["symbol"] == "BTC-USDT"
+    assert fields["received"] == 15
+    assert fields["requested"] == 16
+    assert fields["bar"] == "1s"
+    # Dropped redundant / removed fields:
+    assert "missing_position" not in fields
+    assert "missing_count" not in fields
+    assert "error_class" not in fields
+    # error_detail="got_15_expected_16" is count-derivable -> omitted.
+    assert "error_detail" not in fields
+    # Field ORDER (operator-triage priority):
+    assert list(fields.keys()) == ["symbol", "reason", "received", "requested", "bar"]
+
+
+def test_gate_kline_part_partial_response_keeps_informative_error_detail(monkeypatch):
+    """HTTP 429 / OKX code response: rtt_ms set but error_detail is NOT
+    derivable from counts (received=0 doesn't tell you "rate limited").
+    error_detail is kept; reason=partial_response."""
+    from pancakebot import log as log_module
+
+    gate = _make_gate()
+
+    def stub(*, symbol, **kwargs):
+        if symbol == "BTC-USDT":
+            raise TransientOkxError(
+                "kline_fetch_exhausted: symbol=BTC-USDT class=retryable "
+                "detail=http_429",
+                error_class="retryable",
+                error_detail="http_429",
+                rtt_ms=412,
+                # No received_count -- the response was non-200 so we
+                # didn't parse the body.
+            )
+        return _stub_kline_window_full(None, symbol=symbol, **kwargs)
+
+    monkeypatch.setattr(gate._client, "kline_fetch_window", stub)
+
+    warn_calls: list[dict] = []
+
+    def fake_emit(level, sys_name, sub, event, *, msg=None, **fields):
+        if event == "PARTIAL":
+            warn_calls.append({"sub": sub, "fields": dict(fields)})
+
+    monkeypatch.setattr(log_module, "_emit", fake_emit)
+
+    lock_at_ms = 1_700_000_000_000
+    gate.evaluate(lock_at_ms=lock_at_ms)
+
+    assert len(warn_calls) == 1
+    fields = warn_calls[0]["fields"]
+    assert fields["reason"] == "partial_response"
+    assert fields["error_detail"] == "http_429"
+    assert "received" not in fields  # No body-parse happened.
+    assert "requested" not in fields
+
+
+def test_gate_kline_part_warn_unreachable_on_pre_response_failure(monkeypatch):
+    """Pre-response failure (rtt_ms=None) -> reason='okx_unreachable',
+    no received / requested / missing fields."""
+    from pancakebot import log as log_module
+
+    gate = _make_gate()
+
+    def stub(*, symbol, **kwargs):
+        if symbol == "BTC-USDT":
+            raise TransientOkxError(
+                "kline_fetch_exhausted: symbol=BTC-USDT class=retryable "
+                "detail=ConnectionError",
+                error_class="retryable",
+                error_detail="ConnectionError",
+                # No rtt_ms, no received_count -- pre-response failure.
+            )
+        return _stub_kline_window_full(None, symbol=symbol, **kwargs)
+
+    monkeypatch.setattr(gate._client, "kline_fetch_window", stub)
+
+    warn_calls: list[dict] = []
+
+    def fake_emit(level, sys_name, sub, event, *, msg=None, **fields):
+        if event == "PARTIAL":
+            warn_calls.append({"sub": sub, "fields": dict(fields)})
+
+    monkeypatch.setattr(log_module, "_emit", fake_emit)
+
+    lock_at_ms = 1_700_000_000_000
+    gate.evaluate(lock_at_ms=lock_at_ms)
+
+    assert len(warn_calls) == 1
+    fields = warn_calls[0]["fields"]
+    assert fields["reason"] == "okx_unreachable"
+    assert "missing_position" not in fields
+    assert "missing_count" not in fields
+    assert "received" not in fields
+    assert "requested" not in fields
+    # error_class was dropped from the log line (not derivable beyond
+    # what reason already conveys). error_detail kept because the
+    # exception class name (ConnectionError, ConnectTimeout, etc.) is
+    # operator-meaningful and not derivable from anything else.
+    assert "error_class" not in fields
+    assert fields["error_detail"] == "ConnectionError"
+
+
+def test_okx_client_does_not_emit_exhaust_log(monkeypatch):
+    """Regression: okx_client no longer logs ``error("NET", "OKX",
+    "EXHAUST", ...)`` itself. The structured exception is the operator
+    surface; callers (gate + sync) format the KLINE PARTIAL log."""
+    requested_count = 16
+    oldest = 1_700_000_000_000
+    newest = oldest + (requested_count - 1) * 1000
+    rows = [_candle_row(newest - 1000 - i * 1000) for i in range(requested_count - 1)]
+    client, _ = _make_okx_client_with_response({"code": "0", "data": rows})
+
+    # Patch okx_client's `error` import would be ideal, but we removed
+    # that import entirely. Verify by ensuring no AttributeError on
+    # access (the import is gone).
+    import pancakebot.market_data.okx_client as okx_client_mod
+    assert not hasattr(okx_client_mod, "error"), (
+        "okx_client.error import should have been removed; the EXHAUST log "
+        "is the caller's responsibility"
+    )
