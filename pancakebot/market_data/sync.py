@@ -15,8 +15,8 @@ from pathlib import Path
 
 from pancakebot import paths as _proj_paths
 from pancakebot.config import AppConfig
-from pancakebot.util import InvariantError, TransientGraphError
-from pancakebot.log import info
+from pancakebot.util import InvariantError, TransientGraphError, TransientOkxError
+from pancakebot.log import error, info, warn
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.market_data.round_sync import sync_closed_rounds
 from pancakebot.market_data.graph_client import GraphClient
@@ -125,35 +125,53 @@ def sync_runtime_market_data(
     # throttles total OKX requests to 8/s across all threads. Note: the
     # per-round window is now derived from lock_at only; cfg.kline_cutoff_seconds
     # is intentionally NOT used here (silent-corruption fix 2026-04-27).
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        bnb_fut = pool.submit(
-            _sync_1s_klines,
-            rounds=tail_rounds, inst_id="BNB-USDT",
-            store=bnb_store, label="BNB",
-            okx_client=okx_client,
+    #
+    # Sync is fail-loud: any TransientOkxError from a single round aborts
+    # the entire phase. Per-round KLINE PARTIAL warns (emitted inside
+    # _fetch_one_kline) already carry the structured detail; the summary
+    # ERROR below wraps with the orchestrator-level context (which symbol
+    # / which phase) so the operator sees a single high-signal line at
+    # the top of the failure.
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            bnb_fut = pool.submit(
+                _sync_1s_klines,
+                rounds=tail_rounds, inst_id="BNB-USDT",
+                store=bnb_store, label="BNB",
+                okx_client=okx_client,
+            )
+            btc_fut = pool.submit(
+                _sync_1s_klines,
+                rounds=tail_rounds, inst_id="BTC-USDT",
+                store=btc_store, label="BTC",
+                okx_client=okx_client,
+            )
+            eth_fut = pool.submit(
+                _sync_1s_klines,
+                rounds=tail_rounds, inst_id="ETH-USDT",
+                store=eth_store, label="ETH",
+                okx_client=okx_client,
+            )
+            sol_fut = pool.submit(
+                _sync_1s_klines,
+                rounds=tail_rounds, inst_id="SOL-USDT",
+                store=sol_store, label="SOL",
+                okx_client=okx_client,
+            )
+            bnb_synced = bnb_fut.result()
+            btc_synced = btc_fut.result()
+            eth_synced = eth_fut.result()
+            sol_synced = sol_fut.result()
+    except TransientOkxError as e:
+        error(
+            "CORE", "SYNC", "ABORT",
+            msg=(
+                f"1s kline backfill aborted on TransientOkxError; "
+                f"per-symbol KLINE PARTIAL warns above carry the structured "
+                f"detail. err={e}"
+            ),
         )
-        btc_fut = pool.submit(
-            _sync_1s_klines,
-            rounds=tail_rounds, inst_id="BTC-USDT",
-            store=btc_store, label="BTC",
-            okx_client=okx_client,
-        )
-        eth_fut = pool.submit(
-            _sync_1s_klines,
-            rounds=tail_rounds, inst_id="ETH-USDT",
-            store=eth_store, label="ETH",
-            okx_client=okx_client,
-        )
-        sol_fut = pool.submit(
-            _sync_1s_klines,
-            rounds=tail_rounds, inst_id="SOL-USDT",
-            store=sol_store, label="SOL",
-            okx_client=okx_client,
-        )
-        bnb_synced = bnb_fut.result()
-        btc_synced = btc_fut.result()
-        eth_synced = eth_fut.result()
-        sol_synced = sol_fut.result()
+        raise
 
     # Phase 3: Integrity assertion -- with centralized retry inside OkxClient,
     # a successful Phase 2 means every pair has the full expected epoch set by
@@ -224,7 +242,10 @@ def _sync_1s_klines(
     done_epochs = store.load_done_epochs()
     remaining = [r for r in rounds if int(r.epoch) not in done_epochs]
     if not remaining:
-        info("SYNC", "1S_KL", label, msg=f"All {len(done_epochs)} epochs already synced")
+        info(
+            "SYNC", "KLINE", "SKIP",
+            msg=f"{label}: all {len(done_epochs)} epochs already synced",
+        )
         return 0
 
     remaining.sort(key=lambda r: int(r.epoch))
@@ -243,8 +264,9 @@ def _sync_1s_klines(
 
     total_to_fetch = len(prepend_rounds) + len(append_rounds)
     info(
-        "SYNC", "1S_KL", label,
-        msg=f"Fetching {total_to_fetch} rounds ({len(done_epochs)} already done) "
+        "SYNC", "KLINE", "START",
+        msg=f"{label}: fetching {total_to_fetch} rounds "
+            f"({len(done_epochs)} already done) "
             f"append={len(append_rounds)} prepend={len(prepend_rounds)} "
             f"workers={_FETCH_WORKERS} batch_size={_BATCH_SIZE}",
     )
@@ -274,7 +296,7 @@ def _sync_1s_klines(
             _prepend_staging_to_store(store=store, staging_path=staging_path, label=label)
             total_synced += synced
 
-    info("SYNC", "1S_KL", label, msg=f"Done: {total_synced} synced")
+    info("SYNC", "KLINE", "DONE", msg=f"{label}: {total_synced} synced")
     return total_synced
 
 
@@ -318,8 +340,8 @@ def _fetch_and_append(
         synced += len(appendable)
 
         if (batch_start + _BATCH_SIZE) % 200 < _BATCH_SIZE:
-            info("SYNC", "1S_KL", label,
-                 msg=f"  append: {done_count + synced} done")
+            info("SYNC", "KLINE", "APPEND",
+                 msg=f"{label}: {done_count + synced} done")
 
     return synced
 
@@ -340,8 +362,8 @@ def _fetch_to_staging(
             for line in f:
                 if line.strip():
                     staged_epochs.add(int(json.loads(line)["epoch"]))
-        info("SYNC", "1S_KL", label,
-             msg=f"  prepend staging: {len(staged_epochs)} already staged from prior run")
+        info("SYNC", "KLINE", "STAGED",
+             msg=f"{label}: {len(staged_epochs)} already staged from prior run")
 
     still_needed = [r for r in rounds_asc if int(r.epoch) not in staged_epochs]
     if not still_needed:
@@ -365,8 +387,8 @@ def _fetch_to_staging(
                 synced += 1
 
             if (batch_start + _BATCH_SIZE) % 200 < _BATCH_SIZE:
-                info("SYNC", "1S_KL", label,
-                     msg=f"  prepend staging: {synced} staged")
+                info("SYNC", "KLINE", "STAGED",
+                     msg=f"{label}: {synced} staged")
 
     return synced
 
@@ -395,8 +417,8 @@ def _prepend_staging_to_store(*, store: KlineStore, staging_path: str, label: st
 
     # Clean up staging file.
     _os.remove(staging_path)
-    info("SYNC", "1S_KL", label,
-         msg=f"  prepended {len(staging_records)} older epochs into store")
+    info("SYNC", "KLINE", "PREPENDED",
+         msg=f"{label}: prepended {len(staging_records)} older epochs into store")
 
 
 def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient) -> list[dict]:
@@ -428,18 +450,67 @@ def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient) -> dict:
     Raises InvariantError on shape violations. Raises TransientOkxError if
     the shared retry policy in ``OkxClient.kline_fetch_window`` exhausts
     (rare with RETRY_SYNC's 5-attempt budget; sync treats it as fail-loud
-    rather than skipping the round).
+    rather than skipping the round). Before re-raising the transient, a
+    single WARN is emitted with the exception's structured fields -- the
+    okx_client layer no longer logs EXHAUST itself (data-plane only), so
+    this is the operator-facing surface for the failure.
     """
     epoch = int(rnd.epoch)
     lock_at = int(rnd.lock_at)
     lock_at_ms = lock_at * 1000
     # Sync's bulk fetch doesn't consume the per-call RTT (no operator
     # log line for it), so discard the second tuple element.
-    klines, _rtt_ms = okx_client.kline_fetch_window(
-        symbol=inst_id,
-        oldest_open_ms=lock_at_ms - _HISTORY_OLDEST_OFFSET_MS,
-        newest_open_ms_inclusive=lock_at_ms - _HISTORY_NEWEST_OFFSET_MS,
-        retry_policy=RETRY_SYNC,
-        rate_acquire_fn=okx_rate_acquire,
-    )
+    try:
+        klines, _rtt_ms = okx_client.kline_fetch_window(
+            symbol=inst_id,
+            oldest_open_ms=lock_at_ms - _HISTORY_OLDEST_OFFSET_MS,
+            newest_open_ms_inclusive=lock_at_ms - _HISTORY_NEWEST_OFFSET_MS,
+            retry_policy=RETRY_SYNC,
+            rate_acquire_fn=okx_rate_acquire,
+        )
+    except TransientOkxError as e:
+        # Match the gate's KLINE PARTIAL field policy + ordering. Sync is
+        # bulk-historical so publish-delay is unlikely (OKX should have
+        # published all candles by now), but the same taxonomy keeps
+        # log-aggregation queries unified across live + sync paths.
+        received = getattr(e, "received_count", None)
+        requested = getattr(e, "requested_count", None)
+        error_detail = getattr(e, "error_detail", None)
+        rtt_ms = getattr(e, "rtt_ms", None)
+
+        if (
+            error_detail is not None
+            and error_detail.startswith("got_")
+            and received is not None
+            and requested is not None
+            and received < requested
+        ):
+            reason = "okx_publish_delay"
+        elif rtt_ms is not None:
+            reason = "partial_response"
+        else:
+            reason = "okx_unreachable"
+
+        fields: dict[str, object] = {
+            "symbol": inst_id,
+            "epoch": epoch,
+            "reason": reason,
+        }
+        # received + requested emitted as a pair (see momentum_gate.py
+        # for the rationale; okx_client only populates received_count on
+        # INSUFFICIENT responses).
+        if received is not None and requested is not None:
+            fields["received"] = received
+            fields["requested"] = requested
+        fields["bar"] = "1s"
+        if (
+            error_detail is not None
+            and not error_detail.startswith("got_")
+            and error_detail != "empty_data"
+        ):
+            fields["error_detail"] = error_detail
+        warn("SYNC", "KLINE", "PARTIAL", **fields)
+        # Sync's contract is fail-loud: re-raise so the orchestrator
+        # surfaces the failure as a SYNC ERROR summary line and aborts.
+        raise
     return {"epoch": epoch, "lock_at": lock_at, "klines_1s": klines}

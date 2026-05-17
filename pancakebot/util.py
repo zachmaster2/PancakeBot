@@ -26,7 +26,7 @@ class TransientOkxError(Exception):
 
     ``error_class`` mirrors ``_OkxErrorClass.value`` from okx_client
     (``"retryable" | "permanent" | "insufficient"``); ``error_detail`` is
-    the same short string the EXHAUST log line emits
+    the same short string the EXHAUST log line used to emit
     (``"got_15_expected_16" | "http_429" | "okx_code_50011" | ...``).
     ``rtt_ms`` is the HTTP round-trip time of the final attempt when a
     response was actually received from OKX (INSUFFICIENT/RETRYABLE-from-
@@ -35,7 +35,12 @@ class TransientOkxError(Exception):
     pre-bytes timeout) -- the time-to-failure of those paths isn't a
     meaningful "OKX RTT" for downstream analysis.
 
-    All three default to None for backwards compatibility with bare
+    ``received_count`` / ``requested_count`` carry the partial-response
+    shape: how many rows OKX returned vs how many were asked for. Both
+    are ``None`` when the request didn't reach the response-parsing path
+    (pre-response failure).
+
+    All fields default to None for backwards compatibility with bare
     ``raise TransientOkxError("msg")`` callsites.
     """
 
@@ -46,11 +51,15 @@ class TransientOkxError(Exception):
         error_class: str | None = None,
         error_detail: str | None = None,
         rtt_ms: int | None = None,
+        received_count: int | None = None,
+        requested_count: int | None = None,
     ) -> None:
         super().__init__(message)
         self.error_class = error_class
         self.error_detail = error_detail
         self.rtt_ms = rtt_ms
+        self.received_count = received_count
+        self.requested_count = requested_count
 
 
 # -- Paths ---------------------------------------------------------

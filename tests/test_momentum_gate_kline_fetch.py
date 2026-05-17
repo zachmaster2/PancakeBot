@@ -316,12 +316,21 @@ def test_evaluate_emits_one_warn_per_failed_symbol_on_transient():
     assert len(warn_calls) == 2, (
         f"expected 2 warns (ETH+SOL), got {len(warn_calls)}: {warn_calls}"
     )
-    sub_tags = sorted(args[1] for args, _ in warn_calls)
-    assert sub_tags == ["ETH", "SOL"]
+    # SUB now identifies the subsystem ("KLINE"), not the per-symbol value
+    # (which lives in the ``symbol=`` field of the kv tail). The symbol
+    # values surface via kwargs["symbol"], not args[1].
+    symbol_tags = sorted(kwargs["symbol"] for _, kwargs in warn_calls)
+    assert symbol_tags == ["ETH-USDT", "SOL-USDT"]
     for args, kwargs in warn_calls:
         assert args[0] == "GATE"
-        assert args[2] == "FETCH_FAIL"
-        assert "kline_fetch_exhausted" in kwargs.get("msg", "")
+        assert args[1] == "KLINE"
+        assert args[2] == "PARTIAL"
+        # Structured kwargs (symbol, reason, optional received/requested,
+        # bar, optional error_detail) replaced the prior free-text
+        # ``msg=f"reason={e}"`` shape in 2026-05-17.
+        assert kwargs.get("reason") in (
+            "okx_publish_delay", "partial_response", "okx_unreachable"
+        )
 
 
 def test_evaluate_all_three_transient_produces_three_warns_and_one_skip():
@@ -340,7 +349,12 @@ def test_evaluate_all_three_transient_produces_three_warns_and_one_skip():
         result = gate.evaluate(lock_at_ms=_LOCK_AT_MS)
     assert result.skip_reason == "kline_fetch_transient_failure"
     assert len(warn_calls) == 3
-    assert sorted(args[1] for args, _ in warn_calls) == ["BTC", "ETH", "SOL"]
+    # SUB is always "KLINE" (subsystem); per-symbol value lives in the
+    # ``symbol=...`` field of the kv tail.
+    assert all(args[1] == "KLINE" for args, _ in warn_calls)
+    assert sorted(kwargs["symbol"] for _, kwargs in warn_calls) == [
+        "BTC-USDT", "ETH-USDT", "SOL-USDT",
+    ]
     assert gate._consecutive_fetch_failures == 1
 
 

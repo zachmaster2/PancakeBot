@@ -19,6 +19,14 @@ from pancakebot.util import InvariantError
 
 _SYS_NAME_W: int = 8
 _SUB_W: int = 6
+# Event column width (left-padded, hard-enforced by ``_emit``). Sized
+# to fit the longest event name in the codebase (currently
+# ``ROTATE_FAIL`` and ``IMPORT_FAIL`` at 11 chars). Convention:
+# event names describe what HAPPENED (an action / outcome) and should
+# leverage the SUB column to avoid redundancy -- e.g. SUB=KLINE +
+# EVENT=PARTIAL reads cleaner than SUB=KLINE + EVENT=KLINE_PARTIAL.
+# If a future event name exceeds 11, ``InvariantError`` fires at emit
+# time so the dev can either shorten the name or bump this width.
 _EVENT_W: int = 11
 
 # Bundle 5 2026-05-14: a RotatingFileHandler-backed Python ``logging``
@@ -206,9 +214,9 @@ def _emit(level: str, sys_name: str, sub: str, event: str, *, msg: str | None = 
     line = (
         f"{ts}  "
         f"{level:<5} "
-        f"{sys_name:<8} "
-        f"{sub:<6} "
-        f"{event:<11}"
+        f"{sys_name:<{_SYS_NAME_W}} "
+        f"{sub:<{_SUB_W}} "
+        f"{event:<{_EVENT_W}}"
         f"{tail}"
     )
 
