@@ -106,6 +106,26 @@ def ensure_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         "btc_fetch_ms",
         "eth_fetch_ms",
         "sol_fetch_ms",
+        # Per-round wake-mode + kline fetch fire offset for offline
+        # publish-delay-tail analysis. Added 2026-05-17.
+        # ``wake_mode``: "dynamic" (Bundle 5 v2 anchor-driven) or
+        #   "static" (anchor poll timed out / not wired). Empty string
+        #   when an early-skip path (e.g. risk_bankroll_stale at the
+        #   bankroll wake) fired before the anchor poll resolved.
+        # ``kline_fire_offset_before_lock_ms``: ms before ``lock_at`` at
+        #   which the parallel kline GETs fired (= critical_path lead -
+        #   POOL_READ_TIME_MS). Empty string for the same early-skip
+        #   paths.
+        "wake_mode",
+        "kline_fire_offset_before_lock_ms",
+        # Per-symbol kline-fetch RESULT codes for the joint
+        # fail-rate-vs-fire-time distribution. Added 2026-05-17.
+        # Codes (see MomentumGate.last_fetch_results docstring):
+        #   "ok" / "partial:got_N_expected_M" / "error:<detail>" /
+        #   "not_fetched"
+        "btc_fetch_result",
+        "eth_fetch_result",
+        "sol_fetch_result",
     ]
     p = Path(path)
     if reset or not p.exists():
@@ -274,6 +294,11 @@ def record_cycle_audit(
     btc_fetch_ms: int | None = None,
     eth_fetch_ms: int | None = None,
     sol_fetch_ms: int | None = None,
+    wake_mode: str = "",
+    kline_fire_offset_before_lock_ms: int | None = None,
+    btc_fetch_result: str = "not_fetched",
+    eth_fetch_result: str = "not_fetched",
+    sol_fetch_result: str = "not_fetched",
 ) -> None:
     # Use RPC-fetched pool values when available (live/dry mode);
     # fall back to round_t.bets snapshot (backtest / no RPC data).
@@ -365,6 +390,14 @@ def record_cycle_audit(
             "btc_fetch_ms": "" if btc_fetch_ms is None else btc_fetch_ms,
             "eth_fetch_ms": "" if eth_fetch_ms is None else eth_fetch_ms,
             "sol_fetch_ms": "" if sol_fetch_ms is None else sol_fetch_ms,
+            "wake_mode": wake_mode,
+            "kline_fire_offset_before_lock_ms": (
+                "" if kline_fire_offset_before_lock_ms is None
+                else kline_fire_offset_before_lock_ms
+            ),
+            "btc_fetch_result": btc_fetch_result,
+            "eth_fetch_result": eth_fetch_result,
+            "sol_fetch_result": sol_fetch_result,
         },
     )
 

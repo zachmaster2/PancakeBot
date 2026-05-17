@@ -19,7 +19,38 @@ class TransientGraphError(Exception):
 
 
 class TransientOkxError(Exception):
-    pass
+    """OKX fetch failed after the retry budget exhausted (or single-attempt
+    on the live decision path). Optionally carries structured detail so
+    callers can render per-symbol result codes for observability without
+    parsing the str message.
+
+    ``error_class`` mirrors ``_OkxErrorClass.value`` from okx_client
+    (``"retryable" | "permanent" | "insufficient"``); ``error_detail`` is
+    the same short string the EXHAUST log line emits
+    (``"got_15_expected_16" | "http_429" | "okx_code_50011" | ...``).
+    ``rtt_ms`` is the HTTP round-trip time of the final attempt when a
+    response was actually received from OKX (INSUFFICIENT/RETRYABLE-from-
+    HTTP/PERMANENT-from-HTTP). It is ``None`` when no response was
+    received (pre-response network exception: DNS fail, connect refused,
+    pre-bytes timeout) -- the time-to-failure of those paths isn't a
+    meaningful "OKX RTT" for downstream analysis.
+
+    All three default to None for backwards compatibility with bare
+    ``raise TransientOkxError("msg")`` callsites.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_class: str | None = None,
+        error_detail: str | None = None,
+        rtt_ms: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_class = error_class
+        self.error_detail = error_detail
+        self.rtt_ms = rtt_ms
 
 
 # -- Paths ---------------------------------------------------------

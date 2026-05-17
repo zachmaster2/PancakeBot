@@ -153,6 +153,26 @@ class MomentumGate:
         # caller AFTER the timing guard so file I/O doesn't delay bet
         # submission.
         self.last_fetch_timing: dict[str, int] | None = None
+        # Per-symbol fetch RESULT codes from the last evaluate() call.
+        # One entry per symbol in ``_OKX_SYMBOLS_FETCHED`` (BTC/ETH/SOL).
+        # Codes:
+        #   "ok"                          — successful fetch (full window returned)
+        #   "partial:got_N_expected_M"    — INSUFFICIENT: OKX returned fewer
+        #                                   candles than requested (typically the
+        #                                   newest candle not yet published)
+        #   "error:<detail>"              — RETRYABLE or PERMANENT class error
+        #                                   (e.g. "error:http_429",
+        #                                   "error:okx_code_50011",
+        #                                   "error:json_parse_error")
+        #   "not_fetched"                 — symbol wasn't attempted this round
+        #                                   (only happens if the evaluate path
+        #                                   short-circuits before submit; not
+        #                                   used in the current flow)
+        # Persisted to cycle_audit CSV (btc_fetch_result / eth_fetch_result /
+        # sol_fetch_result) so the publish-delay tail can be analysed
+        # offline conditional on the round's wake_mode + fire offset.
+        # Added 2026-05-17.
+        self.last_fetch_results: dict[str, str] | None = None
         # Consecutive-failure escalation state (TransientOkxError streak).
         self._consecutive_fetch_failures: int = 0
         # ThreadPoolExecutor lives for the gate's lifetime so we don't pay
@@ -207,6 +227,7 @@ class MomentumGate:
         # current round's audit row. The successful path overwrites this at
         # line 255 with the fetched durations. (Y2 fix 2026-05-12.)
         self.last_fetch_timing = None
+        self.last_fetch_results = None
 
         cutoff_ts_ms = lock_at_ms - self._cfg.kline_cutoff_seconds * 1000
         max_lookback = max(self._cfg.mtf_lookbacks)
@@ -259,7 +280,49 @@ class MomentumGate:
                 durations[sym_short] = rtt_ms
             except (InvariantError, TransientOkxError) as e:
                 errors[sym_short] = e
+                # Capture the partial RTT even on failure when the OKX
+                # call actually returned bytes (INSUFFICIENT / response-
+                # path RETRYABLE / response-path PERMANENT). This lets
+                # offline analysis distinguish "OKX was slow to publish
+                # the cutoff candle" (call completed, RTT present, result
+                # ``partial:got_N_expected_M``) from "OKX never replied"
+                # (call failed pre-response, RTT absent, result
+                # ``error:<ExceptionName>``).
+                if isinstance(e, TransientOkxError) and e.rtt_ms is not None:
+                    durations[sym_short] = e.rtt_ms
         self.last_fetch_timing = {f"{sym}_ms": ms for sym, ms in durations.items()}
+        # Build per-symbol result codes for offline analysis. One entry per
+        # attempted symbol; absent symbols (BNB today) don't appear here.
+        # See ``self.last_fetch_results`` field doc for code format.
+        fetch_results: dict[str, str] = {}
+        for sym_short in _OKX_SYMBOLS_FETCHED:
+            if sym_short in results:
+                fetch_results[sym_short] = "ok"
+            elif sym_short in errors:
+                err = errors[sym_short]
+                if isinstance(err, TransientOkxError):
+                    cls = err.error_class
+                    detail = err.error_detail
+                    if cls == "insufficient" and isinstance(detail, str) and detail.startswith("got_"):
+                        fetch_results[sym_short] = f"partial:{detail}"
+                    elif isinstance(detail, str):
+                        fetch_results[sym_short] = f"error:{detail}"
+                    else:
+                        # Legacy TransientOkxError without structured fields
+                        # (shouldn't reach here from kline_fetch_window in
+                        # current code, but defensive for future raise sites).
+                        fetch_results[sym_short] = "error:unstructured"
+                else:
+                    # InvariantError is raised below as a hard failure;
+                    # record it for completeness even though the round
+                    # won't continue.
+                    fetch_results[sym_short] = "error:invariant"
+            else:
+                # Symbol was in _OKX_SYMBOLS_FETCHED but neither succeeded
+                # nor errored -- shouldn't happen given as_completed iterates
+                # every submitted future, but record defensively.
+                fetch_results[sym_short] = "not_fetched"
+        self.last_fetch_results = fetch_results
 
         invariant_errors = [
             (s, e) for s, e in errors.items() if isinstance(e, InvariantError)

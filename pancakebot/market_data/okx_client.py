@@ -487,6 +487,13 @@ class OkxClient:
         last_detail = ""
         last_class: _OkxErrorClass | None = None
         rtt_ms = 0
+        # Track whether the final attempt actually received bytes from OKX.
+        # True -> rtt_ms is a meaningful OKX HTTP round-trip even when the
+        # response is classified INSUFFICIENT / RETRYABLE / PERMANENT.
+        # False -> the .get() raised before bytes returned (DNS fail,
+        # connect refused, pre-bytes timeout); rtt_ms measures time-to-
+        # failure, not OKX latency, so callers should treat it as unset.
+        response_received = False
         for attempt in range(retry_policy.max_attempts):
             if rate_acquire_fn is not None:
                 rate_acquire_fn()
@@ -500,9 +507,11 @@ class OkxClient:
             except requests.RequestException as e:
                 rtt_ms = int((time.perf_counter() - t_get_start) * 1000)
                 cls, detail = _classify_exception(e)
+                response_received = False
             else:
                 rtt_ms = int((time.perf_counter() - t_get_start) * 1000)
                 cls, detail = _classify_response(resp, expected_count)
+                response_received = True
 
             if cls == _OkxErrorClass.SUCCESS:
                 if attempt > 0:
@@ -562,7 +571,15 @@ class OkxClient:
                       symbol=symbol, error_class=cls.value, error_detail=detail)
                 raise TransientOkxError(
                     f"kline_fetch_exhausted: symbol={symbol} "
-                    f"class={cls.value} detail={detail}"
+                    f"class={cls.value} detail={detail}",
+                    error_class=cls.value,
+                    error_detail=detail,
+                    # Only surface rtt_ms when OKX actually returned bytes.
+                    # Pre-response failures (DNS / connect refused / pre-
+                    # bytes timeout) have a measurable time-to-failure
+                    # but it is not a meaningful OKX RTT for downstream
+                    # publish-delay-tail analysis.
+                    rtt_ms=rtt_ms if response_received else None,
                 )
             base_delay = retry_policy.backoff_seconds[attempt]
             delay = base_delay * random.uniform(_RETRY_JITTER_MIN_FRACTION, _RETRY_JITTER_MAX_FRACTION)
