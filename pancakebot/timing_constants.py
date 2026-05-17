@@ -67,14 +67,6 @@ Cross-validations enforced at config load. The CUTOFFS are fixed
 inputs (set by strategy / data-horizon requirements); the OFFSETS
 must fit within the cutoff windows.
 
-    (critical_path_wakeup_offset_before_lock_ms - POOL_READ_TIME_MS)
-        <= (kline_cutoff_seconds * 1000 - OKX_KLINE_PUBLISH_DELAY_P95_MS)
-        (the kline fetch fires inside the critical path AFTER the pool
-        snapshot, i.e. at lock - (critical_path_wakeup_offset_before_lock_ms -
-        POOL_READ_TIME_MS); the cutoff candle has typically been
-        published by then; rare publish-delay tail misses are
-        absorbed by the streak counter)
-
     (final_rpc_poll_wakeup_offset_before_lock_ms
         - rpc_rtt_p99_for_batch(EXPECTED_FINAL_POLL_BATCH_SIZE)
         - RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
@@ -102,31 +94,31 @@ from __future__ import annotations
 
 # --- OKX REST timing -------------------------------------------------------
 
-# OKX /history-candles publishing latency (= time between candle close and
-# the candle being available via REST /history-candles for our 3-symbol
-# parallel fetch).
+# OKX /history-candles publishing latency reference (informational only,
+# not gated by the runtime). The bot always fetches at the latest moment
+# the wake schedule allows, so the per-round publish-tail risk depends on
+# how late dynamic mode fires -- not on a configured "budget." The only
+# runtime tolerance is the streak counter
+# (``max_consecutive_kline_fetch_failures``), which absorbs up to N
+# consecutive ``got_<N-1>_expected_N`` outcomes before crashing the bot
+# (-> supervisor restart + Discord alert).
 #
+# Empirically measured distribution (kept here so future operators don't
+# re-derive what we've already paid the cost to measure):
+#   P95 ≈ 700ms, P99 ≈ 1300ms
 # Source: research/p4c_canonical_loop_probe.py at varying wake offsets,
 #         n=1000 + n=200 prior, 2026-05-02..2026-05-03.
 # Method: probe @ wake=850ms (1150ms post-close) → 98.3% per-symbol
 #         first-try; probe @ wake=1200ms (800ms post-close) → 96.9%.
+# Last measured: 2026-05-03.
 #
-# Two percentile values are exposed:
-#   - P95: the budget the cutoff cross-validation uses. The kline-fetch
-#     wake fires at lock - kline_fetch_wakeup_offset_ms; the cutoff
-#     candle has had (cutoff_ms - kline_fetch_wakeup_offset_ms) time
-#     to publish by then. Validation: that gap >= P95 publish delay
-#     (~5% of fetches will hit a still-unpublished cutoff candle and
-#     skip via the streak-counter path -- acceptable tail).
-#   - P99: documented strict tail (extrapolated from probe). NOT used
-#     in validation: at the canonical operating point (cutoff=2,
-#     kline_fetch_wakeup_offset_ms=1090) the gap is 910ms < 1300ms,
-#     so a strict-P99 validation would block a known-good config.
-#     The strategy tolerates P99 misses; the streak counter is the
-#     safety net.
-# Last measured: 2026-05-03
-OKX_KLINE_PUBLISH_DELAY_P95_MS: int = 700
-OKX_KLINE_PUBLISH_DELAY_P99_MS: int = 1300
+# Removed 2026-05-17: the prior ``OKX_KLINE_PUBLISH_DELAY_P95_MS`` and
+# ``OKX_KLINE_PUBLISH_DELAY_P99_MS`` constants + their config-load tier
+# ladder + the ``kline_publish_tier`` label they emitted. The tier check
+# was a one-shot config-load gate, never re-consulted at runtime; with
+# the Bundle 5 v2 dynamic anchor-driven wake, the actual fetch fires at
+# whatever offset the anchor dictates anyway, making the static-wake
+# tier label misleading.
 
 # OKX REST round-trip time for /history-candles fetches. Pooled p95 over
 # the 4 symbols (BTC, ETH, SOL, BNB).
@@ -516,13 +508,6 @@ POOL_READ_TIME_MS: int = 5
 
 # --- Module-load sanity checks --------------------------------------------
 
-# Percentile order must hold: P95 <= P99 (probe noise that inverted them
-# would silently break the tier-fallback validation in config.py).
-assert OKX_KLINE_PUBLISH_DELAY_P95_MS <= OKX_KLINE_PUBLISH_DELAY_P99_MS, (
-    f"OKX_KLINE_PUBLISH_DELAY_P95_MS ({OKX_KLINE_PUBLISH_DELAY_P95_MS}) "
-    f"must be <= OKX_KLINE_PUBLISH_DELAY_P99_MS "
-    f"({OKX_KLINE_PUBLISH_DELAY_P99_MS}); probe ordering violated"
-)
 assert OKX_KLINE_FETCH_RTT_P95_MS <= OKX_KLINE_FETCH_RTT_P99_MS, (
     f"OKX_KLINE_FETCH_RTT_P95_MS ({OKX_KLINE_FETCH_RTT_P95_MS}) "
     f"must be <= OKX_KLINE_FETCH_RTT_P99_MS "

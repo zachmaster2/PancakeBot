@@ -2,11 +2,10 @@
 # How many seconds before lock_at to sample kline data. The strategy
 # REQUIRES the kline closing at lock - kline_cutoff_seconds (cutoff=2
 # is the canonical baseline; without that kline the strategy falls
-# apart). The validation at config load checks the WAKE OFFSET fits
-# the cutoff window:
-#   kline_fetch_wakeup_offset_ms <= kline_cutoff_seconds * 1000
-#                                   - OKX_KLINE_PUBLISH_DELAY_P95_MS
-# (the cutoff is fixed by strategy; the offsets adjust around it).
+# apart). Runtime tolerance for OKX publish-delay tails is via the
+# max_consecutive_kline_fetch_failures streak counter (the bot fetches
+# at the latest possible moment the wake schedule allows; the
+# streak counter absorbs occasional publish-delay misses).
 kline_cutoff_seconds = 2
 
 # Pool aggregate horizon: only on-chain bets with block_ts < lock_at -

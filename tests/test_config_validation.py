@@ -3,10 +3,6 @@
 Covers ``kline_cutoff_seconds`` range validation: ``cutoff < 1`` would
 request a candle past lock_at (which OKX hasn't published), and
 ``cutoff > 30`` erodes the gate's predictive horizon for no benefit.
-The wake-offset cross-validation is enforced separately via
-``kline_fetch_wakeup_offset_ms <= kline_cutoff_seconds * 1000 -
-OKX_KLINE_PUBLISH_DELAY_P95_MS``; see test_p4c_lock_safety_margin.py
-for that path.
 
 Run:
     python -m pytest tests/test_config_validation.py -v
@@ -49,12 +45,16 @@ def _write_cfg(tmp_path: Path, cutoff: int) -> Path:
     return p
 
 
-@pytest.mark.parametrize("cutoff", [2, 3, 15, 30])
+@pytest.mark.parametrize("cutoff", [1, 2, 3, 15, 30])
 def test_kline_cutoff_seconds_accepts_valid_range(tmp_path, cutoff):
-    """Range [1..30] PLUS wake-offset cross-validation:
-    kline_fetch_wakeup_offset_ms <= kline_cutoff*1000 -
-    OKX_KLINE_PUBLISH_DELAY_P95_MS. With kline_fetch_wakeup=1090 and
-    P95=700, the minimum valid cutoff is 2 (=2000ms; 1090 <= 1300).
+    """Range [1..30] accepted by the runtime-section validator.
+
+    Note: prior to 2026-05-17 cutoff=1 was rejected at load by the
+    publish-tier wake-offset cross-validation. That gate has been
+    removed (it didn't influence runtime behavior, only the startup
+    label); cutoff=1 now loads, though the strategy is still expected
+    to fail in practice because OKX won't have published the cutoff
+    candle by fetch time. The streak counter is the runtime safety net.
     """
     cfg = load_app_config(str(_write_cfg(tmp_path, cutoff)))
     assert cfg.kline_cutoff_seconds == cutoff
@@ -168,7 +168,7 @@ def _run_all() -> int:
     """Standalone runner (parametrize unrolled manually)."""
     failed = 0
     import tempfile
-    for valid in [2, 3, 15, 30]:
+    for valid in [1, 2, 3, 15, 30]:
         with tempfile.TemporaryDirectory() as td:
             try:
                 test_kline_cutoff_seconds_accepts_valid_range(Path(td), valid)
