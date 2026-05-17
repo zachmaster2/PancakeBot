@@ -489,6 +489,11 @@ def _record_dry_cycle_audit(
     btc_fetch_ms: int | None = None,
     eth_fetch_ms: int | None = None,
     sol_fetch_ms: int | None = None,
+    wake_mode: str = "",
+    kline_fire_offset_before_lock_ms: int | None = None,
+    btc_fetch_result: str = "not_fetched",
+    eth_fetch_result: str = "not_fetched",
+    sol_fetch_result: str = "not_fetched",
 ) -> None:
     if not cfg.dry:
         return
@@ -513,6 +518,11 @@ def _record_dry_cycle_audit(
         btc_fetch_ms=btc_fetch_ms,
         eth_fetch_ms=eth_fetch_ms,
         sol_fetch_ms=sol_fetch_ms,
+        wake_mode=wake_mode,
+        kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+        btc_fetch_result=btc_fetch_result,
+        eth_fetch_result=eth_fetch_result,
+        sol_fetch_result=sol_fetch_result,
     )
 
 

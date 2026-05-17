@@ -100,6 +100,23 @@ def _kline_timing_get(gate, key: str) -> int | None:
     return timing.get(key)
 
 
+def _kline_result_get(gate, sym_short: str) -> str:
+    """Safe lookup into ``gate.last_fetch_results[sym_short]``.
+
+    Returns ``"not_fetched"`` when the gate is None or hasn't run yet
+    this round (e.g. early-skip paths like risk_bankroll_stale or
+    pool_not_ready). Cycle-audit persists the string as-is so downstream
+    analysis can distinguish "round skipped before fetch" from "fetch
+    failed."
+    """
+    if gate is None:
+        return "not_fetched"
+    results = gate.last_fetch_results
+    if results is None:
+        return "not_fetched"
+    return results.get(sym_short, "not_fetched")
+
+
 # -- Heartbeat context -------------------------------------------------------
 # _run_one_iteration refreshes this at the top of every tick; _sleep_until_ts
 # reads it to emit a per-second heartbeat during long sleeps (deadlock
@@ -386,6 +403,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             # noinspection PyProtectedMember
             gate = closed.strategy_pipeline._gate
 
+        # Per-round wake-mode + kline-fire-offset for offline analysis. Filled
+        # in at critical_path resolution (lines ~585-630) once the anchor
+        # poll result is known. Early-skip paths (e.g. risk_bankroll_stale,
+        # which fires at the bankroll wake before the anchor poll) leave
+        # these empty -- the bot never decided which mode to use.
+        wake_mode: str = ""
+        kline_fire_offset_before_lock_ms: int | None = None
+
         # If we missed the previous epoch's cutoff and are now targeting a
         # newer epoch, the previously-locked epoch (which just closed) may
         # become claimable before the next cutoff. In that case, we must
@@ -488,6 +513,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     bankroll_before_action_bnb=last_known_bankroll,
                     bankroll_after_action_bnb=last_known_bankroll,
                     skip_reason="risk_bankroll_stale",
+                    wake_mode=wake_mode,
+                    kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                    btc_fetch_result=_kline_result_get(gate, "btc"),
+                    eth_fetch_result=_kline_result_get(gate, "eth"),
+                    sol_fetch_result=_kline_result_get(gate, "sol"),
                 )
                 info("RUN", "ACT", "SKIP",
                      msg=f"Skip epoch {current_epoch}: risk_bankroll_stale")
@@ -623,11 +653,28 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                           f"dynamic_lead_ms={_dynamic_lead_ms} "
                           f"anchor_bn={round_anchor.block_number} "
                           f"epoch={current_epoch}"))
+                wake_mode = "dynamic"
+                kline_fire_offset_before_lock_ms = (
+                    _dynamic_lead_ms - _tc.POOL_READ_TIME_MS
+                )
             else:
                 info("RUN", "LOOP", "OFFSET",
                      msg=(f"critical_path source=static "
                           f"(anchor poll timed out or malformed) "
                           f"epoch={current_epoch}"))
+                wake_mode = "static"
+                kline_fire_offset_before_lock_ms = (
+                    cfg.critical_path_wakeup_offset_before_lock_ms
+                    - _tc.POOL_READ_TIME_MS
+                )
+        else:
+            # No rpc_poller wired (rare; usually means backtest path
+            # routed here by mistake). Use static defaults.
+            wake_mode = "static"
+            kline_fire_offset_before_lock_ms = (
+                cfg.critical_path_wakeup_offset_before_lock_ms
+                - _tc.POOL_READ_TIME_MS
+            )
         info("RUN", "LOOP", "SLEEP",
              msg=(f"Sleeping {int(critical_path_wake_ts - _utc_now())}s "
                   f"(wait_for_critical_path, source={critical_path_source}) "
@@ -671,6 +718,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     bankroll_before_action_bnb=bankroll_bnb,
                     bankroll_after_action_bnb=bankroll_bnb,
                     skip_reason=skip_reason,
+                    wake_mode=wake_mode,
+                    kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                    btc_fetch_result=_kline_result_get(gate, "btc"),
+                    eth_fetch_result=_kline_result_get(gate, "eth"),
+                    sol_fetch_result=_kline_result_get(gate, "sol"),
                 )
                 info("RUN", "ACT", "SKIP",
                      msg=f"Skip epoch {current_epoch}: {skip_reason}")
@@ -744,11 +796,25 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
                 eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
                 sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
+                wake_mode=wake_mode,
+                kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                btc_fetch_result=_kline_result_get(gate, "btc"),
+                eth_fetch_result=_kline_result_get(gate, "eth"),
+                sol_fetch_result=_kline_result_get(gate, "sol"),
             )
             info("RUN", "ACT", "SKIP", msg=f"Skip epoch {current_epoch}: {reason}")
             # SKIP path: no time pressure, safe to log timing here.
             if gate is not None and gate.last_fetch_timing is not None:
-                info("GATE", "FETCH", "TIMING", **gate.last_fetch_timing)
+                info(
+                    "GATE", "FETCH", "TIMING",
+                    epoch=current_epoch,
+                    source=wake_mode,
+                    fire_offset_ms=(
+                        "" if kline_fire_offset_before_lock_ms is None
+                        else kline_fire_offset_before_lock_ms
+                    ),
+                    **gate.last_fetch_timing,
+                )
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
@@ -824,6 +890,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
                 eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
                 sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
+                wake_mode=wake_mode,
+                kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                btc_fetch_result=_kline_result_get(gate, "btc"),
+                eth_fetch_result=_kline_result_get(gate, "eth"),
+                sol_fetch_result=_kline_result_get(gate, "sol"),
             )
             info(
                 "RUN",
@@ -1007,12 +1078,26 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
                 eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
                 sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
+                wake_mode=wake_mode,
+                kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                btc_fetch_result=_kline_result_get(gate, "btc"),
+                eth_fetch_result=_kline_result_get(gate, "eth"),
+                sol_fetch_result=_kline_result_get(gate, "sol"),
             )
 
         # Step 14b: Deferred GATE logging -- emit AFTER bet so file I/O
         # doesn't delay bet submission in the critical path.
         if gate is not None and gate.last_fetch_timing is not None:
-            info("GATE", "FETCH", "TIMING", **gate.last_fetch_timing)
+            info(
+                "GATE", "FETCH", "TIMING",
+                epoch=current_epoch,
+                source=wake_mode,
+                fire_offset_ms=(
+                    "" if kline_fire_offset_before_lock_ms is None
+                    else kline_fire_offset_before_lock_ms
+                ),
+                **gate.last_fetch_timing,
+            )
         # Log signal details for dry-run visibility.
         _log_deferred_gate_signal(decision)
 
