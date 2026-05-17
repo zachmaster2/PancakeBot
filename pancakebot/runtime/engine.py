@@ -175,20 +175,10 @@ def _fetch_current_bnb_price_usd(cfg: RuntimeConfig) -> float:
 def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
     """Emit one INFO line summarizing the timing config in effect.
 
-    Operators read this at startup to confirm which publish-delay tier
-    the gate is running under (P99 = strict full-inclusion guarantee;
-    P95 = operating budget, ~5% publish-delay tail absorbed by the
-    streak counter) without having to derive the math from raw constants.
+    Operators read this at startup to confirm which wake offsets and
+    deadlines are derived from the current ``timing_constants.py`` values
+    without having to derive the math from raw constants themselves.
     """
-    if cfg.kline_publish_tier == "P99":
-        tier_msg = "P99 (strict; full-inclusion guarantee)"
-    elif cfg.kline_publish_tier == "P95":
-        tier_msg = (
-            "P95 (operating budget; ~5% publish-delay tail absorbed by "
-            "streak counter)"
-        )
-    else:
-        tier_msg = f"{cfg.kline_publish_tier} (unrecognized tier)"
     info(
         "CORE", "RUN", "TIMING",
         msg=(
@@ -201,8 +191,7 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
             f"critical_path_wakeup={cfg.critical_path_wakeup_offset_before_lock_ms}ms "
             f"bet_submit_deadline={cfg.bet_submit_deadline_offset_before_lock_ms}ms "
             f"bet_tx_receipt_timeout={cfg.bet_tx_receipt_timeout_seconds}s "
-            f"claim_tx_receipt_timeout={cfg.claim_tx_receipt_timeout_seconds}s "
-            f"kline_publish_tier={tier_msg}"
+            f"claim_tx_receipt_timeout={cfg.claim_tx_receipt_timeout_seconds}s"
         ),
     )
 

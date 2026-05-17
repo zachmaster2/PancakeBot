@@ -334,9 +334,6 @@ class AppConfig:
     - ``bet_submit_deadline_offset_before_lock_ms``
     - ``critical_path_wakeup_offset_before_lock_ms``
     - ``bankroll_wakeup_offset_before_lock_ms``
-    - ``kline_publish_tier``: ``"P99"`` (strict, full-inclusion guarantee)
-      or ``"P95"`` (operating budget; ~5% tail absorbed by streak counter).
-      Selected by tier-ladder cross-validation: P99 first, P95 fallback.
     """
 
     # User-tunable
@@ -351,7 +348,6 @@ class AppConfig:
     ramp_poll_1_wakeup_offset_before_lock_ms: int
     ramp_poll_2_wakeup_offset_before_lock_ms: int
     bankroll_wakeup_offset_before_lock_ms: int
-    kline_publish_tier: str
 
     # Other
     dry_initial_bankroll_bnb: float
@@ -937,51 +933,16 @@ def load_app_config(path: str) -> AppConfig:
     # bankroll wake's 5s budget vs ~50-200ms wallet RPC means the
     # ramp_1 -> bankroll ordering is robust without an explicit check.
 
-    # The kline fetch fires INSIDE the critical-path wake, after the
-    # ~5ms pool snapshot. So the kline-fetch effective offset (= time
-    # until lock when the GETs go out) is the critical-path wake offset
-    # minus POOL_READ_TIME_MS.
-    kline_fetch_offset_within_critical_ms = (
-        critical_path_wakeup_offset_before_lock_ms - _tc.POOL_READ_TIME_MS
-    )
-
-    # Tier-based publish-delay validation: prefer strict P99
-    # (full-inclusion guarantee that the cutoff candle is published at
-    # fetch time); fall back to P95 (operating budget; ~5% publish-delay
-    # tail absorbed by the streak counter). InvariantError fires only if
-    # even the looser P95 budget is exceeded.
-    #
-    # Behavior across cutoffs at the locked offsets:
-    #   - cutoff=2 (canonical): P99 budget=700ms < kline-fetch=1090ms.
-    #     P95 budget=1300ms >= 1090ms -> tier="P95".
-    #   - cutoff=3+: P99 budget=1700ms+ >= 1090ms -> tier="P99".
-    #     Auto-strict; no code change needed when a future user opts
-    #     into a larger cutoff.
-    p99_budget_ms = (
-        kline_cutoff_seconds * 1000 - _tc.OKX_KLINE_PUBLISH_DELAY_P99_MS
-    )
-    p95_budget_ms = (
-        kline_cutoff_seconds * 1000 - _tc.OKX_KLINE_PUBLISH_DELAY_P95_MS
-    )
-    if kline_fetch_offset_within_critical_ms <= p99_budget_ms:
-        kline_publish_tier = "P99"
-    elif kline_fetch_offset_within_critical_ms <= p95_budget_ms:
-        kline_publish_tier = "P95"
-    else:
-        raise InvariantError(
-            f"config_kline_fetch_wakeup_exceeds_cutoff_publish_budget: "
-            f"kline_fetch_offset_within_critical_ms="
-            f"{kline_fetch_offset_within_critical_ms}ms "
-            f"exceeds P95 budget ({p95_budget_ms}ms) at "
-            f"kline_cutoff_seconds={kline_cutoff_seconds}s "
-            f"(P99 budget={p99_budget_ms}ms; "
-            f"P95={_tc.OKX_KLINE_PUBLISH_DELAY_P95_MS}ms; "
-            f"P99={_tc.OKX_KLINE_PUBLISH_DELAY_P99_MS}ms). "
-            f"Increase kline_cutoff_seconds or reduce wake offset."
-        )
-
     # Bundle 5 v2 (2026-05-14): the NTP wake budget cross-validation
     # is retired alongside the application-level NTP layer itself.
+    #
+    # 2026-05-17: the prior P95/P99 publish-tier ladder is retired too.
+    # That check was a one-shot config-load gate; under Bundle 5 v2 the
+    # actual fetch fires at whatever offset the per-round anchor dictates,
+    # which is independent of the static wake's relation to the
+    # OKX publish percentiles. The streak counter
+    # (``max_consecutive_kline_fetch_failures``) remains the only runtime
+    # tolerance mechanism for publish-delay tails.
 
     # [dry]
     dry_initial_bankroll_bnb = _opt_float(dry_sec, "initial_bankroll_bnb", 50.0)
@@ -1023,7 +984,6 @@ def load_app_config(path: str) -> AppConfig:
         ramp_poll_1_wakeup_offset_before_lock_ms=ramp_poll_1_wakeup_offset_before_lock_ms,
         ramp_poll_2_wakeup_offset_before_lock_ms=ramp_poll_2_wakeup_offset_before_lock_ms,
         bankroll_wakeup_offset_before_lock_ms=bankroll_wakeup_offset_before_lock_ms,
-        kline_publish_tier=kline_publish_tier,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_clamp_bet_to_contract_minimum=live_clamp_bet_to_contract_minimum,
         backtest_round_count=backtest_round_count,

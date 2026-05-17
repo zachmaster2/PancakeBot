@@ -140,9 +140,11 @@ from constants in `pancakebot/timing_constants.py`.
 
 - `kline_cutoff_seconds = 2` — strategy data horizon for OKX klines
   (FIXED by strategy: the kline closing at `lock - cutoff` is required).
-  Cross-validated at load via the wake-offset framing:
-  `kline_fetch_wakeup_offset_ms <= kline_cutoff_seconds * 1000 -
-  OKX_KLINE_PUBLISH_DELAY_P95_MS`.
+  Tolerance for OKX publish-delay tails is via the
+  `max_consecutive_kline_fetch_failures` streak counter at runtime, not
+  via a config-load budget. Empirical OKX publish-delay distribution:
+  P95 ≈ 700ms, P99 ≈ 1300ms (informational; see
+  `pancakebot/timing_constants.py`).
 - `pool_cutoff_seconds = 6` — pool-aggregate data horizon for BSC events.
   Cross-validated at load:
   `pool_read_wakeup_offset_ms <= pool_cutoff_seconds * 1000 -
