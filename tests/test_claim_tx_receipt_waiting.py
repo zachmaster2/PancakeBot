@@ -104,8 +104,6 @@ def _scan_kwargs(*, contract, cursor_path: Path, claim_timeout: int = 35):
         buffer_seconds=30,
         page_size=100,
         gas_limit=300_000,
-        claim_batch_size=2,
-        min_bet_with_gas_bnb=None,
         claim_tx_receipt_timeout_seconds=claim_timeout,
     )
 
@@ -308,3 +306,127 @@ def test_claim_receipt_timeout_threaded_from_kwarg(
         ),
     )
     assert contract.claim_calls[0]["receipt_timeout_seconds"] == timeout
+
+
+# ---------------------------------------------------------------------------
+# 7. Chunking: 25 pending epochs drain across 3 claim() TXs (10/10/5)
+# ---------------------------------------------------------------------------
+
+def test_claim_25_pending_chunks_into_three_txs(tmp_path, monkeypatch):
+    """25 claimable epochs from one scan must split into 3 TXs of size
+    10/10/5 (per ``_MAX_CLAIM_EPOCHS_PER_TX``). Each chunk gets its own
+    ``contract.claim()`` invocation; the cursor advances past all 25
+    after the 3rd succeeds.
+
+    This is the realistic startup-after-outage scenario: bot was offline
+    for ~24h, wins accumulated unclaimed, first scan after restart finds
+    them all and must drain across multiple TXs without exceeding BSC
+    per-TX gas budgets on public RPCs.
+    """
+    epochs = list(range(700, 725))  # 25 epochs, all claimable
+    contract = _FakeContract(
+        user_rounds=epochs,
+        claimable_map={e: (True, False) for e in epochs},
+        close_ts_map={e: 0 for e in epochs},
+        wallet_balance=10.0,
+        claim_outcome=ClaimSubmitResult(
+            tx_hash="0xchunked", status="success",
+            included_block_number=42, included_block_timestamp=10000,
+        ),
+    )
+    monkeypatch.setattr(
+        live_mod, "_send_claim_failure_alert", lambda **kw: None,
+    )
+    cursor_path = tmp_path / "cursor.txt"
+
+    result = live_mod.claim_scan_cursor(
+        **_scan_kwargs(contract=contract, cursor_path=cursor_path),
+    )
+
+    # All 25 reported claimed.
+    assert result.claimed_n == 25
+    # Three TXs: 10 + 10 + 5.
+    assert len(contract.claim_calls) == 3
+    assert contract.claim_calls[0]["epochs"] == list(range(700, 710))
+    assert contract.claim_calls[1]["epochs"] == list(range(710, 720))
+    assert contract.claim_calls[2]["epochs"] == list(range(720, 725))
+    # Per-chunk gas_limit scales with chunk size.
+    assert contract.claim_calls[0]["gas_limit"] == 300_000 * 10
+    assert contract.claim_calls[1]["gas_limit"] == 300_000 * 10
+    assert contract.claim_calls[2]["gas_limit"] == 300_000 * 5
+    # Cursor advances past all 25.
+    assert int(cursor_path.read_text()) == 25
+
+
+def test_claim_chunking_timeout_mid_drain_parks_cursor(tmp_path, monkeypatch):
+    """If the SECOND chunk times out mid-drain (chunk 1 succeeded), the
+    drain halts. Cursor parks at the first un-claimed epoch (start of
+    chunk 2); chunk-1's 10 epochs ARE counted as claimed. Next iteration
+    will re-detect chunk-2+ and re-attempt.
+
+    Exercises the principle: a timeout stops draining; success before
+    the timeout is preserved.
+    """
+    epochs = list(range(800, 815))  # 15 epochs → would be 10 + 5
+
+    # _FakeContract returns the same outcome for every claim() call by
+    # default; build a variant that returns different outcomes per call.
+    class _SequencedClaimContract(_FakeContract):
+        def __init__(self, *, outcomes: list[ClaimSubmitResult], **kw):
+            super().__init__(claim_outcome=outcomes[0], **kw)
+            self._outcomes = outcomes
+            self._call_idx = 0
+
+        def claim(self, **kw):  # type: ignore[override]
+            self.claim_calls.append({
+                "epochs": list(kw["epochs"]),
+                "gas_limit": int(kw["gas_limit"]),
+                "gas_price_wei": int(kw["gas_price_wei"]),
+                "wait_receipt": bool(kw["wait_receipt"]),
+                "receipt_timeout_seconds": int(kw["receipt_timeout_seconds"]),
+            })
+            outcome = self._outcomes[
+                min(self._call_idx, len(self._outcomes) - 1)
+            ]
+            self._call_idx += 1
+            return outcome
+
+    contract = _SequencedClaimContract(
+        outcomes=[
+            ClaimSubmitResult(
+                tx_hash="0xchunk1ok", status="success",
+                included_block_number=1, included_block_timestamp=0,
+            ),
+            ClaimSubmitResult(
+                tx_hash="0xchunk2timeout", status="timeout",
+                included_block_number=None, included_block_timestamp=None,
+            ),
+        ],
+        user_rounds=epochs,
+        claimable_map={e: (True, False) for e in epochs},
+        close_ts_map={e: 0 for e in epochs},
+        wallet_balance=10.0,
+    )
+    sent_alerts: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        live_mod, "_send_claim_failure_alert",
+        lambda **kw: sent_alerts.append(kw),
+    )
+    cursor_path = tmp_path / "cursor.txt"
+
+    result = live_mod.claim_scan_cursor(
+        **_scan_kwargs(contract=contract, cursor_path=cursor_path),
+    )
+
+    # Only chunk 1's 10 epochs were successfully claimed.
+    assert result.claimed_n == 10
+    # Two TXs attempted: chunk 1 (success) + chunk 2 (timeout).
+    assert len(contract.claim_calls) == 2
+    assert contract.claim_calls[0]["epochs"] == list(range(800, 810))
+    assert contract.claim_calls[1]["epochs"] == list(range(810, 815))
+    # Timeout alert was sent for chunk 2 only.
+    assert len(sent_alerts) == 1
+    assert sent_alerts[0]["reason"] == "timeout"
+    assert sent_alerts[0]["epochs"] == list(range(810, 815))
+    # Cursor parks at the first un-claimed epoch (chunk-2 start = index 10).
+    assert int(cursor_path.read_text()) == 10
