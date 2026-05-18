@@ -94,11 +94,19 @@ class ClaimSubmitResult:
         (TX may still mine later). Caller logs + alerts; no retry. Next
         iteration's ``claim_scan_cursor`` will re-detect the still-claimable
         epochs and try again.
+
+    ``total_amount_wei`` is the sum of ``amount`` fields from the
+    ``Claim(sender, epoch, amount)`` events emitted by the TX. Populated
+    only on ``"success"`` (where the receipt's logs are decodable); ``None``
+    for ``"revert"`` (no events emitted) and ``"timeout"`` (no receipt yet).
+    The operator-facing CLAIM log line consumes this to lead with the actual
+    BNB received rather than just the epoch count.
     """
     tx_hash: str
     status: Literal["success", "revert", "timeout"]
     included_block_number: int | None
     included_block_timestamp: int | None
+    total_amount_wei: int | None = None
 
 
 class Web3PredictionContract:
@@ -725,9 +733,26 @@ class Web3PredictionContract:
         block_number = int(receipt["blockNumber"])
         block_timestamp = int(self.block_timestamp(block_number))
         chain_status = int(receipt.get("status", 0))
+
+        # Extract total BNB claimed by summing ``amount`` across the
+        # PredictionV2 Claim(sender, epoch, amount) events in the receipt.
+        # Only meaningful for status=success (revert emits no events).
+        total_amount_wei: int | None = None
+        if chain_status == 1:
+            try:
+                # noinspection PyProtectedMember
+                claim_events = self._contract.events.Claim().process_receipt(receipt)
+                total_amount_wei = sum(int(ev["args"]["amount"]) for ev in claim_events)
+            except Exception:
+                # Best-effort: if event decode fails for any reason, leave
+                # total_amount_wei=None. The caller's log line tolerates this
+                # by omitting the BNB amount rather than crashing.
+                total_amount_wei = None
+
         return ClaimSubmitResult(
             tx_hash=tx_hash,
             status="success" if chain_status == 1 else "revert",
             included_block_number=block_number,
             included_block_timestamp=block_timestamp,
+            total_amount_wei=total_amount_wei,
         )

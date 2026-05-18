@@ -15,7 +15,6 @@ from pancakebot import paths as _paths
 from pancakebot.constants import RETRY_BACKOFF_SECONDS
 from pancakebot.util import InvariantError, TransientRpcError
 from pancakebot.log import info, warn
-from pancakebot.util import bankroll_suffix, usd_suffix
 from pancakebot.runtime.audit import (
     append_audit_row as _append_dry_audit_row,
     ensure_audit_csv as _ensure_dry_audit_csv,
@@ -573,32 +572,29 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             bankroll=bankroll_after_settle, start_at=int(rd.start_ts),
         )
 
-        bnbusd_price = rd.close_price_usd if rd.close_price_usd > 0 else rd.lock_price_usd
-
-        # Brief INFO log (no key=value fields)
         if outcome == "win":
+            # payout multiplier = gross credit / stake. A loss yields
+            # credit=0 (no entry here); refund yields credit==bet (1.00x,
+            # also not emitted as WIN). For win, the multiplier captures
+            # the round's payoff in operator-readable terms.
+            payout_x = credit_bnb / bet_bnb if bet_bnb > 0 else 0.0
             info(
                 "WIN",
-                f"Won {credit_bnb:.4f} BNB"
-                + usd_suffix(amount_bnb=credit_bnb, bnbusd_price=bnbusd_price)
-                + f" on epoch {e}"
-                + bankroll_suffix(bankroll_bnb=bankroll_after_settle, bnbusd_price=bnbusd_price),
+                f"Won {credit_bnb:.4f} BNB on epoch {e}, "
+                f"payout {payout_x:.2f}x "
+                f"(bankroll: {bankroll_after_settle:.4f} BNB)",
             )
         elif outcome == "refund":
             info(
                 "REFUND",
-                f"Refunded {credit_bnb:.4f} BNB"
-                + usd_suffix(amount_bnb=credit_bnb, bnbusd_price=bnbusd_price)
-                + f" on epoch {e}"
-                + bankroll_suffix(bankroll_bnb=bankroll_after_settle, bnbusd_price=bnbusd_price),
+                f"Refunded {credit_bnb:.4f} BNB on epoch {e} "
+                f"(bankroll: {bankroll_after_settle:.4f} BNB)",
             )
         else:
             info(
                 "LOSS",
-                f"Lost {bet_bnb:.4f} BNB"
-                + usd_suffix(amount_bnb=bet_bnb, bnbusd_price=bnbusd_price)
-                + f" on epoch {e}"
-                + bankroll_suffix(bankroll_bnb=bankroll_after_settle, bnbusd_price=bnbusd_price),
+                f"Lost {bet_bnb:.4f} BNB on epoch {e} "
+                f"(bankroll: {bankroll_after_settle:.4f} BNB)",
             )
 
         settled_ts = int(time.time())

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from pancakebot.chain.prediction_contract import Web3PredictionContract
+from pancakebot.constants import BNB_WEI
 from pancakebot.util import InvariantError
 from pancakebot.log import info, warn
 
@@ -185,21 +186,42 @@ def claim_scan_cursor(
             claim_ms = int((time.perf_counter() - t0) * 1000)
 
             if result.status == "success":
-                info(
-                    "CLAIM",
-                    f"Claimed {len(to_claim)} epochs ({to_claim[0]}..{to_claim[-1]}) "
-                    f"tx={result.tx_hash} claim_ms={claim_ms}ms gas_limit={chunk_gas_limit}",
-                )
+                # ``total_amount_wei`` is summed from the chain's Claim
+                # events on the TX receipt; the contract wrapper falls
+                # back to ``None`` on decode failure. Render the BNB
+                # amount when available; omit gracefully otherwise.
+                if result.total_amount_wei is not None:
+                    amount_bnb = result.total_amount_wei / BNB_WEI
+                    amount_str = f"{amount_bnb:.4f} BNB"
+                else:
+                    amount_str = "(amount unavailable)"
+                if len(to_claim) == 1:
+                    info(
+                        "CLAIM",
+                        f"Claimed {amount_str} from epoch {to_claim[0]} "
+                        f"(tx {result.tx_hash}, {claim_ms}ms)",
+                    )
+                else:
+                    info(
+                        "CLAIM",
+                        f"Claimed {amount_str} from {len(to_claim)} rounds "
+                        f"(epochs {to_claim[0]}-{to_claim[-1]}, "
+                        f"tx {result.tx_hash}, {claim_ms}ms)",
+                    )
                 claimed_total += len(to_claim)
                 pending_claims = pending_claims[len(to_claim):]
                 continue
 
             if result.status == "revert":
+                if len(to_claim) == 1:
+                    epoch_str = f"epoch {to_claim[0]}"
+                else:
+                    epoch_str = f"{len(to_claim)} rounds (epochs {to_claim[0]}-{to_claim[-1]})"
                 warn(
                     "CLAIM",
-                    f"Claim TX reverted: {len(to_claim)} epochs ({to_claim[0]}..{to_claim[-1]}) "
-                    f"tx={result.tx_hash} claim_ms={claim_ms}ms gas_limit={chunk_gas_limit} "
-                    f"block_number={result.included_block_number}",
+                    f"Claim TX reverted for {epoch_str} "
+                    f"(tx {result.tx_hash}, {claim_ms}ms, "
+                    f"block {result.included_block_number})",
                 )
                 _send_claim_failure_alert(
                     reason="revert",
@@ -215,11 +237,15 @@ def claim_scan_cursor(
                 continue
 
             # status == "timeout"
+            if len(to_claim) == 1:
+                epoch_str = f"epoch {to_claim[0]}"
+            else:
+                epoch_str = f"{len(to_claim)} rounds (epochs {to_claim[0]}-{to_claim[-1]})"
             warn(
                 "CLAIM",
-                f"Claim TX timed out: {len(to_claim)} epochs ({to_claim[0]}..{to_claim[-1]}) "
-                f"tx={result.tx_hash} claim_ms={claim_ms}ms gas_limit={chunk_gas_limit} "
-                f"receipt_timeout_seconds={int(claim_tx_receipt_timeout_seconds)}",
+                f"Claim TX timed out for {epoch_str} "
+                f"(tx {result.tx_hash}, {claim_ms}ms, "
+                f"receipt_timeout {int(claim_tx_receipt_timeout_seconds)}s)",
             )
             _send_claim_failure_alert(
                 reason="timeout",
