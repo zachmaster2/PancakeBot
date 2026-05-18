@@ -672,19 +672,92 @@ def test_periodic_timeout_state_b_suspend_in_ramp_window():
     assert timeout == pytest.approx(6.1, abs=1e-6)
 
 
-def test_periodic_timeout_state_b_last_in_bounds_tick_just_before_ramp():
-    """At now = lock_at - 13s (just before the last in-bounds tick
-    at lock_at - 12s = round_open + 288), the cadence still fires
-    that tick — it lands at lock_at - 12s, which is outside the
-    ramp window (starts at lock_at - 7.5s). Timeout = 1s."""
+def test_periodic_timeout_reschedule_when_anchored_tick_in_rtt_safety_band():
+    """The anchored tick is outside the ramp window itself but close
+    enough that its worst-case HTTP RTT (5s + 0.05s safety = 5.05s)
+    could extend into ramp_1's wake. Fire earlier at the latest safe
+    time so a full-timeout poll still completes before ramp_window_start.
+
+    Canonical config: ramp_window_start = lock_at - 7.5,
+    safe_fire_latest = ramp_window_start - 5 - 0.05 = lock_at - 12.55.
+    At now = lock_at - 13, the anchored next_at = round_open + 288 =
+    lock_at - 12, which falls in the (safe_fire_latest, ramp_window_start)
+    band. safe_fire_latest (lock_at - 12.55) is 0.45s in the future →
+    reschedule, timeout = 0.45s.
+    """
     p = _make_anchored_poller()
     lock_at = 1_000_300
     now = lock_at - 13
     timeout, state = p._compute_periodic_timeout(
         now=float(now), lock_at=lock_at, period=8,
     )
-    assert state == "steady"
-    assert timeout == pytest.approx(1.0, abs=1e-6)
+    assert state == "reschedule"
+    assert timeout == pytest.approx(0.45, abs=1e-6)
+
+
+def test_periodic_timeout_suspend_when_safe_fire_latest_has_passed():
+    """The novel safety branch added 2026-05-18: the anchored tick is
+    outside the ramp window itself, but ``safe_fire_latest`` has
+    already passed (the previous poll overran). Firing now would
+    risk a periodic in-flight at ramp_1's wake. Suspend the tick;
+    ramp_1+ramp_2 absorb the extra backlog.
+
+    Canonical config (period=8, ramp_offset=7.5s, max_rtt=5s,
+    safety=0.05s):
+      ramp_window_start = lock_at - 7.5
+      safe_fire_latest = lock_at - 12.55
+      Band (safe_fire_latest, ramp_window_start) is 5.05s wide.
+
+    At canonical anchoring, k=36 yields next_at = round_open + 288 =
+    lock_at - 12 — inside the band (not the ramp window itself). The
+    overrun branch fires for now in (lock_at - 12.55, lock_at - 12):
+    next_at is still ≤ ramp_window_start so the in-window suspend
+    doesn't trigger, but safe_fire_latest is already in the past so
+    no safe-fire moment remains.
+
+    At now = lock_at - 12.5:
+      - next_at = lock_at - 12 (NOT in ramp window: -12 < -7.5)
+      - next_at > safe_fire_latest (-12 > -12.55): in the band
+      - safe_fire_latest <= now (-12.55 <= -12.5): overrun
+      → suspend, timeout = lock_at + 0.1 - now = 12.6s
+
+    Critical: if the in-window suspend branch (next_at >=
+    ramp_window_start) fired here instead, the assertion would still
+    pass — both branches return "suspend" with the same timeout.
+    Hence the explicit assertions below on next_at, safe_fire_latest,
+    and ramp_window_start positions: they pin the test to the
+    overrun branch, not in-window suspend.
+    """
+    p = _make_anchored_poller()
+    lock_at = 1_000_300
+    now = lock_at - 12.5
+
+    # Pin the branch: assert the geometric conditions that route to
+    # the overrun branch specifically (next_at outside ramp window,
+    # safe_fire_latest in the past).
+    round_open = lock_at - 300
+    ramp_window_start = lock_at - 7.5
+    safe_fire_latest = ramp_window_start - 5 - 0.05  # = lock_at - 12.55
+    k = max(1, int((now - round_open) // 8) + 1)
+    next_at = round_open + k * 8
+    assert next_at == lock_at - 12, (
+        f"test setup invariant: expected next_at=lock_at-12, got {next_at - lock_at}"
+    )
+    assert next_at < ramp_window_start, (
+        "next_at must NOT be in the ramp window itself — otherwise the test "
+        "would hit the in-window suspend branch, not the overrun branch"
+    )
+    assert safe_fire_latest <= now, (
+        "safe_fire_latest must already be in the past — otherwise the test "
+        "would hit the reschedule branch, not the overrun branch"
+    )
+
+    timeout, state = p._compute_periodic_timeout(
+        now=float(now), lock_at=lock_at, period=8,
+    )
+    assert state == "suspend"
+    # Suspend sleeps to lock_at + 0.1: timeout = 12.6.
+    assert timeout == pytest.approx(12.6, abs=1e-6)
 
 
 def test_periodic_timeout_state_c_stale_anchor_wall_clock_fallback():

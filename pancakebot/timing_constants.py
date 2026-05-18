@@ -367,6 +367,41 @@ RPC_HTTP_SINGLE_TIMEOUT_SECONDS: int = 5
 # keeping cursor close to head.
 RPC_PERIODIC_POLL_INTERVAL_SECONDS: int = 8
 
+# Defense-in-depth pad on top of RPC_HTTP_BATCH_TIMEOUT_SECONDS when
+# deciding the latest safe time a periodic poll may fire before the
+# ramp window opens.
+#
+# What it protects: the race where a periodic poll's ``_poll_lock``
+# release barely overlaps with ramp_1's wake and non-blocking acquire.
+# If a periodic poll anchored just before ramp_window_start hits its
+# full HTTP timeout (5s), it completes IN-FLIGHT against ramp_1's wake
+# at lock_at − ramp_poll_1_offset. Even a few ms of overlap causes
+# ramp_1's ``_poll_lock.acquire(blocking=False)`` to fail and silently
+# drop ramp_1.
+#
+# What it accounts for:
+#   - OS scheduler jitter on thread wake (~1 ms typical, up to a few
+#     ms worst case under load)
+#   - urllib3 HTTP read-after-timeout cleanup time (~few ms to surface
+#     the timeout exception and release the connection back to the pool)
+#   - Python GIL release latency between request completion in the
+#     network thread and lock release in the poller thread (microseconds
+#     typically, but adversarial GC pauses can extend it)
+#
+# Why 50 ms and not less: cushion against pathological cases — loaded
+# system, GC pause, antivirus scan interrupt — while staying small
+# enough to be operationally invisible (this pad effectively shortens
+# the periodic cadence by ~50 ms once per round, which is negligible
+# against the 8 s base cadence).
+#
+# Why not bigger: the suspend-on-overrun branch in
+# ``_compute_periodic_timeout`` is the actual correctness fix for this
+# race. This buffer is purely defense-in-depth for the rare
+# exact-timeout-with-bad-jitter case where a periodic completed within
+# the buffer of ramp_1's wake; a larger buffer would needlessly skip
+# more periodic ticks per round without proportionate safety gain.
+RPC_PERIODIC_TO_RAMP_SAFETY_BUFFER_SECONDS: float = 0.05
+
 # Final-poll wake derivation safety cushion (cross-RPC variance the
 # spike didn't capture, etc.). Engineering judgment.
 RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS: int = 200
