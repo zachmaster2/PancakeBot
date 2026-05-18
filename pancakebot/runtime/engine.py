@@ -16,7 +16,7 @@ from pancakebot.constants import (
 )
 from pancakebot.util import InvariantError, TransientRpcError
 from pancakebot.log import info, warn
-from pancakebot.util import bankroll_suffix, format_bankroll, usd_suffix
+from pancakebot.util import format_bankroll
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot import paths
 from pancakebot.runtime.dry import (
@@ -907,10 +907,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             bankroll_after_live = bankroll_bnb - amount_bnb
             info(
                 "BET",
-                f"Betting {amount_bnb:.4f} BNB"
-                + usd_suffix(amount_bnb=amount_bnb, bnbusd_price=bnbusd_price)
-                + f" on {bet_side} for epoch {current_epoch}"
-                + bankroll_suffix(bankroll_bnb=bankroll_after_live, bnbusd_price=bnbusd_price),
+                f"Bet {amount_bnb:.4f} BNB on {bet_side} for epoch {current_epoch} "
+                f"(bankroll: {bankroll_after_live:.4f} BNB)",
             )
             if tx_submit is None:
                 raise InvariantError("live_bet_submit_missing")
@@ -971,10 +969,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
             info(
                 "BET",
-                f"Betting {amount_bnb:.4f} BNB"
-                + usd_suffix(amount_bnb=amount_bnb, bnbusd_price=bnbusd_price)
-                + f" on {bet_side} for epoch {current_epoch}"
-                + bankroll_suffix(bankroll_bnb=bankroll_after_bet, bnbusd_price=bnbusd_price),
+                f"Bet {amount_bnb:.4f} BNB on {bet_side} for epoch {current_epoch} "
+                f"(bankroll: {bankroll_after_bet:.4f} BNB)",
             )
             _dry_record_bet(
                 closed,
