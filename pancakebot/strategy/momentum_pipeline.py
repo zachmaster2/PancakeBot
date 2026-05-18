@@ -12,6 +12,7 @@ were extracted into config in the 2026-04-26 lean&clean refactor.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from pancakebot.bankroll_tracker import BankrollTracker
@@ -27,6 +28,17 @@ from pancakebot.strategy.momentum_gate import (
 from pancakebot.types import Round
 
 
+# Mapping from skip_reason → keys that MUST be present in skip_context.
+# Construction of a SKIP decision with one of these reasons but missing
+# (or empty) skip_context raises InvariantError. The engine consumer
+# trusts the data — no isinstance / None-fallback guards downstream.
+_SKIP_CONTEXT_SCHEMA: Mapping[str, frozenset[str]] = {
+    "risk_drawdown_breaker_fired": frozenset({"drawdown_pct", "threshold_pct"}),
+    "risk_cooldown_active": frozenset({"rounds_remaining"}),
+    "pool_below_minimum": frozenset({"pool_bnb", "min_pool_bnb_at_cutoff"}),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class StrategyPipelineDecision:
     """Normalized open-round strategy pipeline decision (momentum-only variant).
@@ -36,12 +48,43 @@ class StrategyPipelineDecision:
     six ``controller_*`` carryovers from the prior multi-strategy
     architecture. None of those were read in any decision path or written
     to a meaningful CSV column.
+
+    ``skip_context`` carries per-reason structured payload that the engine
+    consumes to compose operator-facing SKIP narratives (added 2026-05-18
+    Phase B v2 T3-B). For SKIP decisions whose ``skip_reason`` is in
+    ``_SKIP_CONTEXT_SCHEMA``, ``skip_context`` is REQUIRED and validated
+    in ``__post_init__`` — the engine consumer reads keys directly and
+    will raise loudly on any drift. For BET decisions and SKIPs whose
+    wording doesn't need extra numbers (e.g. ``gate_no_signal``), it's
+    None.
+
+    Required-context reasons (and their keys):
+      - ``risk_drawdown_breaker_fired`` → {"drawdown_pct", "threshold_pct"}
+      - ``risk_cooldown_active`` → {"rounds_remaining"}
+      - ``pool_below_minimum`` → {"pool_bnb", "min_pool_bnb_at_cutoff"}
     """
 
     action: str
     bet_side: str | None
     bet_size_bnb: float
     skip_reason: str | None
+    skip_context: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        required_keys = _SKIP_CONTEXT_SCHEMA.get(self.skip_reason or "")
+        if required_keys is None:
+            return
+        if self.skip_context is None:
+            raise InvariantError(
+                f"skip_reason={self.skip_reason!r} requires skip_context "
+                f"with keys {sorted(required_keys)}; got None"
+            )
+        missing = required_keys - set(self.skip_context.keys())
+        if missing:
+            raise InvariantError(
+                f"skip_reason={self.skip_reason!r} skip_context missing keys: "
+                f"{sorted(missing)}"
+            )
 
 
 def _compute_bet_size(
@@ -234,7 +277,18 @@ class MomentumOnlyPipeline:
             # observed by the pipeline so the cooldown actually winds down.
             if self._bankroll_tracker.is_paused(start_at):
                 self._bankroll_tracker.tick_cooldown()
-                return self._skip("risk_cooldown_active")
+                # cooldown_remaining is read AFTER tick_cooldown, so it
+                # reflects the rounds remaining INCLUDING the next round
+                # the bot will observe (not counting the current skipped
+                # round itself).
+                return self._skip(
+                    "risk_cooldown_active",
+                    skip_context={
+                        "rounds_remaining": int(
+                            self._bankroll_tracker.cooldown_remaining()
+                        ),
+                    },
+                )
             # Check 2: bankroll below minimum -- skip without firing cooldown.
             current = self._bankroll_tracker.current_bankroll()
             if current < risk.min_bankroll_bnb_to_bet:
@@ -245,7 +299,15 @@ class MomentumOnlyPipeline:
                 dd_frac = (peak - current) / peak
                 if dd_frac >= risk.max_drawdown_fraction_from_peak:
                     self._bankroll_tracker.set_paused(risk.cooldown_rounds, start_at)
-                    return self._skip("risk_drawdown_breaker_fired")
+                    return self._skip(
+                        "risk_drawdown_breaker_fired",
+                        skip_context={
+                            "drawdown_pct": float(dd_frac * 100.0),
+                            "threshold_pct": float(
+                                risk.max_drawdown_fraction_from_peak * 100.0
+                            ),
+                        },
+                    )
 
         if self._gate is not None:
             # Live/dry: gate fetches BTC/ETH/SOL/BNB klines in parallel via
@@ -313,7 +375,15 @@ class MomentumOnlyPipeline:
 
         # Pool filter: skip if visible pool is too small (dilution kills edge).
         if pool_total < self._strategy.pool_filter.min_pool_bnb_at_cutoff:
-            return self._skip("pool_below_minimum")
+            return self._skip(
+                "pool_below_minimum",
+                skip_context={
+                    "pool_bnb": float(pool_total),
+                    "min_pool_bnb_at_cutoff": float(
+                        self._strategy.pool_filter.min_pool_bnb_at_cutoff
+                    ),
+                },
+            )
 
         our_side = pool_bull_bnb if signal_dir == "Bull" else pool_bear_bnb
 
@@ -396,12 +466,17 @@ class MomentumOnlyPipeline:
         )
 
     @staticmethod
-    def _skip(reason: str) -> StrategyPipelineDecision:
+    def _skip(
+        reason: str,
+        *,
+        skip_context: Mapping[str, object] | None = None,
+    ) -> StrategyPipelineDecision:
         return StrategyPipelineDecision(
             action="SKIP",
             bet_side=None,
             bet_size_bnb=0.0,
             skip_reason=reason,
+            skip_context=skip_context,
         )
 
     @staticmethod

@@ -425,6 +425,14 @@ class RpcPoller:
         # Reset on epoch advance.
         self._catchup_infeasible_for_round: bool = False
 
+        # ``(needed_ms, available_ms)`` from the most recent catchup
+        # feasibility check that returned True (= infeasible). Reset
+        # to None on each round advance. Consumed by engine.py at the
+        # SKIP narrative for ``catchup_infeasible_for_round`` rounds
+        # so the operator-facing log line carries the actual numbers
+        # ("need 39.5s, have 30.1s") rather than just the reason flag.
+        self._last_catchup_detail: tuple[int, int] | None = None
+
         # True while a poll is actively fetching/processing blocks.
         # is_pool_ready returns False when this is set so the engine
         # cannot read a half-built pool aggregate. Set/cleared under
@@ -764,9 +772,12 @@ class RpcPoller:
         """
         # Always reset the infeasibility flag at round start; otherwise
         # a past-round flag would carry forward into rounds where the
-        # cursor has been clamped and catch-up is now feasible.
+        # cursor has been clamped and catch-up is now feasible. Reset
+        # the detail tuple too so a SKIP in a later round can't surface
+        # stale numbers from a prior infeasibility event.
         with self._lock:
             self._catchup_infeasible_for_round = False
+            self._last_catchup_detail = None
 
         round_start_ts = lock_at - self._interval_seconds
         rs_block = self._compute_round_start_block(round_start_ts)
@@ -881,13 +892,34 @@ class RpcPoller:
 
     def _is_catchup_infeasible(self, *, blocks_behind: int, lock_at: int) -> bool:
         """Return True if estimated catch-up wallclock exceeds the time
-        budget remaining before lock_at."""
+        budget remaining before lock_at.
+
+        Side effect: when the math returns True, stashes
+        ``(estimated_ms, available_ms)`` on ``self._last_catchup_detail``
+        so the engine SKIP narrative can render the actual numbers.
+        Cleared in ``set_round_phase`` when a new round begins.
+        """
         if blocks_behind <= 0 or lock_at <= 0:
             return False
         estimated_ms = self._estimated_catchup_ms(blocks_behind)
         time_until_lock_ms = max(0, int((lock_at - time.time()) * 1000))
         available_ms = self._available_catchup_ms(time_until_lock_ms)
-        return estimated_ms > available_ms
+        infeasible = estimated_ms > available_ms
+        if infeasible:
+            with self._lock:
+                self._last_catchup_detail = (estimated_ms, available_ms)
+        return infeasible
+
+    @property
+    def last_catchup_detail(self) -> tuple[int, int] | None:
+        """Returns ``(needed_ms, available_ms)`` from the most recent
+        infeasible catchup check, or None if no check has flagged the
+        current round. Reset in ``set_round_phase`` when lock_at advances.
+        Consumed by engine.py at the SKIP narrative for
+        ``catchup_infeasible_for_round`` rounds.
+        """
+        with self._lock:
+            return self._last_catchup_detail
 
     # ------------------------------------------------------------------
     # Engine integration: deadline-driven polls (ramp + final)
