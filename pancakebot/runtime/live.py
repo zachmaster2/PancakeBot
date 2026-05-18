@@ -14,6 +14,16 @@ from pancakebot.log import info, warn
 
 _PAGE_SIZE_DEFAULT = 100
 
+
+def _truncate_tx_hash(tx_hash: str) -> str:
+    """Render the first 8 chars of a tx hash with a trailing ellipsis
+    (e.g. ``0x123456...``). Mirrors the BET log convention in engine.py.
+    Full hash remains available in the Discord alert payload and on
+    explorer; the operator stdout line just needs a session-disambiguator."""
+    if not tx_hash or len(tx_hash) <= 8:
+        return tx_hash
+    return f"{tx_hash[:8]}..."
+
 # Operational cap on epochs per ``claim()`` TX. The PredictionV2 contract's
 # ``claim(uint256[])`` ABI accepts any array length, but in practice BSC's
 # public-RPC submission caps + per-epoch gas (~100-150k for storage writes
@@ -195,18 +205,19 @@ def claim_scan_cursor(
                     amount_str = f"{amount_bnb:.4f} BNB"
                 else:
                     amount_str = "(amount unavailable)"
+                _tx_short = _truncate_tx_hash(result.tx_hash)
                 if len(to_claim) == 1:
                     info(
                         "CLAIM",
                         f"Claimed {amount_str} from epoch {to_claim[0]} "
-                        f"(tx {result.tx_hash}, {claim_ms}ms)",
+                        f"(tx {_tx_short}, {claim_ms}ms)",
                     )
                 else:
                     info(
                         "CLAIM",
                         f"Claimed {amount_str} from {len(to_claim)} rounds "
                         f"(epochs {to_claim[0]}-{to_claim[-1]}, "
-                        f"tx {result.tx_hash}, {claim_ms}ms)",
+                        f"tx {_tx_short}, {claim_ms}ms)",
                     )
                 claimed_total += len(to_claim)
                 pending_claims = pending_claims[len(to_claim):]
@@ -220,7 +231,7 @@ def claim_scan_cursor(
                 warn(
                     "CLAIM",
                     f"Claim TX reverted for {epoch_str} "
-                    f"(tx {result.tx_hash}, {claim_ms}ms, "
+                    f"(tx {_truncate_tx_hash(result.tx_hash)}, {claim_ms}ms, "
                     f"block {result.included_block_number})",
                 )
                 _send_claim_failure_alert(
@@ -244,7 +255,7 @@ def claim_scan_cursor(
             warn(
                 "CLAIM",
                 f"Claim TX timed out for {epoch_str} "
-                f"(tx {result.tx_hash}, {claim_ms}ms, "
+                f"(tx {_truncate_tx_hash(result.tx_hash)}, {claim_ms}ms, "
                 f"receipt_timeout {int(claim_tx_receipt_timeout_seconds)}s)",
             )
             _send_claim_failure_alert(

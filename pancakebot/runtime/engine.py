@@ -112,6 +112,91 @@ def _kline_result_get(gate, sym_short: str) -> str:
     return results.get(sym_short, "not_fetched")
 
 
+def _truncate_tx_hash(tx_hash: str) -> str:
+    """Render the first 8 chars of a tx hash with a trailing ellipsis
+    (e.g. ``0x123456...``). The full hash is captured elsewhere (live
+    latency.jsonl for bets; chain explorer is the authoritative source).
+    Truncated form keeps operator stdout single-glance scannable while
+    preserving enough disambiguation to cross-reference per session."""
+    if not tx_hash or len(tx_hash) <= 8:
+        return tx_hash
+    return f"{tx_hash[:8]}..."
+
+
+# Severity precedence among kline failure subtypes — higher = more severe.
+# When multiple symbols fail in the same round, the engine SKIP lead uses
+# the most-severe subtype across all failed symbols.
+_KLINE_FAIL_SEVERITY: dict[str, int] = {
+    "kline_publish_delay": 1,
+    "kline_http_error": 2,
+    "kline_unreachable": 3,
+}
+
+
+def _classify_kline_failure(
+    last_fetch_results: dict[str, str] | None,
+) -> tuple[str, str] | None:
+    """Inspect per-symbol fetch results from ``gate.last_fetch_results``
+    and return ``(subtype, message_body)`` for the SKIP narrative, or
+    ``None`` if no failures.
+
+    Subtypes:
+      - ``kline_publish_delay``: ``partial:got_N_expected_M`` — OKX
+        served a short response, typically the newest candle wasn't yet
+        published. Rendered: ``BTC: N of M candles``.
+      - ``kline_unreachable``: ``error:<network-class>`` — no bytes
+        received (ConnectionError / Timeout / DNS / etc.). Rendered:
+        ``BTC: ConnectionError``.
+      - ``kline_http_error``: ``error:<http_class>`` — bytes received
+        but with an error response (http_429, okx_code_*, empty_data,
+        json_parse_error). Rendered: ``BTC: http_429``.
+
+    Multi-symbol failure: the message body enumerates all failed symbols
+    comma-separated; the returned subtype is the most severe.
+
+    Unknown result shapes fall back to ``kline_http_error`` severity
+    (defensive); empirically the three families above cover every
+    `last_fetch_results` value populated by ``momentum_gate.evaluate``.
+    """
+    if not last_fetch_results:
+        return None
+    subtype_for_sym: dict[str, str] = {}
+    body_parts: list[str] = []
+    for sym_short, result in last_fetch_results.items():
+        if result in ("ok", "not_fetched"):
+            continue
+        sym_upper = sym_short.upper()
+        if result.startswith("partial:got_"):
+            # partial:got_15_expected_16 → "15 of 16 candles"
+            tokens = result[len("partial:"):].split("_")
+            try:
+                got, exp = int(tokens[1]), int(tokens[3])
+                body_parts.append(f"{sym_upper}: {got} of {exp} candles")
+            except (IndexError, ValueError):
+                body_parts.append(f"{sym_upper}: {result}")
+            subtype_for_sym[sym_short] = "kline_publish_delay"
+        elif result.startswith("error:"):
+            detail = result[len("error:"):]
+            body_parts.append(f"{sym_upper}: {detail}")
+            if (
+                detail.startswith("http_")
+                or detail.startswith("okx_code_")
+                or detail in ("empty_data", "json_parse_error")
+            ):
+                subtype_for_sym[sym_short] = "kline_http_error"
+            else:
+                subtype_for_sym[sym_short] = "kline_unreachable"
+        else:
+            body_parts.append(f"{sym_upper}: {result}")
+            subtype_for_sym[sym_short] = "kline_http_error"
+    if not subtype_for_sym:
+        return None
+    most_severe = max(
+        subtype_for_sym.values(), key=lambda s: _KLINE_FAIL_SEVERITY[s]
+    )
+    return most_severe, ", ".join(body_parts)
+
+
 # -- Heartbeat context -------------------------------------------------------
 # _run_one_iteration refreshes this at the top of every tick; _sleep_until_ts
 # reads it to emit a per-second heartbeat during long sleeps (deadlock
@@ -496,7 +581,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     eth_fetch_result=_kline_result_get(gate, "eth"),
                     sol_fetch_result=_kline_result_get(gate, "sol"),
                 )
-                warn("SKIP", f"Skip epoch {current_epoch}: risk_bankroll_stale err={e}")
+                # Per T3-A spec: short message, no err detail (the
+                # underlying exception class is captured in cycle_audit
+                # via skip_reason="risk_bankroll_stale"; the operator
+                # line just needs the actionable signal).
+                warn("SKIP", f"Skipped epoch {current_epoch}: bankroll stale")
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
             # Forward freshest bankroll to tracker (live only; dry records
@@ -678,7 +767,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     eth_fetch_result=_kline_result_get(gate, "eth"),
                     sol_fetch_result=_kline_result_get(gate, "sol"),
                 )
-                warn("SKIP", f"Skip epoch {current_epoch}: {skip_reason} endpoint={cfg.rpc_poller.current_endpoint}")
+                # skip_reason is "pool_not_ready_cold_start_in_progress"
+                # or "pool_not_ready_catchup_infeasible_for_round";
+                # route by the inner ready_reason.
+                if ready_reason == "cold_start_in_progress":
+                    info("SKIP", f"Skipped epoch {current_epoch}: cold start in progress")
+                elif ready_reason == "catchup_infeasible_for_round":
+                    # TODO T3-followup: expose RpcPoller.last_catchup_detail
+                    # (need_seconds, have_seconds) to upgrade this to the
+                    # spec form "Skipped epoch X: RPC catchup infeasible
+                    # (need 39.5s, have 30.1s)". Until then, keep the
+                    # generic form — the structured reason is captured
+                    # in cycle_audit; the numbers are recoverable from
+                    # the WARN poller log that fired upstream.
+                    warn("SKIP", f"Skipped epoch {current_epoch}: RPC catchup infeasible")
+                else:
+                    warn("SKIP", f"Skipped epoch {current_epoch}: {skip_reason}")
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
             pool_ts_cutoff = lock_ts_t - cfg.pool_cutoff_seconds
@@ -751,20 +855,56 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 eth_fetch_result=_kline_result_get(gate, "eth"),
                 sol_fetch_result=_kline_result_get(gate, "sol"),
             )
+            # T3-A: reason-routed SKIP with custom wording per reason.
+            # In-scope reasons get bespoke prose; out-of-scope reasons
+            # keep generic "Skipped epoch X: <reason>" with a TODO
+            # comment for the data-plumbing follow-up.
             if reason == "kline_fetch_transient_failure" and gate is not None:
-                # Fold the kline per-symbol detail (formerly emitted as a
-                # standalone WARN from momentum_gate.py) INTO this SKIP at
-                # WARN level. Operator-facing T1 wording is mechanical;
-                # T3 polishes per-reason phrasing.
-                _details = " ".join(
-                    f"{sym}={result}"
-                    for sym, result in (gate.last_fetch_results or {}).items()
-                    if result not in ("ok", "not_fetched")
-                )
-                _suffix = f" ({_details})" if _details else ""
-                warn("SKIP", f"Skip epoch {current_epoch}: {reason}{_suffix}")
+                classification = _classify_kline_failure(gate.last_fetch_results)
+                if classification is not None:
+                    subtype, body = classification
+                    _prefix_per_subtype = {
+                        "kline_publish_delay": "incomplete kline data",
+                        "kline_unreachable": "kline source unreachable",
+                        "kline_http_error": "kline source returned error",
+                    }
+                    prefix = _prefix_per_subtype[subtype]
+                    warn(
+                        "SKIP",
+                        f"Skipped epoch {current_epoch}: {prefix} ({body})",
+                    )
+                else:
+                    # Defensive: gate flagged the transient skip but
+                    # last_fetch_results came back empty/all-ok. Shouldn't
+                    # happen given the gate's own state-management, but
+                    # fall back to generic WARN rather than asserting.
+                    warn(
+                        "SKIP",
+                        f"Skipped epoch {current_epoch}: kline_fetch_transient_failure",
+                    )
+            elif reason == "gate_no_signal":
+                info("SKIP", f"Skipped epoch {current_epoch}: gate did not fire")
+            elif reason == "risk_drawdown_breaker_fired":
+                # TODO T3-followup: extend StrategyPipelineDecision with
+                # ``skip_context`` carrying drawdown_pct + threshold_pct
+                # for the spec form "Skipped epoch X: drawdown breaker
+                # fired (18.2% from peak, threshold 15%)". Data lives
+                # inside the pipeline's risk gate; plumbing it through
+                # the decision dataclass is a separate commit.
+                warn("SKIP", f"Skipped epoch {current_epoch}: {reason}")
+            elif reason == "risk_cooldown_active":
+                # TODO T3-followup: skip_context.rounds_remaining for
+                # spec form "Skipped epoch X: cooldown active (42 rounds
+                # remaining)".
+                info("SKIP", f"Skipped epoch {current_epoch}: {reason}")
+            elif reason == "pool_below_minimum":
+                # TODO T3-followup: skip_context.{pool_bnb,
+                # min_pool_bnb_at_cutoff} for spec form "Skipped epoch X:
+                # pool below minimum (0.8 BNB < 1.5 BNB threshold)".
+                info("SKIP", f"Skipped epoch {current_epoch}: {reason}")
             else:
-                info("SKIP", f"Skip epoch {current_epoch}: {reason}")
+                # Unrecognized reason — render generically.
+                info("SKIP", f"Skipped epoch {current_epoch}: {reason}")
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
@@ -810,11 +950,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         bet_submit_offset_ms = lock_ms - now_utc_ms
         margin_ms = lock_ms - deadline_ms
         if now_utc_ms >= deadline_ms:
+            # "Past safe submit time" = how late we are vs the deadline.
+            # margin_ms / submit_offset_ms / source remain in cycle_audit
+            # if offline analysis needs them.
+            late_ms = int(now_utc_ms - deadline_ms)
             warn(
                 "SKIP",
-                f"Skip epoch {current_epoch}: too_close_to_lock_for_bet "
-                f"submit_offset_ms={bet_submit_offset_ms:.0f} "
-                f"margin_ms={margin_ms} source={deadline_source}",
+                f"Skipped epoch {current_epoch}: too late to submit bet "
+                f"({late_ms}ms past safe submit time)",
             )
             _record_dry_cycle_audit(
                 cfg,
@@ -905,13 +1048,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             # round and eliminates a TransientRpcError bubble path. Display
             # value is accurate to within the gas fee (~1e-5 BNB).
             bankroll_after_live = bankroll_bnb - amount_bnb
+            if tx_submit is None:
+                raise InvariantError("live_bet_submit_missing")
             info(
                 "BET",
                 f"Bet {amount_bnb:.4f} BNB on {bet_side} for epoch {current_epoch} "
-                f"(bankroll: {bankroll_after_live:.4f} BNB)",
+                f"(tx {_truncate_tx_hash(tx_submit.tx_hash)}, "
+                f"bankroll: {bankroll_after_live:.4f} BNB)",
             )
-            if tx_submit is None:
-                raise InvariantError("live_bet_submit_missing")
             receipt_confirmed_ms = (
                 float(tx_submit.t_receipt_confirmed_mono_ms)
                 if tx_submit.t_receipt_confirmed_mono_ms is not None
