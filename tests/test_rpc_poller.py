@@ -1322,6 +1322,82 @@ def test_init_cursor_marks_infeasible_and_jumps_to_head_when_no_time():
     assert p._last_polled_block_number == 100_000
 
 
+# ---------------------------------------------------------------------------
+# T3-B: RpcPoller.last_catchup_detail exposes (need_ms, have_ms) for the
+# engine's SKIP narrative ("RPC catchup infeasible (need 39.5s, have 30.1s)")
+# ---------------------------------------------------------------------------
+
+
+def test_last_catchup_detail_captured_when_infeasibility_check_fires():
+    """When ``_is_catchup_infeasible`` returns True, the poller stashes
+    ``(estimated_ms, available_ms)`` on ``last_catchup_detail`` so the
+    engine's catchup_infeasible SKIP narrative can render the numbers.
+    """
+    import time as _t
+    p = _make_poller()
+    # Force a known-infeasible scenario: 597 blocks behind, 30s until lock.
+    # estimated_ms = 29 batches × 1319ms + 1 partial → ~39.5s
+    # available_ms = 30000 - 200 safety = 29800ms
+    # → infeasible.
+    now = _t.time()
+    lock_at = int(now + 30)
+    blocks_behind = 597
+
+    assert p._is_catchup_infeasible(
+        blocks_behind=blocks_behind, lock_at=lock_at,
+    ) is True
+    detail = p.last_catchup_detail
+    assert detail is not None
+    need_ms, have_ms = detail
+    # Need substantially exceeds have for this construction.
+    assert need_ms > have_ms
+    # Empirical: ~39.5s vs ~29.8s.
+    assert 35_000 <= need_ms <= 45_000, f"need_ms={need_ms} outside expected band"
+    assert 28_000 <= have_ms <= 30_500, f"have_ms={have_ms} outside expected band"
+
+
+def test_last_catchup_detail_reset_on_epoch_advance():
+    """A new round's epoch-advance hook clears any stashed catchup detail
+    so a later SKIP can't surface stale numbers from a prior round.
+
+    The reset lives in ``_on_epoch_advance`` (called from
+    ``set_round_phase`` when the epoch number changes). The very first
+    ``set_round_phase`` routes through ``_initialize_cursor_from_head``
+    which is a different path; the reset is only relevant for the
+    round-to-round transition where stale numbers could leak across.
+    """
+    import time as _t
+    p = _make_poller()
+    # Populate detail via an infeasible check (as if a prior round
+    # observed catchup_infeasible_for_round).
+    now = _t.time()
+    p._is_catchup_infeasible(blocks_behind=597, lock_at=int(now + 30))
+    assert p.last_catchup_detail is not None
+
+    # Mock the RPC head fetch + round_start derivation so
+    # _on_epoch_advance can run without real chain calls.
+    p._compute_round_start_block = lambda _ts: 99_000  # type: ignore[assignment]
+    p._rpc_eth_block_number = lambda: 99_010  # type: ignore[assignment]
+
+    # _on_epoch_advance is the canonical round-boundary hook; calling
+    # it directly exercises the reset without the first-call cursor-init
+    # branch in set_round_phase.
+    p._on_epoch_advance(lock_at=int(now) + 300, current_epoch=100_001)
+
+    assert p.last_catchup_detail is None, (
+        "_on_epoch_advance must clear last_catchup_detail; otherwise a "
+        "SKIP in a later round could surface stale numbers from a prior round"
+    )
+
+
+def test_last_catchup_detail_returns_none_when_no_check_has_fired():
+    """Fresh poller (no infeasibility check yet) returns None — engine
+    SKIP narrative gracefully falls back to the no-numbers wording.
+    """
+    p = _make_poller()
+    assert p.last_catchup_detail is None
+
+
 def test_init_cursor_handles_head_before_round_start():
     """If head_ts <= round_start_ts (head is BEHIND round_start, e.g.
     lock_at far in the future), set cursor to head and return — daemon's

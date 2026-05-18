@@ -773,14 +773,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 if ready_reason == "cold_start_in_progress":
                     info("SKIP", f"Skipped epoch {current_epoch}: cold start in progress")
                 elif ready_reason == "catchup_infeasible_for_round":
-                    # TODO T3-followup: expose RpcPoller.last_catchup_detail
-                    # (need_seconds, have_seconds) to upgrade this to the
-                    # spec form "Skipped epoch X: RPC catchup infeasible
-                    # (need 39.5s, have 30.1s)". Until then, keep the
-                    # generic form — the structured reason is captured
-                    # in cycle_audit; the numbers are recoverable from
-                    # the WARN poller log that fired upstream.
-                    warn("SKIP", f"Skipped epoch {current_epoch}: RPC catchup infeasible")
+                    # The same code path that sets _catchup_infeasible_for_round
+                    # populates _last_catchup_detail in _is_catchup_infeasible.
+                    # If we observe the flag without the detail, that's a
+                    # pollster invariant violation — raise loudly rather
+                    # than degrade silently.
+                    _catchup = cfg.rpc_poller.last_catchup_detail
+                    if _catchup is None:
+                        raise InvariantError(
+                            "rpc_poller_catchup_infeasible_without_detail"
+                        )
+                    _need_s, _have_s = _catchup[0] / 1000.0, _catchup[1] / 1000.0
+                    warn(
+                        "SKIP",
+                        f"Skipped epoch {current_epoch}: RPC catchup infeasible "
+                        f"(need {_need_s:.1f}s, have {_have_s:.1f}s)",
+                    )
                 else:
                     warn("SKIP", f"Skipped epoch {current_epoch}: {skip_reason}")
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
@@ -885,23 +893,31 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             elif reason == "gate_no_signal":
                 info("SKIP", f"Skipped epoch {current_epoch}: gate did not fire")
             elif reason == "risk_drawdown_breaker_fired":
-                # TODO T3-followup: extend StrategyPipelineDecision with
-                # ``skip_context`` carrying drawdown_pct + threshold_pct
-                # for the spec form "Skipped epoch X: drawdown breaker
-                # fired (18.2% from peak, threshold 15%)". Data lives
-                # inside the pipeline's risk gate; plumbing it through
-                # the decision dataclass is a separate commit.
-                warn("SKIP", f"Skipped epoch {current_epoch}: {reason}")
+                # skip_context is required for this reason — pipeline's
+                # StrategyPipelineDecision.__post_init__ enforces it.
+                # Direct access; if anything is wrong, raise loudly.
+                _ctx = decision.skip_context
+                warn(
+                    "SKIP",
+                    f"Skipped epoch {current_epoch}: drawdown breaker fired "
+                    f"({_ctx['drawdown_pct']:.1f}% from peak, "
+                    f"threshold {_ctx['threshold_pct']:.0f}%)",
+                )
             elif reason == "risk_cooldown_active":
-                # TODO T3-followup: skip_context.rounds_remaining for
-                # spec form "Skipped epoch X: cooldown active (42 rounds
-                # remaining)".
-                info("SKIP", f"Skipped epoch {current_epoch}: {reason}")
+                _ctx = decision.skip_context
+                info(
+                    "SKIP",
+                    f"Skipped epoch {current_epoch}: cooldown active "
+                    f"({_ctx['rounds_remaining']} rounds remaining)",
+                )
             elif reason == "pool_below_minimum":
-                # TODO T3-followup: skip_context.{pool_bnb,
-                # min_pool_bnb_at_cutoff} for spec form "Skipped epoch X:
-                # pool below minimum (0.8 BNB < 1.5 BNB threshold)".
-                info("SKIP", f"Skipped epoch {current_epoch}: {reason}")
+                _ctx = decision.skip_context
+                info(
+                    "SKIP",
+                    f"Skipped epoch {current_epoch}: pool below minimum "
+                    f"({_ctx['pool_bnb']:.2f} BNB < "
+                    f"{_ctx['min_pool_bnb_at_cutoff']:.2f} BNB threshold)",
+                )
             else:
                 # Unrecognized reason — render generically.
                 info("SKIP", f"Skipped epoch {current_epoch}: {reason}")
