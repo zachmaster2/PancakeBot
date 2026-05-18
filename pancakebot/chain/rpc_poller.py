@@ -514,9 +514,11 @@ class RpcPoller:
                 "eth_getBlockByNumber", ["latest", False],
                 timeout_s=timeout_s,
             )
-        except Exception as e:  # noqa: BLE001
-            info("RPC_POLL", "ANCHOR", "ERR",
-                 msg=f"fire_anchor_poll: {type(e).__name__}: {e}")
+        except Exception:  # noqa: BLE001
+            # Anchor poll timeout / malformed response: fallback to static
+            # wake. wake_mode="static" in cycle_audit signals this happened;
+            # operator-facing emit is dropped at Phase B v2 (was per-round
+            # noise, not anomaly-worthy in isolation).
             return None
         if not isinstance(block, dict):
             return None
@@ -586,10 +588,10 @@ class RpcPoller:
             target=self._periodic_loop, daemon=True, name="rpc-poller-periodic",
         )
         self._periodic_thread.start()
-        info("RPC_POLL", "START", "OK",
-             msg=(f"RPC poller started endpoint={self._current_endpoint} "
-                  f"periodic={self._periodic_poll_interval_s}s "
-                  f"batch={self._batch_size}"))
+        info("START",
+             f"RPC poller started endpoint={self._current_endpoint} "
+             f"periodic={self._periodic_poll_interval_s}s "
+             f"batch={self._batch_size}")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -603,7 +605,7 @@ class RpcPoller:
         # Drain the urllib3 connection pool — closes any persistent
         # sockets so the process exits cleanly.
         self._pool.clear()
-        info("RPC_POLL", "STOP", "OK", msg="RPC poller stopped")
+        info("STOP", "RPC poller stopped")
 
     # ------------------------------------------------------------------
     # Engine integration: round-phase + decision-time pool read
@@ -650,9 +652,7 @@ class RpcPoller:
                 return
 
             if is_first_call:
-                info("RPC_POLL", "EPOCH", "INIT",
-                     msg=f"Initialized at epoch {current_epoch}",
-                     epoch=current_epoch)
+                info("START", f"RPC poll initialized at epoch {current_epoch}")
                 self._current_epoch = current_epoch
             else:
                 # Drop stale epochs (strictly less than new current_epoch)
@@ -780,9 +780,6 @@ class RpcPoller:
         if new_cursor > prev_cursor:
             with self._lock:
                 self._last_polled_block_number = new_cursor
-            info("RPC_POLL", "EPOCH", "RESET",
-                 msg=(f"cursor {prev_cursor}->{new_cursor} "
-                      f"(skipped {new_cursor - prev_cursor} stale-round blocks)"))
 
         # Feasibility check: how far behind are we vs how much time
         # remains, with a single fresh head fetch.
@@ -809,11 +806,9 @@ class RpcPoller:
             if time_until_lock_ms > 0:
                 with self._lock:
                     self._catchup_infeasible_for_round = True
-                warn("RPC_POLL", "CATCH", "INFEAS",
-                     msg=(f"behind {blocks_behind} blocks, "
-                          f"est {self._estimated_catchup_ms(blocks_behind)}ms "
-                          f"> avail {self._available_catchup_ms(time_until_lock_ms)}ms; "
-                          f"skipping round {current_epoch}"))
+                # INFEAS WARN folded into engine.py SKIP narrative
+                # at Phase B v2 (the round is going to be skipped anyway;
+                # one operator line per skip is enough).
 
     def _compute_round_start_block(self, round_start_ts: int) -> int | None:
         """Return the block-number whose timestamp ~= round_start_ts.
@@ -987,13 +982,10 @@ class RpcPoller:
                 try:
                     head, head_ts = self._rpc_eth_get_latest_block_header()
                 except Exception as e:  # noqa: BLE001
-                    warn("RPC_POLL", "COLD", "FAIL",
-                         msg=(f"init_cursor: eth_getBlockByNumber(latest): "
-                              f"{type(e).__name__}: {e}"))
+                    warn("ALERT", f"init_cursor: eth_getBlockByNumber(latest) failed: {type(e).__name__}: {e}")
                     return
                 if head <= 0 or head_ts <= 0:
-                    warn("RPC_POLL", "COLD", "FAIL",
-                         msg=f"init_cursor: invalid header head={head} ts={head_ts}")
+                    warn("ALERT", f"init_cursor: invalid header head={head} ts={head_ts}")
                     return
 
                 with self._lock:
@@ -1010,10 +1002,10 @@ class RpcPoller:
                         # Y1 safeguard: authoritatively clear any flag a
                         # racing daemon poll may have set.
                         self._catchup_infeasible_for_round = False
-                    info("RPC_POLL", "COLD", "OK",
-                         msg=(f"init_cursor: head_ts {head_ts} <= "
-                              f"round_start_ts {round_start_ts}; cursor at "
-                              f"head={head} (no in-round blocks yet)"))
+                    info("START",
+                         f"init_cursor: head_ts {head_ts} <= "
+                         f"round_start_ts {round_start_ts}; cursor at "
+                         f"head={head} (no in-round blocks yet)")
                     return
 
                 # delta_blocks: how many blocks since round_start.
@@ -1055,12 +1047,11 @@ class RpcPoller:
                     time_until_lock_ms = max(
                         0, int((lock_at_local - time.time()) * 1000),
                     )
-                    warn("RPC_POLL", "COLD", "INFEAS",
-                         msg=(f"init_cursor: catchup {blocks_to_backfill} blocks "
-                              f"would take ~{self._estimated_catchup_ms(blocks_to_backfill)}ms "
-                              f"> {self._available_catchup_ms(time_until_lock_ms)}ms "
-                              f"available; cursor jumped to head, "
-                              f"will resume on next round"))
+                    warn("SKIP",
+                         f"Skip cold-start round: catchup {blocks_to_backfill} blocks "
+                         f"would take ~{self._estimated_catchup_ms(blocks_to_backfill)}ms "
+                         f"> {self._available_catchup_ms(time_until_lock_ms)}ms "
+                         f"available; cursor jumped to head, will resume on next round")
                     return
 
                 with self._lock:
@@ -1070,14 +1061,13 @@ class RpcPoller:
                     # uninitialized cursor=0 sentinel.
                     self._catchup_infeasible_for_round = False
 
-                info("RPC_POLL", "COLD", "INIT",
-                     msg=(f"init_cursor: cursor at {round_start_block - 1}; "
-                          f"first periodic tick will catch up "
-                          f"{blocks_to_backfill} blocks"))
+                info("START",
+                     f"init_cursor: cursor at {round_start_block - 1}; "
+                     f"first periodic tick will catch up "
+                     f"{blocks_to_backfill} blocks")
 
             except Exception as e:  # noqa: BLE001
-                warn("RPC_POLL", "COLD", "FAIL",
-                     msg=f"{type(e).__name__}: {e}")
+                warn("ALERT", f"init_cursor failed: {type(e).__name__}: {e}")
             finally:
                 with self._lock:
                     self._cold_start_in_progress = False
@@ -1164,8 +1154,7 @@ class RpcPoller:
             try:
                 self._poll_now(deadline_ms=0, label="period")
             except Exception as e:  # noqa: BLE001
-                warn("RPC_POLL", "PERIOD", "FAIL",
-                     msg=f"{type(e).__name__}: {e}")
+                warn("ALERT", f"periodic poll failed: {type(e).__name__}: {e}")
 
     def _compute_periodic_timeout(
         self, *, now: float, lock_at: int, period: int,
@@ -1226,10 +1215,10 @@ class RpcPoller:
         if not self._connected:
             self._connected = True
             self._cold_start_done.set()
-            info("RPC_POLL", "COLD", "OK",
-                 msg=f"first poll complete; pool aggregate ready "
-                     f"(cursor={self._last_polled_block_number}, "
-                     f"epochs_tracked={len(self._pools)})")
+            info("READY",
+                 f"first poll complete; pool aggregate ready "
+                 f"(cursor={self._last_polled_block_number}, "
+                 f"epochs_tracked={len(self._pools)})")
 
     def _poll_now(self, *, deadline_ms: int, label: str) -> None:
         """Core poll: fetch new blocks since _last_polled_block_number,
@@ -1256,8 +1245,7 @@ class RpcPoller:
                 with self._lock:
                     self._last_poll_succeeded = False
                     self._last_poll_error = f"head_fetch:{type(e).__name__}:{e}"
-                warn("RPC_POLL", label.upper(), "ERR",
-                     msg=f"eth_blockNumber: {self._last_poll_error}")
+                warn("ALERT", f"{label} poll: eth_blockNumber failed: {self._last_poll_error}")
                 return
 
             with self._lock:
@@ -1298,11 +1286,10 @@ class RpcPoller:
                 if time_until_lock_ms > 0:
                     with self._lock:
                         self._catchup_infeasible_for_round = True
-                    warn("RPC_POLL", label.upper(), "INFEAS",
-                         msg=(f"behind {blocks_to_catchup} blocks, "
-                              f"est {self._estimated_catchup_ms(blocks_to_catchup)}ms "
-                              f"> avail {self._available_catchup_ms(time_until_lock_ms)}ms; "
-                              f"aborting poll"))
+                    # Per-poll INFEAS WARN dropped at Phase B v2 — the
+                    # engine's SKIP narrative for the round carries the
+                    # detail and fires once per skipped round.
+                    pass
                 # else: trailing post-lock periodic; cursor will advance on
                 # the next successful poll once set_round_phase updates
                 # _lock_at for the new round. No flag, no warn.
@@ -1321,10 +1308,10 @@ class RpcPoller:
                 if deadline_ms > 0:
                     elapsed_ms = int((time.time() - t_start) * 1000)
                     if elapsed_ms > deadline_ms:
-                        warn("RPC_POLL", label.upper(), "SLOW",
-                             msg=(f"deadline exceeded after batch_start={batch_start}: "
-                                  f"elapsed={elapsed_ms}ms > deadline={deadline_ms}ms; "
-                                  f"aborting remaining batches"))
+                        warn("ALERT",
+                             f"{label} poll deadline exceeded after batch_start={batch_start}: "
+                             f"elapsed={elapsed_ms}ms > deadline={deadline_ms}ms; "
+                             f"aborting remaining batches")
                         break
                 batch_end = min(batch_start + self._batch_size - 1, head)
                 batch_nums = list(range(batch_start, batch_end + 1))
@@ -1336,8 +1323,7 @@ class RpcPoller:
                     # cursor advance + feasibility check together prevent
                     # the catch-up backlog from compounding. INFO severity
                     # avoids alert noise on routine outages.
-                    info("RPC_POLL", label.upper(), "BATCH_FAIL",
-                         msg=error_seen)
+                    warn("ALERT", f"{label} poll batch failed: {error_seen}")
                     break
                 blocks_polled += len(batch_nums)
                 with self._lock:
@@ -1358,31 +1344,18 @@ class RpcPoller:
                     self._latch_first_successful_poll_locked()
                 self._last_poll_too_slow = too_slow
 
-            # Status taxonomy:
-            #   OK       - full poll succeeded
-            #   PARTIAL  - some batches succeeded, then error_seen
-            #   EMPTY    - zero batches succeeded (error_seen != None)
-            #              OR endpoint returned empty for valid range
-            # Severity: INFO for the timeout-driven cases (transient and
-            # expected). WARN only when we got an empty-but-no-error
-            # reply for a valid range — that IS unusual.
-            if error_seen is None:
-                status = "OK"
-                emit = info
-            elif blocks_polled == 0:
-                status = "EMPTY"
-                emit = info
-            else:
-                status = "PARTIAL"
-                emit = info
+            # Phase B v2 (2026-05-18): per-poll OK lines DROPPED — they fired
+            # every 8s (periodic) + ramp/final polls = ~30-50/round, mostly
+            # operator-noise. PARTIAL / EMPTY remain at WARN level since
+            # each indicates an anomaly worth reading.
             if blocks_polled == 0 and error_seen is None and n_blocks > 0:
-                # Endpoint returned empty for a valid range — rare and
-                # worth flagging.
-                status = "EMPTY"
-                emit = warn
-            emit("RPC_POLL", label.upper(), status,
-                 msg=(f"polled {blocks_polled}/{n_blocks} blocks "
-                      f"({from_block}..{head}) in {rtt_ms}ms"))
+                warn("ALERT",
+                     f"{label} poll EMPTY: 0/{n_blocks} blocks "
+                     f"({from_block}..{head}) in {rtt_ms}ms (endpoint returned empty for valid range)")
+            elif error_seen is not None and blocks_polled > 0:
+                warn("ALERT",
+                     f"{label} poll PARTIAL: {blocks_polled}/{n_blocks} blocks "
+                     f"({from_block}..{head}) in {rtt_ms}ms")
 
         finally:
             with self._lock:

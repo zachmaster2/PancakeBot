@@ -48,15 +48,12 @@ def _send_claim_failure_alert(
     """
     webhook = os.environ.get(_LIVE_ALERTS_WEBHOOK_ENV, "").strip()
     if not webhook:
-        warn("CLAIM", "ALERT", "DISABLED",
-             reason=reason, tx_hash=tx_hash,
-             msg=f"{_LIVE_ALERTS_WEBHOOK_ENV} unset; CLAIM FAILED alert not sent")
+        warn("ALERT", f"{_LIVE_ALERTS_WEBHOOK_ENV} unset; CLAIM FAILED alert not sent (reason={reason} tx={tx_hash})")
         return
     try:
         import requests
     except Exception as e:
-        warn("CLAIM", "ALERT", "IMPORT_FAIL",
-             reason=reason, tx_hash=tx_hash, err=str(e))
+        warn("ALERT", f"CLAIM FAILED alert import failed (reason={reason} tx={tx_hash} err={e})")
         return
 
     epoch_str = ",".join(str(int(e)) for e in epochs)
@@ -71,14 +68,11 @@ def _send_claim_failure_alert(
     try:
         r = requests.post(webhook, json=payload, timeout=10)
     except Exception as e:
-        warn("CLAIM", "ALERT", "POST_FAIL",
-             reason=reason, tx_hash=tx_hash, err=str(e))
+        warn("ALERT", f"CLAIM FAILED alert post failed (reason={reason} tx={tx_hash} err={e})")
         return
     if not (200 <= r.status_code < 300):
-        warn("CLAIM", "ALERT", "BAD_STATUS",
-             reason=reason, tx_hash=tx_hash,
-             http_status=r.status_code,
-             body=str(getattr(r, "text", ""))[:200])
+        body = str(getattr(r, "text", ""))[:200]
+        warn("ALERT", f"CLAIM FAILED alert bad status (reason={reason} tx={tx_hash} http_status={r.status_code} body={body})")
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,15 +186,9 @@ def claim_scan_cursor(
 
             if result.status == "success":
                 info(
-                    "NET",
-                    "RPC",
                     "CLAIM",
-                    epoch=to_claim[0],
-                    tx=result.tx_hash,
-                    claim_ms=f"{claim_ms}ms",
-                    batch_n=len(to_claim),
-                    last_epoch=to_claim[-1],
-                    gas_limit=chunk_gas_limit,
+                    f"Claimed {len(to_claim)} epochs ({to_claim[0]}..{to_claim[-1]}) "
+                    f"tx={result.tx_hash} claim_ms={claim_ms}ms gas_limit={chunk_gas_limit}",
                 )
                 claimed_total += len(to_claim)
                 pending_claims = pending_claims[len(to_claim):]
@@ -208,14 +196,10 @@ def claim_scan_cursor(
 
             if result.status == "revert":
                 warn(
-                    "CLAIM", "TX", "REVERT",
-                    epoch=to_claim[0],
-                    last_epoch=to_claim[-1],
-                    tx=result.tx_hash,
-                    claim_ms=f"{claim_ms}ms",
-                    batch_n=len(to_claim),
-                    gas_limit=chunk_gas_limit,
-                    block_number=result.included_block_number,
+                    "CLAIM",
+                    f"Claim TX reverted: {len(to_claim)} epochs ({to_claim[0]}..{to_claim[-1]}) "
+                    f"tx={result.tx_hash} claim_ms={claim_ms}ms gas_limit={chunk_gas_limit} "
+                    f"block_number={result.included_block_number}",
                 )
                 _send_claim_failure_alert(
                     reason="revert",
@@ -232,14 +216,10 @@ def claim_scan_cursor(
 
             # status == "timeout"
             warn(
-                "CLAIM", "TX", "TIMEOUT",
-                epoch=to_claim[0],
-                last_epoch=to_claim[-1],
-                tx=result.tx_hash,
-                claim_ms=f"{claim_ms}ms",
-                batch_n=len(to_claim),
-                gas_limit=chunk_gas_limit,
-                receipt_timeout_seconds=int(claim_tx_receipt_timeout_seconds),
+                "CLAIM",
+                f"Claim TX timed out: {len(to_claim)} epochs ({to_claim[0]}..{to_claim[-1]}) "
+                f"tx={result.tx_hash} claim_ms={claim_ms}ms gas_limit={chunk_gas_limit} "
+                f"receipt_timeout_seconds={int(claim_tx_receipt_timeout_seconds)}",
             )
             _send_claim_failure_alert(
                 reason="timeout",

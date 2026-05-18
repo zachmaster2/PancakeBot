@@ -192,9 +192,8 @@ def ensure_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
             # Absolute fallback: leave the old file in place and write the
             # new schema to a parallel path. Surfaced via warn log so the
             # operator notices.
-            warn("AUDIT", "CSV", "ROTATE_FAIL",
-                 msg=f"could not rotate {path}; writing new schema "
-                     f"to {path}.rotate-fallback")
+            warn("ALERT",
+                 f"could not rotate {path}; writing new schema to {path}.rotate-fallback")
             fallback_path = f"{path}.rotate-fallback"
             with open(fallback_path, "w", newline="") as f:
                 w = csv.writer(f)

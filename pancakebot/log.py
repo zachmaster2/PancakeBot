@@ -1,33 +1,28 @@
-"""Fixed-width structured logger with info/warn/error levels and typed field formatting."""
+"""Fixed-width structured logger with info/warn/error levels and a single ACTION column.
+
+Phase B v2 (2026-05-18): collapsed the prior 3-column hierarchy
+(SYSTEM/SUB/EVENT, each with its own width + naming convention) into a
+single ACTION column. Operator-facing messages are now plain English
+sentences passed positionally; there is no `**fields` kv rendering and
+no `msg=` short-circuit. Callers pick an ACTION verb from the canonical
+vocabulary (see ``docs/logging.md``) and compose the message as prose.
+"""
 from __future__ import annotations
 
 import datetime
 import logging
-import math
-import numbers
 import os
 import sys
 from logging.handlers import RotatingFileHandler
-from typing import Any
 
 from pancakebot.util import InvariantError
 
-# Logging goals:
-# - Fixed-width columns for readability.
-# - Keep logs concise and stable (no debug mode).
-# - INFO for normal progress; WARN for retry attempts; ERROR for transient failures.
-
-_SYS_NAME_W: int = 8
-_SUB_W: int = 6
-# Event column width (left-padded, hard-enforced by ``_emit``). Sized
-# to fit the longest event name in the codebase (currently
-# ``ROTATE_FAIL`` and ``IMPORT_FAIL`` at 11 chars). Convention:
-# event names describe what HAPPENED (an action / outcome) and should
-# leverage the SUB column to avoid redundancy -- e.g. SUB=KLINE +
-# EVENT=PARTIAL reads cleaner than SUB=KLINE + EVENT=KLINE_PARTIAL.
-# If a future event name exceeds 11, ``InvariantError`` fires at emit
-# time so the dev can either shorten the name or bump this width.
-_EVENT_W: int = 11
+# Action column width (left-padded, hard-enforced by ``_emit``). Sized to
+# fit the longest action verb in the canonical vocabulary (PROGRESS = 8,
+# RECOVER = 7, REFUND = 6). Exceeding 8 chars raises ``InvariantError``
+# at emit time so a typo or a stray verb-not-in-vocab is caught
+# immediately rather than silently misaligning the column.
+_ACTION_W: int = 8
 
 # Bundle 5 2026-05-14: a RotatingFileHandler-backed Python ``logging``
 # sink mirrors every ``_emit`` call into ``var/{mode}/runtime.log``. The
@@ -45,10 +40,6 @@ _FILE_LOGGER.propagate = False
 _FILE_LOGGER.setLevel(logging.DEBUG)
 
 # Level mapping: our "INFO"/"WARN"/"ERROR" strings → logging module ints.
-# Bundle 5 logging levels stay coarse — we don't yet emit DEBUG from the
-# structured logger, but configure the file handler at DEBUG so future
-# debug events (e.g. from third-party libs that log to the pancakebot
-# namespace) are captured without a config change.
 _LEVEL_TO_LOGGING: dict[str, int] = {
     "INFO": logging.INFO,
     "WARN": logging.WARNING,
@@ -73,7 +64,7 @@ def configure_file_logging(log_path: str) -> RotatingFileHandler:
     File rotation: 25MB threshold, 7 backups, parent dir auto-created.
     Format: ``HH:MM:SS.mmm message``. The format intentionally drops
     %(levelname)s and %(name)s because the rendered ``_emit`` line
-    (passed as %(message)s) already carries level + sys_name columns;
+    (passed as %(message)s) already carries the level column;
     duplicating them would (a) waste bytes per line and (b) cause a
     level-string drift between stdout (``WARN``) and file
     (Python's ``WARNING``). The handler's own ``asctime`` captures
@@ -120,14 +111,6 @@ def configure_file_logging(log_path: str) -> RotatingFileHandler:
         encoding="utf-8",
     )
     handler.setLevel(logging.DEBUG)
-    # NB (reviewer flag, Bundle 5): we deliberately drop %(levelname)s
-    # from the file format because the rendered ``_emit`` line (passed
-    # in as %(message)s) ALREADY includes the level column ("INFO",
-    # "WARN", "ERROR" — note "WARN", not Python's "WARNING"). Including
-    # %(levelname)s would cause a level-string drift: stdout shows
-    # "WARN" while file shows "WARNING", breaking operator-side
-    # ``\bWARN\b`` grep on the file. The handler's level filter still
-    # applies via setLevel(DEBUG).
     formatter = logging.Formatter(
         fmt="%(asctime)s.%(msecs)03d %(message)s",
         datefmt="%H:%M:%S",
@@ -145,107 +128,47 @@ def _ts_hundredths() -> str:
     return f"{base}.{hundredths:02d}"
 
 
-def _fmt_float_by_key(key: str, x: float) -> str:
-    # Consistent, human-readable numeric formatting.
-    # Rules (locked):
-    # - *_bnb               -> 4 decimals (Pancake UI style)
-    # - *probability*       -> 5 decimals
-    # - *_fraction          -> 4 decimals
-    # - *_multiple          -> 4 decimals
-    # - default floats      -> 4 decimals
-    if not math.isfinite(x):
-        return "inf" if x > 0 else "-inf" if x < 0 else "nan"
+def _emit(level: str, action: str, message: str) -> None:
+    """Render and emit a structured log line to stdout + file sink.
 
-    k = key.lower()
-    if k.endswith("_bnb"):
-        return f"{x:.4f}"
-    if "probability" in k:
-        return f"{x:.5f}"
-    if k.endswith("_fraction"):
-        return f"{x:.4f}"
-    if k.endswith("_multiple"):
-        return f"{x:.4f}"
-    return f"{x:.4f}"
+    ``action`` must be from the canonical vocabulary (see
+    ``docs/logging.md``); ≤ ``_ACTION_W`` chars enforced here.
+    ``message`` is the operator-facing English sentence — no kv
+    rendering, no formatting helpers; callers compose prose directly.
+    """
+    if len(action) > _ACTION_W:
+        raise InvariantError("log_action_too_long")
 
-
-def _fmt_value(key: str, v: Any) -> str:
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if v is None:
-        return "null"
-    if isinstance(v, numbers.Real) and not isinstance(v, (bool, int)):
-        return _fmt_float_by_key(key, float(v))
-    return str(v)
-
-
-def _shorten_long(k: str, v: str) -> str:
-    if k == "tx" and len(v) > 24:
-        return f"{v[:8]}...{v[-8:]}"
-    return v
-
-
-def _fmt_fields(fields: dict[str, Any]) -> str:
-    if not fields:
-        return ""
-    parts: list[str] = []
-    for k, v in fields.items():
-        val = _shorten_long(k, _fmt_value(k, v))
-        parts.append(f"{k}={val}")
-    return " " + " ".join(parts)
-
-
-def _emit(level: str, sys_name: str, sub: str, event: str, *, msg: str | None = None, **fields: Any) -> None:
     ts = _ts_hundredths()
-
-    if len(sys_name) > _SYS_NAME_W:
-        raise InvariantError("log_label_too_long_sys")
-    if len(sub) > _SUB_W:
-        raise InvariantError("log_label_too_long_sub")
-    if len(event) > _EVENT_W:
-        raise InvariantError("log_label_too_long_event")
-
-    # Fixed-width columns for readability (spaces only; no tabs).
-    tail = ""
-    if msg is not None and msg != "":
-        tail = " " + str(msg)
-    elif fields:
-        tail = _fmt_fields(fields)
-
     line = (
         f"{ts}  "
-        f"{level:<5} "
-        f"{sys_name:<{_SYS_NAME_W}} "
-        f"{sub:<{_SUB_W}} "
-        f"{event:<{_EVENT_W}}"
-        f"{tail}"
+        f"{level:<5}  "
+        f"{action:<{_ACTION_W}}  "
+        f"{message}"
     )
 
     rendered = line.rstrip()
     sys.stdout.write(rendered + "\n")
     sys.stdout.flush()
 
-    # Bundle 5 2026-05-14: dual-write into the namespaced
-    # ``pancakebot`` logger so a RotatingFileHandler (configured at
-    # startup by ``configure_file_logging``) can persist every line to
-    # ``var/{mode}/runtime.log``. When no handler is attached (backtest,
-    # sync, unit-test contexts) ``Logger.log`` is a near-no-op and the
-    # stdout path is unaffected. Wrap in try/except so any logging-
-    # subsystem failure does NOT propagate up and abort the caller —
-    # the stdout write above already succeeded and is the source of
-    # truth; the file mirror is a strictly additive sink.
+    # Bundle 5 2026-05-14: dual-write into the namespaced ``pancakebot``
+    # logger. When no handler is attached (backtest, sync, unit-test
+    # contexts) ``Logger.log`` is a near-no-op. Wrap in try/except so
+    # any logging-subsystem failure does NOT abort the caller — the
+    # stdout write above is the source of truth.
     try:
         _FILE_LOGGER.log(_LEVEL_TO_LOGGING.get(level, logging.INFO), rendered)
     except Exception:
         pass
 
 
-def info(sys_name: str, sub: str, event: str, *, msg: str | None = None, **fields: Any) -> None:
-    _emit("INFO", sys_name, sub, event, msg=msg, **fields)
+def info(action: str, message: str) -> None:
+    _emit("INFO", action, message)
 
 
-def warn(sys_name: str, sub: str, event: str, *, msg: str | None = None, **fields: Any) -> None:
-    _emit("WARN", sys_name, sub, event, msg=msg, **fields)
+def warn(action: str, message: str) -> None:
+    _emit("WARN", action, message)
 
 
-def error(sys_name: str, sub: str, event: str, *, msg: str | None = None, **fields: Any) -> None:
-    _emit("ERROR", sys_name, sub, event, msg=msg, **fields)
+def error(action: str, message: str) -> None:
+    _emit("ERROR", action, message)

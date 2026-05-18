@@ -300,62 +300,53 @@ def test_evaluate_skips_with_kline_fetch_transient_failure_on_any_transient():
         assert result.signal is None
 
 
-def test_evaluate_emits_one_warn_per_failed_symbol_on_transient():
-    """Per-symbol detail goes into one warn() per failure."""
+def test_evaluate_populates_last_fetch_results_per_failed_symbol():
+    """Phase B v2: gate no longer emits a per-symbol WARN. Instead, the
+    per-symbol fetch outcome lands in ``gate.last_fetch_results`` (which
+    the engine consumes when composing its SKIP narrative for
+    kline_fetch_transient_failure). Verify the dict has one entry per
+    fetched symbol with the right shape: 'ok' for successes,
+    'partial:<detail>' for INSUFFICIENT class, 'error:<detail>' for
+    everything else."""
     gate, fake_client = _make_gate()
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS),
         errors={
-            "ETH-USDT": TransientOkxError("kline_fetch_exhausted: net_error"),
-            "SOL-USDT": TransientOkxError("kline_fetch_exhausted: net_error"),
+            "ETH-USDT": TransientOkxError(
+                "net_error", error_class="retryable", error_detail="net_down"),
+            "SOL-USDT": TransientOkxError(
+                "net_error", error_class="retryable", error_detail="net_down"),
         },
     )
-    patcher, warn_calls = _capture_warns()
-    with patcher:
-        gate.evaluate(lock_at_ms=_LOCK_AT_MS)
-    assert len(warn_calls) == 2, (
-        f"expected 2 warns (ETH+SOL), got {len(warn_calls)}: {warn_calls}"
-    )
-    # SUB now identifies the subsystem ("KLINE"), not the per-symbol value
-    # (which lives in the ``symbol=`` field of the kv tail). The symbol
-    # values surface via kwargs["symbol"], not args[1].
-    symbol_tags = sorted(kwargs["symbol"] for _, kwargs in warn_calls)
-    assert symbol_tags == ["ETH-USDT", "SOL-USDT"]
-    for args, kwargs in warn_calls:
-        assert args[0] == "GATE"
-        assert args[1] == "KLINE"
-        assert args[2] == "PARTIAL"
-        # Structured kwargs (symbol, reason, optional received/requested,
-        # bar, optional error_detail) replaced the prior free-text
-        # ``msg=f"reason={e}"`` shape in 2026-05-17.
-        assert kwargs.get("reason") in (
-            "okx_publish_delay", "partial_response", "okx_unreachable"
-        )
+    gate.evaluate(lock_at_ms=_LOCK_AT_MS)
+    assert gate.last_fetch_results is not None
+    assert set(gate.last_fetch_results.keys()) == {"btc", "eth", "sol"}
+    assert gate.last_fetch_results["btc"] == "ok"
+    assert gate.last_fetch_results["eth"].startswith("error:")
+    assert gate.last_fetch_results["sol"].startswith("error:")
 
 
-def test_evaluate_all_three_transient_produces_three_warns_and_one_skip():
-    """All-3-down round: 3 warns + 1 generic skip + streak += 1."""
+def test_evaluate_all_three_transient_increments_streak_and_skips():
+    """All-3-down round: skip_reason=kline_fetch_transient_failure +
+    streak += 1. Per-symbol detail lands in last_fetch_results (no
+    standalone WARN emission post-Phase-B-v2)."""
     gate, fake_client = _make_gate()
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=[],
         errors={
-            "BTC-USDT": TransientOkxError("kline_fetch_exhausted: net_down"),
-            "ETH-USDT": TransientOkxError("kline_fetch_exhausted: net_down"),
-            "SOL-USDT": TransientOkxError("kline_fetch_exhausted: net_down"),
+            "BTC-USDT": TransientOkxError(
+                "net_down", error_class="retryable", error_detail="net_down"),
+            "ETH-USDT": TransientOkxError(
+                "net_down", error_class="retryable", error_detail="net_down"),
+            "SOL-USDT": TransientOkxError(
+                "net_down", error_class="retryable", error_detail="net_down"),
         },
     )
-    patcher, warn_calls = _capture_warns()
-    with patcher:
-        result = gate.evaluate(lock_at_ms=_LOCK_AT_MS)
+    result = gate.evaluate(lock_at_ms=_LOCK_AT_MS)
     assert result.skip_reason == "kline_fetch_transient_failure"
-    assert len(warn_calls) == 3
-    # SUB is always "KLINE" (subsystem); per-symbol value lives in the
-    # ``symbol=...`` field of the kv tail.
-    assert all(args[1] == "KLINE" for args, _ in warn_calls)
-    assert sorted(kwargs["symbol"] for _, kwargs in warn_calls) == [
-        "BTC-USDT", "ETH-USDT", "SOL-USDT",
-    ]
     assert gate._consecutive_fetch_failures == 1
+    assert set(gate.last_fetch_results.keys()) == {"btc", "eth", "sol"}
+    assert all(v.startswith("error:") for v in gate.last_fetch_results.values())
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +364,7 @@ def test_streak_resets_on_successful_fetch_regardless_of_signal():
         errors={s: TransientOkxError("net_down") for s in
                 ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
-    patcher, _calls = _capture_warns()
-    with patcher:
-        gate.evaluate(lock_at_ms=_LOCK_AT_MS)
+    gate.evaluate(lock_at_ms=_LOCK_AT_MS)
     assert gate._consecutive_fetch_failures == 1
 
     # Round 2: clean fetch, but flat market → gate_no_signal.
@@ -397,20 +386,18 @@ def test_streak_escalates_to_invariant_error_at_three_consecutive_failures():
         errors={s: TransientOkxError("net_down") for s in
                 ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
-    patcher, _calls = _capture_warns()
     raised = None
-    with patcher:
-        # First _MAX_CONSECUTIVE_FETCH_FAILURES - 1 rounds skip; the Nth
-        # fires InvariantError.
-        for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
-            result = gate.evaluate(lock_at_ms=_LOCK_AT_MS + i * 300_000)
-            assert result.skip_reason == "kline_fetch_transient_failure"
-        try:
-            gate.evaluate(
-                lock_at_ms=_LOCK_AT_MS + _MAX_CONSECUTIVE_FETCH_FAILURES * 300_000,
-            )
-        except InvariantError as e:
-            raised = e
+    # First _MAX_CONSECUTIVE_FETCH_FAILURES - 1 rounds skip; the Nth
+    # fires InvariantError.
+    for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
+        result = gate.evaluate(lock_at_ms=_LOCK_AT_MS + i * 300_000)
+        assert result.skip_reason == "kline_fetch_transient_failure"
+    try:
+        gate.evaluate(
+            lock_at_ms=_LOCK_AT_MS + _MAX_CONSECUTIVE_FETCH_FAILURES * 300_000,
+        )
+    except InvariantError as e:
+        raised = e
     assert raised is not None, (
         f"expected InvariantError after {_MAX_CONSECUTIVE_FETCH_FAILURES} consecutive transients"
     )
@@ -422,7 +409,6 @@ def test_streak_does_not_escalate_when_a_clean_round_intervenes():
     """N-1 transient rounds, then a clean round, then N-1 more transient
     rounds → no escalation (streak was reset between clusters)."""
     gate, fake_client = _make_gate()
-    patcher, _calls = _capture_warns()
 
     # First (N-1) transient rounds.
     fake_client.kline_fetch_window.side_effect = _make_router(
@@ -430,9 +416,8 @@ def test_streak_does_not_escalate_when_a_clean_round_intervenes():
         errors={s: TransientOkxError("net_down") for s in
                 ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
-    with patcher:
-        for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
-            gate.evaluate(lock_at_ms=_LOCK_AT_MS + i * 300_000)
+    for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
+        gate.evaluate(lock_at_ms=_LOCK_AT_MS + i * 300_000)
     assert gate._consecutive_fetch_failures == _MAX_CONSECUTIVE_FETCH_FAILURES - 1
 
     # Clean round resets the streak.
@@ -448,10 +433,9 @@ def test_streak_does_not_escalate_when_a_clean_round_intervenes():
         errors={s: TransientOkxError("net_down") for s in
                 ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
-    with patcher:
-        for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
-            result = gate.evaluate(lock_at_ms=_LOCK_AT_MS + 10_000_000 + i * 300_000)
-            assert result.skip_reason == "kline_fetch_transient_failure"
+    for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
+        result = gate.evaluate(lock_at_ms=_LOCK_AT_MS + 10_000_000 + i * 300_000)
+        assert result.skip_reason == "kline_fetch_transient_failure"
     # Should be at N-1, not escalated.
     assert gate._consecutive_fetch_failures == _MAX_CONSECUTIVE_FETCH_FAILURES - 1
 

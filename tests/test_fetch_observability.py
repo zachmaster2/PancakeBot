@@ -520,149 +520,16 @@ def test_okx_client_carries_received_and_requested_counts_on_insufficient():
     assert not hasattr(raised, "missing_position")
 
 
-def test_gate_kline_part_publish_delay_reason_and_field_order(monkeypatch):
-    """Partial response (insufficient + got_N): reason=okx_publish_delay.
-    Field order in the log line is: symbol, reason, received, requested,
-    bar. error_detail is OMITTED because ``got_15_expected_16`` is pure
-    count-restatement (derivable from received/requested)."""
-    from pancakebot import log as log_module
-
-    gate = _make_gate()
-
-    def stub(*, symbol, **kwargs):
-        if symbol == "BTC-USDT":
-            raise TransientOkxError(
-                "kline_fetch_exhausted: symbol=BTC-USDT class=insufficient "
-                "detail=got_15_expected_16",
-                error_class="insufficient",
-                error_detail="got_15_expected_16",
-                rtt_ms=287,
-                received_count=15,
-                requested_count=16,
-            )
-        return _stub_kline_window_full(None, symbol=symbol, **kwargs)
-
-    monkeypatch.setattr(gate._client, "kline_fetch_window", stub)
-
-    warn_calls: list[dict] = []
-
-    def fake_emit(level, sys_name, sub, event, *, msg=None, **fields):
-        if event == "PARTIAL":
-            warn_calls.append({"sub": sub, "fields": dict(fields)})
-
-    monkeypatch.setattr(log_module, "_emit", fake_emit)
-
-    lock_at_ms = 1_700_000_000_000
-    gate.evaluate(lock_at_ms=lock_at_ms)
-
-    assert len(warn_calls) == 1
-    fields = warn_calls[0]["fields"]
-    # SUB is the subsystem identifier ("KLINE"), NOT the symbol value.
-    # The symbol surfaces in the kv tail as ``symbol=BTC-USDT``.
-    assert warn_calls[0]["sub"] == "KLINE"
-    # Reason: high-confidence publish_delay (partial-data response,
-    # detail starts with "got_").
-    assert fields["reason"] == "okx_publish_delay"
-    assert fields["symbol"] == "BTC-USDT"
-    assert fields["received"] == 15
-    assert fields["requested"] == 16
-    assert fields["bar"] == "1s"
-    # Dropped redundant / removed fields:
-    assert "missing_position" not in fields
-    assert "missing_count" not in fields
-    assert "error_class" not in fields
-    # error_detail="got_15_expected_16" is count-derivable -> omitted.
-    assert "error_detail" not in fields
-    # Field ORDER (operator-triage priority):
-    assert list(fields.keys()) == ["symbol", "reason", "received", "requested", "bar"]
-
-
-def test_gate_kline_part_partial_response_keeps_informative_error_detail(monkeypatch):
-    """HTTP 429 / OKX code response: rtt_ms set but error_detail is NOT
-    derivable from counts (received=0 doesn't tell you "rate limited").
-    error_detail is kept; reason=partial_response."""
-    from pancakebot import log as log_module
-
-    gate = _make_gate()
-
-    def stub(*, symbol, **kwargs):
-        if symbol == "BTC-USDT":
-            raise TransientOkxError(
-                "kline_fetch_exhausted: symbol=BTC-USDT class=retryable "
-                "detail=http_429",
-                error_class="retryable",
-                error_detail="http_429",
-                rtt_ms=412,
-                # No received_count -- the response was non-200 so we
-                # didn't parse the body.
-            )
-        return _stub_kline_window_full(None, symbol=symbol, **kwargs)
-
-    monkeypatch.setattr(gate._client, "kline_fetch_window", stub)
-
-    warn_calls: list[dict] = []
-
-    def fake_emit(level, sys_name, sub, event, *, msg=None, **fields):
-        if event == "PARTIAL":
-            warn_calls.append({"sub": sub, "fields": dict(fields)})
-
-    monkeypatch.setattr(log_module, "_emit", fake_emit)
-
-    lock_at_ms = 1_700_000_000_000
-    gate.evaluate(lock_at_ms=lock_at_ms)
-
-    assert len(warn_calls) == 1
-    fields = warn_calls[0]["fields"]
-    assert fields["reason"] == "partial_response"
-    assert fields["error_detail"] == "http_429"
-    assert "received" not in fields  # No body-parse happened.
-    assert "requested" not in fields
-
-
-def test_gate_kline_part_warn_unreachable_on_pre_response_failure(monkeypatch):
-    """Pre-response failure (rtt_ms=None) -> reason='okx_unreachable',
-    no received / requested / missing fields."""
-    from pancakebot import log as log_module
-
-    gate = _make_gate()
-
-    def stub(*, symbol, **kwargs):
-        if symbol == "BTC-USDT":
-            raise TransientOkxError(
-                "kline_fetch_exhausted: symbol=BTC-USDT class=retryable "
-                "detail=ConnectionError",
-                error_class="retryable",
-                error_detail="ConnectionError",
-                # No rtt_ms, no received_count -- pre-response failure.
-            )
-        return _stub_kline_window_full(None, symbol=symbol, **kwargs)
-
-    monkeypatch.setattr(gate._client, "kline_fetch_window", stub)
-
-    warn_calls: list[dict] = []
-
-    def fake_emit(level, sys_name, sub, event, *, msg=None, **fields):
-        if event == "PARTIAL":
-            warn_calls.append({"sub": sub, "fields": dict(fields)})
-
-    monkeypatch.setattr(log_module, "_emit", fake_emit)
-
-    lock_at_ms = 1_700_000_000_000
-    gate.evaluate(lock_at_ms=lock_at_ms)
-
-    assert len(warn_calls) == 1
-    fields = warn_calls[0]["fields"]
-    assert fields["reason"] == "okx_unreachable"
-    assert "missing_position" not in fields
-    assert "missing_count" not in fields
-    assert "received" not in fields
-    assert "requested" not in fields
-    # error_class was dropped from the log line (not derivable beyond
-    # what reason already conveys). error_detail kept because the
-    # exception class name (ConnectionError, ConnectTimeout, etc.) is
-    # operator-meaningful and not derivable from anything else.
-    assert "error_class" not in fields
-    assert fields["error_detail"] == "ConnectionError"
+# Phase B v2 (2026-05-18): the gate-side per-symbol kline WARN emission
+# (formerly ``warn("GATE","KLINE","PARTIAL", ...)`` from momentum_gate.py)
+# was deleted; per-symbol detail now folds into the engine-side SKIP
+# narrative at ``kline_fetch_transient_failure``. T3 will add the
+# replacement tests asserting on the engine SKIP message content. For
+# T1, the data-collection side is verified via
+# ``gate.last_fetch_results`` in ``test_momentum_gate_kline_fetch.py``
+# (which the engine consumes); the okx_client TransientOkxError field
+# shape tests above (test_*_received_requested_*) still verify the
+# upstream classification that drives those values.
 
 
 def test_okx_client_does_not_emit_exhaust_log(monkeypatch):

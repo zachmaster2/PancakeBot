@@ -1307,12 +1307,15 @@ def test_init_cursor_logs_infeas_at_warn_severity():
         _mod.warn = orig_warn
         _mod.info = orig_info
 
+    # Phase B v2 (2026-05-18): the cold-start INFEAS line now emits with
+    # ACTION="SKIP" + WARN level (was ("RPC_POLL","COLD","INFEAS") under the
+    # old 3-column hierarchy). Verify exactly one SKIP-WARN fired.
     cold_infeas_warn = [
         a for a in seen["warn"]
-        if len(a[0]) >= 3 and a[0][1] == "COLD" and a[0][2] == "INFEAS"
+        if len(a[0]) >= 1 and a[0][0] == "SKIP"
     ]
     assert len(cold_infeas_warn) == 1, (
-        "exactly one COLD INFEAS log expected at WARN severity"
+        "exactly one SKIP log expected at WARN severity"
     )
 
 

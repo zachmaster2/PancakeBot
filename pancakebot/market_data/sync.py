@@ -68,10 +68,8 @@ def sync_runtime_market_data(
     cache_n = int(cfg.backtest.backtest_round_count)
 
     info(
-        "CORE",
-        "SYNC",
         "START",
-        msg=f"Sync setup: backtest_round_count={int(cfg.backtest.backtest_round_count)} closed_cache_needed={int(cache_n)}",
+        f"Sync setup: backtest_round_count={int(cfg.backtest.backtest_round_count)} closed_cache_needed={int(cache_n)}",
     )
 
     # Phase 1: Sync closed rounds from The Graph.
@@ -84,14 +82,10 @@ def sync_runtime_market_data(
             )
             break
         except TransientGraphError as e:
-            info(
-                "CORE",
-                "SYNC",
+            warn(
                 "RETRY",
-                msg=(
-                    "Caught TransientGraphError during sync-only closed-round sync: "
-                    f"retrying after delay err={str(e)}"
-                ),
+                "Caught TransientGraphError during sync-only closed-round sync: "
+                f"retrying after delay err={e}",
             )
             sleep_seconds(int(_TRANSIENT_NETWORK_DELAY_SECONDS))
 
@@ -104,13 +98,9 @@ def sync_runtime_market_data(
     latest_closed_epoch = int(rounds_all[-1].epoch)
 
     info(
-        "CORE",
-        "SYNC",
-        "ROUNDS",
-        msg=(
-            f"Closed rounds synced: stored_n={int(stored_closed_round_count)} "
-            f"epochs=[{int(earliest_closed_epoch)}..{int(latest_closed_epoch)}]"
-        ),
+        "PROGRESS",
+        f"Closed rounds synced: stored_n={int(stored_closed_round_count)} "
+        f"epochs=[{int(earliest_closed_epoch)}..{int(latest_closed_epoch)}]",
     )
 
     # Phase 2: Sync BNB + BTC + ETH + SOL 1s klines in parallel (anchored at lockAt).
@@ -164,12 +154,9 @@ def sync_runtime_market_data(
             sol_synced = sol_fut.result()
     except TransientOkxError as e:
         error(
-            "CORE", "SYNC", "ABORT",
-            msg=(
-                f"1s kline backfill aborted on TransientOkxError; "
-                f"per-symbol KLINE PARTIAL warns above carry the structured "
-                f"detail. err={e}"
-            ),
+            "CRASH",
+            f"1s kline backfill aborted on TransientOkxError; "
+            f"per-symbol SKIP warns above carry the structured detail. err={e}",
         )
         raise
 
@@ -194,11 +181,9 @@ def sync_runtime_market_data(
             )
 
     info(
-        "CORE", "SYNC", "INTEG",
-        msg=(
-            f"Stores aligned: {len(final_round_epochs)} epochs "
-            f"[{min(final_round_epochs)}..{max(final_round_epochs)}]"
-        ),
+        "PROGRESS",
+        f"Stores aligned: {len(final_round_epochs)} epochs "
+        f"[{min(final_round_epochs)}..{max(final_round_epochs)}]",
     )
 
     stored_closed_round_count = len(final_rounds)
@@ -242,10 +227,7 @@ def _sync_1s_klines(
     done_epochs = store.load_done_epochs()
     remaining = [r for r in rounds if int(r.epoch) not in done_epochs]
     if not remaining:
-        info(
-            "SYNC", "KLINE", "SKIP",
-            msg=f"{label}: all {len(done_epochs)} epochs already synced",
-        )
+        info("DONE", f"{label}: all {len(done_epochs)} epochs already synced")
         return 0
 
     remaining.sort(key=lambda r: int(r.epoch))
@@ -264,11 +246,11 @@ def _sync_1s_klines(
 
     total_to_fetch = len(prepend_rounds) + len(append_rounds)
     info(
-        "SYNC", "KLINE", "START",
-        msg=f"{label}: fetching {total_to_fetch} rounds "
-            f"({len(done_epochs)} already done) "
-            f"append={len(append_rounds)} prepend={len(prepend_rounds)} "
-            f"workers={_FETCH_WORKERS} batch_size={_BATCH_SIZE}",
+        "START",
+        f"{label}: fetching {total_to_fetch} rounds "
+        f"({len(done_epochs)} already done) "
+        f"append={len(append_rounds)} prepend={len(prepend_rounds)} "
+        f"workers={_FETCH_WORKERS} batch_size={_BATCH_SIZE}",
     )
 
     total_synced = 0
@@ -296,7 +278,7 @@ def _sync_1s_klines(
             _prepend_staging_to_store(store=store, staging_path=staging_path, label=label)
             total_synced += synced
 
-    info("SYNC", "KLINE", "DONE", msg=f"{label}: {total_synced} synced")
+    info("DONE", f"{label}: {total_synced} synced")
     return total_synced
 
 
@@ -340,8 +322,7 @@ def _fetch_and_append(
         synced += len(appendable)
 
         if (batch_start + _BATCH_SIZE) % 200 < _BATCH_SIZE:
-            info("SYNC", "KLINE", "APPEND",
-                 msg=f"{label}: {done_count + synced} done")
+            info("PROGRESS", f"{label}: {done_count + synced} done")
 
     return synced
 
@@ -362,8 +343,7 @@ def _fetch_to_staging(
             for line in f:
                 if line.strip():
                     staged_epochs.add(int(json.loads(line)["epoch"]))
-        info("SYNC", "KLINE", "STAGED",
-             msg=f"{label}: {len(staged_epochs)} already staged from prior run")
+        info("PROGRESS", f"{label}: {len(staged_epochs)} already staged from prior run")
 
     still_needed = [r for r in rounds_asc if int(r.epoch) not in staged_epochs]
     if not still_needed:
@@ -387,8 +367,7 @@ def _fetch_to_staging(
                 synced += 1
 
             if (batch_start + _BATCH_SIZE) % 200 < _BATCH_SIZE:
-                info("SYNC", "KLINE", "STAGED",
-                     msg=f"{label}: {synced} staged")
+                info("PROGRESS", f"{label}: {synced} staged")
 
     return synced
 
@@ -417,8 +396,7 @@ def _prepend_staging_to_store(*, store: KlineStore, staging_path: str, label: st
 
     # Clean up staging file.
     _os.remove(staging_path)
-    info("SYNC", "KLINE", "PREPENDED",
-         msg=f"{label}: prepended {len(staging_records)} older epochs into store")
+    info("DONE", f"{label}: prepended {len(staging_records)} older epochs into store")
 
 
 def _fetch_batch(batch: list, inst_id: str, okx_client: OkxClient) -> list[dict]:
@@ -469,10 +447,10 @@ def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient) -> dict:
             rate_acquire_fn=okx_rate_acquire,
         )
     except TransientOkxError as e:
-        # Match the gate's KLINE PARTIAL field policy + ordering. Sync is
+        # Compose a single SKIP message per failed symbol/epoch. Sync is
         # bulk-historical so publish-delay is unlikely (OKX should have
-        # published all candles by now), but the same taxonomy keeps
-        # log-aggregation queries unified across live + sync paths.
+        # published all candles by now); the same taxonomy keeps log
+        # parsing unified across live + sync paths.
         received = getattr(e, "received_count", None)
         requested = getattr(e, "requested_count", None)
         error_detail = getattr(e, "error_detail", None)
@@ -491,26 +469,19 @@ def _fetch_one_kline(rnd, inst_id: str, okx_client: OkxClient) -> dict:
         else:
             reason = "okx_unreachable"
 
-        fields: dict[str, object] = {
-            "symbol": inst_id,
-            "epoch": epoch,
-            "reason": reason,
-        }
-        # received + requested emitted as a pair (see momentum_gate.py
-        # for the rationale; okx_client only populates received_count on
-        # INSUFFICIENT responses).
+        parts = [f"symbol={inst_id}", f"epoch={epoch}", f"reason={reason}"]
         if received is not None and requested is not None:
-            fields["received"] = received
-            fields["requested"] = requested
-        fields["bar"] = "1s"
+            parts.append(f"received={received}")
+            parts.append(f"requested={requested}")
+        parts.append("bar=1s")
         if (
             error_detail is not None
             and not error_detail.startswith("got_")
             and error_detail != "empty_data"
         ):
-            fields["error_detail"] = error_detail
-        warn("SYNC", "KLINE", "PARTIAL", **fields)
+            parts.append(f"error_detail={error_detail}")
+        warn("SKIP", " ".join(parts))
         # Sync's contract is fail-loud: re-raise so the orchestrator
-        # surfaces the failure as a SYNC ERROR summary line and aborts.
+        # surfaces the failure as a CRASH summary line and aborts.
         raise
     return {"epoch": epoch, "lock_at": lock_at, "klines_1s": klines}

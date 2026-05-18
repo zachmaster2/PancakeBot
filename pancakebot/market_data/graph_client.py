@@ -66,7 +66,7 @@ class GraphClient:
         try:
             data = self._post(query, variables={})
         except TransientGraphError as e:
-            warn("NET", "GRAPH", "FETCH", kind="closed_rounds_page", err=str(e))
+            warn("ALERT", f"Graph fetch failed: kind=latest_closed_epoch err={e}")
             raise
         rounds = self._req_list(data.get("rounds"), "data.rounds")
         if len(rounds) != 1:
@@ -98,7 +98,7 @@ class GraphClient:
         try:
             return self._fetch_latest_round_with_bets(state="open", query_first=query_first)
         except TransientGraphError as e:
-            warn("NET", "GRAPH", "FETCH", kind="open_round", err=str(e))
+            warn("ALERT", f"Graph fetch failed: kind=open_round err={e}")
             raise
 
     def fetch_latest_locked_round(self) -> Round:
@@ -125,7 +125,7 @@ class GraphClient:
         try:
             return self._fetch_latest_round_with_bets(state="locked", query_first=query_first)
         except TransientGraphError as e:
-            warn("NET", "GRAPH", "FETCH", kind="locked_round", err=str(e))
+            warn("ALERT", f"Graph fetch failed: kind=locked_round err={e}")
             raise
 
     def fetch_open_round(self, epoch: int) -> Round:
@@ -226,7 +226,7 @@ class GraphClient:
         try:
             data = self._post(query, variables=vars_obj)
         except TransientGraphError as e:
-            warn("NET", "GRAPH", "FETCH", kind="closed_rounds_page", err=str(e))
+            warn("ALERT", f"Graph fetch failed: kind=closed_rounds_page err={e}")
             raise
 
         rounds_payload = self._req_list(data.get("rounds"), "data.rounds")
@@ -258,7 +258,7 @@ class GraphClient:
         try:
             data = self._post(query, variables={"epoch": str(int(epoch)), "first": int(first), "skip": int(skip)})
         except TransientGraphError as e:
-            warn("NET", "GRAPH", "FETCH", kind="round_bets_page", err=str(e))
+            warn("ALERT", f"Graph fetch failed: kind=round_bets_page err={e}")
             raise
 
         rounds = self._req_list(data.get("rounds"), "data.rounds")

@@ -129,17 +129,13 @@ def run_from_config(
             okx_client=okx_client,
         )
         info(
-            "CORE",
-            "SYNC",
             "DONE",
-            msg=(
-                f"closed_rounds={int(summary.stored_closed_round_count)} "
-                f"epochs=[{int(summary.earliest_closed_epoch)}..{int(summary.latest_closed_epoch)}] "
-                f"bnb_synced={int(summary.bnb_klines_synced)} "
-                f"btc_synced={int(summary.btc_klines_synced)} "
-                f"eth_synced={int(summary.eth_klines_synced)} "
-                f"sol_synced={int(summary.sol_klines_synced)}"
-            ),
+            f"sync done: closed_rounds={int(summary.stored_closed_round_count)} "
+            f"epochs=[{int(summary.earliest_closed_epoch)}..{int(summary.latest_closed_epoch)}] "
+            f"bnb_synced={int(summary.bnb_klines_synced)} "
+            f"btc_synced={int(summary.btc_klines_synced)} "
+            f"eth_synced={int(summary.eth_klines_synced)} "
+            f"sol_synced={int(summary.sol_klines_synced)}",
         )
         return
 

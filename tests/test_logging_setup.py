@@ -91,7 +91,7 @@ def test_configure_file_logging_creates_parent_directory(tmp_path):
 def test_info_call_writes_to_file(tmp_path):
     log_path = tmp_path / "runtime.log"
     configure_file_logging(str(log_path))
-    info("TEST", "SUB", "EVENT", msg="hello world")
+    info("TEST", "hello world")
     # Flush to ensure handler wrote before we read it back.
     for h in _FILE_LOGGER.handlers:
         h.flush()
@@ -106,7 +106,7 @@ def test_info_call_writes_to_file(tmp_path):
 def test_warn_call_writes_with_warning_level(tmp_path):
     log_path = tmp_path / "runtime.log"
     configure_file_logging(str(log_path))
-    warn("TEST", "SUB", "EVENT", msg="something off")
+    warn("TEST", "something off")
     for h in _FILE_LOGGER.handlers:
         h.flush()
     content = log_path.read_text(encoding="utf-8")
@@ -122,7 +122,7 @@ def test_warn_call_writes_with_warning_level(tmp_path):
 def test_error_call_writes_with_error_level(tmp_path):
     log_path = tmp_path / "runtime.log"
     configure_file_logging(str(log_path))
-    error("TEST", "SUB", "EVENT", msg="boom")
+    error("TEST", "boom")
     for h in _FILE_LOGGER.handlers:
         h.flush()
     content = log_path.read_text(encoding="utf-8")
@@ -147,7 +147,7 @@ def test_idempotent_no_duplicate_writes(tmp_path):
     log_path = tmp_path / "runtime.log"
     configure_file_logging(str(log_path))
     configure_file_logging(str(log_path))  # idempotent re-call
-    info("TEST", "SUB", "EVENT", msg="unique-marker-string")
+    info("TEST", "unique-marker-string")
     for h in _FILE_LOGGER.handlers:
         h.flush()
     content = log_path.read_text(encoding="utf-8")
@@ -172,7 +172,7 @@ def test_reconfigure_different_path_writes_only_to_new_file(tmp_path):
     path_b = tmp_path / "b.log"
     configure_file_logging(str(path_a))
     configure_file_logging(str(path_b))
-    info("TEST", "SUB", "EVENT", msg="second-config-marker")
+    info("TEST", "second-config-marker")
     for h in _FILE_LOGGER.handlers:
         h.flush()
     assert "second-config-marker" in path_b.read_text(encoding="utf-8")
@@ -193,7 +193,7 @@ def test_rotation_triggers_on_maxbytes_threshold(tmp_path):
     handler.maxBytes = 1024
     # Write more than 1KB of log lines.
     for i in range(200):
-        info("TEST", "SUB", "EVENT", msg=f"line-{i}-padding-padding-padding")
+        info("TEST", f"line-{i}-padding-padding-padding")
     handler.flush()
     # After crossing threshold, .1 backup should exist.
     backup_path = Path(str(log_path) + ".1")
@@ -210,8 +210,7 @@ def test_backup_count_caps_at_seven(tmp_path):
     # Need to trigger > 7 rotations.
     for batch in range(15):
         for i in range(20):
-            info("TEST", "SUB", "EVENT",
-                 msg=f"batch{batch}-line{i}-paddingpaddingpadding")
+            info("TEST", f"batch{batch}-line{i}-paddingpaddingpadding")
         handler.flush()
     # Count rotated files: .1 through .7 may exist, but never .8.
     rotated = [
@@ -225,7 +224,7 @@ def test_backup_count_caps_at_seven(tmp_path):
 def test_format_includes_time_level_message(tmp_path):
     log_path = tmp_path / "runtime.log"
     configure_file_logging(str(log_path))
-    info("TEST", "SUB", "EVENT", msg="format-probe")
+    info("TEST", "format-probe")
     for h in _FILE_LOGGER.handlers:
         h.flush()
     content = log_path.read_text(encoding="utf-8")
@@ -248,7 +247,7 @@ def test_no_handler_attached_is_noop(tmp_path):
     # _reset_pancakebot_logger fixture already detached all handlers.
     assert len(_FILE_LOGGER.handlers) == 0
     # Should not raise.
-    info("TEST", "SUB", "EVENT", msg="no-handler-attached")
+    info("TEST", "no-handler-attached")
 
 
 def test_relative_path_resolves_against_repo_root(tmp_path, monkeypatch):
@@ -309,7 +308,7 @@ def test_propagate_disabled_no_root_handler_writes(tmp_path, monkeypatch):
     probe = ProbeHandler(level=logging.DEBUG)
     root_logger.addHandler(probe)
     try:
-        info("TEST", "SUB", "EVENT", msg="propagate-probe")
+        info("TEST", "propagate-probe")
     finally:
         root_logger.removeHandler(probe)
     # No records should have reached the root logger.

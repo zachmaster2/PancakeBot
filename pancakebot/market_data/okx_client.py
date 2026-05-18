@@ -320,13 +320,13 @@ class OkxClient:
                 try:
                     f.result()
                 except requests.RequestException as e:
-                    warn("NET", "OKX", "WARM_SKIP",
-                         msg=f"warmup conn {i} failed (transient, ignored): "
-                             f"{type(e).__name__}: {e}")
+                    warn("ALERT",
+                         f"OKX warmup conn {i} failed (transient, ignored): "
+                         f"{type(e).__name__}: {e}")
                 except (ConnectionResetError, OSError) as e:
-                    warn("NET", "OKX", "WARM_SKIP",
-                         msg=f"warmup conn {i} raw socket error (transient, "
-                             f"ignored): {type(e).__name__}: {e}")
+                    warn("ALERT",
+                         f"OKX warmup conn {i} raw socket error (transient, ignored): "
+                         f"{type(e).__name__}: {e}")
 
     # ----------------------------------------------------------------
     # Clock skew measurement
@@ -515,9 +515,7 @@ class OkxClient:
 
             if cls == _OkxErrorClass.SUCCESS:
                 if attempt > 0:
-                    info("NET", "OKX", "RECOVER",
-                         attempts=attempt + 1, endpoint="history-candles",
-                         symbol=symbol)
+                    info("RECOVER", f"OKX history-candles {symbol} recovered after {attempt + 1} attempts")
                 body = resp.json()
                 rows = body["data"]  # OKX returns newest-first
                 arrays: list[list] = []
@@ -603,10 +601,9 @@ class OkxClient:
                 )
             base_delay = retry_policy.backoff_seconds[attempt]
             delay = base_delay * random.uniform(_RETRY_JITTER_MIN_FRACTION, _RETRY_JITTER_MAX_FRACTION)
-            warn("NET", "OKX", "RETRY",
-                 attempt=attempt + 1, delay_s=f"{delay:.2f}",
-                 endpoint="history-candles", symbol=symbol,
-                 error_class=cls.value, error_detail=detail)
+            warn("RETRY",
+                 f"OKX history-candles {symbol} retry attempt={attempt + 1} "
+                 f"delay_s={delay:.2f} error_class={cls.value} error_detail={detail}")
             time.sleep(delay)
 
         # Defensive: loop above always returns or raises.
