@@ -48,10 +48,6 @@ from time import sleep as sleep_seconds
 # padding absorbs alignment retries near RPC boundaries.
 _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS = 5
 
-_CLAIM_BATCH_SIZE = 10
-
-_TRANSIENT_NETWORK_DELAY_SECONDS = 10
-
 
 # -- NTP clock sync ----------------------------------------------------------
 # The bot's scheduling uses chain-anchored timestamps (lock_at from BSC, in
@@ -269,28 +265,15 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
     )
 
     while True:
-        try:
-            _run_one_iteration(cfg, closed_state)
-        except TransientRpcError as e:
-            info(
-                "CORE",
-                "RUN",
-                "RETRY",
-                msg=(
-                    "Caught TransientRpcError during runtime loop: "
-                    f"retrying after delay err={str(e)}"
-                ),
-            )
-            info(
-                "CORE",
-                "LOOP",
-                "SLEEP",
-                msg=(
-                    f"duration={_TRANSIENT_NETWORK_DELAY_SECONDS}s "
-                    "reason=delay_after_transient_network_error"
-                ),
-            )
-            sleep_seconds(_TRANSIENT_NETWORK_DELAY_SECONDS)
+        # Per-subsystem TransientRpcError handling lives at each callsite:
+        #   - _epoch_handshake: bounded local retry
+        #   - bankroll wake: SKIP round with risk_bankroll_stale
+        #   - _sleep_and_claim close_ts: bounded local retry (same pattern as handshake)
+        #   - claim_scan_cursor callers: fail-soft (log warn + continue)
+        #   - bet submission: crash → supervisor restart (round was lost anyway)
+        # No top-level catch — there is no remaining bubble path where a
+        # generic 10s-sleep-and-retry helps.
+        _run_one_iteration(cfg, closed_state)
 
 
 def _mono_ms() -> float:
@@ -350,21 +333,23 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Step 2: Initial claim scan (one-time, live only) after first alignment.
         if not closed.claim_scan_initialized:
             if not cfg.dry:
-                claim_scan_cursor(
-                    contract=cfg.contract,
-                    wallet_address=cfg.wallet_address,
-                    dry=False,
-                    cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
-                    locked_epoch=locked_epoch,
-                    current_epoch=current_epoch,
-                    now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
-                    buffer_seconds=cfg.buffer_seconds,
-                    page_size=100,
-                    gas_limit=BACKTEST_GAS_LIMIT_CLAIM,
-                    claim_batch_size=_CLAIM_BATCH_SIZE,
-                    min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + BACKTEST_GAS_COST_BET_BNB,
-                    claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
-                )
+                try:
+                    claim_scan_cursor(
+                        contract=cfg.contract,
+                        wallet_address=cfg.wallet_address,
+                        dry=False,
+                        cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
+                        locked_epoch=locked_epoch,
+                        current_epoch=current_epoch,
+                        now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
+                        buffer_seconds=cfg.buffer_seconds,
+                        page_size=100,
+                        gas_limit=BACKTEST_GAS_LIMIT_CLAIM,
+                        claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
+                    )
+                except TransientRpcError as e:
+                    warn("CLAIM", "SCAN", "SKIP",
+                         reason="rpc_transient", err=str(e))
 
             _dry_settle_available_bets(cfg, closed)
             closed.claim_scan_initialized = True
@@ -968,7 +953,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         amount_bnb = amount_wei / BNB_WEI
 
         if not cfg.dry:
-            bankroll_after_live = cfg.contract.wallet_balance_bnb(cfg.wallet_address)
+            # Derive post-bet bankroll arithmetically rather than re-querying
+            # the chain. The bet amount has been broadcast (TX wait_receipt=True
+            # confirmed inclusion above); gas cost is absorbed at the next
+            # round's bankroll wake fetch. Saves one RPC roundtrip per BET
+            # round and eliminates a TransientRpcError bubble path. Display
+            # value is accurate to within the gas fee (~1e-5 BNB).
+            bankroll_after_live = bankroll_bnb - amount_bnb
             info(
                 "RUN",
                 "ACT",
@@ -1172,7 +1163,23 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
 
 
 def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int) -> None:
-    close_ts = int(cfg.contract.close_ts(claim_epoch))
+    # Bounded local retry around ``contract.close_ts`` — the only RPC call
+    # in this function with real budget before the claim wake. Mirrors the
+    # pattern in ``_epoch_handshake``. Exhaust → InvariantError → bot crashes
+    # → supervisor restart (cleaner than top-level sleep-and-retry).
+    close_ts: int | None = None
+    for idx, delay_seconds in enumerate([0] + list(RETRY_BACKOFF_SECONDS)):
+        if delay_seconds > 0:
+            sleep_seconds(delay_seconds)
+        try:
+            close_ts = int(cfg.contract.close_ts(claim_epoch))
+            break
+        except TransientRpcError as e:
+            warn("CORE", "CLAIM", "RETRY",
+                 reason="rpc_close_ts", attempt=idx, err=str(e))
+            continue
+    if close_ts is None:
+        raise InvariantError("close_ts_retry_exhausted")
     if close_ts <= 0:
         raise InvariantError("close_ts_invalid")
 
@@ -1182,23 +1189,27 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     # Epoch handshake to refresh round state (both modes).
     locked_round2, _open_round2, current_epoch2, _open_rd2 = _epoch_handshake(cfg)
 
-    # Live only: claim scan to collect winnings.
+    # Live only: claim scan to collect winnings. Fail-soft on transient RPC:
+    # the next iteration's claim scan will re-detect any still-claimable
+    # epochs naturally.
     if not cfg.dry:
-        claim_scan_cursor(
-            contract=cfg.contract,
-            wallet_address=cfg.wallet_address,
-            dry=False,
-            cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
-            locked_epoch=locked_round2.epoch,
-            current_epoch=current_epoch2,
-            now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
-            buffer_seconds=cfg.buffer_seconds,
-            page_size=100,
-            gas_limit=BACKTEST_GAS_LIMIT_CLAIM,
-            claim_batch_size=_CLAIM_BATCH_SIZE,
-            min_bet_with_gas_bnb=cfg.min_bet_amount_bnb + BACKTEST_GAS_COST_BET_BNB,
-            claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
-        )
+        try:
+            claim_scan_cursor(
+                contract=cfg.contract,
+                wallet_address=cfg.wallet_address,
+                dry=False,
+                cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
+                locked_epoch=locked_round2.epoch,
+                current_epoch=current_epoch2,
+                now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
+                buffer_seconds=cfg.buffer_seconds,
+                page_size=100,
+                gas_limit=BACKTEST_GAS_LIMIT_CLAIM,
+                claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
+            )
+        except TransientRpcError as e:
+            warn("CLAIM", "SCAN", "SKIP",
+                 reason="rpc_transient", err=str(e))
 
     # Dry: settle simulated bets against oracle price.
     _dry_settle_available_bets(cfg, closed)

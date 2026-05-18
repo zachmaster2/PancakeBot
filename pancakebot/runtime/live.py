@@ -13,6 +13,17 @@ from pancakebot.log import info, warn
 
 _PAGE_SIZE_DEFAULT = 100
 
+# Operational cap on epochs per ``claim()`` TX. The PredictionV2 contract's
+# ``claim(uint256[])`` ABI accepts any array length, but in practice BSC's
+# public-RPC submission caps + per-epoch gas (~100-150k for storage writes
+# + BNB transfer) make ~10 the soft maximum before TXs risk rejection or
+# deprioritization. This constant matches the pre-2026-05-18 operational
+# default (then named ``_CLAIM_BATCH_SIZE`` in engine.py); it's preserved
+# as the per-TX chunk cap even though the *trigger* is now per-win rather
+# than per-batch-of-10-accumulated. DO NOT remove without a chain-side
+# verification that larger TXs land reliably across all WRITE_PATH_RPC_URLS.
+_MAX_CLAIM_EPOCHS_PER_TX = 10
+
 # Env var holding the live-mode Discord webhook URL. Mirrors the supervisor's
 # ``_env_var_for_mode("live")`` definition so a misrouted webhook here would
 # produce the same operator-visible miss as a supervisor-side issue.
@@ -107,8 +118,6 @@ def claim_scan_cursor(
     buffer_seconds: int,
     page_size: int = _PAGE_SIZE_DEFAULT,
     gas_limit: int = 300_000,
-    claim_batch_size: int = 10,
-    min_bet_with_gas_bnb: float | None = None,
     claim_tx_receipt_timeout_seconds: int = 35,
 ) -> ClaimScanResult:
     """Scan the user's rounds list and claim any claimable/refundable past epochs.
@@ -116,9 +125,11 @@ def claim_scan_cursor(
     Notes:
       - The contract's getUserRounds returns only epoch ids (no ledger metadata).
       - We treat claimable()/refundable() as the authoritative indicator that a claim is possible.
-      - Claims are batched up to claim_batch_size epochs per tx.
-      - If fewer than claim_batch_size claims are pending, we only flush them when
-        wallet bankroll falls below min_bet_with_gas_bnb (if provided).
+      - All claimable epochs found in a single scan are claimed in ONE TX
+        (PredictionV2's ``claim(uint256[])`` takes an epoch array). In practice
+        this is 1 epoch per scan (the per-win case); occasionally 2+ on startup
+        or after a missed iteration. There is no per-N threshold gating —
+        every scan with at least one claimable epoch fires a claim TX.
       - In dry mode, we NEVER submit a claim transaction; simulated_net_delta_bnb is always 0.0.
         Dry bankroll updates are handled by the runtime's dry settlement logic, not by this scan.
 
@@ -153,37 +164,25 @@ def claim_scan_cursor(
 
     claimed_total = 0
     pending_claims: list[tuple[int, int]] = []
-    # Set True when ANY chunk in a flush returns status="timeout". Caller
-    # honors this to avoid re-attempting the same chunks via the post-loop
-    # force-flush (the timed-out TX may still mine and the next iteration
-    # re-detects naturally).
-    claim_flush_timed_out = False
 
-    if claim_batch_size <= 0:
-        raise InvariantError("claim_batch_size_nonpositive")
-    floor_bnb = min_bet_with_gas_bnb
-    if floor_bnb is not None and floor_bnb <= 0.0:
-        raise InvariantError("claim_min_bet_with_gas_nonpositive")
+    def _flush_pending() -> None:
+        """Drain ``pending_claims`` across N TXs of up to
+        ``_MAX_CLAIM_EPOCHS_PER_TX`` epochs each.
 
-    def _flush_pending(*, force_all: bool) -> None:
-        nonlocal claimed_total, pending_claims, claim_flush_timed_out
-        if not pending_claims:
-            return
-        if force_all:
-            n = len(pending_claims)
-        else:
-            n = (len(pending_claims) // claim_batch_size) * claim_batch_size
-        if n <= 0:
-            return
-        to_claim = [ep for ep, _ in pending_claims[:n]]
-        consumed_pairs = 0
-        for idx in range(0, len(to_claim), claim_batch_size):
-            chunk = to_claim[idx : idx + claim_batch_size]
-            chunk_gas_limit = gas_limit * len(chunk)
+        On success/revert: advance past the chunk, continue draining.
+        On timeout: stop. Leave the chunk + remaining as pending so the
+        cursor parks at the first un-claimed epoch; next iteration's scan
+        re-detects (the timed-out TX may still mine).
+        """
+        nonlocal claimed_total, pending_claims
+        while pending_claims:
+            chunk_pairs = pending_claims[:_MAX_CLAIM_EPOCHS_PER_TX]
+            to_claim = [ep for ep, _ in chunk_pairs]
+            chunk_gas_limit = gas_limit * len(to_claim)
             t0 = time.perf_counter()
             gas_price_wei = contract.suggest_gas_price_wei()
             result = contract.claim(
-                epochs=chunk,
+                epochs=to_claim,
                 gas_limit=chunk_gas_limit,
                 gas_price_wei=gas_price_wei,
                 wait_receipt=True,
@@ -196,63 +195,63 @@ def claim_scan_cursor(
                     "NET",
                     "RPC",
                     "CLAIM",
-                    epoch=chunk[0],
+                    epoch=to_claim[0],
                     tx=result.tx_hash,
                     claim_ms=f"{claim_ms}ms",
-                    batch_n=len(chunk),
-                    last_epoch=chunk[-1],
+                    batch_n=len(to_claim),
+                    last_epoch=to_claim[-1],
                     gas_limit=chunk_gas_limit,
                 )
-                claimed_total += len(chunk)
-                consumed_pairs += len(chunk)
+                claimed_total += len(to_claim)
+                pending_claims = pending_claims[len(to_claim):]
                 continue
 
             if result.status == "revert":
                 warn(
                     "CLAIM", "TX", "REVERT",
-                    epoch=chunk[0],
-                    last_epoch=chunk[-1],
+                    epoch=to_claim[0],
+                    last_epoch=to_claim[-1],
                     tx=result.tx_hash,
                     claim_ms=f"{claim_ms}ms",
-                    batch_n=len(chunk),
+                    batch_n=len(to_claim),
                     gas_limit=chunk_gas_limit,
                     block_number=result.included_block_number,
                 )
                 _send_claim_failure_alert(
                     reason="revert",
                     tx_hash=result.tx_hash,
-                    epochs=chunk,
+                    epochs=to_claim,
                     gas_limit=chunk_gas_limit,
                 )
-                # Advance past the reverted batch -- no retry. Next iteration's
-                # cursor walk will re-pick any epochs that re-show as claimable.
-                consumed_pairs += len(chunk)
+                # Advance past the reverted chunk -- no retry. Next iteration's
+                # cursor walk re-picks any epochs that re-show as claimable.
+                # Continue draining remaining chunks; a reverted chunk doesn't
+                # block downstream pending epochs from being attempted.
+                pending_claims = pending_claims[len(to_claim):]
                 continue
 
             # status == "timeout"
             warn(
                 "CLAIM", "TX", "TIMEOUT",
-                epoch=chunk[0],
-                last_epoch=chunk[-1],
+                epoch=to_claim[0],
+                last_epoch=to_claim[-1],
                 tx=result.tx_hash,
                 claim_ms=f"{claim_ms}ms",
-                batch_n=len(chunk),
+                batch_n=len(to_claim),
                 gas_limit=chunk_gas_limit,
                 receipt_timeout_seconds=int(claim_tx_receipt_timeout_seconds),
             )
             _send_claim_failure_alert(
                 reason="timeout",
                 tx_hash=result.tx_hash,
-                epochs=chunk,
+                epochs=to_claim,
                 gas_limit=chunk_gas_limit,
             )
-            # Stop flushing further chunks this iteration -- the timed-out
-            # TX may still mine. Leave the unconsumed pending_claims in place
-            # so the cursor stays parked at the first un-claimed epoch.
-            claim_flush_timed_out = True
-            break
-
-        pending_claims = pending_claims[consumed_pairs:]
+            # STOP draining. Leave the timed-out chunk + remaining pairs
+            # in pending_claims so the cursor parks at the first un-claimed
+            # epoch. The timed-out TX may still mine; next iteration's
+            # scan re-detects whatever is still claimable.
+            return
 
     # Fetch all epoch IDs in one batched RPC call (instead of N pages).
     all_epochs = contract.get_user_rounds_all_batched(
@@ -274,7 +273,10 @@ def claim_scan_cursor(
         scannable.append(e)
     scanned = len(scannable)
 
-    # Batch-check claimable + refundable for all scannable epochs.
+    # Batch-check claimable + refundable for all scannable epochs, then
+    # flush ALL pending in a single claim TX. Natural batching for the
+    # multi-epoch-at-once case (startup, missed iteration); per-win semantics
+    # for the steady state.
     if not dry and scannable:
         cr_map = contract.claimable_refundable_batch(
             epochs=scannable, wallet_address=wallet_address,
@@ -283,30 +285,10 @@ def claim_scan_cursor(
             c, r = cr_map.get(e, (False, False))
             if c or r:
                 pending_claims.append((e, cursor + i))
-                _flush_pending(force_all=False)
+        _flush_pending()
 
     scanned_total = scanned
     cursor += scanned
-
-    if (not dry) and pending_claims and not claim_flush_timed_out:
-        if floor_bnb is not None:
-            wallet_bnb = float(contract.wallet_balance_bnb(wallet_address))
-            should_force_flush = wallet_bnb < floor_bnb
-            info(
-                "NET",
-                "RPC",
-                "CLAIM",
-                msg=(
-                    f"claim_batch_pending={len(pending_claims)} "
-                    f"wallet_bnb={wallet_bnb:.6f} "
-                    f"min_bet_with_gas_bnb={floor_bnb:.6f} "
-                    f"force_small_batch={str(should_force_flush).lower()}"
-                ),
-            )
-        else:
-            should_force_flush = True
-        if should_force_flush:
-            _flush_pending(force_all=True)
     if pending_claims:
         cursor = pending_claims[0][1]
     _write_int_file_atomic(path, cursor)
