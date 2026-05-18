@@ -75,12 +75,7 @@ def sync_closed_rounds(*, graph: GraphClient, store: ClosedRoundsStore, cache_n:
 
     missing_n = needed_n - tmp_store.count_rounds()
     if missing_n > 0:
-        info(
-            "CORE",
-            "STORE",
-            "SYNC",
-            msg=f"Ensuring store contains enough closed rounds: missing_n={missing_n}",
-        )
+        info("PROGRESS", f"Ensuring store contains enough closed rounds: missing_n={missing_n}")
         # Ensure that the desired cache size is covered.
         _ensure_min_count_by_scanning_older(graph=graph, store=tmp_store, needed_n=needed_n)
 
@@ -118,12 +113,7 @@ def _ensure_min_count_by_scanning_older(*, graph: GraphClient, store: ClosedRoun
 
         scan_start = max(scan_end - page_size + 1, 1)
 
-        info(
-            "CORE",
-            "STORE",
-            "SYNC",
-            msg=f"Fetching additional older closed rounds: range=[{scan_start}..{scan_end}]",
-        )
+        info("PROGRESS", f"Fetching additional older closed rounds: range=[{scan_start}..{scan_end}]")
         rounds = graph.fetch_closed_rounds(
             order="asc",
             epoch_gte=scan_start,
@@ -179,12 +169,7 @@ def _fetch_and_append_range(*, graph: GraphClient, store: ClosedRoundsStore, sta
         if window_end > end_epoch:
             window_end = end_epoch
 
-        info(
-            "CORE",
-            "STORE",
-            "SYNC",
-            msg=f"Fetching {fetch_type} closed rounds: range=[{window_start}..{window_end}]",
-        )
+        info("PROGRESS", f"Fetching {fetch_type} closed rounds: range=[{window_start}..{window_end}]")
         rounds = graph.fetch_closed_rounds(
             order="asc",
             epoch_gte=window_start,

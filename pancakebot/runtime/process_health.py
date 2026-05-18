@@ -149,11 +149,9 @@ def write_heartbeat(
     except Exception as e:
         _consecutive_heartbeat_failures += 1
         warn(
-            "HEALTH", "HRTBT", "WRITE_FAIL",
-            msg=(
-                f"heartbeat write failed (consecutive={_consecutive_heartbeat_failures}/"
-                f"{_MAX_CONSECUTIVE_HEARTBEAT_FAILURES}): {type(e).__name__}: {e}"
-            ),
+            "ALERT",
+            f"heartbeat write failed (consecutive={_consecutive_heartbeat_failures}/"
+            f"{_MAX_CONSECUTIVE_HEARTBEAT_FAILURES}): {type(e).__name__}: {e}",
         )
         if _consecutive_heartbeat_failures >= _MAX_CONSECUTIVE_HEARTBEAT_FAILURES:
             raise InvariantError(

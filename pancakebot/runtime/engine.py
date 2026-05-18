@@ -36,7 +36,6 @@ from pancakebot.chain.rpc_poller import (
 )
 from pancakebot import timing_constants as _tc
 from pancakebot.runtime.process_health import write_heartbeat
-from pancakebot.strategy.momentum_pipeline import StrategyPipelineDecision
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
@@ -193,19 +192,17 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
     without having to derive the math from raw constants themselves.
     """
     info(
-        "CORE", "RUN", "TIMING",
-        msg=(
-            f"timing config: kline_cutoff={cfg.kline_cutoff_seconds}s "
-            f"pool_cutoff={cfg.pool_cutoff_seconds}s "
-            f"ramp_poll_1_wakeup={cfg.ramp_poll_1_wakeup_offset_before_lock_ms}ms "
-            f"bankroll_wakeup={cfg.bankroll_wakeup_offset_before_lock_ms}ms "
-            f"ramp_poll_2_wakeup={cfg.ramp_poll_2_wakeup_offset_before_lock_ms}ms "
-            f"final_rpc_poll_wakeup={cfg.final_rpc_poll_wakeup_offset_before_lock_ms}ms "
-            f"critical_path_wakeup={cfg.critical_path_wakeup_offset_before_lock_ms}ms "
-            f"bet_submit_deadline={cfg.bet_submit_deadline_offset_before_lock_ms}ms "
-            f"bet_tx_receipt_timeout={cfg.bet_tx_receipt_timeout_seconds}s "
-            f"claim_tx_receipt_timeout={cfg.claim_tx_receipt_timeout_seconds}s"
-        ),
+        "START",
+        f"timing config: kline_cutoff={cfg.kline_cutoff_seconds}s "
+        f"pool_cutoff={cfg.pool_cutoff_seconds}s "
+        f"ramp_poll_1_wakeup={cfg.ramp_poll_1_wakeup_offset_before_lock_ms}ms "
+        f"bankroll_wakeup={cfg.bankroll_wakeup_offset_before_lock_ms}ms "
+        f"ramp_poll_2_wakeup={cfg.ramp_poll_2_wakeup_offset_before_lock_ms}ms "
+        f"final_rpc_poll_wakeup={cfg.final_rpc_poll_wakeup_offset_before_lock_ms}ms "
+        f"critical_path_wakeup={cfg.critical_path_wakeup_offset_before_lock_ms}ms "
+        f"bet_submit_deadline={cfg.bet_submit_deadline_offset_before_lock_ms}ms "
+        f"bet_tx_receipt_timeout={cfg.bet_tx_receipt_timeout_seconds}s "
+        f"claim_tx_receipt_timeout={cfg.claim_tx_receipt_timeout_seconds}s",
     )
 
 
@@ -258,10 +255,8 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         )
         closed_state.strategy_pipeline.set_bankroll_tracker(tracker)
     info(
-        "CORE",
-        "RUN",
-        "BANKROLL",
-        msg=f"Starting bankroll: {format_bankroll(bankroll_bnb=bankroll_bnb, bnbusd_price=bnbusd_price)}",
+        "START",
+        f"Starting bankroll: {format_bankroll(bankroll_bnb=bankroll_bnb, bnbusd_price=bnbusd_price)}",
     )
 
     while True:
@@ -348,8 +343,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                         claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
                     )
                 except TransientRpcError as e:
-                    warn("CLAIM", "SCAN", "SKIP",
-                         reason="rpc_transient", err=str(e))
+                    warn("ALERT", f"claim scan failed: rpc_transient err={e}")
 
             _dry_settle_available_bets(cfg, closed)
             closed.claim_scan_initialized = True
@@ -482,8 +476,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     _tracker = closed.strategy_pipeline._bankroll_tracker
                     if _tracker is not None:
                         last_known_bankroll = _tracker.current_bankroll()
-                warn("RUN", "WALLET", "STALE",
-                     msg=f"Skip epoch {current_epoch}: risk_bankroll_stale err={e}")
                 _record_dry_cycle_audit(
                     cfg,
                     closed,
@@ -504,8 +496,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     eth_fetch_result=_kline_result_get(gate, "eth"),
                     sol_fetch_result=_kline_result_get(gate, "sol"),
                 )
-                info("RUN", "ACT", "SKIP",
-                     msg=f"Skip epoch {current_epoch}: risk_bankroll_stale")
+                warn("SKIP", f"Skip epoch {current_epoch}: risk_bankroll_stale err={e}")
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
             # Forward freshest bankroll to tracker (live only; dry records
@@ -598,7 +589,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         )
         round_anchor: AnchorState | None = None
         critical_path_wake_ts = static_critical_path_wake_ts
-        critical_path_source = "static"
         if cfg.rpc_poller is not None:
             anchor_poll_fire_ts = lock_ts_t - _tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS / 1000.0
             _sleep_until_ts(
@@ -625,28 +615,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 # Even at boundary-zone rounds dynamic_wake_ms >= lock-1057ms,
                 # i.e. >= anchor_poll_fire_ts + 200ms slack. Take it as-is.
                 critical_path_wake_ts = dynamic_wake_ms / 1000.0
-                critical_path_source = "dynamic"
-                _static_lead_ms = int(round(
-                    (lock_ts_t - static_critical_path_wake_ts) * 1000
-                ))
                 _dynamic_lead_ms = int(round(
                     (lock_ts_t - critical_path_wake_ts) * 1000
                 ))
-                info("RUN", "LOOP", "OFFSET",
-                     msg=(f"critical_path source=dynamic "
-                          f"static_lead_ms={_static_lead_ms} "
-                          f"dynamic_lead_ms={_dynamic_lead_ms} "
-                          f"anchor_bn={round_anchor.block_number} "
-                          f"epoch={current_epoch}"))
                 wake_mode = "dynamic"
                 kline_fire_offset_before_lock_ms = (
                     _dynamic_lead_ms - _tc.POOL_READ_TIME_MS
                 )
             else:
-                info("RUN", "LOOP", "OFFSET",
-                     msg=(f"critical_path source=static "
-                          f"(anchor poll timed out or malformed) "
-                          f"epoch={current_epoch}"))
                 wake_mode = "static"
                 kline_fire_offset_before_lock_ms = (
                     cfg.critical_path_wakeup_offset_before_lock_ms
@@ -660,10 +636,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 cfg.critical_path_wakeup_offset_before_lock_ms
                 - _tc.POOL_READ_TIME_MS
             )
-        info("RUN", "LOOP", "SLEEP",
-             msg=(f"Sleeping {int(critical_path_wake_ts - _utc_now())}s "
-                  f"(wait_for_critical_path, source={critical_path_source}) "
-                  f"epoch={current_epoch}"))
         _sleep_until_ts(
             critical_path_wake_ts, reason="wait_for_critical_path",
             epoch=current_epoch,
@@ -686,9 +658,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             ready, ready_reason = cfg.rpc_poller.is_pool_ready(current_epoch)
             if not ready:
                 skip_reason = f"pool_not_ready_{ready_reason}"
-                warn("RPC_POLL", "READY", "SKIP",
-                     msg=f"Skip epoch {current_epoch}: {skip_reason}",
-                     endpoint=cfg.rpc_poller.current_endpoint)
                 _record_dry_cycle_audit(
                     cfg,
                     closed,
@@ -709,8 +678,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     eth_fetch_result=_kline_result_get(gate, "eth"),
                     sol_fetch_result=_kline_result_get(gate, "sol"),
                 )
-                info("RUN", "ACT", "SKIP",
-                     msg=f"Skip epoch {current_epoch}: {skip_reason}")
+                warn("SKIP", f"Skip epoch {current_epoch}: {skip_reason} endpoint={cfg.rpc_poller.current_endpoint}")
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
             pool_ts_cutoff = lock_ts_t - cfg.pool_cutoff_seconds
@@ -718,10 +686,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 epoch=current_epoch, max_ts=pool_ts_cutoff,
             )
             pool_total = pool_bull_bnb + pool_bear_bnb
-            if pool_total > 0:
-                info("RPC_POLL", "ROUND", "DATA",
-                     epoch=current_epoch, pool_bnb=f"{pool_total:.4f}",
-                     endpoint=cfg.rpc_poller.current_endpoint)
             # Note: the prior pool=0 + chain_active "data integrity
             # violation" check is GONE in Era 11. With deterministic
             # polling, pool=0 just means the round genuinely had no
@@ -787,19 +751,20 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 eth_fetch_result=_kline_result_get(gate, "eth"),
                 sol_fetch_result=_kline_result_get(gate, "sol"),
             )
-            info("RUN", "ACT", "SKIP", msg=f"Skip epoch {current_epoch}: {reason}")
-            # SKIP path: no time pressure, safe to log timing here.
-            if gate is not None and gate.last_fetch_timing is not None:
-                info(
-                    "GATE", "FETCH", "TIMING",
-                    epoch=current_epoch,
-                    source=wake_mode,
-                    fire_offset_ms=(
-                        "" if kline_fire_offset_before_lock_ms is None
-                        else kline_fire_offset_before_lock_ms
-                    ),
-                    **gate.last_fetch_timing,
+            if reason == "kline_fetch_transient_failure" and gate is not None:
+                # Fold the kline per-symbol detail (formerly emitted as a
+                # standalone WARN from momentum_gate.py) INTO this SKIP at
+                # WARN level. Operator-facing T1 wording is mechanical;
+                # T3 polishes per-reason phrasing.
+                _details = " ".join(
+                    f"{sym}={result}"
+                    for sym, result in (gate.last_fetch_results or {}).items()
+                    if result not in ("ok", "not_fetched")
                 )
+                _suffix = f" ({_details})" if _details else ""
+                warn("SKIP", f"Skip epoch {current_epoch}: {reason}{_suffix}")
+            else:
+                info("SKIP", f"Skip epoch {current_epoch}: {reason}")
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
@@ -845,14 +810,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         bet_submit_offset_ms = lock_ms - now_utc_ms
         margin_ms = lock_ms - deadline_ms
         if now_utc_ms >= deadline_ms:
-            info(
-                "BET",
-                "TIMING",
-                "ABORT",
-                epoch=current_epoch,
-                submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
-                margin_ms=margin_ms,
-                source=deadline_source,
+            warn(
+                "SKIP",
+                f"Skip epoch {current_epoch}: too_close_to_lock_for_bet "
+                f"submit_offset_ms={bet_submit_offset_ms:.0f} "
+                f"margin_ms={margin_ms} source={deadline_source}",
             )
             _record_dry_cycle_audit(
                 cfg,
@@ -881,12 +843,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 eth_fetch_result=_kline_result_get(gate, "eth"),
                 sol_fetch_result=_kline_result_get(gate, "sol"),
             )
-            info(
-                "RUN",
-                "ACT",
-                "SKIP",
-                msg=f"Skip epoch {current_epoch}: too_close_to_lock_for_bet",
-            )
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
 
@@ -897,16 +853,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # tells us if the TX landed in time.
         # Bundle 4: ``source`` indicates which deadline mode (dynamic from
         # Lorentz anchor vs static fallback) drove the guard decision.
-        info(
-            "BET",
-            "TIMING",
-            "OFFSET",
-            epoch=current_epoch,
-            submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
-            margin_ms=margin_ms,
-            source=deadline_source,
-        )
-
         # Step 12: Submit bet.
         if decision.bet_side is None:
             raise InvariantError("decision_bet_side_missing")
@@ -922,8 +868,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if not cfg.dry and cfg.live_clamp_bet_to_contract_minimum:
             min_wei = int(round(cfg.min_bet_amount_bnb * BNB_WEI))
             amount_wei = min_wei
-            info("RUN", "ACT", "CLAMP",
-                 msg=f"clamp_bet_to_contract_minimum: clamping {computed_amount_wei / BNB_WEI:.4f} -> {amount_wei / BNB_WEI:.4f} BNB")
+            info("BET", f"clamp_bet_to_contract_minimum: clamping {computed_amount_wei / BNB_WEI:.4f} -> {amount_wei / BNB_WEI:.4f} BNB")
 
         tx_submit = None
         if not cfg.dry:
@@ -961,15 +906,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             # value is accurate to within the gas fee (~1e-5 BNB).
             bankroll_after_live = bankroll_bnb - amount_bnb
             info(
-                "RUN",
-                "ACT",
                 "BET",
-                msg=(
-                    f"Betting {amount_bnb:.4f} BNB"
-                    + usd_suffix(amount_bnb=amount_bnb, bnbusd_price=bnbusd_price)
-                    + f" on {bet_side} for epoch {current_epoch}"
-                    + bankroll_suffix(bankroll_bnb=bankroll_after_live, bnbusd_price=bnbusd_price)
-                ),
+                f"Betting {amount_bnb:.4f} BNB"
+                + usd_suffix(amount_bnb=amount_bnb, bnbusd_price=bnbusd_price)
+                + f" on {bet_side} for epoch {current_epoch}"
+                + bankroll_suffix(bankroll_bnb=bankroll_after_live, bnbusd_price=bnbusd_price),
             )
             if tx_submit is None:
                 raise InvariantError("live_bet_submit_missing")
@@ -1011,15 +952,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 included_late = (
                     int(tx_submit.included_block_timestamp) >= int(lock_ts_t)
                 )
-                info(
-                    "BET",
-                    "INCLUSION",
-                    "LATE" if included_late else "OK",
-                    epoch=current_epoch,
-                    included_block_ts=int(tx_submit.included_block_timestamp),
-                    lock_ts=int(lock_ts_t),
-                    submit_offset_ms=f"{bet_submit_offset_ms:.0f}",
-                )
+                if included_late:
+                    warn(
+                        "ALERT",
+                        f"Bet TX included LATE for epoch {current_epoch}: "
+                        f"included_block_ts={int(tx_submit.included_block_timestamp)} "
+                        f"lock_ts={int(lock_ts_t)} "
+                        f"submit_offset_ms={bet_submit_offset_ms:.0f}",
+                    )
         else:
             # Step 14: Dry bookkeeping (including gas proxy) + record.
             if closed.simulated_bankroll_bnb is None:
@@ -1030,15 +970,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             bankroll_after_bet = closed.simulated_bankroll_bnb
 
             info(
-                "RUN",
-                "ACT",
                 "BET",
-                msg=(
-                    f"Betting {amount_bnb:.4f} BNB"
-                    + usd_suffix(amount_bnb=amount_bnb, bnbusd_price=bnbusd_price)
-                    + f" on {bet_side} for epoch {current_epoch}"
-                    + bankroll_suffix(bankroll_bnb=bankroll_after_bet, bnbusd_price=bnbusd_price)
-                ),
+                f"Betting {amount_bnb:.4f} BNB"
+                + usd_suffix(amount_bnb=amount_bnb, bnbusd_price=bnbusd_price)
+                + f" on {bet_side} for epoch {current_epoch}"
+                + bankroll_suffix(bankroll_bnb=bankroll_after_bet, bnbusd_price=bnbusd_price),
             )
             _dry_record_bet(
                 closed,
@@ -1076,33 +1012,15 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 sol_fetch_result=_kline_result_get(gate, "sol"),
             )
 
-        # Step 14b: Deferred GATE logging -- emit AFTER bet so file I/O
-        # doesn't delay bet submission in the critical path.
-        if gate is not None and gate.last_fetch_timing is not None:
-            info(
-                "GATE", "FETCH", "TIMING",
-                epoch=current_epoch,
-                source=wake_mode,
-                fire_offset_ms=(
-                    "" if kline_fire_offset_before_lock_ms is None
-                    else kline_fire_offset_before_lock_ms
-                ),
-                **gate.last_fetch_timing,
-            )
-        # Log signal details for dry-run visibility.
-        _log_deferred_gate_signal(decision)
+        # Per-round GATE FETCH TIMING + GATE SIGNAL FIRE info emissions
+        # were dropped at Phase B v2 (2026-05-18): cycle_audit.csv captures
+        # the same data (btc/eth/sol_fetch_ms, wake_mode,
+        # kline_fire_offset_before_lock_ms, bet_side, bet_size_bnb)
+        # byte-equivalent. Operator-facing stdout no longer needs them.
 
         # Step 15: Sleep until claim + claim scan.
         _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
         return
-
-
-def _log_deferred_gate_signal(decision: StrategyPipelineDecision) -> None:
-    """Log GATE signal details after bet submission (deferred from evaluate)."""
-    if decision.action == "BET":
-        info("GATE", "SIGNAL", "FIRE",
-             side=decision.bet_side,
-             strength=f"{decision.bet_size_bnb:.4f}")
 
 
 def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
@@ -1118,23 +1036,23 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
         try:
             current_epoch = int(cfg.contract.current_epoch())
         except TransientRpcError as e:
-            warn("CORE", "LOOP", "RETRY", reason="rpc_current_epoch", attempt=idx, err=str(e))
+            warn("RETRY", f"epoch_handshake: rpc_current_epoch attempt={idx} err={e}")
             continue
 
         locked_epoch = current_epoch - 1
         if locked_epoch <= 0:
-            warn("CORE", "LOOP", "RETRY", reason="locked_epoch_nonpositive", attempt=idx)
+            warn("RETRY", f"epoch_handshake: locked_epoch_nonpositive attempt={idx}")
             continue
 
         try:
             locked_rd = cfg.contract.round_data(locked_epoch)
             open_rd = cfg.contract.round_data(current_epoch)
         except TransientRpcError as e:
-            warn("CORE", "LOOP", "RETRY", reason="rpc_round_data", attempt=idx, err=str(e))
+            warn("RETRY", f"epoch_handshake: rpc_round_data attempt={idx} err={e}")
             continue
 
         if locked_rd.lock_ts <= 0:
-            warn("CORE", "LOOP", "RETRY", reason="locked_lock_ts_zero", attempt=idx)
+            warn("RETRY", f"epoch_handshake: locked_lock_ts_zero attempt={idx}")
             continue
 
         locked_round = Round(
@@ -1175,8 +1093,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
             close_ts = int(cfg.contract.close_ts(claim_epoch))
             break
         except TransientRpcError as e:
-            warn("CORE", "CLAIM", "RETRY",
-                 reason="rpc_close_ts", attempt=idx, err=str(e))
+            warn("RETRY", f"close_ts: rpc attempt={idx} err={e}")
             continue
     if close_ts is None:
         raise InvariantError("close_ts_retry_exhausted")
@@ -1208,8 +1125,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
                 claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
             )
         except TransientRpcError as e:
-            warn("CLAIM", "SCAN", "SKIP",
-                 reason="rpc_transient", err=str(e))
+            warn("ALERT", f"claim scan failed: rpc_transient err={e}")
 
     # Dry: settle simulated bets against oracle price.
     _dry_settle_available_bets(cfg, closed)
@@ -1226,11 +1142,6 @@ def _sleep_until_ts(target_ts: float, *, reason: str, epoch: int | None = None) 
     remaining = target_ts - _utc_now()
     if remaining <= 0.5:
         return
-
-    msg = f"Sleeping {int(remaining)}s ({reason})"
-    if epoch is not None:
-        msg = msg + f" epoch={epoch}"
-    info("RUN", "LOOP", "SLEEP", msg=msg)
 
     while True:
         remaining2 = target_ts - _utc_now()

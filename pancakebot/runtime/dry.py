@@ -14,7 +14,7 @@ from pathlib import Path
 from pancakebot import paths as _paths
 from pancakebot.constants import RETRY_BACKOFF_SECONDS
 from pancakebot.util import InvariantError, TransientRpcError
-from pancakebot.log import info
+from pancakebot.log import info, warn
 from pancakebot.util import bankroll_suffix, usd_suffix
 from pancakebot.runtime.audit import (
     append_audit_row as _append_dry_audit_row,
@@ -99,8 +99,7 @@ def _archive_dry_runtime_state(
         for f in existing:
             f.unlink(missing_ok=True)
         if n_lines > 0:
-            info("RUN", "DRY", "CLEAN",
-                 msg=f"Deleted previous dry state ({n_lines} rounds, below {_MIN_ROUNDS_TO_ARCHIVE} threshold)")
+            info("START", f"Deleted previous dry state ({n_lines} rounds, below {_MIN_ROUNDS_TO_ARCHIVE} threshold)")
         return None
     archive_root = Path(_paths.DRY_ARCHIVE_ROOT).resolve()
     archive_root.mkdir(parents=True, exist_ok=True)
@@ -401,23 +400,10 @@ def _fetch_wallet_balance_bnb_with_retries(
         try:
             return float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
         except TransientRpcError as e:
-            info(
-                "CORE",
-                "RUN",
+            warn(
                 "RETRY",
-                msg=(
-                    f"Caught TransientRpcError during {reason}: "
-                    f"retrying after delay err={e}"
-                ),
-            )
-            info(
-                "CORE",
-                "LOOP",
-                "SLEEP",
-                msg=(
-                    f"duration={delay_seconds}s "
-                    "reason=delay_after_transient_network_error"
-                ),
+                f"TransientRpcError during {reason}: "
+                f"retrying after delay={delay_seconds}s err={e}",
             )
             sleep_seconds(delay_seconds)
     return float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
@@ -592,39 +578,27 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         # Brief INFO log (no key=value fields)
         if outcome == "win":
             info(
-                "RUN",
-                "ACT",
-                "DRY_SETTLE",
-                msg=(
-                    f"Won {credit_bnb:.4f} BNB"
-                    + usd_suffix(amount_bnb=credit_bnb, bnbusd_price=bnbusd_price)
-                    + f" on epoch {e}"
-                    + bankroll_suffix(bankroll_bnb=bankroll_after_settle, bnbusd_price=bnbusd_price)
-                ),
+                "WIN",
+                f"Won {credit_bnb:.4f} BNB"
+                + usd_suffix(amount_bnb=credit_bnb, bnbusd_price=bnbusd_price)
+                + f" on epoch {e}"
+                + bankroll_suffix(bankroll_bnb=bankroll_after_settle, bnbusd_price=bnbusd_price),
             )
         elif outcome == "refund":
             info(
-                "RUN",
-                "ACT",
-                "DRY_SETTLE",
-                msg=(
-                    f"Refunded {credit_bnb:.4f} BNB"
-                    + usd_suffix(amount_bnb=credit_bnb, bnbusd_price=bnbusd_price)
-                    + f" on epoch {e}"
-                    + bankroll_suffix(bankroll_bnb=bankroll_after_settle, bnbusd_price=bnbusd_price)
-                ),
+                "REFUND",
+                f"Refunded {credit_bnb:.4f} BNB"
+                + usd_suffix(amount_bnb=credit_bnb, bnbusd_price=bnbusd_price)
+                + f" on epoch {e}"
+                + bankroll_suffix(bankroll_bnb=bankroll_after_settle, bnbusd_price=bnbusd_price),
             )
         else:
             info(
-                "RUN",
-                "ACT",
-                "DRY_SETTLE",
-                msg=(
-                    f"Lost {bet_bnb:.4f} BNB"
-                    + usd_suffix(amount_bnb=bet_bnb, bnbusd_price=bnbusd_price)
-                    + f" on epoch {e}"
-                    + bankroll_suffix(bankroll_bnb=bankroll_after_settle, bnbusd_price=bnbusd_price)
-                ),
+                "LOSS",
+                f"Lost {bet_bnb:.4f} BNB"
+                + usd_suffix(amount_bnb=bet_bnb, bnbusd_price=bnbusd_price)
+                + f" on epoch {e}"
+                + bankroll_suffix(bankroll_bnb=bankroll_after_settle, bnbusd_price=bnbusd_price),
             )
 
         settled_ts = int(time.time())
@@ -673,7 +647,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
 
 def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     """Initialize live/dry runtime state. No disk sync -- pure RPC + OKX."""
-    info("CORE", "RUN", "SETUP", msg="Core setup: strategy=momentum_gate mode=rpc_only")
+    info("START", "Core setup: strategy=momentum_gate mode=rpc_only")
 
     strategy_pipeline = _build_momentum_pipeline(cfg=cfg)
     # No warmup rounds needed: OKX gate fetches live at decision time.
@@ -689,7 +663,7 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
                 for f in _dry_runtime_state_files():
                     if f.exists():
                         f.unlink(missing_ok=True)
-                info("RUN", "DRY", "CLEAN", msg="Deleted previous dry state (--no-archive)")
+                info("START", "Deleted previous dry state (--no-archive)")
             else:
                 archived = _archive_dry_runtime_state(
                     reason="startup_fresh_reset",
@@ -697,8 +671,7 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
                 )
                 if archived is not None:
                     archive_log = Path(_paths.DRY_ARCHIVE_ROOT) / archived.name
-                    info("RUN", "DRY", "ARCHIVE",
-                         msg=f"Archived previous dry runtime state to {archive_log}")
+                    info("START", f"Archived previous dry runtime state to {archive_log}")
         bankroll_state = _resolve_initial_dry_bankroll_state(cfg)
         closed.simulated_bankroll_bnb = bankroll_state.simulated_bankroll_bnb
         # Wire PersistedBankrollTracker now that we know the initial bankroll.
@@ -725,10 +698,8 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
         )
         closed.dry_settled_epochs = settled_epochs
         info(
-            "RUN",
-            "DRY",
-            "STATE",
-            msg=f"Loaded dry bankroll {bankroll_state.simulated_bankroll_bnb:.6f} BNB source={bankroll_state.source}",
+            "START",
+            f"Loaded dry bankroll {bankroll_state.simulated_bankroll_bnb:.6f} BNB source={bankroll_state.source}",
         )
 
     return closed

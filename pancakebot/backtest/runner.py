@@ -167,7 +167,7 @@ def run_backtest(
     backtest_round_count = backtest_cfg.backtest_round_count
     initial_bankroll_bnb = backtest_cfg.initial_bankroll_bnb
 
-    info("BACK", "SETUP", "START", msg="Loading closed rounds and klines")
+    info("START", "Loading closed rounds and klines")
     t0 = time.perf_counter()
 
     all_rounds = _load_all_rounds(runtime_cfg)
@@ -179,8 +179,7 @@ def run_backtest(
         ext_only = [r for r in ext_rounds if int(r.epoch) not in existing]
         ext_only.sort(key=lambda r: int(r.epoch))
         all_rounds = ext_only + all_rounds
-        info("BACK", "SETUP", "EXT_LOAD",
-             msg=f"loaded {len(ext_only)} extended rounds (older than canonical floor)")
+        info("START", f"loaded {len(ext_only)} extended rounds (older than canonical floor)")
     if not all_rounds:
         raise InvariantError("backtest_no_closed_rounds")
 
@@ -208,14 +207,10 @@ def run_backtest(
     last_epoch = sim_rounds[-1].epoch
     elapsed_load = time.perf_counter() - t0
     info(
-        "BACK",
-        "SETUP",
-        "LOADED",
-        msg=(
-            f"rounds={len(all_rounds)} "
-            f"sim_rounds={len(sim_rounds)} epochs=[{first_epoch}..{last_epoch}] "
-            f"load_elapsed={elapsed_load:.1f}s"
-        ),
+        "START",
+        f"rounds={len(all_rounds)} "
+        f"sim_rounds={len(sim_rounds)} epochs=[{first_epoch}..{last_epoch}] "
+        f"load_elapsed={elapsed_load:.1f}s",
     )
 
     # BNB klines are stored on `_bnb_klines_by_epoch` but never read
@@ -225,9 +220,7 @@ def run_backtest(
     # accepts the empty dict so the wiring is preserved for any
     # future BNB-aware research that re-enables this path.
     bnb_klines: dict[int, list[list]] = {}
-    info("BACK", "SETUP", "BNB_KL",
-         msg="BNB load skipped (strategy does not read BNB klines; "
-             "saves ~3 GB RAM)")
+    info("START", "BNB load skipped (strategy does not read BNB klines; saves ~3 GB RAM)")
 
     # Compute the per-record kline window from the gate config.
     # candle_count = max(mtf_lookbacks) + 1 covers the deepest lookback
@@ -243,9 +236,8 @@ def run_backtest(
         extended_path=_ext_btc,
     )
     if btc_klines:
-        info("BACK", "SETUP", "BTC_KL",
-             msg=f"Loaded BTC 1s klines for {len(btc_klines)} epochs "
-                 f"(cutoff={_cs}, candle_count={_candle_count})")
+        info("START", f"Loaded BTC 1s klines for {len(btc_klines)} epochs "
+             f"(cutoff={_cs}, candle_count={_candle_count})")
     eth_klines = (
         _load_klines_from(
             _ETH_KLINES_PATH, kline_cutoff_seconds=_cs, candle_count=_candle_count,
@@ -254,7 +246,7 @@ def run_backtest(
         if _ETH_KLINES_PATH.exists() or (_ext_eth is not None and _ext_eth.exists()) else {}
     )
     if eth_klines:
-        info("BACK", "SETUP", "ETH_KL", msg=f"Loaded ETH 1s klines for {len(eth_klines)} epochs")
+        info("START", f"Loaded ETH 1s klines for {len(eth_klines)} epochs")
     sol_klines = (
         _load_klines_from(
             _SOL_KLINES_PATH, kline_cutoff_seconds=_cs, candle_count=_candle_count,
@@ -263,7 +255,7 @@ def run_backtest(
         if _SOL_KLINES_PATH.exists() or (_ext_sol is not None and _ext_sol.exists()) else {}
     )
     if sol_klines:
-        info("BACK", "SETUP", "SOL_KL", msg=f"Loaded SOL 1s klines for {len(sol_klines)} epochs")
+        info("START", f"Loaded SOL 1s klines for {len(sol_klines)} epochs")
 
     # Build momentum pipeline (no live gate -- backtest uses cached 1s klines).
     from pancakebot.bankroll_tracker import InMemoryBankrollTracker
@@ -287,7 +279,7 @@ def run_backtest(
     pipeline.refresh_btc_klines(btc_klines_by_epoch=btc_klines)
     pipeline.refresh_eth_klines(eth_klines_by_epoch=eth_klines)
     pipeline.refresh_sol_klines(sol_klines_by_epoch=sol_klines)
-    info("BACK", "SETUP", "PIPELINE", msg="MomentumOnlyPipeline ready (backtest/4-asset mode)")
+    info("READY", "MomentumOnlyPipeline ready (backtest/4-asset mode)")
 
     # Output files.
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -371,12 +363,7 @@ def run_backtest(
             pipeline.settle_closed_rounds(rounds=[round_t])
 
             if (i + 1) % 500 == 0:
-                info(
-                    "BACK",
-                    "PROG",
-                    "SIM",
-                    msg=f"idx={i+1}/{len(sim_rounds)} bankroll={bankroll:.4f} BNB",
-                )
+                info("PROGRESS", f"idx={i+1}/{len(sim_rounds)} bankroll={bankroll:.4f} BNB")
 
     elapsed_sim = time.perf_counter() - t_sim_start
 
@@ -388,16 +375,12 @@ def run_backtest(
     bet_rate = _safe_rate(stats.num_bets, total_rounds)
 
     info(
-        "BACK",
-        "RESULT",
         "SUMMARY",
-        msg=(
-            f"rounds={total_rounds} bets={stats.num_bets} "
-            f"win_rate={win_rate:.1%} bet_rate={bet_rate:.1%} "
-            f"net_pnl={net_pnl:+.4f} BNB "
-            f"final_bankroll={bankroll:.4f} BNB "
-            f"elapsed={elapsed_sim:.1f}s"
-        ),
+        f"rounds={total_rounds} bets={stats.num_bets} "
+        f"win_rate={win_rate:.1%} bet_rate={bet_rate:.1%} "
+        f"net_pnl={net_pnl:+.4f} BNB "
+        f"final_bankroll={bankroll:.4f} BNB "
+        f"elapsed={elapsed_sim:.1f}s",
     )
 
     skip_detail = dict(sorted(stats.skip_counts_by_reason.items(), key=lambda x: -x[1]))
@@ -428,7 +411,7 @@ def run_backtest(
     # Generate equity curve plot.
     equity_path = out_dir / "equity_curves.png"
     _plot_equity_curve(trades_path, equity_path, initial_bankroll_bnb, total_rounds)
-    info("BACK", "RESULT", "FILES", msg=f"trades={trades_path} summary={summary_path} equity={equity_path}")
+    info("DONE", f"trades={trades_path} summary={summary_path} equity={equity_path}")
 
 
 def _plot_equity_curve(
