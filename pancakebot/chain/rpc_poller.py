@@ -1103,13 +1103,22 @@ class RpcPoller:
         State B — steady (``now < _lock_at``): anchor cadence to
             ``round_open = _lock_at − interval_seconds``. Compute the
             next anchored tick ``next_at = round_open + k * period``
-            for smallest k>=1 such that ``next_at > now``. If
-            ``next_at`` would land inside the ramp/final window
-            ``[_lock_at − ramp_poll_1_offset, _lock_at]`` (closed at the
-            ramp boundary — see ``_compute_periodic_timeout``), drop it:
-            sleep to ``_lock_at + 0.1s`` so the next loop iteration
-            picks up State C (and shortly afterwards, the fresh anchor
-            from the next set_round_phase).
+            for smallest k>=1 such that ``next_at > now``.
+
+            Three sub-cases inside State B (see
+            ``_compute_periodic_timeout``):
+            - the anchored tick has comfortable margin before
+              ramp_window_start — fire at next_at.
+            - the anchored tick is outside the ramp window but its
+              worst-case HTTP RTT could extend past ramp_window_start
+              — reschedule to fire at the latest safe time
+              (``ramp_window_start − max_rtt − safety``). If that
+              time has already passed (previous poll overran), suspend.
+            - the anchored tick lands INSIDE the ramp window — suspend.
+
+            Suspended ticks sleep to ``_lock_at + 0.1s`` so the next
+            loop iteration picks up State C (and shortly afterwards,
+            the fresh anchor from the next set_round_phase).
 
         State C — stale anchor (``now >= _lock_at``): round just locked,
             engine is in _sleep_and_claim, set_round_phase for the next
@@ -1161,31 +1170,47 @@ class RpcPoller:
     ) -> tuple[float, str]:
         """Return ``(wait_timeout_seconds, state_label)`` for the
         lock-anchored periodic loop. Extracted from ``_periodic_loop``
-        so the State B / State C / suspend math is unit-testable
-        without spinning up the daemon thread.
-
-        - ``"steady"`` (State B, ``now < lock_at``): timeout = time until
-          next anchored tick at ``round_open + k*period``.
-        - ``"suspend"`` (State B sub-case): the next anchored tick falls
-          inside the ramp/final window
-          ``[lock_at − ramp_poll_1_offset, lock_at]``. Timeout sleeps to
-          ``lock_at + 0.1s`` so the next iteration falls into State C.
-        - ``"stale"`` (State C, ``now >= lock_at``): wall-clock fallback
-          at ``period`` seconds (engine in ``_sleep_and_claim``;
-          set_round_phase hasn't yet advanced ``_lock_at`` to the next
-          round). Periodic still polls; post-lock INFEAS gating in
-          ``_poll_now`` suppresses false flag/WARN.
-
-        The suspend predicate is ``next_at >= ramp_window_start``
-        (closed at the boundary, not open). At canonical config (period=8s,
-        ramp_offset=7500ms) no exact-boundary tick exists, but a future
-        change to either constant could create one. Keeping the safer
-        side of the inequality is defensive: a tick landing exactly on
-        ``lock_at − ramp_offset`` is the FIRST possible race candidate
-        for ``_poll_lock`` against ramp_1, so we suspend it.
+        so the cadence math is unit-testable without spinning up the
+        daemon thread.
 
         Caller is responsible for State A (``lock_at <= 0``) before
         invoking this helper.
+
+        Post-lock fallback (``now >= lock_at``) returns ``"stale"``:
+        wall-clock cadence while the engine is in ``_sleep_and_claim``
+        and ``set_round_phase`` hasn't yet advanced ``_lock_at``.
+
+        Before lock, the periodic poll must not race ``ramp_poll_1``
+        for ``_poll_lock``. The ramp wake fires at
+        ``lock_at − ramp_poll_1_offset`` and uses non-blocking acquire;
+        if a periodic poll is still in flight at that moment, ramp_1 is
+        silently dropped. Two distinct dangers:
+
+          * The anchored tick lands INSIDE the ramp window. Suspend it.
+            (Example: ramp_window_start=lock_at−7.5s, next_at=lock_at−4s.)
+
+          * The anchored tick is just BEFORE the window, but its HTTP
+            timeout (5s) plus jitter could extend it past
+            ramp_window_start. Try to fire earlier, at
+            ``ramp_window_start − max_rtt − safety``, so a full-timeout
+            poll completes before the ramp wake. If the latest safe
+            fire time has already PASSED (the prior poll overran),
+            suspend rather than fire a doomed poll.
+
+        Outcomes returned:
+
+        - ``"steady"``: fire at the anchored ``round_open + k*period``.
+        - ``"reschedule"``: fire earlier than anchored, at the latest
+          time a worst-case-RTT poll can complete before the ramp
+          window opens.
+        - ``"suspend"``: skip this round's tick; sleep to
+          ``lock_at + 0.1s`` so the next iteration falls into the
+          stale-anchor branch.
+        - ``"stale"``: post-lock wall-clock cadence.
+
+        ``"steady"`` and ``"reschedule"`` both fire a poll;
+        ``"suspend"`` and ``"stale"`` do not race ramp_1 (suspend
+        skips entirely; stale fires only after lock_at).
         """
         if now >= lock_at:
             return float(period), "stale"
@@ -1193,10 +1218,44 @@ class RpcPoller:
         ramp_window_start = (
             lock_at - self._ramp_poll_1_wakeup_offset_ms / 1000.0
         )
+        # Latest moment a worst-case-RTT periodic poll can BEGIN and
+        # still finish before the ramp window opens. A poll that hits
+        # the full HTTP timeout (RPC_HTTP_BATCH_TIMEOUT_SECONDS) holds
+        # ``_poll_lock`` for that long; firing later than this would
+        # leave the lock held when ramp_1 wakes.
+        safe_fire_latest = (
+            ramp_window_start
+            - _tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS
+            - _tc.RPC_PERIODIC_TO_RAMP_SAFETY_BUFFER_SECONDS
+        )
         k = max(1, int((now - round_open) // period) + 1)
         next_at = round_open + k * period
+
+        # The anchored tick lands inside the ramp window itself —
+        # firing here would either race ramp_1 directly or block it.
+        # Sleep past lock and let the stale-anchor branch resume.
         if next_at >= ramp_window_start:
             return max(0.1, lock_at + 0.1 - now), "suspend"
+
+        # The anchored tick is outside the ramp window but close
+        # enough that its worst-case RTT could extend into ramp_1.
+        # Try to fire earlier at the latest safe time; if that time
+        # has already passed (the previous poll overran), suspend
+        # instead of firing a doomed poll that would still overlap.
+        # Example (reschedule): canonical config (period=8, ramp=7.5,
+        #   max_rtt=5, safety=0.05). At now=lock_at−13, anchored
+        #   next_at=lock_at−12 falls in (safe_fire_latest=lock_at−12.55,
+        #   ramp_window_start=lock_at−7.5). Reschedule to lock_at−12.55.
+        # Example (overrun → suspend): previous poll completed at
+        #   lock_at−12.5 (overran past safe_fire_latest=lock_at−12.55
+        #   by 50 ms). No safe time remains; suspend and let
+        #   ramp_1+ramp_2 absorb the extra backlog.
+        if next_at > safe_fire_latest:
+            if safe_fire_latest > now:
+                return safe_fire_latest - now, "reschedule"
+            return max(0.1, lock_at + 0.1 - now), "suspend"
+
+        # Anchored tick has comfortable margin before the ramp window.
         return max(0.0, next_at - now), "steady"
 
     def _latch_first_successful_poll_locked(self) -> None:
