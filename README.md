@@ -41,7 +41,7 @@ pancakebot/
     chain/                               # BSC chain interaction
         prediction_contract.py           # Web3 contract wrapper
         contract_config.py, rpc_pool.py
-        pool_watcher.py                  # WSS real-time pool tracking
+        rpc_poller.py                    # Era 11 (2026-05-07+): batched RPC pool event accumulation
 
     market_data/                         # Data fetch + store
         okx_client.py                    # OKX REST with session pooling
@@ -122,18 +122,21 @@ See [docs/architecture.html](docs/architecture.html) for the visual diagram.
 
 Three pre-lock wakes anchored at the chain-supplied `lock_at` timestamp,
 plus a post-close claim wake anchored at `close_at(prev_locked_epoch)`.
-The ntp-sync and bankroll wakes use deliberately generous (5 s) gaps
-above the critical path — robustness over micro-optimization for
-non-critical-path operations. The critical path wake is a single
-scheduled event whose budget covers a sequential pool snapshot →
-kline fetch → signal compute → bet submit. All ms offsets DERIVED
-from constants in `pancakebot/timing_constants.py`.
+The bankroll wake uses a deliberately generous (5 s) gap above the
+critical path — robustness over micro-optimization for non-critical-path
+operations. The critical path wake is a single scheduled event whose
+budget covers a sequential pool snapshot → kline fetch → signal compute
+→ bet submit. All ms offsets DERIVED from constants in
+`pancakebot/timing_constants.py`. Static-fallback values shown; the
+live dynamic-mode critical-path wake is recomputed per-round from the
+predicted predecessor block (Bundle 5 v2, 2026-05-14).
 
-| Wake | Anchor + offset | Activities |
+| Wake | Anchor + offset (static fallback) | Activities |
 |---|---|---|
-| `wait_for_bankroll` | `lock_at - 6045ms` | Refresh wallet balance: live mode = BSC RPC; dry mode = in-memory simulated bankroll. Feeds the risk gates and `decide_open_round` with fresh-truth |
-| `wait_for_critical_path` | `lock_at - 1095ms` | Single critical-path entry. Sequentially: pool snapshot from WSS (`pool_cutoff_seconds = 6` data horizon) → 3 parallel OKX `/history-candles` GETs (BTC/ETH/SOL) → signal compute → bet submit |
-| Pre-bet timing guard | `lock_at - 750ms` | Abort if decision-ready past the safety margin (TX would mine after lock) |
+| `wait_for_bankroll` | `lock_at - 5970ms` | Refresh wallet balance: live mode = BSC RPC; dry mode = in-memory simulated bankroll. Feeds the risk gates and `decide_open_round` with fresh-truth |
+| Anchor poll | `lock_at - 1300ms` | Single sub-second poll of chain head's BEP-520-encoded ms timestamp; drives dynamic critical-path scheduling |
+| `wait_for_critical_path` | `lock_at - 970ms` | Single critical-path entry. Sequentially: pool snapshot from RPC poller (Era 11; `pool_cutoff_seconds = 6` data horizon) → 3 parallel OKX `/history-candles` GETs (BTC/ETH/SOL) → signal compute → bet submit |
+| Pre-bet timing guard | `lock_at - 625ms` | Abort if decision-ready past the safety margin (TX would mine after lock) |
 | `wait_for_claim` | `close_at(prev_locked) + buffer_seconds + 5s` (≈ 35s post-close) | Sleep for previous round's settlement; claim winnings (live; receipt-waited with `claim_tx_receipt_timeout_seconds ≈ 35s`, revert/timeout fires Discord `CLAIM FAILED` alert) |
 
 ### Configurable knobs (`config.toml [runtime]`)
@@ -146,9 +149,9 @@ from constants in `pancakebot/timing_constants.py`.
   P95 ≈ 700ms, P99 ≈ 1300ms (informational; see
   `pancakebot/timing_constants.py`).
 - `pool_cutoff_seconds = 6` — pool-aggregate data horizon for BSC events.
-  Cross-validated at load:
-  `pool_read_wakeup_offset_ms <= pool_cutoff_seconds * 1000 -
-  WSS_BET_EVENT_ARRIVAL_DELAY_P99_MS`.
+  Cross-validated at load against the RPC poll schedule (final-poll
+  offset must accommodate batch RTT p99 + safety buffer before the
+  critical-path wake reads the pool snapshot).
 - `max_consecutive_kline_fetch_failures = 5` — streak counter before bot
   crashes (supervisor restart + Discord alert).
 
