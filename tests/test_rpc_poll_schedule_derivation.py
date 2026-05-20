@@ -264,21 +264,22 @@ def test_canonical_pool_cutoff_6_produces_expected_offsets():
     Bundle 4 (2026-05-14): all offsets shifted by ±50ms due to
     BSC_BLOCK_TIME_MS: 500 → 450 (post-Lorentz empirical correction).
     Derivation now uses the new constants
-    (BSC_QUANTUM + BSC_BLOCK_TIME + VALIDATOR_ASSEMBLY + ONE_WAY = 700)
-    for bet_submit_deadline (was 200+500+50=750), and the block-time
+    (BSC_QUANTUM + BSC_BLOCK_TIME + VALIDATOR_ASSEMBLY + ONE_WAY = 625)
+    for bet_submit_deadline, and the block-time
     update ripples through final = pool_cutoff*1000 - BSC_BLOCK_TIME - ...
 
     Schedule at canonical pool_cutoff=6 (Bundle 4):
         final  = 6000 - 450 - 600 - 200             = 4750ms
         ramp_2 = 4750 + 1100 (RPC_RAMP_2_TO_FINAL)  = 5850ms
         ramp_1 = 5850 + 1700 (RPC_RAMP_1_TO_RAMP_2) = 7550ms
-        critical_path = bet_submit + 290 + 50 + 5   = 1045ms (was 1095)
-        bet_submit    = 50 + 450 + 50 + 150         = 700ms (was 750)
+        critical_path = bet_submit + 290 + 50 + 5   = 970ms (post 2026-05-20 re-measurement)
+        bet_submit    = 50 + 450 + 50 + 75          = 625ms (post 2026-05-20 re-measurement)
     """
     s = _derive_schedule(6)
     # Bundle 4 shifts (50ms tighter on critical_path/bet_submit; 50ms later on RPC polls).
-    assert s["critical_path"] == 1045
-    assert s["bet_submit"] == 700
+    # 2026-05-20: BSC_BET_SUBMIT_ONE_WAY_MS 150 → 75 shrinks critical_path and bet_submit by 75ms each.
+    assert s["critical_path"] == 970
+    assert s["bet_submit"] == 625
     assert s["final"] == 4750
     assert s["ramp_2"] == 5850
     assert s["ramp_1"] == 7550

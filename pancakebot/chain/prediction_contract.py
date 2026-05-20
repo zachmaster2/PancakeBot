@@ -517,12 +517,13 @@ class Web3PredictionContract:
         # hash. There is no one-way path here.
         #
         # The TX is committed to the validator's mempool at the moment
-        # the RPC accepts it. Bundle 4 budgets ``BSC_BET_SUBMIT_ONE_WAY_MS=150``
-        # for that one-way path — empirically validated 2026-05-16 against
-        # the production write-path RPC (p99 RTT 277ms → 139ms one-way,
-        # 150ms covers p99 with 11ms safety margin). See
-        # var/strategy_review/send_raw_tx_probe.md for the full
-        # distribution.
+        # the RPC accepts it. Bundle 4 budgets ``BSC_BET_SUBMIT_ONE_WAY_MS=75``
+        # for that one-way path — re-measured 2026-05-20 against the
+        # production write-path RPC (4×100-TX probe, n=400). Modal p99
+        # RTT ~80ms → ~40ms one-way; 75ms covers p99/2 with ≥12ms margin
+        # in all 4 runs. See
+        # var/strategy_review/2026_05_20_send_raw_tx_probe_100_at_*.md
+        # for the full distributions.
         signed = self._require_account().sign_transaction(tx)
         t_tx_signed = float(time.perf_counter() * 1000.0)
         try:

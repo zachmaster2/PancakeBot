@@ -20,8 +20,8 @@ Derivation chain (computed at config-load time in ``pancakebot/config.py``):
     bet_submit_deadline_offset_before_lock_ms  = (BSC_QUANTUM_MS              # 50ms — quantum-shift buffer
                                       + BSC_BLOCK_TIME_MS         # 450ms — one full slot back-off
                                       + VALIDATOR_ASSEMBLY_WINDOW_MS  # 50ms — validator TX-list freeze
-                                      + BSC_BET_SUBMIT_ONE_WAY_MS)  # 150ms — one-way RPC submit
-    # = 700ms STATIC FALLBACK (Bundle 4 2026-05-14). Used when Lorentz ms-encoding
+                                      + BSC_BET_SUBMIT_ONE_WAY_MS)  # 75ms — one-way RPC submit
+    # = 625ms STATIC FALLBACK (Bundle 4 2026-05-14). Used when Lorentz ms-encoding
     # is unavailable (pre-Lorentz chain or detection failed). Live decision path
     # under Lorentz uses ``RpcPoller.compute_dynamic_submit_deadline_ms()`` for
     # per-round prediction that's typically 250-300ms tighter than this fallback.
@@ -133,7 +133,7 @@ OKX_KLINE_FETCH_RTT_P95_MS: int = 290
 # walks back from the predicted predecessor block by
 #   (OKX_KLINE_FETCH_RTT_P99_MS + MOMENTUM_GATE_COMPUTE_TIME_MS
 #    + POOL_READ_TIME_MS + BSC_BET_SUBMIT_ONE_WAY_MS)
-# = 352 + 50 + 5 + 150 = 557ms.
+# = 352 + 50 + 5 + 75 = 482ms.
 #
 # Why 352 (not the 363 from the pooled canonical probe): the production
 # decision-path effective p99 is "max-of-3" across the 3 OKX symbols
@@ -240,23 +240,22 @@ VALIDATOR_ASSEMBLY_WINDOW_MS: int = 50
 # so the LOCAL deadline for ``eth_sendRawTransaction(...)`` is that minus
 # this one-way budget.
 #
-# Empirically validated 2026-05-16 via probe:
-# ``research/probe_send_raw_transaction_rtt.py --mode full`` ran 100
-# self-transfer TXs from the production wallet via the primary write-
-# path RPC ``bsc-dataseed1.defibit.io``. 100/100 sent, 100/100 included
-# within 30s. Round-trip RTT: p50=37ms, p95=188ms, p99=277ms, max=277ms.
-# One-way ≈ RTT/2 + propagation; the 50ms-quantum cover for p99/2 (139ms)
-# is 150ms with 11ms safety margin. Lowering to 100ms would cover p95/2
-# but leave ~1-2% of TXs arriving slightly past the dynamic submit
-# deadline (clean BET TIMING ABORT, but lost bet opportunity); the
-# critical-path budget gain (50ms = ~5% of static-wake budget) is not
-# worth the asymmetric cost.
+# Re-measured 2026-05-20 via 4 independent 100-TX probes (n=400 total)
+# across two UTC hours (~04:50 and ~19:18) and two spacings (1s, 10s):
+# p95 RTT clustered at 46-53ms across all four runs (vs. 188ms on
+# 2026-05-16 — ~4× network/RPC speedup). p99 RTT 65-127ms with the
+# single 127ms sample being a one-off outlier; modal p99 ~80ms.
+# One-way ≈ RTT/2 + propagation. p99/2 across runs: 33-63ms. The 75ms
+# value covers p99/2 with ≥12ms margin in all 4 runs and absorbs the
+# Phase-2 outlier's RTT/2 (63ms) with 12ms margin. Choosing 75ms over
+# the script's auto-recommendation of 50ms preserves a half-quantum
+# tail-outlier buffer.
 #
-# Source: research/probe_send_raw_transaction_rtt.py n=100, 2026-05-16.
-#         Full distribution + reasoning in
-#         var/strategy_review/send_raw_tx_probe.md.
-# Last measured: 2026-05-16
-BSC_BET_SUBMIT_ONE_WAY_MS: int = 150
+# Source: research/probe_send_raw_tx_rtt_2026_05_20*.py (n=400 across
+#         4 runs). Full distributions in
+#         var/strategy_review/2026_05_20_send_raw_tx_probe_100_at_{1s,10s}{,_hour2}.{jsonl,md}.
+# Last measured: 2026-05-20
+BSC_BET_SUBMIT_ONE_WAY_MS: int = 75
 
 # --- RPC poll timing (Era 11: 2026-05-07 pivot) ---------------------------
 #
