@@ -803,8 +803,8 @@ def load_app_config(path: str) -> AppConfig:
     #   BSC_QUANTUM_MS             (50)  — guard against 50ms quantum shift
     #   BSC_BLOCK_TIME_MS          (450) — back off one full slot if needed
     #   VALIDATOR_ASSEMBLY_WINDOW_MS (50) — validator's TX-list freeze window
-    #   BSC_BET_SUBMIT_ONE_WAY_MS  (150) — one-way RPC send to validator mempool
-    # = 700ms total (down from 750ms pre-Bundle-4).
+    #   BSC_BET_SUBMIT_ONE_WAY_MS  (75)  — one-way RPC send to validator mempool
+    # = 625ms total.
     bet_submit_deadline_offset_before_lock_ms = (
         _tc.BSC_QUANTUM_MS
         + _tc.BSC_BLOCK_TIME_MS

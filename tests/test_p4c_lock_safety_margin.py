@@ -71,7 +71,7 @@ def _write_cfg(tmp_path: Path, *, cutoff: int = 2, extra: str = "") -> Path:
 
 def test_bet_submit_deadline_offset_derived_correctly(tmp_path):
     """Bundle 4 (2026-05-14): derivation is
-    (BSC_QUANTUM_MS + BSC_BLOCK_TIME_MS + VALIDATOR_ASSEMBLY_WINDOW_MS + BSC_BET_SUBMIT_ONE_WAY_MS) = 700.
+    (BSC_QUANTUM_MS + BSC_BLOCK_TIME_MS + VALIDATOR_ASSEMBLY_WINDOW_MS + BSC_BET_SUBMIT_ONE_WAY_MS) = 625.
     These constants reflect BEP-520 ms-encoding awareness and the
     correct one-way RPC framing (vs the prior round-trip overestimate). Used
     only as static fallback; the live decision path uses
@@ -85,7 +85,7 @@ def test_bet_submit_deadline_offset_derived_correctly(tmp_path):
         + tc.BSC_BET_SUBMIT_ONE_WAY_MS
     )
     assert cfg.bet_submit_deadline_offset_before_lock_ms == expected
-    assert cfg.bet_submit_deadline_offset_before_lock_ms == 700  # Bundle 4 locked snapshot
+    assert cfg.bet_submit_deadline_offset_before_lock_ms == 625  # 2026-05-20 re-measurement
 
 
 def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
@@ -94,8 +94,8 @@ def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
     snapshot -> kline fetch -> signal compute -> bet submit; all the
     operation-time constants roll up into the one wake offset.
 
-    Bundle 4 (2026-05-14): 1095 -> 1045ms (50ms tighter), driven by the
-    bet_submit_deadline_offset_before_lock_ms reduction from 750 -> 700ms.
+    2026-05-20: 1045 -> 970ms (75ms tighter), driven by the
+    BSC_BET_SUBMIT_ONE_WAY_MS reduction from 150 -> 75ms after re-measurement.
     """
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     expected = (
@@ -105,7 +105,7 @@ def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
         + tc.POOL_READ_TIME_MS
     )
     assert cfg.critical_path_wakeup_offset_before_lock_ms == expected
-    assert cfg.critical_path_wakeup_offset_before_lock_ms == 1045  # Bundle 4 locked snapshot
+    assert cfg.critical_path_wakeup_offset_before_lock_ms == 970  # 2026-05-20 re-measurement
 
 
 def test_bankroll_wakeup_offset_derived_correctly(tmp_path):
@@ -115,7 +115,7 @@ def test_bankroll_wakeup_offset_derived_correctly(tmp_path):
         + tc.BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS
     )
     assert cfg.bankroll_wakeup_offset_before_lock_ms == expected
-    assert cfg.bankroll_wakeup_offset_before_lock_ms == 6045  # Bundle 4 locked snapshot
+    assert cfg.bankroll_wakeup_offset_before_lock_ms == 5970  # 2026-05-20 re-measurement
 
 
 def test_wake_chain_strictly_increasing(tmp_path):
