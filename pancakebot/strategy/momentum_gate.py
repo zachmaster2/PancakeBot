@@ -417,6 +417,13 @@ class MomentumGate:
         except Exception:  # noqa: BLE001 -- never block bot shutdown
             pass
 
+    def warmup_okx_session(self, connections: int = 3) -> None:
+        """Proxy to the underlying OkxClient's warmup. Called per-round from
+        the okx_warmup_wakeup wake (lock - 7000ms) so TLS connections stay
+        fresh across long idle windows (e.g. catchup_infeasible streaks).
+        Best-effort; OkxClient.warmup swallows transient errors."""
+        self._client.warmup(connections=connections)
+
     @staticmethod
     def _skip(reason: str) -> MomentumGateResult:
         return MomentumGateResult(

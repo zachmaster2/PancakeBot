@@ -523,6 +523,28 @@ def rpc_rtt_p99_for_batch(batch_size: int) -> int:
 # Last measured: 2026-05-06
 BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS: int = 5000
 
+# OKX warmup wake (2026-05-21): pre-bet TLS-handshake warmup for the
+# OkxClient's HTTPS connection pool. Fires BEFORE bankroll_wake so any
+# OKX-side keep-alive expiry (typical nginx default ~75s) from a long
+# idle window (e.g. a catchup_infeasible streak) is paid OUT of the
+# critical path. Without this, the first kline fetch after a long idle
+# pays a 500-800ms TLS handshake during the bet-decision window —
+# observed 2026-05-21 in live mode when 5 consecutive
+# pool_not_ready_catchup_infeasible_for_round skips left OKX idle for
+# ~25 minutes; on the recovery round, fetch_ms ran 734-850ms vs typical
+# 270ms, contributing to a missed lock-block inclusion.
+#
+# Slot rationale: between ramp_poll_1 (lock - 7550ms) and bankroll
+# (lock - 5970ms), leaving ~550ms headroom on each side for a slow
+# warmup (~270ms typical, ~800ms worst-case cold). Doesn't touch the
+# critical path; even a fully-failed warmup (rare; OkxClient.warmup
+# swallows transient errors) just means the bet round pays the cold
+# fetch like before.
+#
+# Source: engineering judgment + 2026-05-21 incident.
+# Last measured: 2026-05-21
+OKX_WARMUP_WAKEUP_OFFSET_BEFORE_LOCK_MS: int = 7000
+
 # Bundle 5 v2 (2026-05-14): ``NTP_QUERY_TIME_P99_MS`` and
 # ``NTP_WAKE_OFFSET_PRE_BANKROLL_MS`` are retired alongside the
 # application-level NTP layer. The bot trusts the OS clock (W32Time

@@ -281,6 +281,7 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
         f"timing config: kline_cutoff={cfg.kline_cutoff_seconds}s "
         f"pool_cutoff={cfg.pool_cutoff_seconds}s "
         f"ramp_poll_1_wakeup={cfg.ramp_poll_1_wakeup_offset_before_lock_ms}ms "
+        f"okx_warmup_wakeup={cfg.okx_warmup_wakeup_offset_before_lock_ms}ms "
         f"bankroll_wakeup={cfg.bankroll_wakeup_offset_before_lock_ms}ms "
         f"ramp_poll_2_wakeup={cfg.ramp_poll_2_wakeup_offset_before_lock_ms}ms "
         f"final_rpc_poll_wakeup={cfg.final_rpc_poll_wakeup_offset_before_lock_ms}ms "
@@ -537,6 +538,27 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Refreshes wallet balance so risk gates + decide_open_round
         # see fresh truth. Live mode does a BSC RPC call (~50-200ms
         # p99); dry mode reads in-memory simulated bankroll (sub-ms).
+        # OKX session warmup wake (lock - 7000ms by default). Refreshes
+        # the OkxClient's HTTPS connection pool so the per-round kline
+        # fetch doesn't pay a TLS handshake cost out of the critical
+        # path. Without this, a long idle window (e.g. consecutive
+        # catchup_infeasible skips) lets OKX server keep-alives expire
+        # and the next fetch pays 500-800ms vs typical 270ms — caught
+        # 2026-05-21 live crash post-mortem. Always-runs (idempotent
+        # when connections are already warm). Errors swallowed inside
+        # ``OkxClient.warmup``; bot bets regardless.
+        okx_warmup_wake_ts = lock_ts_t - cfg.okx_warmup_wakeup_offset_before_lock_ms / 1000.0
+        _sleep_until_ts(
+            okx_warmup_wake_ts,
+            reason="wait_for_okx_warmup",
+            epoch=current_epoch,
+        )
+        if closed.strategy_pipeline is not None and hasattr(closed.strategy_pipeline, "_gate"):
+            # noinspection PyProtectedMember
+            _warmup_gate = closed.strategy_pipeline._gate
+            if _warmup_gate is not None:
+                _warmup_gate.warmup_okx_session()
+
         # Generously off the critical path: 5000ms wake budget. On
         # live RPC error, SKIP the iteration with risk_bankroll_stale
         # rather than betting on stale value.

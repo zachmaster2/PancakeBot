@@ -348,6 +348,7 @@ class AppConfig:
     ramp_poll_1_wakeup_offset_before_lock_ms: int
     ramp_poll_2_wakeup_offset_before_lock_ms: int
     bankroll_wakeup_offset_before_lock_ms: int
+    okx_warmup_wakeup_offset_before_lock_ms: int
 
     # Other
     dry_initial_bankroll_bnb: float
@@ -821,6 +822,12 @@ def load_app_config(path: str) -> AppConfig:
         critical_path_wakeup_offset_before_lock_ms
         + _tc.BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS
     )
+    # OKX session warmup wake (2026-05-21): fires before bankroll_wake so
+    # any TLS handshake cost on a stale OkxClient connection is paid OUT
+    # of the bet-decision critical path.
+    okx_warmup_wakeup_offset_before_lock_ms = (
+        _tc.OKX_WARMUP_WAKEUP_OFFSET_BEFORE_LOCK_MS
+    )
     # Bundle 5 v2 (2026-05-14): ``ntp_sync_wakeup_offset_ms`` retired.
     # The bot trusts the OS clock directly (W32Time tightening per
     # README); no application-level NTP wake is scheduled.
@@ -984,6 +991,7 @@ def load_app_config(path: str) -> AppConfig:
         ramp_poll_1_wakeup_offset_before_lock_ms=ramp_poll_1_wakeup_offset_before_lock_ms,
         ramp_poll_2_wakeup_offset_before_lock_ms=ramp_poll_2_wakeup_offset_before_lock_ms,
         bankroll_wakeup_offset_before_lock_ms=bankroll_wakeup_offset_before_lock_ms,
+        okx_warmup_wakeup_offset_before_lock_ms=okx_warmup_wakeup_offset_before_lock_ms,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_clamp_bet_to_contract_minimum=live_clamp_bet_to_contract_minimum,
         backtest_round_count=backtest_round_count,

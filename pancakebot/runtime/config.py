@@ -69,6 +69,7 @@ class RuntimeConfig:
     ramp_poll_2_wakeup_offset_before_lock_ms: int
     final_rpc_poll_wakeup_offset_before_lock_ms: int
     bankroll_wakeup_offset_before_lock_ms: int
+    okx_warmup_wakeup_offset_before_lock_ms: int
     critical_path_wakeup_offset_before_lock_ms: int
     bet_submit_deadline_offset_before_lock_ms: int
 
