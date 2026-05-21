@@ -452,7 +452,7 @@ def _dry_record_bet(
     )
 
 
-def _record_dry_cycle_audit(
+def _record_cycle_audit(
     cfg: RuntimeConfig,
     closed: _ClosedState,
     *,
@@ -480,11 +480,18 @@ def _record_dry_cycle_audit(
     eth_fetch_result: str = "not_fetched",
     sol_fetch_result: str = "not_fetched",
 ) -> None:
-    if not cfg.dry:
-        return
+    """Per-round audit row. Mode-aware: dry mode writes to
+    ``var/dry/cycle_audit.csv``, live mode to ``var/live/cycle_audit.csv``.
+    Single source of truth for the schema (in ``audit.py``); future
+    column additions touch only ``ensure_cycle_audit_csv`` +
+    ``record_cycle_audit``."""
+    cycle_audit_path = (
+        _paths.DRY_CYCLE_AUDIT_PATH if cfg.dry
+        else _paths.LIVE_CYCLE_AUDIT_PATH
+    )
     record_cycle_audit(
         closed,
-        cycle_audit_path=_paths.DRY_CYCLE_AUDIT_PATH,
+        cycle_audit_path=cycle_audit_path,
         current_epoch=current_epoch,
         locked_epoch=locked_epoch,
         lock_ts=lock_ts,
