@@ -12,9 +12,10 @@ from pancakebot.constants import (
     GAS_LIMIT_BET,
     GAS_LIMIT_CLAIM,
     MAX_GAS_COST_BET_BNB,
+    MAX_GAS_PRICE_WEI,
     RETRY_BACKOFF_SECONDS,
 )
-from pancakebot.util import InvariantError, TransientRpcError
+from pancakebot.util import GasPriceCapBreachedError, InvariantError, TransientRpcError
 from pancakebot.log import info, warn
 from pancakebot.util import format_bankroll
 from pancakebot.runtime.config import RuntimeConfig
@@ -28,7 +29,7 @@ from pancakebot.runtime.dry import (
     _init_closed_state,
     _record_cycle_audit,
 )
-from pancakebot.runtime.live import claim_scan_cursor
+from pancakebot.runtime.live import claim_scan_cursor, send_gas_cap_breach_alert
 from pancakebot.chain.rpc_poller import (
     AnchorState,
     compute_submit_deadline_ms,
@@ -1068,7 +1069,59 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         tx_submit = None
         if not cfg.dry:
-            gas_price_wei = cfg.contract.suggest_gas_price_wei()
+            # Gas-cap sanity check: skip the bet if eth.gas_price has run
+            # away from MAX_GAS_PRICE_WEI. Submitting a bet at the cap
+            # while the network is much higher would land at the back of
+            # the priority queue (likely miss the lock-block inclusion
+            # window — gas burned for no inclusion). CRITICAL alert; the
+            # operator must lift the cap before resuming.
+            try:
+                cfg.contract.assert_gas_cap_not_breached()
+            except GasPriceCapBreachedError as gas_err:
+                try:
+                    suggested_wei = int(cfg.contract.suggest_gas_price_wei())
+                except Exception:
+                    suggested_wei = -1
+                send_gas_cap_breach_alert(
+                    path="bet",
+                    suggested_wei=suggested_wei,
+                    cap_wei=int(MAX_GAS_PRICE_WEI),
+                    epoch=current_epoch,
+                )
+                warn(
+                    "SKIP",
+                    f"Skipped epoch {current_epoch}: gas cap breached ({gas_err})",
+                )
+                _record_cycle_audit(
+                    cfg,
+                    closed,
+                    current_epoch=current_epoch,
+                    locked_epoch=locked_epoch,
+                    lock_ts=lock_ts_t,
+                    cutoff_ts=cutoff_ts_t,
+                    locked_price_bnbusd=bnbusd_price,
+                    action="SKIP",
+                    decision_stage="gas_cap_check",
+                    open_round=open_round,
+                    bankroll_before_action_bnb=bankroll_bnb,
+                    bankroll_after_action_bnb=bankroll_bnb,
+                    decision=decision,
+                    skip_reason="gas_cap_breached",
+                    decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
+                    pool_bull_bnb=pool_bull_bnb,
+                    pool_bear_bnb=pool_bear_bnb,
+                    btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
+                    eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
+                    sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
+                    wake_mode=wake_mode,
+                    kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                    btc_fetch_result=_kline_result_get(gate, "btc"),
+                    eth_fetch_result=_kline_result_get(gate, "eth"),
+                    sol_fetch_result=_kline_result_get(gate, "sol"),
+                )
+                _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
+                return
+            gas_price_wei = MAX_GAS_PRICE_WEI
             if bet_side == "Bull":
                 tx_submit = cfg.contract.bet_bull_timed(
                     epoch=current_epoch,

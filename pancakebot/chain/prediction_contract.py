@@ -12,11 +12,12 @@ from web3.exceptions import TimeExhausted
 from pancakebot.constants import (
     BNB_WEI,
     EXPECTED_CHAIN_ID,
+    MAX_GAS_PRICE_WEI,
     PREDICTION_V2_CONTRACT_ADDRESS,
     TREASURY_FEE_DIVISOR,
 )
 from pancakebot.chain.contract_config import Web3ContractConfig
-from pancakebot.util import InvariantError, TransientRpcError
+from pancakebot.util import GasPriceCapBreachedError, InvariantError, TransientRpcError
 
 _T = TypeVar("_T")
 
@@ -374,6 +375,43 @@ class Web3PredictionContract:
     def suggest_gas_price_wei(self) -> int:
         """Return the node-suggested gas price (wei)."""
         return int(self._rpc_call(op="suggest_gas_price_wei", fn=lambda: Web3.to_int(self._w3.eth.gas_price)))
+
+    def assert_gas_cap_not_breached(self) -> None:
+        """Validates that eth.gas_price <= MAX_GAS_PRICE_WEI.
+
+        Live bet/claim TXs are posted at MAX_GAS_PRICE_WEI (the worst-case
+        ceiling). If the node-suggested gas price exceeds the cap, the
+        ceiling is below current network reality and live TXs paid at MAX
+        would land at the back of the priority queue (likely to miss the
+        lock-block inclusion window).
+
+        Raises:
+            GasPriceCapBreachedError: when ``eth.gas_price > MAX_GAS_PRICE_WEI``.
+                The caller should skip the bet/claim, alert the operator,
+                and continue running. The operator must lift the cap and
+                review before resuming.
+
+        Logs warning and returns (does NOT raise) on:
+            - RPC failure fetching ``eth.gas_price``. Proceed with MAX
+              (single-round transient hiccups shouldn't block the bet).
+            - ``eth.gas_price`` == 0. Misbehaving node; proceed with MAX.
+        """
+        try:
+            suggested = self.suggest_gas_price_wei()
+        except TransientRpcError:
+            # Don't crash the round on a transient RPC hiccup; proceed with MAX.
+            # The check repeats next round; sustained outages surface elsewhere
+            # (bankroll wake fetch, etc.).
+            return
+        if suggested == 0:
+            # Misbehaving node returned 0 — can't validate. Proceed with MAX;
+            # the bet still goes out at the ceiling.
+            return
+        if suggested > MAX_GAS_PRICE_WEI:
+            raise GasPriceCapBreachedError(
+                f"eth.gas_price={suggested} > MAX_GAS_PRICE_WEI={MAX_GAS_PRICE_WEI}; "
+                f"raise the cap and review before resuming"
+            )
 
     def get_user_rounds_length(self, wallet_address: str) -> int:
         checksum_address = Web3.to_checksum_address(str(wallet_address))

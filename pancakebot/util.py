@@ -14,6 +14,19 @@ class TransientRpcError(Exception):
     pass
 
 
+class GasPriceCapBreachedError(Exception):
+    """Raised when eth.gas_price exceeds the operator-set MAX_GAS_PRICE_WEI
+    ceiling. Indicates the cap is below current network reality; the
+    operator must lift the cap and review before resuming bets/claims.
+
+    The bot does NOT crash on this — callers in the bet/claim paths catch,
+    alert, skip the action, and continue running. The next round retries
+    naturally; if the network is sustained above the cap the alerts will
+    repeat until the operator intervenes.
+    """
+    pass
+
+
 class TransientGraphError(Exception):
     pass
 
