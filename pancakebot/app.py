@@ -232,6 +232,7 @@ def run_from_config(
         ramp_poll_2_wakeup_offset_before_lock_ms=cfg.ramp_poll_2_wakeup_offset_before_lock_ms,
         final_rpc_poll_wakeup_offset_before_lock_ms=cfg.final_rpc_poll_wakeup_offset_before_lock_ms,
         bankroll_wakeup_offset_before_lock_ms=cfg.bankroll_wakeup_offset_before_lock_ms,
+        okx_warmup_wakeup_offset_before_lock_ms=cfg.okx_warmup_wakeup_offset_before_lock_ms,
         critical_path_wakeup_offset_before_lock_ms=cfg.critical_path_wakeup_offset_before_lock_ms,
         bet_submit_deadline_offset_before_lock_ms=cfg.bet_submit_deadline_offset_before_lock_ms,
         bet_tx_receipt_timeout_seconds=_runtime_receipt_timeout,
