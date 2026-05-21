@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Sequence
 
 from pancakebot.chain.prediction_contract import Web3PredictionContract
-from pancakebot.constants import BNB_WEI
-from pancakebot.util import InvariantError
+from pancakebot.constants import BNB_WEI, MAX_GAS_PRICE_WEI
+from pancakebot.util import GasPriceCapBreachedError, InvariantError
 from pancakebot.log import info, warn
 
 _PAGE_SIZE_DEFAULT = 100
@@ -84,6 +84,72 @@ def _send_claim_failure_alert(
     if not (200 <= r.status_code < 300):
         body = str(getattr(r, "text", ""))[:200]
         warn("ALERT", f"CLAIM FAILED alert bad status (reason={reason} tx={tx_hash} http_status={r.status_code} body={body})")
+
+
+def send_gas_cap_breach_alert(
+    *,
+    path: str,
+    suggested_wei: int,
+    cap_wei: int,
+    epoch: int | None = None,
+    epochs: Sequence[int] | None = None,
+) -> None:
+    """POST a GAS CAP BREACHED message to the live Discord webhook.
+
+    ``path`` is one of ``"bet"`` or ``"claim"``. Bet-side breach is
+    CRITICAL (the round's bet is skipped — direct PnL impact). Claim-side
+    breach is lower-severity (claims retry next round automatically).
+    Best-effort: any exception is swallowed with a WARN log so the
+    bot's hot path never crashes on a webhook hiccup.
+    """
+    webhook = os.environ.get(_LIVE_ALERTS_WEBHOOK_ENV, "").strip()
+    if not webhook:
+        warn(
+            "ALERT",
+            f"{_LIVE_ALERTS_WEBHOOK_ENV} unset; GAS CAP BREACHED alert not sent "
+            f"(path={path} suggested={suggested_wei} cap={cap_wei})",
+        )
+        return
+    try:
+        import requests
+    except Exception as e:
+        warn("ALERT", f"GAS CAP BREACHED alert import failed (path={path} err={e})")
+        return
+
+    if path == "bet":
+        severity = ":rotating_light: **CRITICAL**"
+        action_note = "Bet SKIPPED. OPERATOR ACTION REQUIRED: raise MAX_GAS_PRICE_WEI and review before resuming."
+    else:
+        severity = ":warning:"
+        action_note = "Claim skipped this round (retries next round). Raise MAX_GAS_PRICE_WEI before claims back up."
+
+    epoch_str = ""
+    if epoch is not None:
+        epoch_str = f" epoch=`{int(epoch)}`"
+    elif epochs:
+        epoch_str = " epochs=`[" + ",".join(str(int(e)) for e in epochs) + "]`"
+
+    payload = {
+        "username": "PancakeBot-live",
+        "content": (
+            f"{severity} **PancakeBot-live GAS CAP BREACHED** "
+            f"path=`{path}`{epoch_str} "
+            f"suggested=`{suggested_wei} wei` cap=`{cap_wei} wei` "
+            f"ratio=`{suggested_wei / cap_wei:.2f}x` — {action_note}"
+        ),
+    }
+    try:
+        r = requests.post(webhook, json=payload, timeout=10)
+    except Exception as e:
+        warn("ALERT", f"GAS CAP BREACHED alert post failed (path={path} err={e})")
+        return
+    if not (200 <= r.status_code < 300):
+        body = str(getattr(r, "text", ""))[:200]
+        warn(
+            "ALERT",
+            f"GAS CAP BREACHED alert bad status "
+            f"(path={path} http_status={r.status_code} body={body})",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +251,27 @@ def claim_scan_cursor(
             to_claim = [ep for ep, _ in chunk_pairs]
             chunk_gas_limit = gas_limit * len(to_claim)
             t0 = time.perf_counter()
-            gas_price_wei = contract.suggest_gas_price_wei()
+            # Gas-cap sanity check: bail the entire flush if eth.gas_price
+            # has run away from MAX_GAS_PRICE_WEI. Claims retry next round
+            # naturally; this is lower-severity than the bet-side breach.
+            try:
+                contract.assert_gas_cap_not_breached()
+            except GasPriceCapBreachedError as e:
+                warn("CLAIM", f"Skipping {len(to_claim)} claim(s) due to gas cap breach: {e}")
+                try:
+                    suggested_wei = int(contract.suggest_gas_price_wei())
+                except Exception:
+                    suggested_wei = -1
+                send_gas_cap_breach_alert(
+                    path="claim",
+                    suggested_wei=suggested_wei,
+                    cap_wei=int(MAX_GAS_PRICE_WEI),
+                    epochs=to_claim,
+                )
+                # Leave pending_claims intact so the next iteration's scan
+                # retries the same epochs once the operator lifts the cap.
+                return
+            gas_price_wei = MAX_GAS_PRICE_WEI
             result = contract.claim(
                 epochs=to_claim,
                 gas_limit=chunk_gas_limit,

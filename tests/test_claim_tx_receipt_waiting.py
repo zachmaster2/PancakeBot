@@ -68,7 +68,17 @@ class _FakeContract:
         }
 
     def suggest_gas_price_wei(self) -> int:
-        return 5_000_000_000  # 5 gwei
+        # Under MAX_GAS_PRICE_WEI (1 gwei). Mirrors today's BSC mainnet
+        # floor (~0.05 gwei). Keeps claim-flow tests on the happy path —
+        # gas-cap breach behavior is covered separately in
+        # tests/test_live_gas_cap_sanity.py.
+        return 50_000_000  # 0.05 gwei
+
+    def assert_gas_cap_not_breached(self) -> None:
+        """Fake passes the cap check unconditionally — see the
+        ``suggest_gas_price_wei`` note above. Gas-cap-breach behavior
+        is exercised in dedicated tests, not here."""
+        return None
 
     def wallet_balance_bnb(self, _wallet: str) -> float:
         return self._wallet_balance
