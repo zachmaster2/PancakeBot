@@ -26,7 +26,7 @@ from pancakebot.runtime.dry import (
     _dry_settle_available_bets,
     _fetch_wallet_balance_bnb_with_retries,
     _init_closed_state,
-    _record_dry_cycle_audit,
+    _record_cycle_audit,
 )
 from pancakebot.runtime.live import claim_scan_cursor
 from pancakebot.chain.rpc_poller import (
@@ -561,7 +561,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     _tracker = closed.strategy_pipeline._bankroll_tracker
                     if _tracker is not None:
                         last_known_bankroll = _tracker.current_bankroll()
-                _record_dry_cycle_audit(
+                _record_cycle_audit(
                     cfg,
                     closed,
                     current_epoch=current_epoch,
@@ -747,7 +747,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             ready, ready_reason = cfg.rpc_poller.is_pool_ready(current_epoch)
             if not ready:
                 skip_reason = f"pool_not_ready_{ready_reason}"
-                _record_dry_cycle_audit(
+                _record_cycle_audit(
                     cfg,
                     closed,
                     current_epoch=current_epoch,
@@ -836,7 +836,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             if reason == "":
                 raise InvariantError("policy_skip_missing_reason")
 
-            _record_dry_cycle_audit(
+            _record_cycle_audit(
                 cfg,
                 closed,
                 current_epoch=current_epoch,
@@ -975,7 +975,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 f"Skipped epoch {current_epoch}: too late to submit bet "
                 f"({late_ms}ms past safe submit time)",
             )
-            _record_dry_cycle_audit(
+            _record_cycle_audit(
                 cfg,
                 closed,
                 current_epoch=current_epoch,
@@ -1141,7 +1141,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 bankroll_before_bet_bnb=bankroll_before_bet,
                 bankroll_after_bet_bnb=bankroll_after_bet,
             )
-            _record_dry_cycle_audit(
+            _record_cycle_audit(
                 cfg,
                 closed,
                 current_epoch=current_epoch,
