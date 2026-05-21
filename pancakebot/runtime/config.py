@@ -107,7 +107,7 @@ class RuntimeConfig:
     dry: bool
 
     # Live: clamp all bet sizes to contract minimum for safe testing
-    live_clamp_bet_to_contract_minimum: bool
+    live_min_bet_only: bool
 
     # Fresh start: archive existing dry state before starting
     dry_fresh_start: bool

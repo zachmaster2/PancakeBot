@@ -58,7 +58,7 @@ from pancakebot.config import (
     _DEFAULT_STRATEGY,
     load_strategy_config_from_dict,
 )
-from pancakebot.constants import BACKTEST_GAS_COST_BET_BNB
+from pancakebot.constants import MAX_GAS_COST_BET_BNB
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.settlement import settle_bet_against_closed_round
 from pancakebot.strategy.momentum_gate import MomentumGateConfig
@@ -375,7 +375,7 @@ def run_fold(
                 if bet_side not in ("Bull", "Bear"):
                     raise InvariantError("backtest_bet_side_invalid")
 
-                bankroll -= decision.bet_size_bnb + BACKTEST_GAS_COST_BET_BNB
+                bankroll -= decision.bet_size_bnb + MAX_GAS_COST_BET_BNB
                 outcome = settle_bet_against_closed_round(
                     bet_bnb=decision.bet_size_bnb,
                     bet_side=bet_side,
@@ -383,7 +383,7 @@ def run_fold(
                     treasury_fee_fraction=treasury_fee_fraction,
                 )
                 bankroll += outcome.credit_bnb
-                profit = outcome.credit_bnb - decision.bet_size_bnb - BACKTEST_GAS_COST_BET_BNB
+                profit = outcome.credit_bnb - decision.bet_size_bnb - MAX_GAS_COST_BET_BNB
 
                 stats.num_bets += 1
                 if bet_side == "Bull":

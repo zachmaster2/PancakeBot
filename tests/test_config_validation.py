@@ -31,7 +31,7 @@ kline_cutoff_seconds = {cutoff}
 initial_bankroll_bnb = 50.0
 
 [live]
-clamp_bet_to_contract_minimum = true
+min_bet_only = true
 
 [backtest]
 backtest_round_count = 1000
@@ -87,7 +87,7 @@ kline_cutoff_seconds = 2
 initial_bankroll_bnb = 50.0
 
 [live]
-clamp_bet_to_contract_minimum = true
+min_bet_only = true
 
 [backtest]
 backtest_round_count = 1000

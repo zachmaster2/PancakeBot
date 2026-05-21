@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from pancakebot.constants import BNB_WEI, BACKTEST_GAS_COST_BET_BNB, BACKTEST_GAS_COST_CLAIM_BNB
+from pancakebot.constants import BNB_WEI, MAX_GAS_COST_BET_BNB, MAX_GAS_COST_CLAIM_BNB
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.pool_amounts import compute_pool_amounts_wei
 
@@ -101,22 +101,22 @@ def _load_slice_rounds(epoch_start: int, epoch_end: int) -> dict[int, RoundData]
 def _settle_against_winner(*, bet: Bet, winner: str | None, failed: bool,
                            bull_pool_bnb: float, bear_pool_bnb: float) -> float:
     if failed:
-        return -BACKTEST_GAS_COST_BET_BNB - BACKTEST_GAS_COST_CLAIM_BNB
+        return -MAX_GAS_COST_BET_BNB - MAX_GAS_COST_CLAIM_BNB
     if winner is None:
-        return -BACKTEST_GAS_COST_BET_BNB - BACKTEST_GAS_COST_CLAIM_BNB
+        return -MAX_GAS_COST_BET_BNB - MAX_GAS_COST_CLAIM_BNB
     bet_u = bet.side.upper()
     win_u = winner.upper()
     if bet_u != win_u:
-        return -bet.bet_bnb - BACKTEST_GAS_COST_BET_BNB
+        return -bet.bet_bnb - MAX_GAS_COST_BET_BNB
     bull_after = bull_pool_bnb + (bet.bet_bnb if bet_u == "BULL" else 0.0)
     bear_after = bear_pool_bnb + (bet.bet_bnb if bet_u == "BEAR" else 0.0)
     total_after = bull_after + bear_after
     denom = bull_after if bet_u == "BULL" else bear_after
     if denom <= 0.0 or total_after <= 0.0:
-        return -bet.bet_bnb - BACKTEST_GAS_COST_BET_BNB - BACKTEST_GAS_COST_CLAIM_BNB
+        return -bet.bet_bnb - MAX_GAS_COST_BET_BNB - MAX_GAS_COST_CLAIM_BNB
     mult = (total_after * (1.0 - TREASURY_FEE_FRACTION)) / denom
-    credit = bet.bet_bnb * mult - BACKTEST_GAS_COST_CLAIM_BNB
-    return credit - bet.bet_bnb - BACKTEST_GAS_COST_BET_BNB
+    credit = bet.bet_bnb * mult - MAX_GAS_COST_CLAIM_BNB
+    return credit - bet.bet_bnb - MAX_GAS_COST_BET_BNB
 
 
 def main() -> int:
