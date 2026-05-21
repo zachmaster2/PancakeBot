@@ -87,9 +87,11 @@ def main() -> None:
         dupes = find_duplicate_bots()
         if dupes:
             for p in dupes:
-                error("CORE", "START", "DUP_PROC",
-                      msg="another dry/live bot already running",
-                      pid=p["pid"], cmdline=p["cmdline"], started_at=p["started_at"])
+                error(
+                    "START",
+                    f"another dry/live bot already running "
+                    f"pid={p['pid']} cmdline={p['cmdline']} started_at={p['started_at']}",
+                )
             sys.exit(2)
 
     # Process-health instrumentation: write PID file + register atexit cleanup
@@ -110,8 +112,7 @@ def main() -> None:
         # being processed by whatever wrote it.
         archived = archive_stale_crash(crash_path)
         if archived is not None:
-            info("CORE", "RUN", "CRASH_ARCH",
-                 msg=f"archived stale crash.json -> {archived.name}")
+            info("START", f"archived stale crash.json -> {archived.name}")
 
     try:
         run_from_config(
@@ -125,7 +126,7 @@ def main() -> None:
             use_extended_data=args.use_extended_data,
         )
     except KeyboardInterrupt:
-        info("CORE", "RUN", "EXIT", msg="Caught KeyboardInterrupt: shutting down")
+        info("EXIT", "Caught KeyboardInterrupt: shutting down")
     except Exception as e:
         # Narrow-catch: Exception (NOT BaseException) so KeyboardInterrupt /
         # SystemExit still propagate cleanly without being treated as crashes.
