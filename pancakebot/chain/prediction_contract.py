@@ -137,9 +137,18 @@ class Web3PredictionContract:
         abi = _load_abi_list(cfg.abi_json_path)
         contract_addr = Web3.to_checksum_address(PREDICTION_V2_CONTRACT_ADDRESS)
 
+        # BSC is a POA chain (Lorentz hardfork): block.extraData is 280
+        # bytes (validator signatures), but stock web3.py expects 32. Without
+        # this middleware, any ``eth.get_block(...)`` raises ExtraDataLengthError
+        # — caught 2026-05-21 when the live bot's ``block_timestamp`` call
+        # inside ``_submit_tx_with_timing`` crashed after a successfully-submitted
+        # bet TX. The send path (``send_raw_transaction``) didn't trip it
+        # because raw tx submission doesn't decode the block header.
+        from web3.middleware import ExtraDataToPOAMiddleware
         self._providers: list[tuple[Web3, Any]] = []
         for url in self._rpc_urls:
             w3 = Web3(Web3.HTTPProvider(url))
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             c = w3.eth.contract(address=contract_addr, abi=abi)
             self._providers.append((w3, c))
 
