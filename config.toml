@@ -27,7 +27,8 @@ initial_bankroll_bnb = 5.0
 # Override all computed bet sizes to the contract minimum.
 # All strategy logic still runs normally -- signal, sizing, filters -- but the
 # actual submitted amount is clamped to minBetAmount for safe testing.
-clamp_bet_to_contract_minimum = true
+# (Default: true. Set to false only after full-size live validation is complete.)
+min_bet_only = true
 
 [backtest]
 # Number of most recent rounds to replay. Also controls how many rounds --sync fetches.

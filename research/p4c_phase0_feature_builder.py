@@ -110,7 +110,7 @@ from research.in_process_runner import (  # noqa: E402
     _EXT_BTC_KLINES_PATH, _EXT_ETH_KLINES_PATH, _EXT_SOL_KLINES_PATH,
 )
 from pancakebot import paths as _paths  # noqa: E402
-from pancakebot.constants import BNB_WEI, BACKTEST_GAS_COST_BET_BNB  # noqa: E402
+from pancakebot.constants import BNB_WEI, MAX_GAS_COST_BET_BNB  # noqa: E402
 from pancakebot.market_data.contract_constants import load_contract_constants  # noqa: E402
 from pancakebot.settlement import settle_bet_against_closed_round  # noqa: E402
 from pancakebot.strategy.momentum_gate import MomentumGateConfig  # noqa: E402
@@ -344,13 +344,13 @@ def canonical_pass_with_epoch(*, sim_rounds, btc_klines_full, eth_klines_full,
     for round_t in sim_rounds:
         decision = pipeline.decide_open_round(round_t=round_t)
         if decision.action == "BET" and decision.bet_size_bnb > 0.0:
-            bankroll -= decision.bet_size_bnb + BACKTEST_GAS_COST_BET_BNB
+            bankroll -= decision.bet_size_bnb + MAX_GAS_COST_BET_BNB
             outcome = settle_bet_against_closed_round(
                 bet_bnb=decision.bet_size_bnb, bet_side=decision.bet_side,
                 round_closed=round_t, treasury_fee_fraction=treasury_fee_fraction,
             )
             bankroll += outcome.credit_bnb
-            profit = outcome.credit_bnb - decision.bet_size_bnb - BACKTEST_GAS_COST_BET_BNB
+            profit = outcome.credit_bnb - decision.bet_size_bnb - MAX_GAS_COST_BET_BNB
             history.append((int(round_t.lock_at), profit,
                              int(round_t.epoch), decision.bet_side))
         pipeline.record_settlement(bankroll=bankroll, start_at=int(round_t.start_at))

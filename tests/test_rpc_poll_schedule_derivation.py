@@ -43,7 +43,7 @@ def _derive_schedule(pool_cutoff_seconds: int) -> dict[str, int]:
     critical_path_wakeup_offset_before_lock_ms = (
         bet_submit_deadline_offset_before_lock_ms
         + _tc.OKX_KLINE_FETCH_RTT_P95_MS
-        + _tc.MOMENTUM_GATE_COMPUTE_TIME_MS
+        + _tc.SIGNAL_COMPUTE_TIME_MS
         + _tc.POOL_READ_TIME_MS
     )
     final_rpc_poll_wakeup_offset_before_lock_ms = (

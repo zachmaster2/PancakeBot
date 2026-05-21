@@ -43,17 +43,28 @@ BNB_WEI = 1_000_000_000_000_000_000
 
 # --- Gas foundation (v1.0 frozen) ---
 
-# Deterministic gas *cost* accounting used for EV/backtest/dry bankroll.
-# Runtime transaction submission still uses on-chain gas suggestions.
-BACKTEST_GAS_PRICE_WEI = 1_000_000_000
+# Worst-case gas-price ceiling shared across all execution modes:
+#   - backtest / dry: assumed-paid for EV/PnL cost accounting (charge
+#     the worst case so simulated bankrolls aren't optimistic)
+#   - live: cap on the gas price paid for bet/claim TXs. The bot's
+#     sanity check raises if eth.gas_price exceeds this — the operator
+#     must lift the cap before resuming.
+# 1 Gwei is comfortably above today's BSC mainnet floor (~0.05 Gwei)
+# yet bounds operator cost per TX.
+MAX_GAS_PRICE_WEI = 1_000_000_000
 
-# Deterministic gas limits (used for cost accounting; may also be used as tx gas limits).
-BACKTEST_GAS_LIMIT_BET = 200_000
-BACKTEST_GAS_LIMIT_CLAIM = 250_000
+# Gas limits posted on bet/claim TXs (also used to compute the worst-case
+# BNB cost below). Sized from on-chain receipt observation; the headroom
+# above typical usage absorbs occasional contract-internal branches.
+GAS_LIMIT_BET = 200_000
+GAS_LIMIT_CLAIM = 250_000
 
-# Deterministic gas costs (BNB). These are costs, not limits.
-BACKTEST_GAS_COST_BET_BNB = float(BACKTEST_GAS_LIMIT_BET) * float(BACKTEST_GAS_PRICE_WEI) / float(BNB_WEI)
-BACKTEST_GAS_COST_CLAIM_BNB = float(BACKTEST_GAS_LIMIT_CLAIM) * float(BACKTEST_GAS_PRICE_WEI) / float(BNB_WEI)
+# Worst-case BNB cost per bet/claim TX (= limit × MAX_GAS_PRICE_WEI).
+# Used by backtest+dry to debit simulated bankrolls. Live mode burns
+# the real on-chain cost (typically less) and re-reads bankroll from
+# chain at the next bankroll-wake.
+MAX_GAS_COST_BET_BNB = float(GAS_LIMIT_BET) * float(MAX_GAS_PRICE_WEI) / float(BNB_WEI)
+MAX_GAS_COST_CLAIM_BNB = float(GAS_LIMIT_CLAIM) * float(MAX_GAS_PRICE_WEI) / float(BNB_WEI)
 
 # --- Runtime retry ---
 

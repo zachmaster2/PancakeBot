@@ -38,7 +38,7 @@ def _ssot_dynamic_wake_ms(*, anchor_milli_ts: int, lock_ms: int) -> int:
     )
     return deadline_ms - (
         tc.OKX_KLINE_FETCH_RTT_P99_MS
-        + tc.MOMENTUM_GATE_COMPUTE_TIME_MS
+        + tc.SIGNAL_COMPUTE_TIME_MS
         + tc.POOL_READ_TIME_MS
     )
 
@@ -60,7 +60,7 @@ def test_wake_equals_deadline_minus_workload():
     )
     expected_wake = deadline_ms - (
         tc.OKX_KLINE_FETCH_RTT_P99_MS
-        + tc.MOMENTUM_GATE_COMPUTE_TIME_MS
+        + tc.SIGNAL_COMPUTE_TIME_MS
         + tc.POOL_READ_TIME_MS
     )
     actual_wake = _ssot_dynamic_wake_ms(
@@ -121,7 +121,7 @@ def test_quantum_backoff_propagates_to_wake():
     )
     expected_wake = deadline_ms - (
         tc.OKX_KLINE_FETCH_RTT_P99_MS
-        + tc.MOMENTUM_GATE_COMPUTE_TIME_MS
+        + tc.SIGNAL_COMPUTE_TIME_MS
         + tc.POOL_READ_TIME_MS
     )
     assert wake_ms == expected_wake

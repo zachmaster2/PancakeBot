@@ -612,7 +612,7 @@
       </div>
       <div class="loop-step action">
         <div class="ls-title">Timing Guard + Execute</div>
-        <div class="ls-desc">Abort if decision-ready is within bet_submit_deadline_offset_before_lock_ms of lock_at (TX submitted that close would land after lock and revert). Otherwise submit bet (receipt-waited with <code>bet_tx_receipt_timeout_seconds &asymp; 35s</code>). Live mode: clamp to min bet when <code>clamp_bet_to_contract_minimum=true</code>.</div>
+        <div class="ls-desc">Abort if decision-ready is within bet_submit_deadline_offset_before_lock_ms of lock_at (TX submitted that close would land after lock and revert). Otherwise submit bet (receipt-waited with <code>bet_tx_receipt_timeout_seconds &asymp; 35s</code>). Live mode: clamp to min bet when <code>min_bet_only=true</code>.</div>
         <div class="ls-time">lock_at &minus; bet_submit_deadline_offset_before_lock_ms &rarr; ~750ms before lock</div>
       </div>
       <div class="loop-step settle">
@@ -633,7 +633,7 @@
       <div class="mode-card live">
         <div class="mode-flag">--live</div>
         <h3>Live Mode</h3>
-        <p>Real-time trading with real BNB. Requires <code>BSC_WALLET_PRIVATE_KEY</code>. <code>clamp_bet_to_contract_minimum</code> clamps sizes for safe testing.</p>
+        <p>Real-time trading with real BNB. Requires <code>BSC_WALLET_PRIVATE_KEY</code>. <code>min_bet_only</code> clamps sizes for safe testing.</p>
       </div>
       <div class="mode-card dry">
         <div class="mode-flag">--dry</div>

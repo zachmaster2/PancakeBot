@@ -48,7 +48,7 @@ kline_cutoff_seconds = {cutoff}
 initial_bankroll_bnb = 50.0
 
 [live]
-clamp_bet_to_contract_minimum = true
+min_bet_only = true
 
 [backtest]
 backtest_round_count = 1000
@@ -101,7 +101,7 @@ def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
     expected = (
         cfg.bet_submit_deadline_offset_before_lock_ms
         + tc.OKX_KLINE_FETCH_RTT_P95_MS
-        + tc.MOMENTUM_GATE_COMPUTE_TIME_MS
+        + tc.SIGNAL_COMPUTE_TIME_MS
         + tc.POOL_READ_TIME_MS
     )
     assert cfg.critical_path_wakeup_offset_before_lock_ms == expected
@@ -239,7 +239,7 @@ def _wake_to_block_landing_ms(*, kline_fetch_wakeup_offset_ms: int, fetch_rtt_ms
     """
     sign_overhead_ms = 5
     decision_ready_ms_after_wake = (
-        fetch_rtt_ms + tc.MOMENTUM_GATE_COMPUTE_TIME_MS + sign_overhead_ms
+        fetch_rtt_ms + tc.SIGNAL_COMPUTE_TIME_MS + sign_overhead_ms
     )
     mempool_ms_after_wake = decision_ready_ms_after_wake + tc.BSC_BET_SUBMIT_ONE_WAY_MS
     worst_case_block_landing_ms_after_wake = mempool_ms_after_wake + tc.BSC_BLOCK_TIME_MS
@@ -268,7 +268,7 @@ def test_inclusion_math_at_locked_constants_p95_fetch_aborts_safely(tmp_path):
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     # decision_ready_ms_after_wake at p95 fetch
     p95_decision_ms_after_wake = (
-        tc.OKX_KLINE_FETCH_RTT_P95_MS + tc.MOMENTUM_GATE_COMPUTE_TIME_MS
+        tc.OKX_KLINE_FETCH_RTT_P95_MS + tc.SIGNAL_COMPUTE_TIME_MS
     )
     kline_fetch_offset = cfg.critical_path_wakeup_offset_before_lock_ms - tc.POOL_READ_TIME_MS
     decision_ready_offset_ms = kline_fetch_offset - p95_decision_ms_after_wake
@@ -329,7 +329,7 @@ def test_guard_fires_at_p99_fetch_decision_ready(tmp_path):
     # but critical_path - pool_read - signal_compute = kline_fetch_offset, so
     # decision_ready = lock - kline_fetch_offset + kline_fetch_p99
     kline_fetch_offset_ms = cfg.critical_path_wakeup_offset_before_lock_ms - tc.POOL_READ_TIME_MS
-    decision_ready = lock_ts - (kline_fetch_offset_ms - 363 - tc.MOMENTUM_GATE_COMPUTE_TIME_MS) / 1000.0
+    decision_ready = lock_ts - (kline_fetch_offset_ms - 363 - tc.SIGNAL_COMPUTE_TIME_MS) / 1000.0
     # At canonical Bundle 4 timing: decision_ready = lock - 0.627s; guard at
     # lock - 0.700s. -0.627 >= -0.700 -> TRUE -> SKIP.
     assert _guard_fires(

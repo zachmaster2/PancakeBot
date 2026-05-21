@@ -9,9 +9,9 @@ from pathlib import Path
 
 from pancakebot.constants import (
     BNB_WEI,
-    BACKTEST_GAS_LIMIT_BET,
-    BACKTEST_GAS_LIMIT_CLAIM,
-    BACKTEST_GAS_COST_BET_BNB,
+    GAS_LIMIT_BET,
+    GAS_LIMIT_CLAIM,
+    MAX_GAS_COST_BET_BNB,
     RETRY_BACKOFF_SECONDS,
 )
 from pancakebot.util import InvariantError, TransientRpcError
@@ -425,7 +425,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                         now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
                         buffer_seconds=cfg.buffer_seconds,
                         page_size=100,
-                        gas_limit=BACKTEST_GAS_LIMIT_CLAIM,
+                        gas_limit=GAS_LIMIT_CLAIM,
                         claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
                     )
                 except TransientRpcError as e:
@@ -733,7 +733,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 )
                 dynamic_wake_ms = anchor_deadline_ms - (
                     _tc.OKX_KLINE_FETCH_RTT_P99_MS
-                    + _tc.MOMENTUM_GATE_COMPUTE_TIME_MS
+                    + _tc.SIGNAL_COMPUTE_TIME_MS
                     + _tc.POOL_READ_TIME_MS
                 )
                 # The dynamic wake should be slightly AFTER the anchor poll
@@ -1057,14 +1057,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if computed_amount_wei <= 0:
             raise InvariantError("bet_amount_wei_nonpositive")
 
-        # Live safety: if clamp_bet_to_contract_minimum is set, clamp the submitted amount to
+        # Live safety: if min_bet_only is set, clamp the submitted amount to
         # the contract minimum.  All strategy logic runs normally; only the
         # on-chain bet size is reduced.  Audit logs record both sizes.
         amount_wei = computed_amount_wei
-        if not cfg.dry and cfg.live_clamp_bet_to_contract_minimum:
+        if not cfg.dry and cfg.live_min_bet_only:
             min_wei = int(round(cfg.min_bet_amount_bnb * BNB_WEI))
             amount_wei = min_wei
-            info("BET", f"clamp_bet_to_contract_minimum: clamping {computed_amount_wei / BNB_WEI:.4f} -> {amount_wei / BNB_WEI:.4f} BNB")
+            info("BET", f"min_bet_only: clamping {computed_amount_wei / BNB_WEI:.4f} -> {amount_wei / BNB_WEI:.4f} BNB")
 
         tx_submit = None
         if not cfg.dry:
@@ -1073,7 +1073,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 tx_submit = cfg.contract.bet_bull_timed(
                     epoch=current_epoch,
                     amount_wei=amount_wei,
-                    gas_limit=BACKTEST_GAS_LIMIT_BET,
+                    gas_limit=GAS_LIMIT_BET,
                     gas_price_wei=gas_price_wei,
                     wait_receipt=True,
                     receipt_timeout_seconds=cfg.bet_tx_receipt_timeout_seconds,
@@ -1082,7 +1082,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 tx_submit = cfg.contract.bet_bear_timed(
                     epoch=current_epoch,
                     amount_wei=amount_wei,
-                    gas_limit=BACKTEST_GAS_LIMIT_BET,
+                    gas_limit=GAS_LIMIT_BET,
                     gas_price_wei=gas_price_wei,
                     wait_receipt=True,
                     receipt_timeout_seconds=cfg.bet_tx_receipt_timeout_seconds,
@@ -1161,7 +1161,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 raise InvariantError("dry_bankroll_uninitialized")
 
             bankroll_before_bet = closed.simulated_bankroll_bnb
-            closed.simulated_bankroll_bnb -= amount_bnb + BACKTEST_GAS_COST_BET_BNB
+            closed.simulated_bankroll_bnb -= amount_bnb + MAX_GAS_COST_BET_BNB
             bankroll_after_bet = closed.simulated_bankroll_bnb
 
             info(
@@ -1314,7 +1314,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
                 now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
                 buffer_seconds=cfg.buffer_seconds,
                 page_size=100,
-                gas_limit=BACKTEST_GAS_LIMIT_CLAIM,
+                gas_limit=GAS_LIMIT_CLAIM,
                 claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
             )
         except TransientRpcError as e:

@@ -1,4 +1,4 @@
-"""Tests pinning ``clamp_bet_to_contract_minimum`` default + override behavior.
+"""Tests pinning ``min_bet_only`` default + override behavior.
 
 The implicit default (when the operator's ``config.toml`` omits the
 key in ``[live]``) has been ``True`` since the May-16 strict-mode pass
@@ -47,7 +47,7 @@ kline_cutoff_seconds = 2
 initial_bankroll_bnb = 50.0
 
 [live]
-clamp_bet_to_contract_minimum = {clamp}
+min_bet_only = {clamp}
 
 [backtest]
 backtest_round_count = 1000
@@ -67,26 +67,26 @@ def _write_cfg(tmp_path: Path, *, clamp: str | None = None) -> Path:
 
 
 def test_default_is_true_when_omitted(tmp_path):
-    """When ``[live] clamp_bet_to_contract_minimum`` is omitted from
+    """When ``[live] min_bet_only`` is omitted from
     config.toml, the implicit default is True. This is the safety-first
     posture: anyone who forgets the key still gets contract-minimum bets,
     not full-strategy sizing."""
     cfg = load_app_config(str(_write_cfg(tmp_path, clamp=None)))
-    assert cfg.live_clamp_bet_to_contract_minimum is True
+    assert cfg.live_min_bet_only is True
 
 
 def test_explicit_false_overrides_default(tmp_path):
-    """Explicit ``clamp_bet_to_contract_minimum = false`` opts out of
+    """Explicit ``min_bet_only = false`` opts out of
     the safety-clamp. This is the "I know what I'm doing, run full bets"
     path. The default must NOT clobber an explicit operator decision."""
     cfg = load_app_config(str(_write_cfg(tmp_path, clamp="false")))
-    assert cfg.live_clamp_bet_to_contract_minimum is False
+    assert cfg.live_min_bet_only is False
 
 
 def test_explicit_true_matches_default(tmp_path):
-    """Explicit ``clamp_bet_to_contract_minimum = true`` is a no-op
+    """Explicit ``min_bet_only = true`` is a no-op
     relative to the implicit default — both produce True. Pinning this
     so the parser doesn't accidentally reject explicit-True as a duplicate
     of the default."""
     cfg = load_app_config(str(_write_cfg(tmp_path, clamp="true")))
-    assert cfg.live_clamp_bet_to_contract_minimum is True
+    assert cfg.live_min_bet_only is True

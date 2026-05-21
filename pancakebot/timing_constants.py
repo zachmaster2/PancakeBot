@@ -27,7 +27,7 @@ Derivation chain (computed at config-load time in ``pancakebot/config.py``):
     # per-round prediction that's typically 250-300ms tighter than this fallback.
     critical_path_wakeup_offset_before_lock_ms = (bet_submit_deadline_offset_before_lock_ms
                                       + OKX_KLINE_FETCH_RTT_P95_MS
-                                      + MOMENTUM_GATE_COMPUTE_TIME_MS
+                                      + SIGNAL_COMPUTE_TIME_MS
                                       + POOL_READ_TIME_MS)
     final_rpc_poll_wakeup_offset_before_lock_ms = (
         pool_cutoff_seconds * 1000
@@ -131,7 +131,7 @@ OKX_KLINE_FETCH_RTT_P95_MS: int = 290
 # Same fetch, p99 measurement. Used by the Bundle 5 (2026-05-14) dynamic
 # critical_path_wakeup_offset_before_lock_ms: ``RpcPoller.compute_dynamic_critical_path_wake_ts()``
 # walks back from the predicted predecessor block by
-#   (OKX_KLINE_FETCH_RTT_P99_MS + MOMENTUM_GATE_COMPUTE_TIME_MS
+#   (OKX_KLINE_FETCH_RTT_P99_MS + SIGNAL_COMPUTE_TIME_MS
 #    + POOL_READ_TIME_MS + BSC_BET_SUBMIT_ONE_WAY_MS)
 # = 352 + 50 + 5 + 75 = 482ms.
 #
@@ -160,7 +160,7 @@ OKX_KLINE_FETCH_RTT_P99_MS: int = 352
 #         pancakebot/strategy/momentum_gate.py:415-... (numpy diff/sum
 #         over 16-row arrays, no I/O).
 # Last measured: 2026-05-03 (engineering judgment, not empirical probe)
-MOMENTUM_GATE_COMPUTE_TIME_MS: int = 50
+SIGNAL_COMPUTE_TIME_MS: int = 50
 
 
 # --- Bundle 5 v2 anchor poll (2026-05-14) ---------------------------------

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from pancakebot import paths as _paths
 from pancakebot.config import BacktestConfig
-from pancakebot.constants import BACKTEST_GAS_COST_BET_BNB
+from pancakebot.constants import MAX_GAS_COST_BET_BNB
 from pancakebot.util import InvariantError
 from pancakebot.log import info
 from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline
@@ -313,7 +313,7 @@ def run_backtest(
                 if bet_side not in ("Bull", "Bear"):
                     raise InvariantError("backtest_bet_side_invalid")
 
-                bankroll -= decision.bet_size_bnb + BACKTEST_GAS_COST_BET_BNB
+                bankroll -= decision.bet_size_bnb + MAX_GAS_COST_BET_BNB
                 outcome = settle_bet_against_closed_round(
                     bet_bnb=decision.bet_size_bnb,
                     bet_side=bet_side,
@@ -321,7 +321,7 @@ def run_backtest(
                     treasury_fee_fraction=runtime_cfg.treasury_fee_fraction,
                 )
                 bankroll += outcome.credit_bnb
-                profit = outcome.credit_bnb - decision.bet_size_bnb - BACKTEST_GAS_COST_BET_BNB
+                profit = outcome.credit_bnb - decision.bet_size_bnb - MAX_GAS_COST_BET_BNB
 
                 stats.num_bets += 1
                 if bet_side == "Bull":

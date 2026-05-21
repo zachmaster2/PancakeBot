@@ -352,7 +352,7 @@ class AppConfig:
 
     # Other
     dry_initial_bankroll_bnb: float
-    live_clamp_bet_to_contract_minimum: bool
+    live_min_bet_only: bool
     backtest_round_count: int
     backtest_initial_bankroll_bnb: float
 
@@ -628,7 +628,7 @@ _CONFIG_SCHEMA: dict[str, set[str]] = {
         "max_consecutive_kline_fetch_failures",
     },
     "dry": {"initial_bankroll_bnb"},
-    "live": {"clamp_bet_to_contract_minimum"},
+    "live": {"min_bet_only"},
     "backtest": {
         "backtest_round_count",
         "initial_bankroll_bnb",
@@ -815,7 +815,7 @@ def load_app_config(path: str) -> AppConfig:
     critical_path_wakeup_offset_before_lock_ms = (
         bet_submit_deadline_offset_before_lock_ms
         + _tc.OKX_KLINE_FETCH_RTT_P95_MS
-        + _tc.MOMENTUM_GATE_COMPUTE_TIME_MS
+        + _tc.SIGNAL_COMPUTE_TIME_MS
         + _tc.POOL_READ_TIME_MS
     )
     bankroll_wakeup_offset_before_lock_ms = (
@@ -957,7 +957,7 @@ def load_app_config(path: str) -> AppConfig:
         raise InvariantError("dry_initial_bankroll_bnb_must_be_positive")
 
     # [live]
-    live_clamp_bet_to_contract_minimum = _opt_bool(live_sec, "clamp_bet_to_contract_minimum", True)
+    live_min_bet_only = _opt_bool(live_sec, "min_bet_only", True)
 
     # [backtest]
     backtest_round_count = _opt_int(backtest_sec, "backtest_round_count", 5000)
@@ -993,7 +993,7 @@ def load_app_config(path: str) -> AppConfig:
         bankroll_wakeup_offset_before_lock_ms=bankroll_wakeup_offset_before_lock_ms,
         okx_warmup_wakeup_offset_before_lock_ms=okx_warmup_wakeup_offset_before_lock_ms,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
-        live_clamp_bet_to_contract_minimum=live_clamp_bet_to_contract_minimum,
+        live_min_bet_only=live_min_bet_only,
         backtest_round_count=backtest_round_count,
         backtest_initial_bankroll_bnb=bt_bankroll,
         backtest=backtest_cfg,
