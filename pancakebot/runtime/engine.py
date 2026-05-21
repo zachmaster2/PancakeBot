@@ -715,11 +715,26 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     anchor_milli_ts=round_anchor.milli_ts,
                     lock_ms=lock_ms_int,
                 )
-                dynamic_wake_ms = predecessor_ms - (
+                # SSOT wake derivation: walk back from the per-round submit
+                # deadline (the same one the bet-timing guard uses below) by
+                # the workload it must accommodate (kline fetch p99 + gate
+                # compute + pool read). ``compute_submit_deadline_ms``
+                # already accounts for the quantum-shift back-off, the
+                # validator assembly window, and the one-way RPC send time;
+                # the earlier inline formula recomputed two of those terms
+                # and silently dropped the assembly window (a 50ms gap that
+                # survived since Bundle 4). Both call sites (wake derivation
+                # here, deadline check at the timing guard) now drive off
+                # the same function; any change to the deadline formula
+                # propagates to the wake automatically.
+                anchor_deadline_ms = compute_submit_deadline_ms(
+                    predicted_predecessor_milli_ts=predecessor_ms,
+                    lock_ms=lock_ms_int,
+                )
+                dynamic_wake_ms = anchor_deadline_ms - (
                     _tc.OKX_KLINE_FETCH_RTT_P99_MS
                     + _tc.MOMENTUM_GATE_COMPUTE_TIME_MS
                     + _tc.POOL_READ_TIME_MS
-                    + _tc.BSC_BET_SUBMIT_ONE_WAY_MS
                 )
                 # The dynamic wake should be slightly AFTER the anchor poll
                 # response landed (which was lock - ~1100ms by design).
