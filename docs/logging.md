@@ -24,54 +24,57 @@ default), but nothing in production emits at DEBUG.
 
 ## Format
 
-`pancakebot/log.py` enforces:
+`pancakebot/log.py` enforces (Phase B v2, 2026-05-18 — commit `7174b5e`):
 
 ```
-{ts}  {LEVEL:<5} {SYSTEM:<8} {SUB:<6} {EVENT:<11}{tail}
+{ts}  {LEVEL:<5}  {ACTION:<8}  {message}
 ```
 
-`tail` is either structured (`**fields` → `key=value` pairs) or narrative
-(`msg="free text"`). `_emit` short-circuits to one or the other; passing
-both means the `msg=` wins and the kwargs are silently dropped (this is
-a footgun — see Principle 1).
+A single ACTION column (≤ 8 chars, enforced at emit time via
+`_ACTION_W`) and a free-form prose message. The prior 3-column
+hierarchy (`SYSTEM` / `SUB` / `EVENT`) and the `**fields` /
+`msg=` dichotomy are retired. Callers pass two positional strings;
+`_emit` does no kv rendering and no formatting helpers.
+
+```python
+info(action: str, message: str) -> None
+warn(action: str, message: str) -> None
+error(action: str, message: str) -> None
+```
+
+The message is the operator-facing English sentence — compose key=value
+fragments into the prose directly when structured data is useful (e.g.
+`info("BET", f"Bet {amount_bnb:.4f} BNB on {bet_side} for epoch {epoch} (tx {tx_short})")`).
+Per-round structured data still lives in `cycle_audit.csv`, not in the
+log line.
 
 ## Design principles
 
-1. **Match form to content.** `**fields` for DATA (queryable); `msg=`
-   for LIFECYCLE (human-readable narrative). Never both on the same
-   emit — `_emit` ignores fields when `msg` is set.
+1. **Pick the ACTION verb from the canonical vocabulary.** ACTION names
+   what's happening at the framework level — `START`, `READY`, `BET`,
+   `CLAIM`, `SKIP`, `RETRY`, `RECOVER`, `ALERT`, `EXIT`, etc. It's NOT
+   the subsystem (no `GATE`, no `RPC`) and NOT a value (no symbol
+   names). Runtime values + identifiers live in the prose.
+   - Bad: `info("BTC", "fetched 16 candles")` (BTC is a value)
+   - Good: `info("READY", "BTC: fetched 16 candles")`
 
-2. **Column values name THINGS, not VALUES.** `SYSTEM` and `SUB`
-   identify the subsystem (a name); `EVENT` names what happened (action
-   verb / state name). Runtime values like symbols, epochs, or labels
-   live in the kv-tail or `msg=`, never in the column slots.
-   - Bad: `WARN GATE BTC FETCH_FAIL` (BTC is a symbol value)
-   - Good: `WARN GATE KLINE PARTIAL symbol=BTC-USDT`
+2. **Prose is composed at the call site.** No format helpers, no kv
+   rendering, no field reordering by the logger. The caller decides
+   exactly how the line reads.
+   - Good: `warn("SKIP", f"Skipped epoch {epoch}: pool below minimum ({pool:.2f} BNB < {threshold:.2f} BNB threshold)")`
+   - Good: `warn("ALERT", f"period poll batch failed: batch[{first}..{last}]: {type(e).__name__}: {e}")`
 
-3. **No redundancy across hierarchy.** If `SUB=KLINE`, EVENT doesn't
-   repeat `KLINE_`. Within the kv-tail, fields don't include data
-   derivable from other fields.
-   - Bad: `received=15 requested=16 missing_count=1` (derivable)
-   - Bad: `error_class=insufficient reason=okx_publish_delay`
-     (`insufficient` derivable from `reason` + counts)
+3. **Don't duplicate data the caller already has structured.** If the
+   data is in `cycle_audit.csv`, don't repeat it in the log line.
+   Operator-facing log lines describe events ("bet placed at 0.001 BNB
+   on Bull for epoch X"); machine-parseable per-round metrics live in
+   the audit CSV.
 
-4. **Don't model scenarios that don't happen.** Conditional fields and
-   error branches only for cases observed in production. Don't fabricate
-   `missing_position=oldest` if OKX only ever truncates the tail.
+4. **Match magnitude to format.** Seconds with 2 decimals for
+   multi-second values (`delay=2.35s`); ms integers for sub-second
+   (`latency=247ms`).
 
-5. **Order kv-pairs by importance.** IDENTIFIER → REASON → QUANTITATIVE
-   → CONTEXT.
-   - Good: `symbol=BTC-USDT reason=okx_publish_delay received=15 requested=16 bar=1s`
-
-6. **Conditional fields only when verifiable.** If you can't be confident
-   in the value, omit the field — don't make one up.
-
-7. **No leading whitespace inside `msg=`.** Column widths already provide
-   alignment.
-   - Bad: `msg="  BTC: 17500 done"`
-   - Good: `msg="BTC: 17500 done"`
-
-8. **Log level = operator urgency, not data type.**
+5. **Log level = operator urgency.**
    - **ERROR**: needs human action now.
    - **WARN**: noteworthy anomaly, no immediate action; each one merits
      being read.
@@ -80,12 +83,9 @@ a footgun — see Principle 1).
    - (No production DEBUG — diagnostic/per-cycle data goes to
      `cycle_audit.csv` or a dedicated audit file.)
 
-9. **Format units to match magnitude (operator-facing narrative).**
-   Seconds with 2 decimals for multi-second values (`delay=2.35s`); ms
-   for sub-second (`latency=247ms`). For structured kv-fields (named
-   with `_ms` / `_seconds` suffix), keep the unit consistent for
-   machine-parseability — the unit lives in the field name, the value
-   is always in that unit.
+6. **Don't model scenarios that don't happen.** Branches and conditional
+   text only for cases observed in production. Don't fabricate a
+   `missing_position=oldest` field if OKX only ever truncates the tail.
 
 ## When to delete a log line vs. keep it
 
@@ -101,8 +101,10 @@ For each existing `info()` callsite, ask:
 ## Reference design
 
 ```
-WARN GATE     KLINE  PARTIAL    symbol=BTC-USDT reason=okx_publish_delay received=15 requested=16 bar=1s
+2026-05-21 22:39:01.02  WARN   SKIP      Skipped epoch 483194: incomplete kline data (SOL: 15 of 16 candles)
+2026-05-21 23:35:07.99  INFO   SKIP      Skipped epoch 483205: pool below minimum (1.31 BNB < 1.50 BNB threshold)
+2026-05-21 17:38:33.78  INFO   START     Starting bankroll: 0.2328 BNB ($153.17 USD)
 ```
 
-(commit `617d76d`) — canonical structured emission. Use as the
-pattern-match template for any new structured WARN.
+ACTION verb on the left, prose on the right. Operators can `grep ACTION`
+to filter by event class and read the prose for context.
