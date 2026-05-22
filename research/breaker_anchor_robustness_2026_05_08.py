@@ -231,17 +231,17 @@ def _run_fold_with_tracker(
         raise InvariantError(f"no rounds: {spec.name}")
 
     btc_klines = {
-        ep: _slice_per_entry(kl, cutoff_seconds=spec.cutoff_seconds,
+        ep: _slice_per_entry(kl, kline_cutoff_seconds=spec.kline_cutoff_seconds,
                              max_lookback=max_lookback, earliest_offset=earliest_offset)
         for ep, kl in btc_unified.items()
     }
     eth_klines = {
-        ep: _slice_per_entry(kl, cutoff_seconds=spec.cutoff_seconds,
+        ep: _slice_per_entry(kl, kline_cutoff_seconds=spec.kline_cutoff_seconds,
                              max_lookback=max_lookback, earliest_offset=earliest_offset)
         for ep, kl in eth_unified.items()
     }
     sol_klines = {
-        ep: _slice_per_entry(kl, cutoff_seconds=spec.cutoff_seconds,
+        ep: _slice_per_entry(kl, kline_cutoff_seconds=spec.kline_cutoff_seconds,
                              max_lookback=max_lookback, earliest_offset=earliest_offset)
         for ep, kl in sol_unified.items()
     }
@@ -252,15 +252,15 @@ def _run_fold_with_tracker(
         btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT",
         sol_symbol="SOL-USDT",
-        cutoff_seconds=spec.cutoff_seconds,
+        kline_cutoff_seconds=spec.kline_cutoff_seconds,
         mtf_lookbacks=strategy_cfg.gate.mtf_lookbacks,
-        mtf_threshold=strategy_cfg.gate.mtf_threshold,
+        mtf_min_return_threshold=strategy_cfg.gate.mtf_min_return_threshold,
     )
     pipeline = MomentumOnlyPipeline(
         config=gate_config,
         strategy_config=strategy_cfg,
         gate=None,
-        cutoff_seconds=spec.cutoff_seconds,
+        kline_cutoff_seconds=spec.kline_cutoff_seconds,
         min_bet_amount_bnb=min_bet_amount_bnb,
         treasury_fee_fraction=treasury_fee_fraction,
         bankroll_tracker=tracker,
@@ -400,7 +400,7 @@ def main() -> int:
     # ---------- one-time data load ----------
     spec_template = FoldSpec(
         name="_template",
-        cutoff_seconds=2,
+        kline_cutoff_seconds=2,
         epoch_start=COHORT_EPOCH_START,
         epoch_end=COHORT_EPOCH_END,
     )
@@ -475,7 +475,7 @@ def main() -> int:
         # V0
         spec = FoldSpec(
             name=f"v0_{scale:g}bnb_baseline",
-            cutoff_seconds=2,
+            kline_cutoff_seconds=2,
             epoch_start=COHORT_EPOCH_START,
             epoch_end=COHORT_EPOCH_END,
         )
@@ -504,7 +504,7 @@ def main() -> int:
         # V1-persistent (no restart) -- baseline that all restart patterns compare to
         spec = FoldSpec(
             name=f"v1_persistent_{scale:g}bnb",
-            cutoff_seconds=2,
+            kline_cutoff_seconds=2,
             epoch_start=COHORT_EPOCH_START,
             epoch_end=COHORT_EPOCH_END,
             strategy_overrides={"risk": {"dd_peak_mode": "absolute_ratchet"}},
@@ -537,7 +537,7 @@ def main() -> int:
         for sched_name, sched_set in schedules.items():
             spec = FoldSpec(
                 name=f"v1_inmem_{scale:g}bnb_{sched_name}",
-                cutoff_seconds=2,
+                kline_cutoff_seconds=2,
                 epoch_start=COHORT_EPOCH_START,
                 epoch_end=COHORT_EPOCH_END,
                 strategy_overrides={"risk": {"dd_peak_mode": "absolute_ratchet"}},
@@ -580,7 +580,7 @@ def main() -> int:
             target_bnb = scale * target_pct
             spec = FoldSpec(
                 name=f"v2_fixed_{scale:g}bnb_{tag_name}",
-                cutoff_seconds=2,
+                kline_cutoff_seconds=2,
                 epoch_start=COHORT_EPOCH_START,
                 epoch_end=COHORT_EPOCH_END,
             )
