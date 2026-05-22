@@ -76,9 +76,9 @@ def main(n_rounds: int, offset_ms_override: int | None = None) -> int:
         btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT",
         sol_symbol="SOL-USDT",
-        cutoff_seconds=cfg.kline_cutoff_seconds,
+        kline_cutoff_seconds=cfg.kline_cutoff_seconds,
         mtf_lookbacks=cfg.strategy.gate.mtf_lookbacks,
-        mtf_threshold=cfg.strategy.gate.mtf_threshold,
+        mtf_min_return_threshold=cfg.strategy.gate.mtf_min_return_threshold,
     )
     gate = MomentumGate(config=gate_cfg, okx_client=client)
 
