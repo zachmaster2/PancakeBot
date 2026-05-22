@@ -226,10 +226,30 @@ Examples:
 
 ```
 2026-04-22T23:51:20Z STATUS=UP mode=dry pid=8332 hb_age=0.2s bankroll=5.0000 bets=0 iterations=42 last_epoch=474974
-2026-04-23T00:06:15Z STATUS=CRASHED mode=dry bets=0 last_epoch=474776 crash_age=1.1s exc=AttributeError alert=SENT
-2026-04-23T00:07:32Z STATUS=DOWN mode=live action=SLOW_CRASHLOOP_WARNING new_pid=8348 alert=SENT
+2026-04-23T00:06:15Z STATUS=CRASHED mode=dry bets=0 last_epoch=474776 crash_age=1.1s exc=AttributeError alert=DISPATCHING
+2026-04-23T00:06:15Z STATUS=CRASHED mode=dry alert_outcome=SENT
+2026-04-23T00:07:32Z STATUS=DOWN mode=live action=SLOW_CRASHLOOP_WARNING new_pid=8348 alert=SUPPRESSED_ROUTINE_RESTART
 2026-04-23T00:07:22Z STATUS=DOWN mode=live action=SUPPRESSED_FAST_CRASHLOOP
 ```
+
+### Two-line shape on the Discord-HTTP path (2026-05-22, commit `115185f`)
+
+For ticks that attempt a Discord POST, `supervisor.log` gets TWO lines
+per invocation: a CLASSIFICATION line with `alert=DISPATCHING` written
+BEFORE the HTTP call, then an OUTCOME line with `alert_outcome=<result>`
+written AFTER. The split exists so the classification line lands even
+if the supervisor process is killed by the schtasks 2-minute timeout
+during a hung Discord call (caught 2026-05-21 07:54 UTC — the first
+CRASHED detection tick was missing entirely because the Discord POST
+took longer than the kill window).
+
+Sync-only outcomes (`SUPPRESSED_ROUTINE_RESTART`, `NOT_APPLICABLE`)
+still write a SINGLE line with `alert=<outcome>` directly. Only the
+HTTP path (where it could hang) defers to a second line.
+
+Atomicity: `_write_supervisor_line` uses `os.open(O_APPEND|O_WRONLY|O_CREAT)`
++ a single `os.write()` call. Single-syscall append at the OS layer; no
+Python text-mode buffering between the format step and the disk write.
 
 ## Retry-once on transient reads (Option C, 2026-04-24)
 
