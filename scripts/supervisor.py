@@ -571,7 +571,14 @@ def _format_fields(fields: dict[str, Any]) -> str:
 
 
 def _write_supervisor_line(log_path: Path, mode: str, status: str, fields: dict[str, Any]) -> None:
-    """Append one line. Creates parent dir if missing. Never raises."""
+    """Append one line atomically. Creates parent dir if missing. Never raises.
+
+    Uses ``os.open(O_APPEND | O_WRONLY | O_CREAT)`` + ``os.write()`` (single
+    syscall) rather than Python's buffered ``open("a")`` + ``f.write()`` so
+    concurrent supervisor invocations cannot interleave lines. On Windows,
+    ``O_APPEND`` maps to the ``FILE_APPEND_DATA`` access right, which
+    serializes the seek-to-end + write at the OS level.
+    """
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         ts = _iso_utc_now()
@@ -579,8 +586,16 @@ def _write_supervisor_line(log_path: Path, mode: str, status: str, fields: dict[
         line = f"{ts} STATUS={status} mode={mode}"
         if body:
             line = f"{line} {body}"
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        encoded = (line + "\n").encode("utf-8")
+        fd = os.open(
+            str(log_path),
+            os.O_APPEND | os.O_WRONLY | os.O_CREAT,
+            0o644,
+        )
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
         # Also mirror to stdout for interactive / schtasks visibility.
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
@@ -1078,7 +1093,15 @@ def main(argv: list[str] | None = None) -> int:
                 spawn_failed_detail = detail
 
     # -- Phase 2c: Discord alert (opt-in) --
+    # Determine synchronously what we'll do BEFORE writing the log line.
+    # Outcomes determined sync (no HTTP) go directly into the first log
+    # line. Only the HTTP-attempt path (where we might be killed by
+    # schtasks at the 2-min limit) defers its outcome to a second line.
+    # Caught 2026-05-21 07:54 UTC: the first CRASHED-detection tick was
+    # missing entirely from supervisor.log because the Discord HTTP call
+    # ran past the schtasks kill window — log line was never written.
     alert_outcome: str | None = None
+    will_attempt_http = False
     if args.alert:
         # New policy (2026-05-16): a supervisor-initiated restart that
         # succeeded cleanly is the supervisor doing its job — not a
@@ -1096,29 +1119,45 @@ def main(argv: list[str] | None = None) -> int:
         )
         if routine_restart:
             alert_outcome = "SUPPRESSED_ROUTINE_RESTART"
-        else:
+        elif status in _ALERT_STATES or escalation is not None:
+            will_attempt_http = True
             # Decorate fields with the spawn-failure detail so the
             # Discord message body includes the error reason.
             if spawn_failed_detail is not None:
                 fields["spawn_error"] = spawn_failed_detail
-            if status in _ALERT_STATES or escalation is not None:
-                alert_outcome = _maybe_send_discord(
-                    mode=args.mode,
-                    status=status,
-                    fields=fields,
-                    art=art,
-                    escalation=escalation,
-                )
 
-    # Decorate the single supervisor.log line with action + alert details.
+    # Write the classification line FIRST -- BEFORE any potentially-hanging
+    # IO (Discord HTTP). For sync outcomes we put the alert= field on this
+    # line; for the HTTP path we mark it DISPATCHING and append the actual
+    # result on a second line after Discord returns.
     if action_taken is not None:
         fields["action"] = action_taken
     if new_pid_from_restart is not None:
         fields["new_pid"] = new_pid_from_restart
     if alert_outcome is not None:
         fields["alert"] = alert_outcome
-
+    elif will_attempt_http:
+        fields["alert"] = "DISPATCHING"
     _write_supervisor_line(art["supervisor_log"], args.mode, status, fields)
+
+    # Now attempt Discord HTTP (the part that can hang / get killed).
+    if will_attempt_http:
+        alert_outcome = _maybe_send_discord(
+            mode=args.mode,
+            status=status,
+            fields=fields,
+            art=art,
+            escalation=escalation,
+        )
+        # Best-effort: append outcome on a SECOND line. May not fire if
+        # Discord blocked past the schtasks kill window — in that case
+        # operators correlate via the Discord channel + last_alert.json
+        # rate-limit timestamps. The DISPATCHING line above is the
+        # guaranteed-visible record of intent.
+        _write_supervisor_line(
+            art["supervisor_log"], args.mode, status,
+            {"alert_outcome": alert_outcome},
+        )
 
     if suppressed_fast:
         return EXIT_SUPPRESSED_FAST_CRASHLOOP
