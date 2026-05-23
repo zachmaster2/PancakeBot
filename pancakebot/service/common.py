@@ -4,12 +4,15 @@
 per-mode classes (``PancakeBotLiveService`` / ``PancakeBotDryService``) set
 ``_MODE`` and ``_OTHER_SERVICE`` and inherit everything else.
 
-Key behaviors (all match design doc §1):
-- 1-second supervision loop polling ``classify_state`` (vs. legacy 3-min
-  schtask polling).
+Key behaviors:
+- 1-second supervision loop polling ``classify_running_bot`` (Popen-based,
+  no filesystem race; replaced the legacy artifact-based ``classify_state``
+  on 2026-05-23 after a post-reboot DOWN-race triggered spurious respawns).
 - Bot child spawned with ``CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS``
-  so it survives service-process death (defensive; SCM keeps the service
-  process alive in normal operation).
+  AND immediately assigned to a Windows Job Object configured with
+  ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``. When the service process exits
+  for ANY reason (clean SvcStop, crash, kill -9), Windows automatically
+  kills every process in the job — no orphaned bot children.
 - Stop signaling: ``Popen.terminate()`` (Windows: ``TerminateProcess``).
   Services run console-less, so ``CTRL_BREAK_EVENT`` is not viable
   without ``AllocConsole`` ceremony. The bot's atomic-write state means
@@ -38,6 +41,7 @@ from typing import Any
 # — this module is only imported in service hosts.
 import servicemanager
 import win32event
+import win32job
 import win32service
 import win32serviceutil
 
@@ -58,7 +62,10 @@ _VENV_PYTHON = _REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 
 _POLL_INTERVAL_S: float = 1.0
 _STALE_THRESHOLD_S: float = supervision.DEFAULT_STALE_THRESHOLD_S
-_STARTUP_GRACE_S: float = supervision.DEFAULT_STARTUP_GRACE_S
+# Popen-based classifier grace (30s default — tighter than the legacy 90s
+# because we know exactly when the bot was spawned). See
+# supervision.DEFAULT_RUN_GRACE_S for rationale.
+_STARTUP_GRACE_S: float = supervision.DEFAULT_RUN_GRACE_S
 
 # Stop budget: 20s gives the bot time to flush any in-flight atomic writes
 # without exceeding SCM's 30s SvcStop deadline. Hard kill after this.
@@ -157,7 +164,31 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
         super().__init__(args)
         self._stop_event = win32event.CreateEvent(None, 0, 0, None)
         self._bot_proc: subprocess.Popen | None = None
+        self._bot_started_at: float | None = None
         self._stop_requested: bool = False
+        # Job Object with KILL_ON_JOB_CLOSE — when this service process
+        # exits for ANY reason (clean SvcStop, crash, force-kill), Windows
+        # closes the job handle and automatically kills every child
+        # process in the job. This is what guarantees we never orphan a
+        # bot subprocess if the supervisor dies (the symptom we hit on
+        # 2026-05-23 when an unguarded sys.stderr.write crashed SvcDoRun
+        # and left bot PID 7480 running detached).
+        self._job = self._create_kill_on_close_job()
+
+    @staticmethod
+    def _create_kill_on_close_job():
+        """Create a Job Object configured to kill all members on close."""
+        job = win32job.CreateJobObject(None, "")  # unnamed; held by us only
+        info = win32job.QueryInformationJobObject(
+            job, win32job.JobObjectExtendedLimitInformation,
+        )
+        info["BasicLimitInformation"]["LimitFlags"] |= (
+            win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        win32job.SetInformationJobObject(
+            job, win32job.JobObjectExtendedLimitInformation, info,
+        )
+        return job
 
     # -- SCM entry points --------------------------------------------------
 
@@ -229,7 +260,10 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
             )
             raise
 
-        # Main loop: poll classify_state every _POLL_INTERVAL_S until stop.
+        # Main loop: poll classify_running_bot every _POLL_INTERVAL_S until stop.
+        # classify_running_bot uses Popen.poll() as the authoritative liveness
+        # signal — no filesystem race between spawn and first heartbeat write
+        # (the bug that caused the post-reboot DOWN cascade 2026-05-23).
         while not self._stop_requested:
             rc = win32event.WaitForSingleObject(
                 self._stop_event, int(_POLL_INTERVAL_S * 1000),
@@ -243,14 +277,16 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
                 break
 
             try:
-                status, fields = supervision.classify_state(
-                    self._MODE,
+                status, fields = supervision.classify_running_bot(
+                    self._bot_proc,
+                    self._bot_started_at,
+                    art,
                     stale_threshold_s=_STALE_THRESHOLD_S,
                     startup_grace_s=_STARTUP_GRACE_S,
                 )
             except Exception as e:
                 servicemanager.LogErrorMsg(
-                    f"{self._svc_name_}: classify_state raised: {e!r}"
+                    f"{self._svc_name_}: classify_running_bot raised: {e!r}"
                 )
                 continue
 
@@ -259,17 +295,6 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
 
             if status in ("STALE", "CRASHED", "DOWN"):
                 self._handle_unhealthy(status, fields, art)
-                continue
-
-            if status == "UNINSTRUMENTED":
-                # Should be impossible — we are the only thing that spawns
-                # bots. If somehow seen, alert general and continue (don't
-                # kill someone else's process).
-                notifications.notify(
-                    mode=self._MODE, kind="UNINSTRUMENTED",
-                    fields=fields, art=art,
-                    detail="legacy bot detected outside service control",
-                )
                 continue
 
         # Loop exit path (SvcStop). Notify and report stopped to SCM.
@@ -346,7 +371,16 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
     # -- Bot child management ----------------------------------------------
 
     def _spawn_bot_child(self, art: dict[str, Path]) -> None:
-        """Launch ``python -u run.py --<mode>`` as a detached subprocess."""
+        """Launch ``python -u run.py --<mode>`` as a detached subprocess.
+
+        IMPORTANT: every new bot child MUST be assigned to ``self._job``
+        immediately after Popen. The job has KILL_ON_JOB_CLOSE set, so
+        if the service crashes after spawning but before the assignment,
+        the child would be orphaned. The window between Popen and
+        AssignProcessToJobObject is microseconds, but a sufficiently
+        unlucky crash there still leaks a process. (Acceptable; the
+        leak rate is dominated by the bug-free case.)
+        """
         logs_dir = art["logs_dir"]
         logs_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -373,7 +407,24 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
         finally:
             out_f.close()
             err_f.close()
+
+        # Immediately enroll the child in the kill-on-close job. Uses
+        # Popen._handle (a pywin32 PyHANDLE wrapping the process HANDLE
+        # returned by CreateProcess) — converted to int because
+        # AssignProcessToJobObject accepts either. Failure here is
+        # logged but non-fatal: a child outside the job loses the
+        # auto-kill safety net but is otherwise functional.
+        try:
+            win32job.AssignProcessToJobObject(self._job, int(proc._handle))
+        except Exception as e:
+            servicemanager.LogWarningMsg(
+                f"{self._svc_name_}: AssignProcessToJobObject failed for "
+                f"pid={proc.pid}: {type(e).__name__}: {e} — child will be "
+                f"orphaned if supervisor crashes"
+            )
+
         self._bot_proc = proc
+        self._bot_started_at = time.time()
         servicemanager.LogInfoMsg(
             f"{self._svc_name_}: spawned bot child pid={proc.pid} log={out_log.name}"
         )
@@ -393,6 +444,7 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
         proc = self._bot_proc
         if proc is None or proc.poll() is not None:
             self._bot_proc = None
+            self._bot_started_at = None
             return
 
         servicemanager.LogInfoMsg(
@@ -410,6 +462,7 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
         while time.time() < deadline:
             if proc.poll() is not None:
                 self._bot_proc = None
+                self._bot_started_at = None
                 return
             # Keep SCM alive — STOP_PENDING with a checkpoint advance prevents
             # the SCM stop deadline from firing while we wait.
@@ -427,6 +480,7 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
         except Exception:
             pass
         self._bot_proc = None
+        self._bot_started_at = None
 
     # -- Restart-on-unhealthy (crashloop limiter) --------------------------
 

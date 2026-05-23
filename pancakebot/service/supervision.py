@@ -1,23 +1,35 @@
 """Pure bot-health classification + restart-history helpers (no Win32 deps).
 
-Extracted from ``scripts/supervisor.py`` so the Windows Service in
-``pancakebot.service.common`` can reuse the exact same classification
-semantics. Pure-Python; safe to import on any platform; covered by unit
-tests under ``tests/test_service_lifecycle.py``.
+Two classifier entry points:
 
-Classification order matches the legacy supervisor (first match wins):
-  UP            - fresh heartbeat (mtime < stale_threshold) + PID alive
-  STARTING      - PID file alive, no/stale heartbeat, PID file age < startup_grace
-  STALE         - PID alive but heartbeat stale past threshold (past grace)
-  CRASHED       - crash.json present (regardless of process state)
-  UNINSTRUMENTED- bot process alive (psutil match on run.py --<mode>) but
-                  no heartbeat AND no PID file (legacy pre-Phase-2a bot)
-  DOWN          - none of the above
+  classify_running_bot(proc, proc_started_at, art, ...)
+      The authoritative in-loop classifier used by the Windows Service.
+      Liveness is determined by ``Popen.poll()`` — zero filesystem race.
+      Heartbeat staleness only matters for hung-bot detection AFTER
+      ``startup_grace_s`` has elapsed. This is what the service's
+      supervision loop calls every tick.
+
+  classify_state(mode, ...)
+      Legacy artifact-only classifier (heartbeat.json + bot.pid +
+      crash.json). Kept for first-run / no-Popen-handle use cases
+      (e.g., checking whether a bot is somehow already running outside
+      the service). Vulnerable to the post-spawn DOWN race that
+      classify_running_bot eliminates — do not use in the supervision
+      loop after the initial spawn.
+
+Status values returned by both:
+  UP            - bot alive, heartbeat fresh
+  STARTING      - bot alive, within startup grace, heartbeat not yet fresh
+  STALE         - bot alive, past startup grace, heartbeat stale (hung)
+  CRASHED       - bot dead, crash.json present
+  DOWN          - bot dead (or absent), no crash.json
+  UNINSTRUMENTED- (classify_state only) legacy bot detected outside service
 """
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -30,12 +42,57 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Match supervisor.py defaults exactly so behavior is unchanged across the
 # migration. Tunable per-service if we ever need to.
 DEFAULT_STALE_THRESHOLD_S: float = 5.0
+
+# Legacy artifact-classifier grace (PID-file mtime based).
 DEFAULT_STARTUP_GRACE_S: float = 90.0
+
+# New Popen-based classifier grace. Tighter than the legacy 90s because we
+# now know the bot's actual start time directly — no need to wait for a
+# PID-file write. 30s is comfortably longer than the bot's ~5s init path
+# (RPC poller + bankroll fetch + first round catch-up) so a slow startup
+# isn't classified as STALE prematurely.
+DEFAULT_RUN_GRACE_S: float = 30.0
 
 # Retry-once backoff for transient read failures (Windows AV file-lock race,
 # atomic-rename windows, psutil process-iter transients). Mirrors the legacy
 # supervisor's 500ms backoff.
 _TRANSIENT_READ_BACKOFF_S: float = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Service-safe stderr (sys.stderr is None when hosted by pythonservice.exe)
+# ---------------------------------------------------------------------------
+
+def safe_stderr_write(msg: str) -> None:
+    """Write to sys.stderr when available; silently drop when it's None.
+
+    Windows Services hosted by pythonservice.exe run with NO stdio handles
+    attached, so ``sys.stderr`` is ``None`` and ``sys.stderr.write(...)``
+    raises ``AttributeError: 'NoneType' object has no attribute 'write'``
+    — a hazard that previously crashed the supervisor (2026-05-23 boot).
+
+    Routes through ``servicemanager.LogErrorMsg`` when running inside a
+    service (importable + sys.stderr is None), so error-path diagnostics
+    still land somewhere visible (Windows Event Log → Application,
+    ProviderName = service name). Falls back to plain ``sys.stderr`` for
+    interactive / test invocation.
+    """
+    if sys.stderr is not None:
+        try:
+            sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+            return
+        except Exception:
+            pass  # stderr present but broken — fall through to servicemanager
+    # No stderr → try Windows Event Log via servicemanager (only available
+    # when pywin32 is installed AND we're inside a service host).
+    try:
+        import servicemanager
+        servicemanager.LogErrorMsg(msg.rstrip())
+    except Exception:
+        # Last resort: silently swallow. The alternative is letting an
+        # AttributeError propagate up the call stack and crash the
+        # service, which is exactly the bug we're guarding against.
+        pass
 
 
 def artifacts_for_mode(mode: str) -> dict[str, Path]:
@@ -356,4 +413,109 @@ def write_restart_history(path: Path, entries: list[dict]) -> None:
         tmp.replace(path)
     except Exception:
         # Best-effort. The supervisor must not crash on log-write failure.
-        sys.stderr.write(f"restart_history_write_failed: {path}\n")
+        # safe_stderr_write handles sys.stderr=None (service-hosted) cleanly.
+        safe_stderr_write(f"restart_history_write_failed: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Authoritative Popen-based classifier (new — used by the supervision loop)
+# ---------------------------------------------------------------------------
+
+def classify_running_bot(
+    proc: subprocess.Popen | None,
+    proc_started_at: float | None,
+    art: dict[str, Path],
+    *,
+    stale_threshold_s: float = DEFAULT_STALE_THRESHOLD_S,
+    startup_grace_s: float = DEFAULT_RUN_GRACE_S,
+) -> tuple[str, dict[str, Any]]:
+    """Classify the bot child using the Popen handle as the truth source.
+
+    Eliminates the post-spawn DOWN race that the artifact-only classifier
+    suffers from (where a just-spawned process hasn't yet written its
+    heartbeat/PID and falls through to DOWN). ``proc.poll()`` is
+    authoritative for liveness; heartbeat staleness only matters for
+    detecting a hung-but-alive bot AFTER ``startup_grace_s``.
+
+    Args:
+        proc: the Popen object for the bot child, or None if no bot has
+            been spawned yet (treated as DOWN).
+        proc_started_at: wall-clock time when proc was spawned (from
+            ``time.time()``). Used for the startup-grace window.
+        art: artifacts dict (from ``artifacts_for_mode``) — used to read
+            heartbeat mtime + crash.json.
+        stale_threshold_s: heartbeat-age threshold for STALE.
+        startup_grace_s: window after spawn during which a missing/stale
+            heartbeat is tolerated (STARTING, not STALE).
+
+    Returns:
+        (status, fields) where status is one of UP, STARTING, STALE,
+        CRASHED, DOWN. Fields are best-effort diagnostics.
+
+    Never raises.
+    """
+    now = time.time()
+    fields: dict[str, Any] = {}
+
+    # Decide liveness from Popen — authoritative, zero race.
+    proc_alive: bool = False
+    if proc is not None:
+        try:
+            poll_result = proc.poll()
+        except Exception:
+            poll_result = None  # be conservative on any read error
+        proc_alive = (poll_result is None)
+        fields["pid"] = proc.pid
+
+    if proc_alive:
+        # Process is alive. Decide UP / STARTING / STALE.
+        proc_uptime: float = (
+            (now - proc_started_at) if proc_started_at is not None else 0.0
+        )
+        fields["proc_uptime"] = f"{proc_uptime:.1f}s"
+
+        hb_mtime = _safe_stat_mtime(art["heartbeat"])
+        hb_age: float | None = (now - hb_mtime) if hb_mtime is not None else None
+        if hb_age is not None:
+            fields["hb_age"] = f"{hb_age:.1f}s"
+
+        # Inside startup grace: STARTING regardless of heartbeat freshness.
+        # A just-spawned bot may take a few seconds to write its first
+        # heartbeat (RPC poller init, bankroll fetch, first round catch-up).
+        if proc_uptime < startup_grace_s:
+            return "STARTING", fields
+
+        # Past grace: a missing or stale heartbeat means the bot is hung
+        # (process alive but not making progress).
+        if hb_age is None or hb_age > stale_threshold_s:
+            return "STALE", fields
+
+        # Past grace + fresh heartbeat → healthy.
+        # Surface optional bankroll/iteration/last_epoch from heartbeat
+        # so log lines and Discord alerts have rich context.
+        hb = _safe_read_json(art["heartbeat"])
+        if hb is not None:
+            br = hb.get("bankroll_bnb")
+            if isinstance(br, (int, float)):
+                fields["bankroll"] = f"{float(br):.4f}"
+            ic = hb.get("iteration_count")
+            if isinstance(ic, int):
+                fields["iterations"] = ic
+            le = hb.get("last_epoch")
+            if isinstance(le, int):
+                fields["last_epoch"] = le
+        return "UP", fields
+
+    # Process is dead (or proc is None). Distinguish CRASHED (crash.json
+    # present) from DOWN (no signal).
+    crash = _safe_read_json(art["crash"])
+    if crash is not None:
+        exc_type = crash.get("exc_type")
+        if isinstance(exc_type, str):
+            fields["exc"] = exc_type
+        last_epoch = crash.get("last_epoch")
+        if isinstance(last_epoch, int):
+            fields["last_epoch"] = last_epoch
+        return "CRASHED", fields
+
+    return "DOWN", fields

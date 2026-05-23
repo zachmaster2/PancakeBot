@@ -101,6 +101,16 @@ try {
         # the operator is ready to run.
         Write-Host "[$svcName] setting start type = Disabled..." -ForegroundColor Green
         & sc.exe config $svcName start= disabled | Out-Null
+
+        # Service dependencies: Dnscache + Nla. SCM will not start the
+        # bot supervisor until DNS resolution AND network location
+        # awareness are both ready. This kills the boot-time race where
+        # the bot's first chain RPC failed because DNS wasn't resolving
+        # yet (caught 2026-05-23 reboot: NameResolutionError on
+        # bsc-dataseed1.binance.org at uptime ~17s; service crashed
+        # trying to alert Discord with the failure).
+        Write-Host "[$svcName] setting dependencies = Dnscache, Nla..." -ForegroundColor Green
+        & sc.exe config $svcName depend= Dnscache/Nla | Out-Null
     }
 }
 finally {

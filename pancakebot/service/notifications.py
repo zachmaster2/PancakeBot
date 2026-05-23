@@ -305,8 +305,13 @@ def notify(
     ok, send_detail = _send_discord(webhook, mode, msg)
     if ok:
         return "SENT"
-    sys.stderr.write(
-        f"discord_send_failed mode={mode} kind={kind} detail={send_detail}\n"
+    # safe_stderr_write handles sys.stderr=None when hosted by
+    # pythonservice.exe (otherwise an AttributeError crashes the service —
+    # caught 2026-05-23 post-reboot when first-run Discord POST failed on
+    # not-yet-resolved DNS and the SEND_FAILED branch took down the supervisor).
+    from pancakebot.service.supervision import safe_stderr_write
+    safe_stderr_write(
+        f"discord_send_failed mode={mode} kind={kind} detail={send_detail}"
     )
     return "SEND_FAILED"
 
