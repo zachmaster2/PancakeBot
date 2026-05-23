@@ -4,12 +4,12 @@ Configure Windows Autologon for the current user via Sysinternals Autologon.
 
 .DESCRIPTION
 Autologon is the supported way to make Windows sign in automatically at boot
-without prompting for credentials — required so that a full reboot brings
+without prompting for credentials - required so that a full reboot brings
 the desktop session (and the Claude UWP app launched by the
 ClaudeLaunchElevated scheduled task) back up unattended.
 
 This script:
-  1. Prompts SECURELY for the Windows password (Read-Host -AsSecureString —
+  1. Prompts SECURELY for the Windows password (Read-Host -AsSecureString -
      not visible on screen, not in command history, not in scrollback).
   2. Decrypts the SecureString to a plaintext char buffer JUST LONG ENOUGH
      to pass to Autologon.exe via argv.
@@ -27,7 +27,7 @@ or by clearing HKLM\...\Winlogon\AutoAdminLogon = 0.
 Requires Administrator. Autologon.exe path is hard-coded to the
 expected install location from install_services.ps1's auto-download.
 
-PowerShell 7+ has cleaner SecureString → plaintext APIs (ConvertFrom-
+PowerShell 7+ has cleaner SecureString -> plaintext APIs (ConvertFrom-
 SecureString -AsPlainText); we use the BSTR dance to stay compatible
 with Windows PowerShell 5.1.
 #>
@@ -37,7 +37,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-# Admin check — Autologon writes to HKLM and the LSA secret store.
+# Admin check - Autologon writes to HKLM and the LSA secret store.
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     throw "setup_autologon.ps1 requires Administrator. Re-launch this shell elevated and try again."
@@ -58,10 +58,10 @@ Write-Host ""
 
 $sec = Read-Host -Prompt "Password for $domain\$user" -AsSecureString
 if ($null -eq $sec -or $sec.Length -eq 0) {
-    throw "empty password — aborting"
+    throw "empty password - aborting"
 }
 
-# SecureString → plaintext via BSTR (the safe Windows PowerShell 5.1 idiom).
+# SecureString -> plaintext via BSTR (the safe Windows PowerShell 5.1 idiom).
 $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
 try {
     $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
@@ -70,7 +70,7 @@ try {
     $exit = $LASTEXITCODE
 }
 finally {
-    # ZeroFreeBSTR overwrites the BSTR with zeros before freeing —
+    # ZeroFreeBSTR overwrites the BSTR with zeros before freeing -
     # plaintext is wiped from this address before the page can be paged out.
     [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     Remove-Variable plain -ErrorAction SilentlyContinue
@@ -100,5 +100,5 @@ if ($autoEnabled -eq '1') {
     Write-Host "  or set AutoAdminLogon=0 in the registry directly."
 } else {
     Write-Host ""
-    Write-Host "[warn] AutoAdminLogon != '1' — Autologon.exe may have failed silently. Re-run and watch its output for errors." -ForegroundColor Yellow
+    Write-Host "[warn] AutoAdminLogon != '1' - Autologon.exe may have failed silently. Re-run and watch its output for errors." -ForegroundColor Yellow
 }
