@@ -339,3 +339,215 @@ def test_live_and_dry_service_classes_importable():
     assert PancakeBotLiveService._OTHER_SERVICE == "PancakeBotDry"
     assert PancakeBotDryService._MODE == "dry"
     assert PancakeBotDryService._OTHER_SERVICE == "PancakeBotLive"
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — classify_running_bot (Popen-based, no DOWN-race)
+# ---------------------------------------------------------------------------
+
+class _FakePopen:
+    """Minimal Popen stand-in for testing classify_running_bot without
+    actually spawning a process."""
+    def __init__(self, pid: int, alive: bool, exit_code: int | None = 0):
+        self.pid = pid
+        self._alive = alive
+        self._exit_code = exit_code
+
+    def poll(self):
+        return None if self._alive else self._exit_code
+
+    def kill(self):
+        self._alive = False
+
+
+def test_classify_running_bot_just_spawned_is_starting_not_down(tmp_path):
+    """The DOWN-race fix: a just-spawned Popen with no heartbeat yet must
+    NOT classify as DOWN (the old bug). It should be STARTING (inside grace)."""
+    art = _make_mode_tree(tmp_path, "live")
+    proc = _FakePopen(pid=12345, alive=True)
+    status, fields = supervision.classify_running_bot(
+        proc, proc_started_at=time.time(), art=art,
+        startup_grace_s=30.0,
+    )
+    assert status == "STARTING", f"expected STARTING, got {status} {fields}"
+    assert fields["pid"] == 12345
+
+
+def test_classify_running_bot_killed_process_is_down(tmp_path):
+    """Popen.poll() returning exit code = process dead. No crash.json → DOWN."""
+    art = _make_mode_tree(tmp_path, "live")
+    proc = _FakePopen(pid=12345, alive=False, exit_code=1)
+    status, fields = supervision.classify_running_bot(
+        proc, proc_started_at=time.time() - 60.0, art=art,
+    )
+    assert status == "DOWN", f"expected DOWN, got {status} {fields}"
+
+
+def test_classify_running_bot_killed_with_crash_json_is_crashed(tmp_path):
+    """Dead Popen + crash.json present → CRASHED, not DOWN."""
+    art = _make_mode_tree(tmp_path, "live")
+    _write_crash(art["crash"], exc_type="ValueError")
+    proc = _FakePopen(pid=12345, alive=False, exit_code=1)
+    status, fields = supervision.classify_running_bot(
+        proc, proc_started_at=time.time() - 60.0, art=art,
+    )
+    assert status == "CRASHED"
+    assert fields["exc"] == "ValueError"
+
+
+def test_classify_running_bot_alive_past_grace_with_fresh_heartbeat_is_up(tmp_path):
+    """Process alive, past startup grace, fresh heartbeat → UP."""
+    art = _make_mode_tree(tmp_path, "live")
+    _write_heartbeat(art["heartbeat"], pid=12345)  # fresh mtime
+    proc = _FakePopen(pid=12345, alive=True)
+    status, fields = supervision.classify_running_bot(
+        proc, proc_started_at=time.time() - 60.0, art=art,
+        startup_grace_s=30.0,
+    )
+    assert status == "UP", f"expected UP, got {status} {fields}"
+    # Surface bankroll / iterations / last_epoch when heartbeat readable
+    assert "iterations" in fields
+    assert "last_epoch" in fields
+
+
+def test_classify_running_bot_alive_past_grace_with_stale_heartbeat_is_stale(tmp_path):
+    """Process alive, past startup grace, stale heartbeat → STALE (hung bot)."""
+    art = _make_mode_tree(tmp_path, "live")
+    # Heartbeat aged 60s (way past the 5s stale threshold)
+    _write_heartbeat(art["heartbeat"], pid=12345, age_s=60.0)
+    proc = _FakePopen(pid=12345, alive=True)
+    status, fields = supervision.classify_running_bot(
+        proc, proc_started_at=time.time() - 60.0, art=art,
+        stale_threshold_s=5.0, startup_grace_s=30.0,
+    )
+    assert status == "STALE", f"expected STALE, got {status} {fields}"
+
+
+def test_classify_running_bot_alive_past_grace_no_heartbeat_is_stale(tmp_path):
+    """Process alive, past grace, NO heartbeat file at all → STALE (hung at startup)."""
+    art = _make_mode_tree(tmp_path, "live")
+    # No heartbeat written
+    proc = _FakePopen(pid=12345, alive=True)
+    status, _fields = supervision.classify_running_bot(
+        proc, proc_started_at=time.time() - 60.0, art=art,
+        startup_grace_s=30.0,
+    )
+    assert status == "STALE"
+
+
+def test_classify_running_bot_proc_none_is_down(tmp_path):
+    """proc=None means we haven't spawned yet → DOWN."""
+    art = _make_mode_tree(tmp_path, "live")
+    status, _fields = supervision.classify_running_bot(
+        None, proc_started_at=None, art=art,
+    )
+    assert status == "DOWN"
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — safe_stderr_write None-guard regression test
+# ---------------------------------------------------------------------------
+
+def test_safe_stderr_write_no_attribute_error_when_stderr_is_none(monkeypatch):
+    """When sys.stderr is None (service-hosted), writes must NOT raise
+    AttributeError. This is the regression guard for the post-reboot
+    crash 2026-05-23 where notify()'s SEND_FAILED path took down the
+    service via sys.stderr.write on a NoneType."""
+    monkeypatch.setattr(sys, "stderr", None)
+    # Should not raise — that's the entire requirement.
+    supervision.safe_stderr_write("test message that would have crashed")
+
+
+def test_notify_send_failed_does_not_raise_with_stderr_none(tmp_path, monkeypatch):
+    """End-to-end: a notify() call that hits SEND_FAILED with stderr=None
+    must NOT crash. This is the exact scenario from the post-reboot incident."""
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setenv(notifications.LIVE_WEBHOOK_ENV, "https://invalid.example/webhook")
+    # Make the HTTP call fail synchronously so we hit the SEND_FAILED path.
+    monkeypatch.setattr(
+        notifications, "_send_discord",
+        lambda url, mode, msg: (False, "post_exception:simulated"),
+    )
+    art = _make_mode_tree(tmp_path, "live")
+    # If safe_stderr_write didn't guard the None case, this would raise
+    # AttributeError. Should return "SEND_FAILED" cleanly instead.
+    outcome = notifications.notify(mode="live", kind="STALE", art=art)
+    assert outcome == "SEND_FAILED"
+
+
+def test_write_restart_history_does_not_raise_with_stderr_none(monkeypatch, tmp_path):
+    """write_restart_history's error path also goes through safe_stderr_write."""
+    monkeypatch.setattr(sys, "stderr", None)
+    # Force the write to fail by pointing at a directory that doesn't
+    # exist AND can't be created (use an invalid path).
+    bad_path = tmp_path / "missing" / "subdir" / "rh.jsonl"
+    # The function recovers via parent.mkdir(parents=True), so we need a
+    # path where mkdir itself fails. Use a path containing a NUL byte —
+    # invalid on Windows.
+    bad_path_str = str(tmp_path / "rh\x00.jsonl")
+    try:
+        supervision.write_restart_history(Path(bad_path_str), [{"ts_wall": 1.0}])
+    except ValueError:
+        # NUL byte in path may raise ValueError before the function's
+        # internal try/except. That's fine — it's not the AttributeError
+        # we were guarding against.
+        return
+    # If we got here without exception, the safe_stderr_write guard worked
+    # (the function's internal except triggered the stderr write).
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Job Object with KILL_ON_JOB_CLOSE
+# ---------------------------------------------------------------------------
+
+def test_job_object_kills_child_on_supervisor_death(tmp_path):
+    """Spawn an outer 'supervisor' process that creates a kill-on-close job
+    + spawns a long-sleeping child + assigns it to the job, then exits.
+    The child MUST be killed when the supervisor exits (the job handle
+    closes → KILL_ON_JOB_CLOSE → all members terminated)."""
+    import subprocess as sp
+
+    supervisor_script = r"""
+import subprocess, sys, time
+import win32job
+job = win32job.CreateJobObject(None, "")
+info = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
+info["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, info)
+proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+win32job.AssignProcessToJobObject(job, int(proc._handle))
+sys.stdout.write(f"{proc.pid}\n")
+sys.stdout.flush()
+# Brief sleep to make sure the child is fully running before we exit.
+time.sleep(0.5)
+# Outer process exits here — job handle is closed by the OS as part of
+# process teardown — KILL_ON_JOB_CLOSE fires — child should die.
+"""
+    result = sp.run(
+        [sys.executable, "-c", supervisor_script],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, f"supervisor script failed: {result.stderr}"
+    child_pid_line = result.stdout.strip().splitlines()[-1]
+    child_pid = int(child_pid_line)
+
+    # Wait up to 2s for the child to be killed by job close.
+    import psutil
+    deadline = time.time() + 2.0
+    killed = False
+    while time.time() < deadline:
+        if not psutil.pid_exists(child_pid):
+            killed = True
+            break
+        time.sleep(0.05)
+
+    if not killed:
+        # Cleanup before failing
+        try:
+            psutil.Process(child_pid).kill()
+        except Exception:
+            pass
+        raise AssertionError(
+            f"child pid={child_pid} survived 2s after supervisor exit — "
+            f"KILL_ON_JOB_CLOSE did not work"
+        )
