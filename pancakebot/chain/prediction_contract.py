@@ -60,6 +60,57 @@ def _load_abi_list(path: str) -> list[dict[str, Any]]:
     return obj  # type: ignore[return-value]
 
 
+def _canonical_abi_type(component: dict[str, Any]) -> str:
+    """Build the canonical eth_abi type string for one ABI input/output entry.
+
+    Handles the tuple-inlining that ``eth_abi.codec.decode`` requires:
+    a JSON ABI entry of ``{"type": "tuple[]", "components": [...]}`` must
+    be passed to the codec as ``"(uint8,uint256,bool)[]"`` (the
+    components inlined inside parentheses, with the array suffix
+    preserved).
+    """
+    t = component["type"]
+    if t.startswith("tuple"):
+        inner = ",".join(_canonical_abi_type(c) for c in component.get("components", []))
+        suffix = t[len("tuple"):]  # "", "[]", "[N]" — preserve array suffix verbatim
+        return f"({inner}){suffix}"
+    return t
+
+
+def derive_abi_output_types(abi: list[dict[str, Any]], function_name: str) -> list[str]:
+    """Return the ABI output type strings for the named function.
+
+    Single source of truth: types live in the JSON ABI file only; Python
+    code derives them at runtime via this helper rather than re-declaring
+    them in local tuples. Eliminates the drift class of bug caught
+    2026-05-23 when ``close_ts_batch`` hand-wrote an 11-field tuple for
+    a 14-field on-chain ``rounds()`` struct and crashed at the first
+    bear-amount that ended on a non-{0x00,0x01} byte.
+
+    Tuple outputs are returned in canonical eth_abi form (components
+    inlined inside parentheses), so the result is directly usable as
+    the ``types`` argument to ``codec.decode``.
+
+    Args:
+        abi: parsed JSON ABI list (one entry per function/event/error).
+        function_name: the function's ``name`` field as declared in ABI.
+
+    Returns:
+        Output type strings in declaration order. For ``rounds()`` this is
+        14 entries ending in ``"bool"``. For ``getUserRounds()`` this is
+        ``["uint256[]", "(uint8,uint256,bool)[]", "uint256"]``.
+
+    Raises:
+        InvariantError: if ``function_name`` isn't found as a function in
+            the ABI. (Typos in call sites surface loudly rather than
+            silently producing an empty type list.)
+    """
+    for entry in abi:
+        if entry.get("type") == "function" and entry.get("name") == function_name:
+            return [_canonical_abi_type(out) for out in entry.get("outputs", [])]
+    raise InvariantError(f"abi_function_not_found: {function_name}")
+
+
 @dataclass(frozen=True, slots=True)
 class BetEvent:
     wallet_address: str
@@ -136,6 +187,11 @@ class Web3PredictionContract:
             pk = pk[2:]
 
         abi = _load_abi_list(cfg.abi_json_path)
+        # Keep the raw JSON list around as the SSOT for codec.decode type
+        # derivation (see derive_abi_output_types). web3.py v6+ wraps the
+        # ABI in typed objects inside the Contract; we prefer the raw list
+        # to stay decoupled from web3.py-version-dependent internals.
+        self._abi_raw: list[dict[str, Any]] = abi
         contract_addr = Web3.to_checksum_address(PREDICTION_V2_CONTRACT_ADDRESS)
 
         # BSC is a POA chain (Lorentz hardfork): block.extraData is 280
@@ -451,12 +507,14 @@ class Web3PredictionContract:
             return []
 
         results = self._batch_eth_calls(encoded)
+        # Derive output types from the ABI (SSOT) rather than hand-writing
+        # them here. getUserRounds returns (uint256[], uint256).
+        user_rounds_types = derive_abi_output_types(self._abi_raw, "getUserRounds")
         all_epochs: list[int] = []
         for raw in results:
             if raw is None:
                 continue
-            # Decode using the contract's ABI: returns (uint256[], uint256)
-            decoded = self._w3.codec.decode(["uint256[]", "uint256"], raw)
+            decoded = self._w3.codec.decode(user_rounds_types, raw)
             all_epochs.extend(int(x) for x in decoded[0])
         return all_epochs
 
@@ -469,20 +527,22 @@ class Web3PredictionContract:
             self._contract.functions.rounds(int(e))._encode_transaction_data()
             for e in epochs
         ]
+        # Derive output types from the ABI (SSOT). rounds() returns a 14-
+        # field tuple per abi/prediction_v2_abi.json:
+        #   epoch, startTimestamp, lockTimestamp, closeTimestamp,
+        #   lockPrice, closePrice,
+        #   lockOracleId, closeOracleId,
+        #   totalAmount, bullAmount, bearAmount,
+        #   rewardBaseCalAmount, rewardAmount,
+        #   oracleCalled
+        # close_ts lives at index 3.
+        round_types = derive_abi_output_types(self._abi_raw, "rounds")
         # Batch in chunks of 100 (BSC free RPC limit).
         out: dict[int, int | None] = {}
         for chunk_start in range(0, len(encoded), 100):
             chunk_encoded = encoded[chunk_start:chunk_start + 100]
             chunk_epochs = epochs[chunk_start:chunk_start + 100]
             results = self._batch_eth_calls(chunk_encoded)
-            # rounds() returns a large tuple; close_ts is at index 3.
-            # ABI: (uint256,uint256,uint256,uint256,int256,int256,uint256,uint256,uint256,uint256,bool)
-            round_types = [
-                "uint256", "uint256", "uint256", "uint256",
-                "int256", "int256",
-                "uint256", "uint256", "uint256", "uint256",
-                "bool",
-            ]
             for e, raw in zip(chunk_epochs, results):
                 if raw is None:
                     out[int(e)] = None
@@ -536,12 +596,20 @@ class Web3PredictionContract:
             chunk = encoded[chunk_start:chunk_start + 100]
             all_results.extend(self._batch_eth_calls(chunk))
 
+        # Derive output types from the ABI (SSOT). claimable() and
+        # refundable() both return a single bool; hand-coded ``["bool"]``
+        # would be functionally equivalent today but goes through the same
+        # SSOT helper as the wider-tuple decoders for consistency, so
+        # nothing in this module hand-declares types anymore.
+        claimable_types = derive_abi_output_types(self._abi_raw, "claimable")
+        refundable_types = derive_abi_output_types(self._abi_raw, "refundable")
+
         out: dict[int, tuple[bool, bool]] = {}
         for i, e in enumerate(epochs):
             c_raw = all_results[i * 2]
             r_raw = all_results[i * 2 + 1]
-            c = bool(self._w3.codec.decode(["bool"], c_raw)[0]) if c_raw else False
-            r = bool(self._w3.codec.decode(["bool"], r_raw)[0]) if r_raw else False
+            c = bool(self._w3.codec.decode(claimable_types, c_raw)[0]) if c_raw else False
+            r = bool(self._w3.codec.decode(refundable_types, r_raw)[0]) if r_raw else False
             out[int(e)] = (c, r)
         return out
 
