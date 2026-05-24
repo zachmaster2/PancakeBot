@@ -4,12 +4,9 @@ Install the PancakeBotLive and PancakeBotDry Windows services + configure SCM
 recovery actions.
 
 .DESCRIPTION
-Replaces the legacy schtask-based supervisor architecture
-(scripts/install_supervisor_schtasks.ps1) with real Windows Service
-semantics. The legacy schtasks are NOT removed by this script — see
-scripts/uninstall_old_supervisor.ps1 for that, which is intended to run
-after the new services have been validated for at least a week of
-soak time.
+Installs the PancakeBotLive + PancakeBotDry Windows Services that supervise
+the live and dry trading bots. Replaced the legacy schtask-based supervisor
+architecture on 2026-05-23.
 
 Behavior:
   1. Registers PancakeBotLive and PancakeBotDry with the SCM via pywin32.
@@ -186,7 +183,3 @@ Write-Host "Next steps:" -ForegroundColor Yellow
 Write-Host "  scripts\enable_live.ps1   # flip to Automatic + start (live mode)"
 Write-Host "  scripts\enable_dry.ps1    # flip to Automatic + start (dry mode)"
 Write-Host ""
-Write-Host "Legacy schtasks (PancakeBotSupervisor{Dry,Live}) are NOT touched by"
-Write-Host "this installer. Disable them via Disable-ScheduledTask, then delete"
-Write-Host "with scripts\uninstall_old_supervisor.ps1 once the new services"
-Write-Host "have been validated."
