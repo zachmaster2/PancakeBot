@@ -6,13 +6,15 @@ from pathlib import Path
 from pancakebot.backtest.runner import run_backtest
 from pancakebot.config import BacktestConfig, load_app_config, load_env, require_env
 from pancakebot.constants import (
-    BNB_WEI,
     EXPECTED_CHAIN_ID,
     PREDICTION_V2_GRAPH_ENDPOINT,
     WRITE_PATH_RPC_TIMEOUT_SECONDS,
     WRITE_PATH_RPC_URLS,
 )
-from pancakebot.market_data.contract_constants import load_contract_constants
+from pancakebot.market_data.contract_constants import (
+    fetch_and_save_contract_constants,
+    load_contract_constants,
+)
 from pancakebot.market_data.okx_client import OkxClient
 from pancakebot.strategy.momentum_gate import MomentumGate, MomentumGateConfig
 from pancakebot.market_data.round_store import ClosedRoundsStore
@@ -20,7 +22,6 @@ from pancakebot.market_data.graph_client import GraphClient
 from pancakebot.chain.rpc_pool import choose_rpc_url
 from pancakebot.chain.contract_config import Web3ContractConfig
 from pancakebot.chain.prediction_contract import Web3PredictionContract
-from pancakebot.market_data.contract_constants import ContractConstants, save_contract_constants
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot.runtime import engine
 from pancakebot.market_data.sync import sync_runtime_market_data
@@ -115,6 +116,35 @@ def run_from_config(
 
     if sync:
         load_env()
+
+        # Bootstrap: refresh ``var/contract_constants.json`` from chain
+        # BEFORE the Graph parser tries to load it. ``graph_client.py``'s
+        # ``_parse_round`` calls ``load_contract_constants()`` for every
+        # round to compute lock/close timestamps; without this step,
+        # --sync from a clean state raises ``contract_constants_cache_missing``
+        # — the original bootstrap bug. Read-only contract (empty private
+        # key) since --sync never signs transactions.
+        info("START", "refreshing contract_constants cache from chain")
+        sync_rpc_url = choose_rpc_url(
+            WRITE_PATH_RPC_URLS,
+            expected_chain_id=int(EXPECTED_CHAIN_ID),
+            timeout_seconds=int(WRITE_PATH_RPC_TIMEOUT_SECONDS),
+        )
+        sync_contract_cfg = Web3ContractConfig(
+            rpc_url=sync_rpc_url,
+            rpc_urls=tuple(WRITE_PATH_RPC_URLS),
+            abi_json_path=paths.ABI_JSON_PATH,
+            private_key="",
+        )
+        sync_contract = Web3PredictionContract(sync_contract_cfg)
+        _cc = fetch_and_save_contract_constants(sync_contract)
+        info(
+            "DONE",
+            f"contract_constants cached: min_bet={_cc.min_bet_amount_bnb} BNB "
+            f"treasury_fee={_cc.treasury_fee_fraction} "
+            f"interval={_cc.interval_seconds}s buffer={_cc.buffer_seconds}s",
+        )
+
         graph_api_key = require_env("THE_GRAPH_API_KEY")
         graph = GraphClient(endpoint=PREDICTION_V2_GRAPH_ENDPOINT, api_key=graph_api_key)
         round_store = ClosedRoundsStore(paths.CLOSED_ROUNDS_PATH)
@@ -170,18 +200,14 @@ def run_from_config(
     )
     contract = Web3PredictionContract(contract_cfg)
 
-    treasury_fee_fraction = contract.treasury_fee_rate()
-    min_bet_amount_bnb = float(contract.min_bet_amount()) / float(BNB_WEI)
-    interval_seconds = contract.interval_seconds()
-    buffer_seconds = contract.buffer_seconds()
-    save_contract_constants(
-        constants=ContractConstants(
-            min_bet_amount_bnb=min_bet_amount_bnb,
-            treasury_fee_fraction=treasury_fee_fraction,
-            interval_seconds=interval_seconds,
-            buffer_seconds=buffer_seconds,
-        )
-    )
+    # Fetch contract constants from chain and persist via the shared
+    # helper (same path --sync uses, so the cache stays consistent
+    # across modes).
+    _cc = fetch_and_save_contract_constants(contract)
+    treasury_fee_fraction = _cc.treasury_fee_fraction
+    min_bet_amount_bnb = _cc.min_bet_amount_bnb
+    interval_seconds = _cc.interval_seconds
+    buffer_seconds = _cc.buffer_seconds
 
     okx_client = OkxClient(timeout_seconds=10.0)
     okx_client.warmup()
