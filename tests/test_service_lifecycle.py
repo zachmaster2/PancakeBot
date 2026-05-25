@@ -551,3 +551,156 @@ time.sleep(0.5)
             f"child pid={child_pid} survived 2s after supervisor exit — "
             f"KILL_ON_JOB_CLOSE did not work"
         )
+
+
+# ---------------------------------------------------------------------------
+# _handle_unhealthy SCM state regression — 2026-05-24 StopPending bug
+# ---------------------------------------------------------------------------
+# Backstory: _stop_bot_child reports SERVICE_STOP_PENDING while reaping a
+# dead bot (needed so SCM's 30s stop-deadline doesn't fire mid-reap).
+# Without an explicit restore-to-RUNNING at the end of _handle_unhealthy,
+# SCM was permanently stuck in StopPending after the FIRST STALE-triggered
+# respawn — caught over the weekend when Get-Service showed StopPending
+# despite the bot being alive + supervisor functional.
+# Fix adds a try/finally in _handle_unhealthy that restores SERVICE_RUNNING
+# on every exit path (suppressed/respawn-success/spawn-failed), guarded by
+# self._stop_requested to avoid racing genuine SvcStop.
+
+def _make_fake_service_instance(svc_name="PancakeBotTest", mode="live", stop_requested=False):
+    """Build a _PancakeBotServiceBase without invoking pywin32 __init__
+    (ServiceFramework needs SCM context which we don't have in tests)."""
+    from pancakebot.service.common import _PancakeBotServiceBase
+    svc = _PancakeBotServiceBase.__new__(_PancakeBotServiceBase)
+    svc._MODE = mode
+    svc._OTHER_SERVICE = "PancakeBotDry" if mode == "live" else "PancakeBotLive"
+    svc._svc_name_ = svc_name
+    svc._stop_requested = stop_requested
+    svc._bot_proc = None
+    svc._bot_started_at = None
+    return svc
+
+
+def _mock_supervision_and_notifications(monkeypatch, fast_count=0, slow_count=0):
+    monkeypatch.setattr(supervision, "read_restart_history", lambda p: [])
+    monkeypatch.setattr(supervision, "prune_history", lambda h, now, w: h)
+    monkeypatch.setattr(supervision, "count_within",
+                        lambda h, now, w: fast_count if w < 3600 else slow_count)
+    monkeypatch.setattr(supervision, "write_restart_history", lambda p, h: None)
+    monkeypatch.setattr(notifications, "notify", lambda **kw: "DISABLED")
+
+
+def test_handle_unhealthy_restores_running_after_successful_respawn(monkeypatch, tmp_path):
+    """The exact regression scenario: STALE detected -> _stop_bot_child
+    (pushes STOP_PENDING) -> _spawn_bot_child (success) -> finally restores
+    SERVICE_RUNNING. Last ReportServiceStatus must be SERVICE_RUNNING."""
+    import win32service
+    svc = _make_fake_service_instance()
+    _mock_supervision_and_notifications(monkeypatch)
+
+    status_log = []
+    svc.ReportServiceStatus = lambda s: status_log.append(s)
+
+    # _stop_bot_child stub: simulate what the real one does to SCM
+    def stub_stop(reason):
+        svc.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+        svc._bot_proc = None
+        svc._bot_started_at = None
+    svc._stop_bot_child = stub_stop
+    # _spawn_bot_child stub: simulate a successful spawn
+    class FakeProc:
+        pid = 12345
+    def stub_spawn(art):
+        svc._bot_proc = FakeProc()
+        svc._bot_started_at = time.time()
+    svc._spawn_bot_child = stub_spawn
+    svc._archive_stale_crash = lambda crash: None
+
+    art = _make_mode_tree(tmp_path, "live")
+    svc._handle_unhealthy("STALE", {}, art)
+
+    assert win32service.SERVICE_STOP_PENDING in status_log, \
+        "_stop_bot_child stub should have logged STOP_PENDING"
+    assert status_log[-1] == win32service.SERVICE_RUNNING, \
+        f"last ReportServiceStatus must be SERVICE_RUNNING, got {status_log[-1]}; full: {status_log}"
+
+
+def test_handle_unhealthy_restores_running_after_fast_crashloop_suppression(monkeypatch, tmp_path):
+    """Even on the fast-crashloop suppression branch (no respawn attempted),
+    the finally block must restore SERVICE_RUNNING so SCM doesn't drift if
+    a prior respawn left it in STOP_PENDING."""
+    import win32service
+    svc = _make_fake_service_instance()
+    _mock_supervision_and_notifications(monkeypatch, fast_count=10)  # well past _FAST_RESTART_MAX=3
+
+    status_log = []
+    svc.ReportServiceStatus = lambda s: status_log.append(s)
+    svc._stop_bot_child = lambda reason: None
+    svc._spawn_bot_child = lambda art: None
+    svc._archive_stale_crash = lambda crash: None
+
+    art = _make_mode_tree(tmp_path, "live")
+    svc._handle_unhealthy("STALE", {}, art)
+
+    assert status_log[-1] == win32service.SERVICE_RUNNING, \
+        f"fast-suppress path must still end with SERVICE_RUNNING; got {status_log}"
+
+
+def test_handle_unhealthy_restores_running_after_spawn_failure(monkeypatch, tmp_path):
+    """If _spawn_bot_child raises, supervisor is still alive and will retry
+    next tick — SCM must reflect that with SERVICE_RUNNING, not stay in
+    the STOP_PENDING set by the preceding _stop_bot_child."""
+    import win32service
+    svc = _make_fake_service_instance()
+    _mock_supervision_and_notifications(monkeypatch)
+
+    status_log = []
+    svc.ReportServiceStatus = lambda s: status_log.append(s)
+
+    def stub_stop(reason):
+        svc.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+        svc._bot_proc = None
+    svc._stop_bot_child = stub_stop
+    def stub_spawn_fail(art):
+        raise RuntimeError("simulated spawn failure")
+    svc._spawn_bot_child = stub_spawn_fail
+    svc._archive_stale_crash = lambda crash: None
+
+    art = _make_mode_tree(tmp_path, "live")
+    svc._handle_unhealthy("STALE", {}, art)  # must not raise
+
+    assert win32service.SERVICE_STOP_PENDING in status_log
+    assert status_log[-1] == win32service.SERVICE_RUNNING, \
+        f"spawn-failed path must still end with SERVICE_RUNNING; got {status_log}"
+
+
+def test_handle_unhealthy_does_NOT_restore_running_when_stop_requested(monkeypatch, tmp_path):
+    """Race protection: if SvcStop was called (sets _stop_requested=True)
+    concurrently with _handle_unhealthy, the finally block must NOT flip
+    SCM back to SERVICE_RUNNING — the framework will report STOPPED when
+    SvcDoRun returns, and we don't want to fight that."""
+    import win32service
+    svc = _make_fake_service_instance(stop_requested=True)
+    _mock_supervision_and_notifications(monkeypatch)
+
+    status_log = []
+    svc.ReportServiceStatus = lambda s: status_log.append(s)
+
+    def stub_stop(reason):
+        svc.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+        svc._bot_proc = None
+    svc._stop_bot_child = stub_stop
+    class FakeProc:
+        pid = 12345
+    def stub_spawn(art):
+        svc._bot_proc = FakeProc()
+        svc._bot_started_at = time.time()
+    svc._spawn_bot_child = stub_spawn
+    svc._archive_stale_crash = lambda crash: None
+
+    art = _make_mode_tree(tmp_path, "live")
+    svc._handle_unhealthy("STALE", {}, art)
+
+    # The finally block's guard should have skipped the RUNNING report.
+    # Last status is therefore the STOP_PENDING from _stop_bot_child.
+    assert win32service.SERVICE_RUNNING not in status_log, \
+        f"finally must not flip to RUNNING when _stop_requested=True; got {status_log}"

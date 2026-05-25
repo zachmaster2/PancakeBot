@@ -485,67 +485,94 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
     # -- Restart-on-unhealthy (crashloop limiter) --------------------------
 
     def _handle_unhealthy(self, status: str, fields: dict[str, Any], art: dict[str, Path]) -> None:
-        """Restart the bot, applying fast/slow crashloop limits."""
-        now = time.time()
-        history = supervision.read_restart_history(art["restart_history"])
-        history = supervision.prune_history(history, now, _SLOW_RESTART_WINDOW_S)
+        """Restart the bot, applying fast/slow crashloop limits.
 
-        fast_count = supervision.count_within(history, now, _FAST_RESTART_WINDOW_S)
-        if fast_count >= _FAST_RESTART_MAX:
-            supervision.write_restart_history(art["restart_history"], history)
-            notifications.notify(
-                mode=self._MODE,
-                kind="SUPPRESSED_FAST_CRASHLOOP",
-                fields=fields,
-                art=art,
-                detail=f"{fast_count} restarts in {_FAST_RESTART_WINDOW_S/60:.0f}min "
-                f"≥ {_FAST_RESTART_MAX}; not respawning",
-            )
-            # Don't spawn. Loop will keep polling — eventually the fast window
-            # clears and we'll retry.
-            return
+        Wraps the whole body in try/finally so SCM is restored to
+        ``SERVICE_RUNNING`` on EVERY exit path. ``_stop_bot_child`` pushes
+        SCM to ``SERVICE_STOP_PENDING`` while it reaps the dead bot
+        (necessary to keep SCM's stop-deadline from firing); without an
+        explicit restore-to-RUNNING here, SCM would be permanently stuck
+        in StopPending while the supervisor keeps happily supervising
+        — caught 2026-05-24 weekend when 4 STALE-triggered respawns
+        left ``Get-Service PancakeBotLive`` reporting StopPending despite
+        the bot being alive and the supervisor functional.
 
-        slow_count = supervision.count_within(history, now, _SLOW_RESTART_WINDOW_S)
-        escalate_slow = slow_count >= _SLOW_RESTART_MAX
-
-        # Notify on the underlying state (STALE/CRASHED/DOWN) BEFORE restart.
-        notifications.notify(mode=self._MODE, kind=status, fields=fields, art=art)
-
-        # Drain dead child, archive crash, spawn new.
-        self._stop_bot_child(reason=f"unhealthy:{status}")
-        self._archive_stale_crash(art["crash"])
-
+        Guarded by ``not self._stop_requested`` so we don't race SvcStop
+        when both fire simultaneously: if SvcStop has begun (it's already
+        signaled the stop event), the supervisor is genuinely shutting
+        down and we should let it stay in STOP_PENDING.
+        """
         try:
-            self._spawn_bot_child(art)
-            new_pid = self._bot_proc.pid if self._bot_proc else None
-        except Exception as e:
-            servicemanager.LogErrorMsg(
-                f"{self._svc_name_}: respawn failed: {e!r}"
-            )
-            notifications.notify(
-                mode=self._MODE, kind="SPAWN_FAILED",
-                fields={"spawn_error": f"{type(e).__name__}: {e}"},
-                art=art,
-            )
-            return
+            now = time.time()
+            history = supervision.read_restart_history(art["restart_history"])
+            history = supervision.prune_history(history, now, _SLOW_RESTART_WINDOW_S)
 
-        history.append({
-            "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "ts_wall": now,
-            "trigger": status,
-            "new_pid": new_pid,
-        })
-        supervision.write_restart_history(art["restart_history"], history)
+            fast_count = supervision.count_within(history, now, _FAST_RESTART_WINDOW_S)
+            if fast_count >= _FAST_RESTART_MAX:
+                supervision.write_restart_history(art["restart_history"], history)
+                notifications.notify(
+                    mode=self._MODE,
+                    kind="SUPPRESSED_FAST_CRASHLOOP",
+                    fields=fields,
+                    art=art,
+                    detail=f"{fast_count} restarts in {_FAST_RESTART_WINDOW_S/60:.0f}min "
+                    f"≥ {_FAST_RESTART_MAX}; not respawning",
+                )
+                # Don't spawn. Loop will keep polling — eventually the fast window
+                # clears and we'll retry.
+                return
 
-        if escalate_slow:
-            notifications.notify(
-                mode=self._MODE,
-                kind="SLOW_CRASHLOOP_WARNING",
-                fields=fields,
-                art=art,
-                detail=f"{slow_count} restarts in {_SLOW_RESTART_WINDOW_S/3600:.0f}h "
-                f"≥ {_SLOW_RESTART_MAX}",
-            )
+            slow_count = supervision.count_within(history, now, _SLOW_RESTART_WINDOW_S)
+            escalate_slow = slow_count >= _SLOW_RESTART_MAX
+
+            # Notify on the underlying state (STALE/CRASHED/DOWN) BEFORE restart.
+            notifications.notify(mode=self._MODE, kind=status, fields=fields, art=art)
+
+            # Drain dead child, archive crash, spawn new.
+            self._stop_bot_child(reason=f"unhealthy:{status}")
+            self._archive_stale_crash(art["crash"])
+
+            try:
+                self._spawn_bot_child(art)
+                new_pid = self._bot_proc.pid if self._bot_proc else None
+            except Exception as e:
+                servicemanager.LogErrorMsg(
+                    f"{self._svc_name_}: respawn failed: {e!r}"
+                )
+                notifications.notify(
+                    mode=self._MODE, kind="SPAWN_FAILED",
+                    fields={"spawn_error": f"{type(e).__name__}: {e}"},
+                    art=art,
+                )
+                return
+
+            history.append({
+                "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "ts_wall": now,
+                "trigger": status,
+                "new_pid": new_pid,
+            })
+            supervision.write_restart_history(art["restart_history"], history)
+
+            if escalate_slow:
+                notifications.notify(
+                    mode=self._MODE,
+                    kind="SLOW_CRASHLOOP_WARNING",
+                    fields=fields,
+                    art=art,
+                    detail=f"{slow_count} restarts in {_SLOW_RESTART_WINDOW_S/3600:.0f}h "
+                    f"≥ {_SLOW_RESTART_MAX}",
+                )
+        finally:
+            # Restore SERVICE_RUNNING after _stop_bot_child's transient
+            # STOP_PENDING. Skipped when we're already in SvcStop (race
+            # protection: if SvcStop was called, _stop_requested is True
+            # and the loop should end with the framework reporting STOPPED).
+            if not self._stop_requested:
+                try:
+                    self.ReportServiceStatus(win32service.SERVICE_RUNNING)
+                except Exception:
+                    pass
 
     # -- Crash artifact archival ------------------------------------------
 
