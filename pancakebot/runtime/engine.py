@@ -1232,6 +1232,21 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
         if locked_rd.lock_ts <= 0:
             warn("RETRY", f"epoch_handshake: locked_lock_ts_zero attempt={idx}")
             continue
+        # Step 27e: also retry on the two other zero-state conditions that
+        # appear during the fresh-spawn-during-round-transition window
+        # (executeRound() has incremented currentEpoch but not yet written
+        # lock_price for the new locked epoch / lock_ts for the new open
+        # epoch). _startup_handshake_with_retry wraps this with a longer
+        # ~35s budget; this short-budget guard catches mid-iteration recurrences.
+        if (
+            locked_rd.lock_price_usd is None
+            or locked_rd.lock_price_usd <= 0.0
+        ):
+            warn("RETRY", f"epoch_handshake: locked_lock_price_zero attempt={idx}")
+            continue
+        if open_rd.lock_ts <= 0:
+            warn("RETRY", f"epoch_handshake: open_lock_ts_zero attempt={idx}")
+            continue
 
         locked_round = Round(
             epoch=locked_epoch,

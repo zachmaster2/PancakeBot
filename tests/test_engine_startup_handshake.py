@@ -1,10 +1,17 @@
-"""Tests for ``engine._startup_handshake_with_retry``.
+"""Tests for ``engine._startup_handshake_with_retry`` and the
+zero-state retry guards inside ``engine._epoch_handshake`` itself.
 
 Step 27d: defensive retry wrapper that absorbs the fresh-spawn race
-after a STALE-respawn during a round transition window. The chain may
-briefly report ``locked.lock_price == 0`` or ``open.lock_at == 0``
+after a supervisor respawn during a round transition window. The chain
+may briefly report ``locked.lock_price == 0`` or ``open.lock_at == 0``
 before ``executeRound()`` settles the new values; without this wrapper
 ``_run_one_iteration`` would crash on the unsettled state.
+
+Step 27e-D: defense-in-depth — the bare ``_epoch_handshake`` also
+retries on the two non-``lock_ts`` zero-state conditions
+(``locked.lock_price_usd <= 0`` and ``open.lock_ts <= 0``) within its
+own RETRY_BACKOFF_SECONDS budget. This catches mid-iteration recurrences;
+the startup wrapper handles the longer fresh-spawn window.
 """
 from __future__ import annotations
 
@@ -18,9 +25,30 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from pancakebot.chain.prediction_contract import RoundData  # noqa: E402
 from pancakebot.runtime import engine  # noqa: E402
 from pancakebot.types import Round  # noqa: E402
 from pancakebot.util import InvariantError  # noqa: E402
+
+
+def _make_round_data(
+    *,
+    epoch: int,
+    start_ts: int = 1_700_000_000,
+    lock_ts: int = 1_700_000_300,
+    lock_price_usd: float = 350.0,
+) -> RoundData:
+    return RoundData(
+        epoch=epoch,
+        start_ts=start_ts,
+        lock_ts=lock_ts,
+        close_ts=lock_ts + 300,
+        lock_price_usd=lock_price_usd,
+        close_price_usd=0.0,
+        bull_amount_wei=0,
+        bear_amount_wei=0,
+        oracle_called=False,
+    )
 
 
 def _valid_handshake_tuple(
@@ -158,3 +186,81 @@ def test_startup_handshake_deadline_boundary():
 
     # First check at 1034.999 was below deadline → exactly one sleep occurred.
     assert m_sleep.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Step 27e-D: zero-state retry guards inside _epoch_handshake itself
+# ---------------------------------------------------------------------------
+
+
+def _make_handshake_cfg(contract: mock.Mock) -> mock.Mock:
+    return mock.Mock(contract=contract)
+
+
+def test_epoch_handshake_retries_on_locked_lock_price_zero():
+    """First attempt: locked_rd.lock_price_usd == 0 → retry path triggers.
+    Second attempt: full settled state → returns successfully."""
+    locked_unsettled = _make_round_data(epoch=100, lock_price_usd=0.0)
+    locked_settled = _make_round_data(epoch=100, lock_price_usd=350.0)
+    open_settled = _make_round_data(
+        epoch=101,
+        start_ts=1_700_000_300,
+        lock_ts=1_700_000_600,
+    )
+
+    contract = mock.Mock()
+    contract.current_epoch.return_value = 101
+    contract.round_data.side_effect = [
+        locked_unsettled,  # attempt 1, locked
+        open_settled,      # attempt 1, open
+        locked_settled,    # attempt 2, locked
+        open_settled,      # attempt 2, open
+    ]
+    cfg = _make_handshake_cfg(contract)
+
+    with mock.patch("pancakebot.runtime.engine.sleep_seconds") as m_sleep:
+        locked_r, open_r, ep, open_rd = engine._epoch_handshake(cfg)
+
+    assert ep == 101
+    assert locked_r.lock_price == 350.0
+    assert int(open_r.lock_at) == 1_700_000_600
+    assert open_rd is open_settled
+    # Exactly one retry → one backoff sleep (RETRY_BACKOFF_SECONDS[0] = 2s).
+    assert m_sleep.call_count == 1
+    assert m_sleep.call_args_list[0].args == (2,)
+
+
+def test_epoch_handshake_retries_on_open_lock_ts_zero():
+    """First attempt: open_rd.lock_ts == 0 → retry path triggers.
+    Second attempt: full settled state → returns successfully."""
+    locked_settled = _make_round_data(epoch=100, lock_price_usd=350.0)
+    open_unsettled = _make_round_data(
+        epoch=101,
+        start_ts=1_700_000_300,
+        lock_ts=0,
+    )
+    open_settled = _make_round_data(
+        epoch=101,
+        start_ts=1_700_000_300,
+        lock_ts=1_700_000_600,
+    )
+
+    contract = mock.Mock()
+    contract.current_epoch.return_value = 101
+    contract.round_data.side_effect = [
+        locked_settled,    # attempt 1, locked
+        open_unsettled,    # attempt 1, open
+        locked_settled,    # attempt 2, locked
+        open_settled,      # attempt 2, open
+    ]
+    cfg = _make_handshake_cfg(contract)
+
+    with mock.patch("pancakebot.runtime.engine.sleep_seconds") as m_sleep:
+        locked_r, open_r, ep, open_rd = engine._epoch_handshake(cfg)
+
+    assert ep == 101
+    assert locked_r.lock_price == 350.0
+    assert int(open_r.lock_at) == 1_700_000_600
+    assert open_rd is open_settled
+    assert m_sleep.call_count == 1
+    assert m_sleep.call_args_list[0].args == (2,)
