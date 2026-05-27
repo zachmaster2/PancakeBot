@@ -129,9 +129,6 @@ def main() -> None:
         # SystemExit still propagate cleanly without being treated as crashes.
         # Dry/live only -- backtest/sync run to completion or fail fast.
         if crash_path is not None:
-            # last_epoch was previously read from heartbeat.json (removed
-            # 2026-05-27 Step 27a); crash report now omits it. The exception
-            # traceback still includes the round context if relevant.
             write_crash(crash_path, e, last_epoch=None)
         raise
 
