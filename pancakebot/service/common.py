@@ -292,11 +292,11 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
                 continue
 
             if status in ("CRASHED", "DOWN"):
-                # STALE removed from trigger list 2026-05-27 (Step 27a).
-                # Heartbeat-staleness no longer initiates restarts; only
-                # actual process death (CRASHED with crash.json present, or
-                # DOWN = process dead with no signal) does. classify_running_bot
-                # never returns "STALE" anymore.
+                # Only process death triggers respawn (Step 27a):
+                # CRASHED = process dead with crash.json present, DOWN =
+                # process dead without crash signal. Heartbeat-staleness
+                # was removed as a respawn trigger because it produced
+                # too many false positives from transient network I/O.
                 self._handle_unhealthy(status, fields, art)
                 continue
 
@@ -496,7 +496,7 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
         (necessary to keep SCM's stop-deadline from firing); without an
         explicit restore-to-RUNNING here, SCM would be permanently stuck
         in StopPending while the supervisor keeps happily supervising
-        — caught 2026-05-24 weekend when 4 STALE-triggered respawns
+        — caught 2026-05-24 weekend when 4 respawn-triggered restarts
         left ``Get-Service PancakeBotLive`` reporting StopPending despite
         the bot being alive and the supervisor functional.
 

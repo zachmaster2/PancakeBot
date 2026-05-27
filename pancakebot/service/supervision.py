@@ -303,7 +303,7 @@ def classify_state(
         if legacy_pid is not None:
             fields.clear()
             fields["pid"] = legacy_pid
-            fields["note"] = "legacy_no_pid_file"
+            fields["note"] = "legacy_no_instrumentation"
             return "UNINSTRUMENTED", fields
 
     # 5. DOWN

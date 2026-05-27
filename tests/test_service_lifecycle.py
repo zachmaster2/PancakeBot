@@ -141,7 +141,7 @@ def test_classify_uninstrumented_with_legacy_bot(fake_artifacts, monkeypatch):
     status, fields = supervision.classify_state("live")
     assert status == "UNINSTRUMENTED"
     assert fields["pid"] == 12345
-    assert fields["note"] == "legacy_no_pid_file"
+    assert fields["note"] == "legacy_no_instrumentation"
 
 
 # ---------------------------------------------------------------------------
@@ -513,8 +513,8 @@ time.sleep(0.5)
 # Backstory: _stop_bot_child reports SERVICE_STOP_PENDING while reaping a
 # dead bot (needed so SCM's 30s stop-deadline doesn't fire mid-reap).
 # Without an explicit restore-to-RUNNING at the end of _handle_unhealthy,
-# SCM was permanently stuck in StopPending after the FIRST STALE-triggered
-# respawn — caught over the weekend when Get-Service showed StopPending
+# SCM was permanently stuck in StopPending after the first respawn-triggered
+# restart — caught over the weekend when Get-Service showed StopPending
 # despite the bot being alive + supervisor functional.
 # Fix adds a try/finally in _handle_unhealthy that restores SERVICE_RUNNING
 # on every exit path (suppressed/respawn-success/spawn-failed), guarded by
@@ -544,7 +544,7 @@ def _mock_supervision_and_notifications(monkeypatch, fast_count=0, slow_count=0)
 
 
 def test_handle_unhealthy_restores_running_after_successful_respawn(monkeypatch, tmp_path):
-    """The exact regression scenario: STALE detected -> _stop_bot_child
+    """The exact regression scenario: CRASHED detected -> _stop_bot_child
     (pushes STOP_PENDING) -> _spawn_bot_child (success) -> finally restores
     SERVICE_RUNNING. Last ReportServiceStatus must be SERVICE_RUNNING."""
     import win32service
