@@ -33,17 +33,22 @@ Write-Host "[..] starting PancakeBotLive..." -ForegroundColor Yellow
 Start-Service -Name PancakeBotLive
 $svc.WaitForStatus('Running', '00:00:30')
 
-# Surface the bot child PID, not the service host PID — what operators
-# actually want to see. Heartbeat may not exist yet (first cycle ~1-2s).
+# Surface the bot child PID via Win32_Process. Service host
+# (pythonservice.exe) is the parent; its child python.exe is the actual
+# bot. Bot child may take ~1-2s to spawn after service start.
 Start-Sleep -Seconds 2
-$hb = Join-Path (Split-Path -Parent (Split-Path -Parent $PSCommandPath)) "var\live\heartbeat.json"
-if (Test-Path $hb) {
-    try {
-        $j = Get-Content $hb -Raw | ConvertFrom-Json
-        Write-Host "[ok] PancakeBotLive running (bot child pid=$($j.pid))" -ForegroundColor Green
-    } catch {
-        Write-Host "[ok] PancakeBotLive running (heartbeat not parseable yet)" -ForegroundColor Green
-    }
+$svc_cim = Get-CimInstance -ClassName Win32_Service -Filter "Name='PancakeBotLive'" -ErrorAction SilentlyContinue
+$svc_pid = if ($svc_cim) { $svc_cim.ProcessId } else { $null }
+
+if ($null -eq $svc_pid -or $svc_pid -le 0) {
+    Write-Host "[!!] PancakeBotLive Win32_Service has no ProcessId (unexpected for Running state)" -ForegroundColor Red
+    exit 1
+}
+
+$children = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$svc_pid" -ErrorAction SilentlyContinue)
+if ($children.Count -gt 0) {
+    $bot_pid = $children[0].ProcessId
+    Write-Host "[ok] PancakeBotLive running (service pid=$svc_pid, bot child pid=$bot_pid)" -ForegroundColor Green
 } else {
-    Write-Host "[ok] PancakeBotLive running (heartbeat not yet written)" -ForegroundColor Green
+    Write-Host "[ok] PancakeBotLive running (service pid=$svc_pid, bot child not yet spawned — typical for first ~1-2s)" -ForegroundColor Green
 }
