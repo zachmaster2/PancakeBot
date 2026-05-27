@@ -31,9 +31,8 @@ DRY_TRADES_PATH = "var/dry/trades.csv"
 DRY_SETTLED_EPOCHS_PATH = "var/dry/settled_epochs.txt"
 DRY_ARCHIVE_ROOT = "var/dry/archive"
 
-# Process-health artifacts (Phase 2a -- heartbeat, crash.json, PID file).
-# The runtime writes these; an out-of-process supervisor consumes them.
-DRY_HEARTBEAT_PATH = "var/dry/heartbeat.json"
+# Process-health artifacts (crash.json + PID file). Heartbeat infrastructure
+# removed 2026-05-27 (Step 27a); supervisor uses Popen.poll() for liveness.
 DRY_CRASH_PATH = "var/dry/crash.json"
 DRY_PID_PATH = "var/dry/bot.pid"
 
@@ -48,8 +47,7 @@ LIVE_CLAIM_CURSOR_PATH = "var/live/claim_cursor.txt"
 LIVE_CYCLE_AUDIT_PATH = "var/live/cycle_audit.csv"
 LIVE_TRADES_PATH = "var/live/trades.csv"
 
-# Process-health artifacts (live mirror of the dry trio above).
-LIVE_HEARTBEAT_PATH = "var/live/heartbeat.json"
+# Process-health artifacts (live mirror of the dry pair above).
 LIVE_CRASH_PATH = "var/live/crash.json"
 LIVE_PID_PATH = "var/live/bot.pid"
 

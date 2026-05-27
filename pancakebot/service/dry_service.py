@@ -39,8 +39,8 @@ class PancakeBotDryService(_PancakeBotServiceBase):
         "Supervises the PancakeBot dry-trading bot (python run.py --dry). "
         "Yields to live-priority: refuses to start if PancakeBotLive is running. "
         "Otherwise spawns the bot child on service start, monitors "
-        "heartbeat/PID/crash artifacts, restarts on STALE/CRASHED/DOWN, sends "
-        "Discord alerts on state transitions."
+        "Popen.poll() + crash.json, restarts on CRASHED/DOWN, sends "
+        "Discord alerts on restart patterns."
     )
     _MODE = "dry"
     _OTHER_SERVICE = "PancakeBotLive"

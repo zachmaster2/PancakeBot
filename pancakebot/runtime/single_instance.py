@@ -85,7 +85,7 @@ def find_duplicate_bots():
 
     Both ``--dry`` and ``--live`` count as duplicates regardless of the
     caller's own mode -- they share dry/live state file paths in
-    ``var/`` (bankroll, heartbeat, captures) and would clash on writes.
+    ``var/`` (bankroll, captures) and would clash on writes.
 
     Ancestor PIDs are excluded because the ``py.exe`` launcher (or any
     similar wrapper) becomes the parent of the actual ``python.exe``

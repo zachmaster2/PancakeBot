@@ -16,8 +16,8 @@ Key behaviors:
 - Stop signaling: ``Popen.terminate()`` (Windows: ``TerminateProcess``).
   Services run console-less, so ``CTRL_BREAK_EVENT`` is not viable
   without ``AllocConsole`` ceremony. The bot's atomic-write state means
-  nothing meaningful is lost by hard-kill: heartbeat, PID file, bankroll,
-  trades.csv, crash.json all use tempfile + os.replace atomic rename.
+  nothing meaningful is lost by hard-kill: PID file, bankroll, trades.csv,
+  crash.json all use tempfile + os.replace atomic rename.
 - SCM stop grace: 20s (well under the 30s SCM default; bumps
   STOP_PENDING during the wait so SCM doesn't time out).
 - Mode mutex: SCM-state-based. Live evicts Dry on start; Dry yields to
@@ -61,7 +61,6 @@ _VENV_PYTHON = _REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 # ---------------------------------------------------------------------------
 
 _POLL_INTERVAL_S: float = 1.0
-_STALE_THRESHOLD_S: float = supervision.DEFAULT_STALE_THRESHOLD_S
 # Popen-based classifier grace (30s default — tighter than the legacy 90s
 # because we know exactly when the bot was spawned). See
 # supervision.DEFAULT_RUN_GRACE_S for rationale.
@@ -262,8 +261,8 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
 
         # Main loop: poll classify_running_bot every _POLL_INTERVAL_S until stop.
         # classify_running_bot uses Popen.poll() as the authoritative liveness
-        # signal — no filesystem race between spawn and first heartbeat write
-        # (the bug that caused the post-reboot DOWN cascade 2026-05-23).
+        # signal — no filesystem race (the bug that caused the post-reboot
+        # DOWN cascade 2026-05-23).
         while not self._stop_requested:
             rc = win32event.WaitForSingleObject(
                 self._stop_event, int(_POLL_INTERVAL_S * 1000),
@@ -281,7 +280,6 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
                     self._bot_proc,
                     self._bot_started_at,
                     art,
-                    stale_threshold_s=_STALE_THRESHOLD_S,
                     startup_grace_s=_STARTUP_GRACE_S,
                 )
             except Exception as e:
