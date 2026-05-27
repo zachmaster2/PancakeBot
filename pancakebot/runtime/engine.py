@@ -290,12 +290,12 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         f"Starting bankroll: {format_bankroll(bankroll_bnb=bankroll_bnb, bnbusd_price=bnbusd_price)}",
     )
 
-    # Step 27d: absorb fresh-spawn race after a supervisor respawn during a
-    # round transition. _run_one_iteration would otherwise crash on unsettled
-    # chain state (lock_price=0 or lock_at=0). Bounded by ~35s wall-clock
-    # deadline.
-    _startup_handshake_with_retry(cfg)
-
+    # Fresh-spawn-during-round-transition race is absorbed by the bare
+    # _epoch_handshake retry loop, which retries on all three zero-state
+    # invariants (locked.lock_ts, locked.lock_price_usd, open.lock_ts) with
+    # RETRY_BACKOFF_SECONDS sized so cumulative wait crosses
+    # buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS (~35s) by the 5th
+    # retry, with grace beyond.
     while True:
         # Per-subsystem TransientRpcError handling lives at each callsite:
         #   - _epoch_handshake: bounded local retry
@@ -1232,12 +1232,12 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
         if locked_rd.lock_ts <= 0:
             warn("RETRY", f"epoch_handshake: locked_lock_ts_zero attempt={idx}")
             continue
-        # Step 27e: also retry on the two other zero-state conditions that
-        # appear during the fresh-spawn-during-round-transition window
-        # (executeRound() has incremented currentEpoch but not yet written
-        # lock_price for the new locked epoch / lock_ts for the new open
-        # epoch). _startup_handshake_with_retry wraps this with a longer
-        # ~35s budget; this short-budget guard catches mid-iteration recurrences.
+        # Two other zero-state conditions appear during the
+        # fresh-spawn-during-round-transition window: executeRound() has
+        # incremented currentEpoch but not yet written lock_price for the
+        # new locked epoch / lock_ts for the new open epoch. The
+        # RETRY_BACKOFF_SECONDS budget is sized to span this settlement
+        # window (cumulative ~36s after the 5th retry).
         if (
             locked_rd.lock_price_usd is None
             or locked_rd.lock_price_usd <= 0.0
@@ -1271,33 +1271,6 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
         return locked_round, open_round, current_epoch, open_rd
 
     raise InvariantError("epoch_handshake_exhausted")
-
-
-def _startup_handshake_with_retry(cfg: RuntimeConfig) -> None:
-    # Defensive retry wrapper around _epoch_handshake at startup. Absorbs the
-    # fresh-spawn race after a supervisor respawn during the round transition
-    # window: when the bot spawns mid-transition, the chain may briefly report
-    # locked.lock_price == 0 or open.lock_at == 0 before executeRound() settles
-    # new values. Without this wrapper, _run_one_iteration would immediately
-    # raise locked_round_lock_price_nonpositive and crash, prompting another
-    # supervisor restart. Deadline = buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS
-    # (~35s), well past the chain-enforced settlement window.
-    deadline = time.time() + cfg.buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS
-    while True:
-        locked, open_round, _ep, _open_rd = _epoch_handshake(cfg)
-        if (
-            locked.lock_price is not None
-            and locked.lock_price > 0.0
-            and int(open_round.lock_at) > 0
-        ):
-            return
-        if time.time() >= deadline:
-            raise InvariantError(
-                "startup_handshake_exhausted_retries: "
-                f"locked.lock_price={locked.lock_price} "
-                f"open.lock_at={open_round.lock_at}"
-            )
-        sleep_seconds(2.0)
 
 
 def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int) -> None:
