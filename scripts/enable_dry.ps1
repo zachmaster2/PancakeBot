@@ -38,14 +38,18 @@ Start-Service -Name PancakeBotDry
 $svc.WaitForStatus('Running', '00:00:30')
 
 Start-Sleep -Seconds 2
-$hb = Join-Path (Split-Path -Parent (Split-Path -Parent $PSCommandPath)) "var\dry\heartbeat.json"
-if (Test-Path $hb) {
-    try {
-        $j = Get-Content $hb -Raw | ConvertFrom-Json
-        Write-Host "[ok] PancakeBotDry running (bot child pid=$($j.pid))" -ForegroundColor Green
-    } catch {
-        Write-Host "[ok] PancakeBotDry running (heartbeat not parseable yet)" -ForegroundColor Green
-    }
+$svc_cim = Get-CimInstance -ClassName Win32_Service -Filter "Name='PancakeBotDry'" -ErrorAction SilentlyContinue
+$svc_pid = if ($svc_cim) { $svc_cim.ProcessId } else { $null }
+
+if ($null -eq $svc_pid -or $svc_pid -le 0) {
+    Write-Host "[!!] PancakeBotDry Win32_Service has no ProcessId (unexpected for Running state)" -ForegroundColor Red
+    exit 1
+}
+
+$children = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$svc_pid" -ErrorAction SilentlyContinue)
+if ($children.Count -gt 0) {
+    $bot_pid = $children[0].ProcessId
+    Write-Host "[ok] PancakeBotDry running (service pid=$svc_pid, bot child pid=$bot_pid)" -ForegroundColor Green
 } else {
-    Write-Host "[ok] PancakeBotDry running (heartbeat not yet written; may have been refused by mode mutex)" -ForegroundColor Green
+    Write-Host "[ok] PancakeBotDry running (service pid=$svc_pid, no bot child — may have been refused by mode mutex OR first ~1-2s)" -ForegroundColor Green
 }
