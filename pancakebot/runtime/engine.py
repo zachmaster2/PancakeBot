@@ -290,9 +290,10 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         f"Starting bankroll: {format_bankroll(bankroll_bnb=bankroll_bnb, bnbusd_price=bnbusd_price)}",
     )
 
-    # Step 27d: absorb fresh-spawn race after STALE-respawn during round
-    # transition. _run_one_iteration would otherwise crash on unsettled chain
-    # state (lock_price=0 or lock_at=0). Bounded by ~35s wall-clock deadline.
+    # Step 27d: absorb fresh-spawn race after a supervisor respawn during a
+    # round transition. _run_one_iteration would otherwise crash on unsettled
+    # chain state (lock_price=0 or lock_at=0). Bounded by ~35s wall-clock
+    # deadline.
     _startup_handshake_with_retry(cfg)
 
     while True:
@@ -1259,7 +1260,7 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
 
 def _startup_handshake_with_retry(cfg: RuntimeConfig) -> None:
     # Defensive retry wrapper around _epoch_handshake at startup. Absorbs the
-    # fresh-spawn race after a STALE-respawn during the round transition
+    # fresh-spawn race after a supervisor respawn during the round transition
     # window: when the bot spawns mid-transition, the chain may briefly report
     # locked.lock_price == 0 or open.lock_at == 0 before executeRound() settles
     # new values. Without this wrapper, _run_one_iteration would immediately

@@ -513,8 +513,8 @@ time.sleep(0.5)
 # Backstory: _stop_bot_child reports SERVICE_STOP_PENDING while reaping a
 # dead bot (needed so SCM's 30s stop-deadline doesn't fire mid-reap).
 # Without an explicit restore-to-RUNNING at the end of _handle_unhealthy,
-# SCM was permanently stuck in StopPending after the first respawn-triggered
-# restart — caught over the weekend when Get-Service showed StopPending
+# SCM was permanently stuck in StopPending after the first respawn —
+# caught over the weekend when Get-Service showed StopPending
 # despite the bot being alive + supervisor functional.
 # Fix adds a try/finally in _handle_unhealthy that restores SERVICE_RUNNING
 # on every exit path (suppressed/respawn-success/spawn-failed), guarded by

@@ -496,8 +496,8 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
         (necessary to keep SCM's stop-deadline from firing); without an
         explicit restore-to-RUNNING here, SCM would be permanently stuck
         in StopPending while the supervisor keeps happily supervising
-        — caught 2026-05-24 weekend when 4 respawn-triggered restarts
-        left ``Get-Service PancakeBotLive`` reporting StopPending despite
+        — caught 2026-05-24 weekend when 4 respawns left
+        ``Get-Service PancakeBotLive`` reporting StopPending despite
         the bot being alive and the supervisor functional.
 
         Guarded by ``not self._stop_requested`` so we don't race SvcStop
