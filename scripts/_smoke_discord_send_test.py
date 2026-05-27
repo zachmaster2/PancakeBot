@@ -28,7 +28,7 @@ CHANNELS = [
         "emoji": ":herb:",
         "position": "Test 1/3",
         "expected_channel": "pancakebot-dry-alerts",
-        "purpose": "dry-mode alerts (STALE / CRASHED / DOWN + escalations)",
+        "purpose": "dry-mode alerts (CRASHED / DOWN + escalations)",
     },
     {
         "label": "LIVE_ALERTS",
@@ -37,7 +37,7 @@ CHANNELS = [
         "emoji": ":money_with_wings:",
         "position": "Test 2/3",
         "expected_channel": "pancakebot-live-alerts",
-        "purpose": "live-mode alerts (STALE / CRASHED / DOWN + escalations)",
+        "purpose": "live-mode alerts (CRASHED / DOWN + escalations)",
     },
     {
         "label": "GENERAL",
