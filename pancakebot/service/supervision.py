@@ -5,25 +5,26 @@ Two classifier entry points:
   classify_running_bot(proc, proc_started_at, art, ...)
       The authoritative in-loop classifier used by the Windows Service.
       Liveness is determined by ``Popen.poll()`` — zero filesystem race.
-      Heartbeat staleness only matters for hung-bot detection AFTER
-      ``startup_grace_s`` has elapsed. This is what the service's
-      supervision loop calls every tick.
+      This is what the service's supervision loop calls every tick.
 
   classify_state(mode, ...)
-      Legacy artifact-only classifier (heartbeat.json + bot.pid +
-      crash.json). Kept for first-run / no-Popen-handle use cases
-      (e.g., checking whether a bot is somehow already running outside
-      the service). Vulnerable to the post-spawn DOWN race that
-      classify_running_bot eliminates — do not use in the supervision
-      loop after the initial spawn.
+      Legacy artifact-only classifier (bot.pid + crash.json). Kept for
+      first-run / no-Popen-handle use cases (e.g., checking whether a
+      bot is somehow already running outside the service). Vulnerable
+      to the post-spawn DOWN race that classify_running_bot eliminates
+      — do not use in the supervision loop after the initial spawn.
 
 Status values returned by both:
-  UP            - bot alive, heartbeat fresh
-  STARTING      - bot alive, within startup grace, heartbeat not yet fresh
-  STALE         - bot alive, past startup grace, heartbeat stale (hung)
+  UP            - bot alive
+  STARTING      - bot alive, within startup grace
   CRASHED       - bot dead, crash.json present
   DOWN          - bot dead (or absent), no crash.json
   UNINSTRUMENTED- (classify_state only) legacy bot detected outside service
+
+Heartbeat-staleness STALE classification removed 2026-05-27 (Step 27a full
+cleanup). The 5s heartbeat-age threshold was firing on transient BSC RPC
+hedged-timeouts that auto-resolve next round (~12 false-positive restarts/24h
+with no real bot dysfunction). Process-death is the only restart trigger now.
 """
 from __future__ import annotations
 
@@ -39,18 +40,13 @@ from pancakebot import paths
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Match supervisor.py defaults exactly so behavior is unchanged across the
-# migration. Tunable per-service if we ever need to.
-DEFAULT_STALE_THRESHOLD_S: float = 5.0
-
 # Legacy artifact-classifier grace (PID-file mtime based).
 DEFAULT_STARTUP_GRACE_S: float = 90.0
 
 # New Popen-based classifier grace. Tighter than the legacy 90s because we
 # now know the bot's actual start time directly — no need to wait for a
 # PID-file write. 30s is comfortably longer than the bot's ~5s init path
-# (RPC poller + bankroll fetch + first round catch-up) so a slow startup
-# isn't classified as STALE prematurely.
+# (RPC poller + bankroll fetch + first round catch-up).
 DEFAULT_RUN_GRACE_S: float = 30.0
 
 # Retry-once backoff for transient read failures (Windows AV file-lock race,
@@ -103,7 +99,6 @@ def artifacts_for_mode(mode: str) -> dict[str, Path]:
     """
     if mode == "dry":
         return {
-            "heartbeat": _REPO_ROOT / paths.DRY_HEARTBEAT_PATH,
             "pid": _REPO_ROOT / paths.DRY_PID_PATH,
             "crash": _REPO_ROOT / paths.DRY_CRASH_PATH,
             "supervisor_log": _REPO_ROOT / "var/dry/supervisor.log",
@@ -114,7 +109,6 @@ def artifacts_for_mode(mode: str) -> dict[str, Path]:
         }
     if mode == "live":
         return {
-            "heartbeat": _REPO_ROOT / paths.LIVE_HEARTBEAT_PATH,
             "pid": _REPO_ROOT / paths.LIVE_PID_PATH,
             "crash": _REPO_ROOT / paths.LIVE_CRASH_PATH,
             "supervisor_log": _REPO_ROOT / "var/live/supervisor.log",
@@ -244,50 +238,27 @@ def find_legacy_bot_pid(mode: str) -> int | None:
 def classify_state(
     mode: str,
     *,
-    stale_threshold_s: float = DEFAULT_STALE_THRESHOLD_S,
     startup_grace_s: float = DEFAULT_STARTUP_GRACE_S,
 ) -> tuple[str, dict[str, Any]]:
     """Return (status, fields) for the given mode.
 
     Pure function. Reads filesystem artifacts and process list. Never raises;
     fields populated best-effort.
+
+    Heartbeat reads removed 2026-05-27 (Step 27a). Liveness inferred from
+    bot.pid + crash.json + process-listing only.
     """
     art = artifacts_for_mode(mode)
     now = time.time()
     fields: dict[str, Any] = {}
-
-    hb = _safe_read_json(art["heartbeat"])
-    hb_mtime = _safe_stat_mtime(art["heartbeat"])
-    hb_age: float | None = (now - hb_mtime) if hb_mtime is not None else None
 
     pid_from_file = _safe_read_pid_file(art["pid"])
     pid_file_mtime = _safe_stat_mtime(art["pid"])
     pid_file_age: float | None = (now - pid_file_mtime) if pid_file_mtime is not None else None
     pid_file_is_live = pid_from_file is not None and _pid_is_our_bot(pid_from_file, mode)
 
-    heartbeat_pid: int | None = None
-    if hb is not None:
-        raw = hb.get("pid")
-        if isinstance(raw, int):
-            heartbeat_pid = raw
-
-    if hb is not None:
-        if heartbeat_pid is not None:
-            fields["pid"] = heartbeat_pid
-        br = hb.get("bankroll_bnb")
-        if isinstance(br, (int, float)):
-            fields["bankroll"] = f"{float(br):.4f}"
-        ic = hb.get("iteration_count")
-        if isinstance(ic, int):
-            fields["iterations"] = ic
-        le = hb.get("last_epoch")
-        if isinstance(le, int):
-            fields["last_epoch"] = le
-    if heartbeat_pid is None and pid_file_is_live:
+    if pid_file_is_live:
         fields["pid"] = pid_from_file
-
-    if hb_age is not None:
-        fields["hb_age"] = f"{hb_age:.1f}s"
 
     bets = _safe_count_trades(art["trades"])
     if bets is not None:
@@ -295,34 +266,16 @@ def classify_state(
 
     # State precedence — first match wins.
 
-    # 1. UP
-    if (
-        hb is not None
-        and hb_age is not None
-        and hb_age <= stale_threshold_s
-        and heartbeat_pid is not None
-        and _pid_is_our_bot(heartbeat_pid, mode)
-    ):
+    # 1. UP — PID file points to a live process past startup grace.
+    if pid_file_is_live and pid_file_age is not None and pid_file_age > startup_grace_s:
         return "UP", fields
 
-    # 2. STARTING
-    if (
-        pid_file_is_live
-        and (hb is None or (hb_age is not None and hb_age > stale_threshold_s))
-        and pid_file_age is not None
-        and pid_file_age <= startup_grace_s
-    ):
+    # 2. STARTING — PID file points to a live process inside startup grace.
+    if pid_file_is_live and pid_file_age is not None and pid_file_age <= startup_grace_s:
         fields["since_pid_ts"] = f"{pid_file_age:.0f}s"
         return "STARTING", fields
 
-    # 3. STALE — REMOVED 2026-05-27 (Step 27a). Heartbeat-staleness no
-    # longer triggers restarts: the 5s threshold was firing on transient
-    # network I/O (BSC RPC hedged timeouts) that auto-resolves on the next
-    # round, producing 12 STALE-restarts/24h with no real-world payoff.
-    # Process-death recovery still handled below via CRASHED/DOWN. The
-    # ``hb_age`` field is still surfaced for observability.
-
-    # 4. CRASHED
+    # 3. CRASHED — process dead, crash.json present.
     crash = _safe_read_json(art["crash"])
     crash_mtime = _safe_stat_mtime(art["crash"])
     if crash is not None and crash_mtime is not None:
@@ -336,16 +289,16 @@ def classify_state(
             fields["last_epoch"] = last_epoch
         return "CRASHED", fields
 
-    # 5. UNINSTRUMENTED
-    if hb is None and not pid_file_is_live:
+    # 4. UNINSTRUMENTED — bot running outside service control.
+    if not pid_file_is_live:
         legacy_pid = find_legacy_bot_pid(mode)
         if legacy_pid is not None:
             fields.clear()
             fields["pid"] = legacy_pid
-            fields["note"] = "legacy_no_heartbeat"
+            fields["note"] = "legacy_no_pid_file"
             return "UNINSTRUMENTED", fields
 
-    # 6. DOWN
+    # 5. DOWN
     fields.clear()
     return "DOWN", fields
 
@@ -419,16 +372,12 @@ def classify_running_bot(
     proc_started_at: float | None,
     art: dict[str, Path],
     *,
-    stale_threshold_s: float = DEFAULT_STALE_THRESHOLD_S,
     startup_grace_s: float = DEFAULT_RUN_GRACE_S,
 ) -> tuple[str, dict[str, Any]]:
     """Classify the bot child using the Popen handle as the truth source.
 
     Eliminates the post-spawn DOWN race that the artifact-only classifier
-    suffers from (where a just-spawned process hasn't yet written its
-    heartbeat/PID and falls through to DOWN). ``proc.poll()`` is
-    authoritative for liveness; heartbeat staleness only matters for
-    detecting a hung-but-alive bot AFTER ``startup_grace_s``.
+    suffers from. ``proc.poll()`` is the authoritative liveness signal.
 
     Args:
         proc: the Popen object for the bot child, or None if no bot has
@@ -436,18 +385,18 @@ def classify_running_bot(
         proc_started_at: wall-clock time when proc was spawned (from
             ``time.time()``). Used for the startup-grace window.
         art: artifacts dict (from ``artifacts_for_mode``) — used to read
-            heartbeat mtime + crash.json.
-        stale_threshold_s: heartbeat-age threshold for STALE.
-        startup_grace_s: window after spawn during which a missing/stale
-            heartbeat is tolerated (STARTING, not STALE).
+            crash.json on process death.
+        startup_grace_s: window after spawn during which a slow-init bot
+            is reported as STARTING rather than UP.
 
     Returns:
-        (status, fields) where status is one of UP, STARTING, STALE,
-        CRASHED, DOWN. Fields are best-effort diagnostics.
+        (status, fields) where status is one of UP, STARTING, CRASHED, DOWN.
+        Fields are best-effort diagnostics.
+
+    Heartbeat-staleness STALE classification removed 2026-05-27 (Step 27a).
 
     Never raises.
     """
-    now = time.time()
     fields: dict[str, Any] = {}
 
     # Decide liveness from Popen — authoritative, zero race.
@@ -461,45 +410,14 @@ def classify_running_bot(
         fields["pid"] = proc.pid
 
     if proc_alive:
-        # Process is alive. Decide UP / STARTING / STALE.
         proc_uptime: float = (
-            (now - proc_started_at) if proc_started_at is not None else 0.0
+            (time.time() - proc_started_at) if proc_started_at is not None else 0.0
         )
         fields["proc_uptime"] = f"{proc_uptime:.1f}s"
 
-        hb_mtime = _safe_stat_mtime(art["heartbeat"])
-        hb_age: float | None = (now - hb_mtime) if hb_mtime is not None else None
-        if hb_age is not None:
-            fields["hb_age"] = f"{hb_age:.1f}s"
-
-        # Inside startup grace: STARTING regardless of heartbeat freshness.
-        # A just-spawned bot may take a few seconds to write its first
-        # heartbeat (RPC poller init, bankroll fetch, first round catch-up).
         if proc_uptime < startup_grace_s:
             return "STARTING", fields
 
-        # STALE check REMOVED 2026-05-27 (Step 27a). Past grace with a live
-        # Popen handle ⇒ the bot process is alive. We no longer treat a stale
-        # heartbeat as a restart trigger — the 5s threshold was firing on
-        # transient network I/O (BSC RPC hedged timeouts) that auto-resolves
-        # on the next round, costing ~12 spurious restarts/24h. Process-death
-        # recovery still handled below via CRASHED/DOWN paths. ``hb_age``
-        # remains in fields for observability.
-
-        # Past grace with alive process ⇒ healthy. Surface optional
-        # bankroll/iteration/last_epoch from heartbeat
-        # so log lines and Discord alerts have rich context.
-        hb = _safe_read_json(art["heartbeat"])
-        if hb is not None:
-            br = hb.get("bankroll_bnb")
-            if isinstance(br, (int, float)):
-                fields["bankroll"] = f"{float(br):.4f}"
-            ic = hb.get("iteration_count")
-            if isinstance(ic, int):
-                fields["iterations"] = ic
-            le = hb.get("last_epoch")
-            if isinstance(le, int):
-                fields["last_epoch"] = le
         return "UP", fields
 
     # Process is dead (or proc is None). Distinguish CRASHED (crash.json

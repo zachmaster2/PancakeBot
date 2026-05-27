@@ -13,27 +13,25 @@ from pancakebot.log import info
 from pancakebot.runtime.process_health import (
     archive_stale_crash,
     clear_pid_file,
-    read_last_heartbeat,
     write_crash,
     write_pid_file,
 )
 
 
-def _resolve_process_health_paths(dry: bool) -> tuple[Path, Path, Path]:
-    """Return (pid_path, heartbeat_path, crash_path) for the given mode.
+def _resolve_process_health_paths(dry: bool) -> tuple[Path, Path]:
+    """Return (pid_path, crash_path) for the given mode.
 
     Only meaningful for dry/live (backtest and sync don't need runtime health
-    artifacts). Live-mode triple mirrors the dry-mode layout under var/live/.
+    artifacts). Live-mode pair mirrors the dry-mode layout under var/live/.
+    Heartbeat infra removed 2026-05-27 (Step 27a).
     """
     if dry:
         return (
             Path(paths.DRY_PID_PATH),
-            Path(paths.DRY_HEARTBEAT_PATH),
             Path(paths.DRY_CRASH_PATH),
         )
     return (
         Path(paths.LIVE_PID_PATH),
-        Path(paths.LIVE_HEARTBEAT_PATH),
         Path(paths.LIVE_CRASH_PATH),
     )
 
@@ -98,10 +96,9 @@ def main() -> None:
     # + catch any top-level exception into crash.json before re-raising. Only
     # for dry/live -- backtest and sync complete quickly without supervision.
     pid_path: Path | None = None
-    heartbeat_path: Path | None = None
     crash_path: Path | None = None
     if args.dry or args.live:
-        pid_path, heartbeat_path, crash_path = _resolve_process_health_paths(args.dry)
+        pid_path, crash_path = _resolve_process_health_paths(args.dry)
         write_pid_file(pid_path, os.getpid())
         atexit.register(clear_pid_file, pid_path)
         # Archive any crash.json left behind by a previous bot (renamed with
@@ -132,14 +129,10 @@ def main() -> None:
         # SystemExit still propagate cleanly without being treated as crashes.
         # Dry/live only -- backtest/sync run to completion or fail fast.
         if crash_path is not None:
-            last_epoch: int | None = None
-            if heartbeat_path is not None:
-                hb = read_last_heartbeat(heartbeat_path)
-                if hb is not None:
-                    raw = hb.get("last_epoch")
-                    if isinstance(raw, int):
-                        last_epoch = raw
-            write_crash(crash_path, e, last_epoch=last_epoch)
+            # last_epoch was previously read from heartbeat.json (removed
+            # 2026-05-27 Step 27a); crash report now omits it. The exception
+            # traceback still includes the round context if relevant.
+            write_crash(crash_path, e, last_epoch=None)
         raise
 
 

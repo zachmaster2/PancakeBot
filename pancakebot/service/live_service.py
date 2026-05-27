@@ -41,9 +41,9 @@ class PancakeBotLiveService(_PancakeBotServiceBase):
     _svc_display_name_ = "PancakeBot Live Trading"
     _svc_description_ = (
         "Supervises the PancakeBot live-trading bot (python run.py --live). "
-        "Spawns the bot child on service start, monitors heartbeat/PID/crash "
-        "artifacts, restarts on STALE/CRASHED/DOWN, sends Discord alerts on "
-        "state transitions. Enforces live-priority by stopping PancakeBotDry "
+        "Spawns the bot child on service start, monitors Popen.poll() + "
+        "crash.json, restarts on CRASHED/DOWN, sends Discord alerts on "
+        "restart patterns. Enforces live-priority by stopping PancakeBotDry "
         "if it is running at service-start."
     )
     _MODE = "live"

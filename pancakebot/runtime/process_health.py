@@ -1,12 +1,9 @@
-"""Process-health instrumentation: heartbeat file, PID file, crash dump.
+"""Process-health instrumentation: PID file + crash dump.
 
-Written by the runtime (dry/live) and consumed by an out-of-process supervisor
-(see scripts/dry_supervisor.py in Phase 2b).
+Written by the runtime (dry/live) and consumed by the Windows Service
+supervisor.
 
-Three artifacts per mode:
-  - ``var/<mode>/heartbeat.json``: updated every iteration + every second
-    during sleeps. Its mtime is the supervisor's primary liveness signal.
-    Contents: {pid, ts_wall, last_epoch, bankroll_bnb, iteration_count}.
+Two artifacts per mode:
   - ``var/<mode>/bot.pid``: contains the OS pid as plain text. Written at
     startup, best-effort removed at clean exit. NOT reliable as a sole
     liveness signal (the process may die without clearing it).
@@ -15,10 +12,11 @@ Three artifacts per mode:
     {ts_wall, exc_type, exc_repr, traceback_str, last_epoch}.
 
 All writes are atomic (tempfile + fsync + os.replace) with a bounded retry
-on PermissionError (Windows file-lock race with antivirus / indexer). After
-five consecutive heartbeat-write failures, ``write_heartbeat`` raises
-InvariantError so the bot exits loudly rather than appearing alive to the
-supervisor while silently bleeding.
+on PermissionError (Windows file-lock race with antivirus / indexer).
+
+Heartbeat infrastructure removed 2026-05-27 (Step 27a full cleanup): the
+supervisor uses ``Popen.poll()`` as the authoritative liveness signal; no
+filesystem heartbeat is needed.
 """
 from __future__ import annotations
 
@@ -29,18 +27,8 @@ import time
 import traceback
 from pathlib import Path
 
-from pancakebot.log import warn
-from pancakebot.util import InvariantError, ensure_parent_dir
+from pancakebot.util import ensure_parent_dir
 
-
-# Max consecutive heartbeat write failures before we give up and hard-exit.
-# Rationale: one transient PermissionError is survivable, but sustained
-# failure means the supervisor will treat us as dead anyway -- better to die
-# cleanly than drift.
-_MAX_CONSECUTIVE_HEARTBEAT_FAILURES = 5
-
-# Module-level failure counter (reset on every successful heartbeat).
-_consecutive_heartbeat_failures: int = 0
 
 # PermissionError retry schedule (seconds). Short enough not to push the
 # critical bet path, long enough to get past typical AV scan windows.
@@ -115,71 +103,6 @@ def clear_pid_file(path: Path) -> None:
         pass
 
 
-# -- Heartbeat ---------------------------------------------------------------
-
-def write_heartbeat(
-    path: Path,
-    *,
-    pid: int,
-    ts_wall: float,
-    last_epoch: int | None,
-    bankroll_bnb: float | None,
-    iteration_count: int,
-) -> bool:
-    """Write a heartbeat JSON atomically. Return True on success.
-
-    On write failure: logs a WARN, increments the module-level consecutive-
-    failure counter, and returns False. After
-    ``_MAX_CONSECUTIVE_HEARTBEAT_FAILURES`` consecutive failures, raises
-    ``InvariantError`` so the bot exits loudly.
-    """
-    global _consecutive_heartbeat_failures
-    record = {
-        "pid": int(pid),
-        "ts_wall": float(ts_wall),
-        "last_epoch": (int(last_epoch) if last_epoch is not None else None),
-        "bankroll_bnb": (float(bankroll_bnb) if bankroll_bnb is not None else None),
-        "iteration_count": int(iteration_count),
-    }
-    content = json.dumps(record, separators=(",", ":"), sort_keys=True)
-    try:
-        _atomic_write_text(path, content)
-        _consecutive_heartbeat_failures = 0
-        return True
-    except Exception as e:
-        _consecutive_heartbeat_failures += 1
-        warn(
-            "ALERT",
-            f"heartbeat write failed (consecutive={_consecutive_heartbeat_failures}/"
-            f"{_MAX_CONSECUTIVE_HEARTBEAT_FAILURES}): {type(e).__name__}: {e}",
-        )
-        if _consecutive_heartbeat_failures >= _MAX_CONSECUTIVE_HEARTBEAT_FAILURES:
-            raise InvariantError(
-                f"heartbeat_write_failed_{_consecutive_heartbeat_failures}_times_consecutively"
-            ) from e
-        return False
-
-
-def read_last_heartbeat(path: Path) -> dict | None:
-    """Read + parse the heartbeat JSON. Returns None if absent or malformed.
-
-    Used by the crash handler to populate ``last_epoch`` and by supervisors
-    to classify staleness. Never raises on malformed input -- supervisors
-    need to degrade gracefully.
-    """
-    if not path.exists():
-        return None
-    # noinspection PyBroadException
-    try:
-        text = path.read_text(encoding="utf-8")
-        obj = json.loads(text)
-        if not isinstance(obj, dict):
-            return None
-        return obj
-    except Exception:
-        return None
-
-
 # -- Crash dump --------------------------------------------------------------
 
 def write_crash(path: Path, exc: BaseException, *, last_epoch: int | None) -> None:
@@ -221,7 +144,7 @@ def archive_stale_crash(crash_path: Path, *, min_age_seconds: float = _STALE_CRA
     Preserves forensic data (no deletion) while preventing the supervisor from
     classifying a fresh bot as CRASHED based on a leftover crash marker from a
     previous bot. Called from run.py immediately after the bot writes its PID
-    file, before the main runtime loop begins writing heartbeats.
+    file, before the main runtime loop begins.
 
     Returns the archive path on success, ``None`` if:
       - the crash file doesn't exist (no-op, the common case), or

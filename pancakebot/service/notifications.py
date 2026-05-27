@@ -47,8 +47,7 @@ GENERAL_WEBHOOK_ENV = "PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL"
 # "general" = use general channel; "live" / "dry" = always that channel
 # regardless of the firing service's mode.
 _CHANNEL_BY_KIND: dict[str, str] = {
-    # Bot-health states (legacy supervisor compatibility).
-    "STALE": "mode",
+    # Bot-health states.
     "CRASHED": "mode",
     "DOWN": "mode",
     "UNINSTRUMENTED": "general",
@@ -68,7 +67,6 @@ _CHANNEL_BY_KIND: dict[str, str] = {
 
 # Header decoration per kind (emoji + style).
 _HEADER_DECOR: dict[str, str] = {
-    "STALE": ":warning:",
     "CRASHED": ":rotating_light:",
     "DOWN": ":skull:",
     "UNINSTRUMENTED": ":grey_question:",
@@ -234,12 +232,6 @@ def build_message(
             tb = _clip_text(tb_raw, max_lines=20, max_chars=1500)
             if tb:
                 lines.append("```\n" + tb + "\n```")
-    elif kind == "STALE" and art is not None:
-        hb_age = fields.get("hb_age", "?")
-        lines.append(f"heartbeat age: `{hb_age}`")
-        tail = _tail_latest_err_log(art["logs_dir"], max_lines=20)
-        if tail:
-            lines.append("```\n" + _clip_text(tail, max_lines=20, max_chars=1500) + "\n```")
     elif kind == "UNINSTRUMENTED":
         lines.append("note: legacy bot detected outside service control")
     elif kind == "SPAWN_FAILED":

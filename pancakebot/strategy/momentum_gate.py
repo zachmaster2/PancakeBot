@@ -434,9 +434,16 @@ class MomentumGate:
 def _validate_klines_raw(
     klines: list[list] | None, cutoff_ms: int, label: str, *, candle_count: int,
 ) -> str | None:
-    """Validate raw kline arrays (live + backtest paths)."""
-    if not klines or len(klines) < candle_count:
-        n = 0 if not klines else len(klines)
+    """Validate raw kline arrays (live + backtest paths).
+
+    Uses ``klines is None`` + ``len`` check instead of bare ``not klines`` so
+    numpy 2D arrays (used by research/numpy_kline_loader) don't trigger the
+    "truth value ambiguous" ValueError. Semantically equivalent for Python
+    lists — an empty list has ``len(...) == 0 < candle_count`` so the length
+    check still catches it.
+    """
+    if klines is None or len(klines) < candle_count:
+        n = 0 if klines is None else len(klines)
         return f"gate_{label}_insufficient:got={n}"
 
     newest_ts = int(klines[-1][0])
@@ -488,13 +495,13 @@ def compute_signal_from_klines(
             skip_reason=btc_reason or "gate_no_btc_klines",
         )
 
-    btc_closes = [k[4] for k in btc_klines]
+    btc_closes = [float(k[4]) for k in btc_klines]
     eth_closes = None
-    if eth_klines and len(eth_klines) >= candle_count:
-        eth_closes = [k[4] for k in eth_klines]
+    if eth_klines is not None and len(eth_klines) >= candle_count:
+        eth_closes = [float(k[4]) for k in eth_klines]
     sol_closes = None
-    if sol_klines and len(sol_klines) >= candle_count:
-        sol_closes = [k[4] for k in sol_klines]
+    if sol_klines is not None and len(sol_klines) >= candle_count:
+        sol_closes = [float(k[4]) for k in sol_klines]
 
     return _compute_signal(
         btc_closes, eth_closes, sol_closes,

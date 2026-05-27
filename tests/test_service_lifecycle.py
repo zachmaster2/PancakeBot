@@ -1,8 +1,9 @@
-"""Tests for the new Windows-Service-based supervisor architecture.
+"""Tests for the Windows-Service-based supervisor architecture.
 
 Exercises the pure-logic surface of ``pancakebot/service/``:
-  - ``supervision.classify_state`` for each state (UP / STARTING / STALE /
-    CRASHED / DOWN / UNINSTRUMENTED)
+  - ``supervision.classify_state`` for each state (UP / STARTING /
+    CRASHED / DOWN / UNINSTRUMENTED). Heartbeat-staleness STALE
+    classification removed 2026-05-27 (Step 27a).
   - ``supervision`` restart-history helpers (read / write / prune / count)
   - ``notifications.resolve_webhook_env`` channel routing per kind
   - ``notifications.rate_limit_ok`` cooldown enforcement
@@ -48,7 +49,6 @@ def _make_mode_tree(tmp: Path, mode: str) -> dict[str, Path]:
     mode_dir.mkdir(parents=True, exist_ok=True)
     (mode_dir / "logs").mkdir(exist_ok=True)
     return {
-        "heartbeat": mode_dir / "heartbeat.json",
         "pid": mode_dir / "bot.pid",
         "crash": mode_dir / "crash.json",
         "supervisor_log": mode_dir / "supervisor.log",
@@ -62,16 +62,6 @@ def _make_mode_tree(tmp: Path, mode: str) -> dict[str, Path]:
 def _backdate_mtime(path: Path, age_s: float) -> None:
     past = time.time() - age_s
     os.utime(str(path), (past, past))
-
-
-def _write_heartbeat(path: Path, *, pid: int, age_s: float = 0.0) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
-        "pid": pid, "ts_wall": time.time(), "last_epoch": 100,
-        "bankroll_bnb": 1.5, "iteration_count": 10,
-    }), encoding="utf-8")
-    if age_s > 0:
-        _backdate_mtime(path, age_s)
 
 
 def _write_pid_file(path: Path, pid: int, *, age_s: float = 0.0) -> None:
@@ -117,46 +107,25 @@ def test_classify_down_when_no_artifacts(fake_artifacts):
     assert fields == {}
 
 
-def test_classify_up_with_fresh_heartbeat(fake_artifacts, monkeypatch):
+def test_classify_up_with_fresh_pid_past_grace(fake_artifacts, monkeypatch):
+    """Step 27a: classify_state returns UP when PID file is past startup grace
+    and points to a live process. Heartbeat infrastructure removed."""
     art = fake_artifacts["live"]
-    _write_heartbeat(art["heartbeat"], pid=4242)
+    _write_pid_file(art["pid"], 4242, age_s=120)  # past 90s startup grace
     monkeypatch.setattr(supervision, "_pid_is_our_bot", lambda pid, mode: pid == 4242)
     status, fields = supervision.classify_state("live")
     assert status == "UP", f"unexpected: {status} {fields}"
     assert fields["pid"] == 4242
 
 
-def test_classify_starting_with_fresh_pid_and_no_heartbeat(fake_artifacts, monkeypatch):
+def test_classify_starting_with_fresh_pid(fake_artifacts, monkeypatch):
+    """Step 27a: a fresh PID file (within startup grace) classifies as STARTING."""
     art = fake_artifacts["live"]
     _write_pid_file(art["pid"], 7777)
     monkeypatch.setattr(supervision, "_pid_is_our_bot", lambda pid, mode: pid == 7777)
     status, fields = supervision.classify_state("live")
     assert status == "STARTING"
     assert fields["pid"] == 7777
-
-
-def test_classify_no_longer_returns_stale_with_old_heartbeat(fake_artifacts, monkeypatch):
-    """Step 27a (2026-05-27): heartbeat staleness no longer classifies as STALE.
-
-    Previously a 60s-old heartbeat past startup grace returned STALE,
-    triggering supervisor restart. After Step 27a that path is removed —
-    the classifier returns UP for a live process regardless of heartbeat
-    age. Only actual process death (CRASHED/DOWN) triggers restarts.
-    """
-    art = fake_artifacts["live"]
-    # Heartbeat 60s old (>5s stale threshold), pid alive, pid file 120s old (>90s grace)
-    _write_heartbeat(art["heartbeat"], pid=9999, age_s=60)
-    _write_pid_file(art["pid"], 9999, age_s=120)
-    monkeypatch.setattr(supervision, "_pid_is_our_bot", lambda pid, mode: pid == 9999)
-    status, fields = supervision.classify_state("live")
-    # Old heartbeat + alive PID + past grace ⇒ classify_state falls through
-    # the (now-removed) STALE branch. With no crash.json and no legacy bot,
-    # the only remaining path is DOWN — the legacy artifact-only classifier
-    # cannot reach UP because it requires a FRESH heartbeat. This is fine:
-    # the Popen-based classify_running_bot returns UP in this case (covered
-    # separately by service tests), and classify_state is no longer used in
-    # the supervision loop after the initial spawn.
-    assert status != "STALE"
 
 
 def test_classify_crashed_with_crash_json(fake_artifacts):
@@ -172,7 +141,7 @@ def test_classify_uninstrumented_with_legacy_bot(fake_artifacts, monkeypatch):
     status, fields = supervision.classify_state("live")
     assert status == "UNINSTRUMENTED"
     assert fields["pid"] == 12345
-    assert fields["note"] == "legacy_no_heartbeat"
+    assert fields["note"] == "legacy_no_pid_file"
 
 
 # ---------------------------------------------------------------------------
@@ -232,8 +201,6 @@ def test_restart_history_drops_malformed_lines(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("mode,kind,expected", [
-    ("live", "STALE", notifications.LIVE_WEBHOOK_ENV),
-    ("dry",  "STALE", notifications.DRY_WEBHOOK_ENV),
     ("live", "CRASHED", notifications.LIVE_WEBHOOK_ENV),
     ("dry",  "CRASHED", notifications.DRY_WEBHOOK_ENV),
     ("live", "UNINSTRUMENTED", notifications.GENERAL_WEBHOOK_ENV),
@@ -259,9 +226,9 @@ def test_channel_routing(mode, kind, expected):
 
 def test_rate_limit_first_call_passes(tmp_path):
     path = tmp_path / "last_alert.json"
-    assert notifications.rate_limit_ok(path, "STALE", now=1000.0, cooldown_s=60.0)
+    assert notifications.rate_limit_ok(path, "CRASHED", now=1000.0, cooldown_s=60.0)
     # Second immediate call is suppressed
-    assert not notifications.rate_limit_ok(path, "STALE", now=1010.0, cooldown_s=60.0)
+    assert not notifications.rate_limit_ok(path, "CRASHED", now=1010.0, cooldown_s=60.0)
 
 
 def test_rate_limit_clears_after_cooldown(tmp_path):
@@ -273,11 +240,11 @@ def test_rate_limit_clears_after_cooldown(tmp_path):
 
 def test_rate_limit_per_key_independent(tmp_path):
     path = tmp_path / "last_alert.json"
-    assert notifications.rate_limit_ok(path, "STALE", now=1000.0, cooldown_s=60.0)
-    # Different kind: independent bucket
     assert notifications.rate_limit_ok(path, "CRASHED", now=1000.0, cooldown_s=60.0)
+    # Different kind: independent bucket
+    assert notifications.rate_limit_ok(path, "DOWN", now=1000.0, cooldown_s=60.0)
     # Same kind, still in cooldown
-    assert not notifications.rate_limit_ok(path, "STALE", now=1010.0, cooldown_s=60.0)
+    assert not notifications.rate_limit_ok(path, "CRASHED", now=1010.0, cooldown_s=60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +291,7 @@ def test_notify_disabled_when_env_var_unset(tmp_path, monkeypatch):
     without attempting any HTTP call."""
     monkeypatch.delenv(notifications.LIVE_WEBHOOK_ENV, raising=False)
     art = _make_mode_tree(tmp_path, "live")
-    outcome = notifications.notify(mode="live", kind="STALE", art=art)
+    outcome = notifications.notify(mode="live", kind="CRASHED", art=art)
     assert outcome == "DISABLED"
 
 
@@ -409,58 +376,17 @@ def test_classify_running_bot_killed_with_crash_json_is_crashed(tmp_path):
     assert fields["exc"] == "ValueError"
 
 
-def test_classify_running_bot_alive_past_grace_with_fresh_heartbeat_is_up(tmp_path):
-    """Process alive, past startup grace, fresh heartbeat → UP."""
+def test_classify_running_bot_alive_past_grace_is_up(tmp_path):
+    """Step 27a: alive Popen handle past startup grace ⇒ UP. No heartbeat read."""
     art = _make_mode_tree(tmp_path, "live")
-    _write_heartbeat(art["heartbeat"], pid=12345)  # fresh mtime
     proc = _FakePopen(pid=12345, alive=True)
     status, fields = supervision.classify_running_bot(
         proc, proc_started_at=time.time() - 60.0, art=art,
         startup_grace_s=30.0,
     )
     assert status == "UP", f"expected UP, got {status} {fields}"
-    # Surface bankroll / iterations / last_epoch when heartbeat readable
-    assert "iterations" in fields
-    assert "last_epoch" in fields
-
-
-def test_classify_running_bot_alive_past_grace_with_stale_heartbeat_is_up(tmp_path):
-    """Step 27a (2026-05-27): stale heartbeat no longer triggers STALE.
-
-    Process alive past startup grace with a 60s-old heartbeat now returns UP
-    (was STALE pre-Step-27a). The supervisor relies on Popen.poll() for
-    actual process-death detection (CRASHED/DOWN) and no longer restarts the
-    bot for transient heartbeat-update delays caused by network I/O.
-    """
-    art = _make_mode_tree(tmp_path, "live")
-    # Heartbeat aged 60s (way past the legacy 5s stale threshold)
-    _write_heartbeat(art["heartbeat"], pid=12345, age_s=60.0)
-    proc = _FakePopen(pid=12345, alive=True)
-    status, fields = supervision.classify_running_bot(
-        proc, proc_started_at=time.time() - 60.0, art=art,
-        stale_threshold_s=5.0, startup_grace_s=30.0,
-    )
-    assert status == "UP", f"expected UP after Step 27a, got {status} {fields}"
-    # hb_age still surfaced for observability even though no longer used for classification
-    assert "hb_age" in fields
-
-
-def test_classify_running_bot_alive_past_grace_no_heartbeat_is_up(tmp_path):
-    """Step 27a (2026-05-27): missing heartbeat no longer triggers STALE.
-
-    Process alive past startup grace with NO heartbeat file written now
-    returns UP (was STALE pre-Step-27a). Popen.poll() is the authoritative
-    liveness signal; heartbeat absence is treated as observability gap, not
-    a restart trigger.
-    """
-    art = _make_mode_tree(tmp_path, "live")
-    # No heartbeat written
-    proc = _FakePopen(pid=12345, alive=True)
-    status, _fields = supervision.classify_running_bot(
-        proc, proc_started_at=time.time() - 60.0, art=art,
-        startup_grace_s=30.0,
-    )
-    assert status == "UP"
+    assert fields["pid"] == 12345
+    assert "proc_uptime" in fields
 
 
 def test_classify_running_bot_proc_none_is_down(tmp_path):
@@ -499,7 +425,7 @@ def test_notify_send_failed_does_not_raise_with_stderr_none(tmp_path, monkeypatc
     art = _make_mode_tree(tmp_path, "live")
     # If safe_stderr_write didn't guard the None case, this would raise
     # AttributeError. Should return "SEND_FAILED" cleanly instead.
-    outcome = notifications.notify(mode="live", kind="STALE", art=art)
+    outcome = notifications.notify(mode="live", kind="CRASHED", art=art)
     assert outcome == "SEND_FAILED"
 
 
@@ -644,7 +570,7 @@ def test_handle_unhealthy_restores_running_after_successful_respawn(monkeypatch,
     svc._archive_stale_crash = lambda crash: None
 
     art = _make_mode_tree(tmp_path, "live")
-    svc._handle_unhealthy("STALE", {}, art)
+    svc._handle_unhealthy("CRASHED", {}, art)
 
     assert win32service.SERVICE_STOP_PENDING in status_log, \
         "_stop_bot_child stub should have logged STOP_PENDING"
@@ -667,7 +593,7 @@ def test_handle_unhealthy_restores_running_after_fast_crashloop_suppression(monk
     svc._archive_stale_crash = lambda crash: None
 
     art = _make_mode_tree(tmp_path, "live")
-    svc._handle_unhealthy("STALE", {}, art)
+    svc._handle_unhealthy("CRASHED", {}, art)
 
     assert status_log[-1] == win32service.SERVICE_RUNNING, \
         f"fast-suppress path must still end with SERVICE_RUNNING; got {status_log}"
@@ -694,7 +620,7 @@ def test_handle_unhealthy_restores_running_after_spawn_failure(monkeypatch, tmp_
     svc._archive_stale_crash = lambda crash: None
 
     art = _make_mode_tree(tmp_path, "live")
-    svc._handle_unhealthy("STALE", {}, art)  # must not raise
+    svc._handle_unhealthy("CRASHED", {}, art)  # must not raise (Step 27a renamed STALE→CRASHED)
 
     assert win32service.SERVICE_STOP_PENDING in status_log
     assert status_log[-1] == win32service.SERVICE_RUNNING, \
@@ -726,7 +652,7 @@ def test_handle_unhealthy_does_NOT_restore_running_when_stop_requested(monkeypat
     svc._archive_stale_crash = lambda crash: None
 
     art = _make_mode_tree(tmp_path, "live")
-    svc._handle_unhealthy("STALE", {}, art)
+    svc._handle_unhealthy("CRASHED", {}, art)
 
     # The finally block's guard should have skipped the RUNNING report.
     # Last status is therefore the STOP_PENDING from _stop_bot_child.
