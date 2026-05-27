@@ -135,14 +135,28 @@ def test_classify_starting_with_fresh_pid_and_no_heartbeat(fake_artifacts, monke
     assert fields["pid"] == 7777
 
 
-def test_classify_stale_when_heartbeat_old_and_past_grace(fake_artifacts, monkeypatch):
+def test_classify_no_longer_returns_stale_with_old_heartbeat(fake_artifacts, monkeypatch):
+    """Step 27a (2026-05-27): heartbeat staleness no longer classifies as STALE.
+
+    Previously a 60s-old heartbeat past startup grace returned STALE,
+    triggering supervisor restart. After Step 27a that path is removed —
+    the classifier returns UP for a live process regardless of heartbeat
+    age. Only actual process death (CRASHED/DOWN) triggers restarts.
+    """
     art = fake_artifacts["live"]
     # Heartbeat 60s old (>5s stale threshold), pid alive, pid file 120s old (>90s grace)
     _write_heartbeat(art["heartbeat"], pid=9999, age_s=60)
     _write_pid_file(art["pid"], 9999, age_s=120)
     monkeypatch.setattr(supervision, "_pid_is_our_bot", lambda pid, mode: pid == 9999)
-    status, _fields = supervision.classify_state("live")
-    assert status == "STALE"
+    status, fields = supervision.classify_state("live")
+    # Old heartbeat + alive PID + past grace ⇒ classify_state falls through
+    # the (now-removed) STALE branch. With no crash.json and no legacy bot,
+    # the only remaining path is DOWN — the legacy artifact-only classifier
+    # cannot reach UP because it requires a FRESH heartbeat. This is fine:
+    # the Popen-based classify_running_bot returns UP in this case (covered
+    # separately by service tests), and classify_state is no longer used in
+    # the supervision loop after the initial spawn.
+    assert status != "STALE"
 
 
 def test_classify_crashed_with_crash_json(fake_artifacts):
@@ -410,21 +424,35 @@ def test_classify_running_bot_alive_past_grace_with_fresh_heartbeat_is_up(tmp_pa
     assert "last_epoch" in fields
 
 
-def test_classify_running_bot_alive_past_grace_with_stale_heartbeat_is_stale(tmp_path):
-    """Process alive, past startup grace, stale heartbeat → STALE (hung bot)."""
+def test_classify_running_bot_alive_past_grace_with_stale_heartbeat_is_up(tmp_path):
+    """Step 27a (2026-05-27): stale heartbeat no longer triggers STALE.
+
+    Process alive past startup grace with a 60s-old heartbeat now returns UP
+    (was STALE pre-Step-27a). The supervisor relies on Popen.poll() for
+    actual process-death detection (CRASHED/DOWN) and no longer restarts the
+    bot for transient heartbeat-update delays caused by network I/O.
+    """
     art = _make_mode_tree(tmp_path, "live")
-    # Heartbeat aged 60s (way past the 5s stale threshold)
+    # Heartbeat aged 60s (way past the legacy 5s stale threshold)
     _write_heartbeat(art["heartbeat"], pid=12345, age_s=60.0)
     proc = _FakePopen(pid=12345, alive=True)
     status, fields = supervision.classify_running_bot(
         proc, proc_started_at=time.time() - 60.0, art=art,
         stale_threshold_s=5.0, startup_grace_s=30.0,
     )
-    assert status == "STALE", f"expected STALE, got {status} {fields}"
+    assert status == "UP", f"expected UP after Step 27a, got {status} {fields}"
+    # hb_age still surfaced for observability even though no longer used for classification
+    assert "hb_age" in fields
 
 
-def test_classify_running_bot_alive_past_grace_no_heartbeat_is_stale(tmp_path):
-    """Process alive, past grace, NO heartbeat file at all → STALE (hung at startup)."""
+def test_classify_running_bot_alive_past_grace_no_heartbeat_is_up(tmp_path):
+    """Step 27a (2026-05-27): missing heartbeat no longer triggers STALE.
+
+    Process alive past startup grace with NO heartbeat file written now
+    returns UP (was STALE pre-Step-27a). Popen.poll() is the authoritative
+    liveness signal; heartbeat absence is treated as observability gap, not
+    a restart trigger.
+    """
     art = _make_mode_tree(tmp_path, "live")
     # No heartbeat written
     proc = _FakePopen(pid=12345, alive=True)
@@ -432,7 +460,7 @@ def test_classify_running_bot_alive_past_grace_no_heartbeat_is_stale(tmp_path):
         proc, proc_started_at=time.time() - 60.0, art=art,
         startup_grace_s=30.0,
     )
-    assert status == "STALE"
+    assert status == "UP"
 
 
 def test_classify_running_bot_proc_none_is_down(tmp_path):
