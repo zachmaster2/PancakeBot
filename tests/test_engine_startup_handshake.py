@@ -130,3 +130,31 @@ def test_startup_handshake_exhausts_deadline_raises():
     assert "lock_at=" in msg
     # Deadline tripped on the first attempt's check, so no sleep occurred.
     assert m_sleep.call_count == 0
+
+
+def test_startup_handshake_deadline_boundary():
+    """Regression guard for deadline arithmetic: just-before-deadline still
+    loops; reaching deadline (>=) trips. buffer_seconds=30 + padding=5 = 35s.
+    """
+    cfg = _make_cfg(buffer_seconds=30)
+    zero_price = _valid_handshake_tuple(lock_price=0.0)
+
+    # Startup t0=1000.0 → deadline = 1035.0.
+    # After 1st handshake: t=1034.999 → < deadline → sleep + retry.
+    # After 2nd handshake: t=1035.0 → >= deadline → raise.
+    time_values = iter([1_000.0, 1_034.999, 1_035.0])
+
+    with mock.patch(
+        "pancakebot.runtime.engine._epoch_handshake",
+        return_value=zero_price,
+    ), mock.patch(
+        "pancakebot.runtime.engine.sleep_seconds",
+    ) as m_sleep, mock.patch(
+        "pancakebot.runtime.engine.time.time",
+        side_effect=lambda: next(time_values),
+    ):
+        with pytest.raises(InvariantError):
+            engine._startup_handshake_with_retry(cfg)
+
+    # First check at 1034.999 was below deadline → exactly one sleep occurred.
+    assert m_sleep.call_count == 1
