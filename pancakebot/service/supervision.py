@@ -25,6 +25,14 @@ Heartbeat-staleness STALE classification removed 2026-05-27 (Step 27a full
 cleanup). The 5s heartbeat-age threshold was firing on transient BSC RPC
 hedged-timeouts that auto-resolve next round (~12 false-positive restarts/24h
 with no real bot dysfunction). Process-death is the only restart trigger now.
+
+Operational caveat: liveness is ``Popen.poll()``-based only. An in-loop wedge
+(synchronous blocking call with no timeout) will leave the supervisor
+reporting UP indefinitely — the child process is alive even when its work
+loop is hung. Rely on in-bot invariants (e.g., the gate's
+``max_consecutive_kline_fetch_failures`` streak counter that escalates to
+``InvariantError`` after N consecutive failures) to crash-out of wedges,
+which the supervisor then sees as CRASHED via ``proc.poll()`` and respawns.
 """
 from __future__ import annotations
 
