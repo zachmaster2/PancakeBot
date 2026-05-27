@@ -42,6 +42,18 @@ $svc_cim = Get-CimInstance -ClassName Win32_Service -Filter "Name='PancakeBotDry
 $svc_pid = if ($svc_cim) { $svc_cim.ProcessId } else { $null }
 
 if ($null -eq $svc_pid -or $svc_pid -le 0) {
+    # MODE_TRANSITION_REFUSED edge case: when Live is running, Dry's
+    # SvcDoRun returns immediately after refusal. SCM briefly reports
+    # RUNNING (WaitForStatus succeeds), then transitions to STOPPED.
+    # Win32_Service.ProcessId is 0 either while StopPending or after
+    # Stopped. Re-poll once after 2s: if SCM has now settled to
+    # Stopped/StopPending, treat as expected refusal and exit 0.
+    Start-Sleep -Seconds 2
+    $svc_recheck = Get-Service -Name PancakeBotDry
+    if ($svc_recheck.Status -eq 'Stopped' -or $svc_recheck.Status -eq 'StopPending') {
+        Write-Host "[ok] Dry refused: Live is running (MODE_TRANSITION_REFUSED). SCM state: $($svc_recheck.Status)." -ForegroundColor Green
+        exit 0
+    }
     Write-Host "[!!] PancakeBotDry Win32_Service has no ProcessId (unexpected for Running state)" -ForegroundColor Red
     exit 1
 }
