@@ -315,19 +315,12 @@ def classify_state(
         fields["since_pid_ts"] = f"{pid_file_age:.0f}s"
         return "STARTING", fields
 
-    # 3. STALE
-    stale_pid_alive = (
-        (heartbeat_pid is not None and _pid_is_our_bot(heartbeat_pid, mode))
-        or pid_file_is_live
-    )
-    if (
-        stale_pid_alive
-        and hb is not None
-        and hb_age is not None
-        and hb_age > stale_threshold_s
-        and (pid_file_age is None or pid_file_age > startup_grace_s)
-    ):
-        return "STALE", fields
+    # 3. STALE — REMOVED 2026-05-27 (Step 27a). Heartbeat-staleness no
+    # longer triggers restarts: the 5s threshold was firing on transient
+    # network I/O (BSC RPC hedged timeouts) that auto-resolves on the next
+    # round, producing 12 STALE-restarts/24h with no real-world payoff.
+    # Process-death recovery still handled below via CRASHED/DOWN. The
+    # ``hb_age`` field is still surfaced for observability.
 
     # 4. CRASHED
     crash = _safe_read_json(art["crash"])
@@ -485,13 +478,16 @@ def classify_running_bot(
         if proc_uptime < startup_grace_s:
             return "STARTING", fields
 
-        # Past grace: a missing or stale heartbeat means the bot is hung
-        # (process alive but not making progress).
-        if hb_age is None or hb_age > stale_threshold_s:
-            return "STALE", fields
+        # STALE check REMOVED 2026-05-27 (Step 27a). Past grace with a live
+        # Popen handle ⇒ the bot process is alive. We no longer treat a stale
+        # heartbeat as a restart trigger — the 5s threshold was firing on
+        # transient network I/O (BSC RPC hedged timeouts) that auto-resolves
+        # on the next round, costing ~12 spurious restarts/24h. Process-death
+        # recovery still handled below via CRASHED/DOWN paths. ``hb_age``
+        # remains in fields for observability.
 
-        # Past grace + fresh heartbeat → healthy.
-        # Surface optional bankroll/iteration/last_epoch from heartbeat
+        # Past grace with alive process ⇒ healthy. Surface optional
+        # bankroll/iteration/last_epoch from heartbeat
         # so log lines and Discord alerts have rich context.
         hb = _safe_read_json(art["heartbeat"])
         if hb is not None:

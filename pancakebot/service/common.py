@@ -293,7 +293,12 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
             if status in ("UP", "STARTING"):
                 continue
 
-            if status in ("STALE", "CRASHED", "DOWN"):
+            if status in ("CRASHED", "DOWN"):
+                # STALE removed from trigger list 2026-05-27 (Step 27a).
+                # Heartbeat-staleness no longer initiates restarts; only
+                # actual process death (CRASHED with crash.json present, or
+                # DOWN = process dead with no signal) does. classify_running_bot
+                # never returns "STALE" anymore.
                 self._handle_unhealthy(status, fields, art)
                 continue
 
@@ -525,8 +530,22 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
             slow_count = supervision.count_within(history, now, _SLOW_RESTART_WINDOW_S)
             escalate_slow = slow_count >= _SLOW_RESTART_MAX
 
-            # Notify on the underlying state (STALE/CRASHED/DOWN) BEFORE restart.
-            notifications.notify(mode=self._MODE, kind=status, fields=fields, art=art)
+            # Restart-pattern aggregation (Step 27a policy b, 2026-05-27):
+            # Discord-notify the underlying status only when this is the 3rd+
+            # restart in a 1-hour rolling window. Single isolated restarts
+            # (process auto-recovered within seconds) go to log only; the
+            # SLOW_CRASHLOOP_WARNING below still fires at the 8/24h pattern
+            # for a separate severity signal.
+            recent_restarts_1h = supervision.count_within(history, now, 3600.0)
+            should_notify_status = recent_restarts_1h >= 2  # this would be the 3rd
+            if should_notify_status:
+                notifications.notify(mode=self._MODE, kind=status, fields=fields, art=art)
+            else:
+                servicemanager.LogInfoMsg(
+                    f"{self._svc_name_}: {status} respawn "
+                    f"(recent_restarts_1h={recent_restarts_1h + 1}/3, "
+                    f"Discord suppressed below pattern threshold)"
+                )
 
             # Drain dead child, archive crash, spawn new.
             self._stop_bot_child(reason=f"unhealthy:{status}")
