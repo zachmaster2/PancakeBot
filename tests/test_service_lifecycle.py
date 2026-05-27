@@ -658,3 +658,152 @@ def test_handle_unhealthy_does_NOT_restore_running_when_stop_requested(monkeypat
     # Last status is therefore the STOP_PENDING from _stop_bot_child.
     assert win32service.SERVICE_RUNNING not in status_log, \
         f"finally must not flip to RUNNING when _stop_requested=True; got {status_log}"
+
+
+# ---------------------------------------------------------------------------
+# Step 27c-B: tests for restart-pattern Discord aggregation (3-in-1h)
+# ---------------------------------------------------------------------------
+#
+# Policy: Discord notifies on CRASHED/DOWN respawns ONLY when the
+# `_handle_unhealthy` invocation is the 3rd+ within a 1-hour rolling window.
+# First two restarts log to SCM only. Implementation:
+#
+#     recent_restarts_1h = supervision.count_within(history, now, 3600.0)
+#     should_notify_status = recent_restarts_1h >= 2  # this would be the 3rd
+#
+# These tests intercept notifications.notify to capture every (kind, mode,
+# fields) tuple, then verify only the status-restart aggregation behavior
+# matches policy. SUPPRESSED_FAST_CRASHLOOP and SLOW_CRASHLOOP_WARNING are
+# separate notification paths (independent of restart-pattern aggregation).
+
+def _patch_for_aggregation(monkeypatch, recent_1h_count: int, slow_24h_count: int = 0,
+                            fast_15m_count: int = 0):
+    """Patch supervision/notifications and return a list of captured notify calls.
+
+    The mocked ``count_within`` returns:
+      - fast_15m_count   for window_s = 900   (_FAST_RESTART_WINDOW_S)
+      - recent_1h_count  for window_s = 3600  (restart-pattern aggregation)
+      - slow_24h_count   for window_s = 86400 (_SLOW_RESTART_WINDOW_S)
+
+    Returns the captured-calls list. Each entry is a dict with the kwargs
+    notifications.notify was called with.
+    """
+    captured: list[dict[str, object]] = []
+
+    def fake_count_within(history, now, window_s):
+        if window_s == 900.0 or window_s == 900:
+            return fast_15m_count
+        if window_s == 3600.0 or window_s == 3600:
+            return recent_1h_count
+        if window_s == 86400.0 or window_s == 86400:
+            return slow_24h_count
+        return 0
+
+    def fake_notify(**kwargs):
+        captured.append(dict(kwargs))
+        return "DISABLED"
+
+    monkeypatch.setattr(supervision, "read_restart_history", lambda p: [])
+    monkeypatch.setattr(supervision, "prune_history", lambda h, now, w: h)
+    monkeypatch.setattr(supervision, "count_within", fake_count_within)
+    monkeypatch.setattr(supervision, "write_restart_history", lambda p, h: None)
+    monkeypatch.setattr(notifications, "notify", fake_notify)
+
+    return captured
+
+
+def _make_svc_with_stubs():
+    """Common service instance + stubs for aggregation tests."""
+    import win32service
+    svc = _make_fake_service_instance()
+    svc.ReportServiceStatus = lambda s: None  # don't care about SCM here
+
+    def stub_stop(reason):
+        svc._bot_proc = None
+    svc._stop_bot_child = stub_stop
+
+    class FakeProc:
+        pid = 12345
+    def stub_spawn(art):
+        svc._bot_proc = FakeProc()
+        svc._bot_started_at = time.time()
+    svc._spawn_bot_child = stub_spawn
+    svc._archive_stale_crash = lambda crash: None
+    return svc
+
+
+def test_aggregation_first_restart_in_1h_does_NOT_fire_discord(monkeypatch, tmp_path):
+    """1st restart in window (recent_1h=0): no CRASHED Discord notify."""
+    captured = _patch_for_aggregation(monkeypatch, recent_1h_count=0)
+    svc = _make_svc_with_stubs()
+    art = _make_mode_tree(tmp_path, "live")
+
+    svc._handle_unhealthy("CRASHED", {}, art)
+
+    # No CRASHED-status notify should fire. (SLOW_CRASHLOOP_WARNING is gated
+    # separately at slow_count>=8; fast-suppress at fast_count>=3. Neither
+    # fires here.)
+    crashed_calls = [c for c in captured if c.get("kind") == "CRASHED"]
+    assert len(crashed_calls) == 0, \
+        f"1st restart in 1h must not fire Discord CRASHED; got {captured}"
+
+
+def test_aggregation_second_restart_in_1h_does_NOT_fire_discord(monkeypatch, tmp_path):
+    """2nd restart (recent_1h=1, meaning 1 prior restart in last hour): still no Discord."""
+    captured = _patch_for_aggregation(monkeypatch, recent_1h_count=1)
+    svc = _make_svc_with_stubs()
+    art = _make_mode_tree(tmp_path, "live")
+
+    svc._handle_unhealthy("CRASHED", {}, art)
+
+    crashed_calls = [c for c in captured if c.get("kind") == "CRASHED"]
+    assert len(crashed_calls) == 0, \
+        f"2nd restart in 1h must not fire Discord CRASHED; got {captured}"
+
+
+def test_aggregation_third_restart_in_1h_FIRES_discord(monkeypatch, tmp_path):
+    """3rd restart (recent_1h=2 prior + this one): Discord CRASHED fires."""
+    captured = _patch_for_aggregation(monkeypatch, recent_1h_count=2)
+    svc = _make_svc_with_stubs()
+    art = _make_mode_tree(tmp_path, "live")
+
+    svc._handle_unhealthy("CRASHED", {}, art)
+
+    crashed_calls = [c for c in captured if c.get("kind") == "CRASHED"]
+    assert len(crashed_calls) == 1, \
+        f"3rd restart in 1h must fire Discord CRASHED exactly once; got {captured}"
+    assert crashed_calls[0]["mode"] == "live"
+
+
+def test_aggregation_fourth_restart_in_1h_ALSO_FIRES_discord(monkeypatch, tmp_path):
+    """4th restart (recent_1h=3 prior): Discord continues to fire."""
+    captured = _patch_for_aggregation(monkeypatch, recent_1h_count=3)
+    svc = _make_svc_with_stubs()
+    art = _make_mode_tree(tmp_path, "live")
+
+    svc._handle_unhealthy("DOWN", {}, art)
+
+    down_calls = [c for c in captured if c.get("kind") == "DOWN"]
+    assert len(down_calls) == 1, \
+        f"4th restart in 1h must continue to fire Discord; got {captured}"
+    assert down_calls[0]["mode"] == "live"
+
+
+def test_aggregation_independent_of_slow_crashloop_warning(monkeypatch, tmp_path):
+    """SLOW_CRASHLOOP_WARNING (8+ restarts in 24h) fires regardless of the
+    1h aggregation. With recent_1h=0 (no Discord for status) but slow_24h=8
+    (escalate_slow=True), we should see SLOW_CRASHLOOP_WARNING but NOT
+    CRASHED.
+    """
+    captured = _patch_for_aggregation(monkeypatch, recent_1h_count=0, slow_24h_count=8)
+    svc = _make_svc_with_stubs()
+    art = _make_mode_tree(tmp_path, "live")
+
+    svc._handle_unhealthy("CRASHED", {}, art)
+
+    crashed_calls = [c for c in captured if c.get("kind") == "CRASHED"]
+    slow_calls = [c for c in captured if c.get("kind") == "SLOW_CRASHLOOP_WARNING"]
+    assert len(crashed_calls) == 0, \
+        f"recent_1h=0 must not fire CRASHED Discord; got {captured}"
+    assert len(slow_calls) == 1, \
+        f"slow_24h=8 must fire SLOW_CRASHLOOP_WARNING; got {captured}"
