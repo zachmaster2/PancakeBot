@@ -39,13 +39,12 @@ from pancakebot import timing_constants as _tc
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
-# Extra cushion added to the claim wake time, on top of the chain's
-# ``buffer_seconds`` settlement window. Total claim-wake time =
-# ``close_at(claim_epoch) + buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS``
-# (NOT relative to lock_at -- the bot only claims after the round closes
-# and the keeper has had ``buffer_seconds`` to call settleRound). The
-# padding absorbs alignment retries near RPC boundaries.
-_CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS = 5
+# Padding for RPC alignment near chain transition boundaries. Used for:
+#   - post-close claim safety: claim_ts = close_at(N) + buffer_seconds + padding
+#   - post-lock startup-handshake retry: deadline = startup_ts + buffer_seconds + padding
+# Both contexts need a small extra window beyond the contract's chain-level
+# buffer_seconds to absorb RPC hedged-endpoint lag and alignment retries.
+_RPC_ALIGNMENT_PADDING_SECONDS = 5
 
 
 # -- NTP clock sync ----------------------------------------------------------
@@ -291,6 +290,11 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         f"Starting bankroll: {format_bankroll(bankroll_bnb=bankroll_bnb, bnbusd_price=bnbusd_price)}",
     )
 
+    # Step 27d: absorb fresh-spawn race after STALE-respawn during round
+    # transition. _run_one_iteration would otherwise crash on unsettled chain
+    # state (lock_price=0 or lock_at=0). Bounded by ~35s wall-clock deadline.
+    _startup_handshake_with_retry(cfg)
+
     while True:
         # Per-subsystem TransientRpcError handling lives at each callsite:
         #   - _epoch_handshake: bounded local retry
@@ -416,7 +420,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # lock_at) IS the close_at of ``prev_locked_epoch`` (= epoch T-2).
         # Claim wake fires at: close_at(prev) + buffer + padding.
         prev_close_ts = locked_round.lock_at  # = close_at(prev_locked_epoch)
-        claim_ts = prev_close_ts + cfg.buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
+        claim_ts = prev_close_ts + cfg.buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS
         # claim_ts and cutoff_ts_t are both chain-anchored true UTC; compare
         # against NTP-corrected _utc_now() so a drifted local clock doesn't
         # make us miss the wake-for-claim window.
@@ -1253,6 +1257,33 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
     raise InvariantError("epoch_handshake_exhausted")
 
 
+def _startup_handshake_with_retry(cfg: RuntimeConfig) -> None:
+    # Defensive retry wrapper around _epoch_handshake at startup. Absorbs the
+    # fresh-spawn race after a STALE-respawn during the round transition
+    # window: when the bot spawns mid-transition, the chain may briefly report
+    # locked.lock_price == 0 or open.lock_at == 0 before executeRound() settles
+    # new values. Without this wrapper, _run_one_iteration would immediately
+    # raise locked_round_lock_price_nonpositive and crash, prompting another
+    # supervisor restart. Deadline = buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS
+    # (~35s), well past the chain-enforced settlement window.
+    deadline = time.time() + cfg.buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS
+    while True:
+        locked, open_round, _ep, _open_rd = _epoch_handshake(cfg)
+        if (
+            locked.lock_price is not None
+            and locked.lock_price > 0.0
+            and int(open_round.lock_at) > 0
+        ):
+            return
+        if time.time() >= deadline:
+            raise InvariantError(
+                "startup_handshake_exhausted_retries: "
+                f"locked.lock_price={locked.lock_price} "
+                f"open.lock_at={open_round.lock_at}"
+            )
+        sleep_seconds(2.0)
+
+
 def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int) -> None:
     # Bounded local retry around ``contract.close_ts`` — the only RPC call
     # in this function with real budget before the claim wake. Mirrors the
@@ -1273,7 +1304,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     if close_ts <= 0:
         raise InvariantError("close_ts_invalid")
 
-    claim_ts = close_ts + cfg.buffer_seconds + _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
+    claim_ts = close_ts + cfg.buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS
     _sleep_until_ts(claim_ts, reason="wait_for_claim", epoch=claim_epoch)
 
     # Epoch handshake to refresh round state (both modes).

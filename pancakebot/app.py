@@ -70,11 +70,11 @@ def run_from_config(
         # noinspection PyTypeChecker
         backtest_cfg: BacktestConfig = cfg.backtest
         # Receipt timeouts derived from chain-loaded buffer_seconds +
-        # _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS (≈35s on canonical chain constants).
+        # _RPC_ALIGNMENT_PADDING_SECONDS (≈35s on canonical chain constants).
         # Both bet and claim TX receipts share this timeout sizing.
-        from pancakebot.runtime.engine import _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
+        from pancakebot.runtime.engine import _RPC_ALIGNMENT_PADDING_SECONDS
         _bt_receipt_timeout = (
-            int(cc.buffer_seconds) + int(_CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS)
+            int(cc.buffer_seconds) + int(_RPC_ALIGNMENT_PADDING_SECONDS)
         )
         # noinspection PyTypeChecker
         runtime_cfg = RuntimeConfig(
@@ -246,11 +246,11 @@ def run_from_config(
     rpc_poller.start()
 
     # Receipt timeouts derived from chain-loaded buffer_seconds +
-    # _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS (≈35s on canonical chain constants).
+    # _RPC_ALIGNMENT_PADDING_SECONDS (≈35s on canonical chain constants).
     # Both bet and claim TX receipts share this timeout sizing.
-    from pancakebot.runtime.engine import _CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS
+    from pancakebot.runtime.engine import _RPC_ALIGNMENT_PADDING_SECONDS
     _runtime_receipt_timeout = (
-        int(buffer_seconds) + int(_CLAIM_RECEIPT_TIMEOUT_PADDING_SECONDS)
+        int(buffer_seconds) + int(_RPC_ALIGNMENT_PADDING_SECONDS)
     )
 
     runtime_cfg = RuntimeConfig(
