@@ -10,9 +10,6 @@ Kinds:
     history_slow       - populates restart_history.jsonl with 9 entries spanning last 12 h
     history_48h        - drops a 48h-old entry into restart_history.jsonl
 
-heartbeat_fresh / heartbeat_stale kinds removed 2026-05-27 (Step 27c-D):
-the bot no longer writes heartbeat.json, so these branches had no callers.
-
 All writes are plain (not atomic) -- this is test-only glue, not supervisor code.
 """
 from __future__ import annotations
