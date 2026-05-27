@@ -5,12 +5,13 @@ Usage:
 
 Kinds:
     crash              - writes crash.json with a realistic AttributeError
-    heartbeat_fresh    - fresh heartbeat pointing at pid=<extra0>
-    heartbeat_stale    - stale heartbeat (mtime 10s ago) pointing at pid=<extra0>
     pid_old            - writes bot.pid=<extra0> with mtime 120s ago
     history_fast       - populates restart_history.jsonl with 4 entries spanning last 5 min
     history_slow       - populates restart_history.jsonl with 9 entries spanning last 12 h
     history_48h        - drops a 48h-old entry into restart_history.jsonl
+
+heartbeat_fresh / heartbeat_stale kinds removed 2026-05-27 (Step 27c-D):
+the bot no longer writes heartbeat.json, so these branches had no callers.
 
 All writes are plain (not atomic) -- this is test-only glue, not supervisor code.
 """
@@ -57,26 +58,6 @@ def main() -> int:
             ),
             "last_epoch": 474776,
         }))
-        return 0
-    if kind == "heartbeat_fresh":
-        pid = int(extra[0])
-        p = _path(mode, "heartbeat.json")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({
-            "pid": pid, "ts_wall": now, "last_epoch": 474974,
-            "bankroll_bnb": 5.0, "iteration_count": 42,
-        }))
-        return 0
-    if kind == "heartbeat_stale":
-        pid = int(extra[0])
-        p = _path(mode, "heartbeat.json")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({
-            "pid": pid, "ts_wall": now - 10, "last_epoch": 474974,
-            "bankroll_bnb": 5.0, "iteration_count": 42,
-        }))
-        past = now - 10
-        os.utime(str(p), (past, past))
         return 0
     if kind == "pid_old":
         pid = int(extra[0])
