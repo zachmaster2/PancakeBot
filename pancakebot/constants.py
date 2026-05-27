@@ -68,4 +68,11 @@ MAX_GAS_COST_CLAIM_BNB = float(GAS_LIMIT_CLAIM) * float(MAX_GAS_PRICE_WEI) / flo
 
 # --- Runtime retry ---
 
-RETRY_BACKOFF_SECONDS = [2, 4, 8, 16, 32, 58]  # locked
+# Backoff schedule for runtime retry loops (epoch handshake, close_ts
+# fetch, wallet-balance refresh). Designed so the cumulative wall-clock
+# wait crosses 35s (buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS,
+# the contract-enforced executeRound deadline + RPC alignment slack)
+# after the 5th retry: 2+4+6+10+14 = 36s. Subsequent backoffs provide
+# grace for genuinely degraded chain conditions before raising the
+# *_exhausted invariants. Total budget: 116s across 8 retries.
+RETRY_BACKOFF_SECONDS = [2, 4, 6, 10, 14, 20, 26, 34]
