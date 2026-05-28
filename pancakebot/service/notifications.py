@@ -65,26 +65,24 @@ _CHANNEL_BY_KIND: dict[str, str] = {
     "SERVICE_CRASHED": "general",
 }
 
-# Header decoration per kind (emoji + style).
-_HEADER_DECOR: dict[str, str] = {
-    "CRASHED": ":rotating_light:",
-    "DOWN": ":skull:",
-    "UNINSTRUMENTED": ":grey_question:",
-    "STARTED": ":white_check_mark:",
-    "REBOOTED": ":arrows_counterclockwise:",
-    "RECOVERY_AFTER_CRASH": ":wrench:",
-    "STOPPED": ":octagonal_sign:",
-    "MODE_TRANSITION": ":arrow_right:",
-    "MODE_TRANSITION_REFUSED": ":no_entry:",
-    "SUPPRESSED_FAST_CRASHLOOP": ":fire:",
-    "SLOW_CRASHLOOP_WARNING": ":fire:",
-    "SPAWN_FAILED": ":boom:",
-    "SERVICE_CRASHED": ":fire:",
+# Severity tag per kind. ASCII-only, monospace-friendly. Replaces the
+# earlier emoji-shortcode header that rendered as Discord emoji glyphs
+# (visually noisy and hard to filter / grep in alert pipelines).
+_SEVERITY_BY_KIND: dict[str, str] = {
+    "CRASHED": "CRIT",
+    "DOWN": "CRIT",
+    "STOPPED": "CRIT",
+    "SPAWN_FAILED": "CRIT",
+    "SERVICE_CRASHED": "CRIT",
+    "UNINSTRUMENTED": "WARN",
+    "MODE_TRANSITION_REFUSED": "WARN",
+    "SUPPRESSED_FAST_CRASHLOOP": "WARN",
+    "SLOW_CRASHLOOP_WARNING": "WARN",
+    "STARTED": "INFO",
+    "REBOOTED": "INFO",
+    "RECOVERY_AFTER_CRASH": "INFO",
+    "MODE_TRANSITION": "INFO",
 }
-
-
-def _iso_utc_now() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _local_time_str() -> str:
@@ -206,12 +204,11 @@ def build_message(
     """Compose a Discord message body for the given notification kind."""
     fields = fields or {}
     hostname = socket.gethostname()
-    ts = _iso_utc_now()
     local = _local_time_str()
 
-    emoji = _HEADER_DECOR.get(kind, ":information_source:")
-    header = f"{emoji} **{kind}** `PancakeBot-{mode}` on `{hostname}` at `{ts}`"
-    lines: list[str] = [header, f"Local: `{local}`"]
+    severity = _SEVERITY_BY_KIND.get(kind, "INFO")
+    header = f"[{severity}] **{kind}** `PancakeBot-{mode}` on `{hostname}` at `{local}`"
+    lines: list[str] = [header]
 
     if detail:
         lines.append(f"detail: `{detail}`")
@@ -319,12 +316,10 @@ def notify_service_error(*, mode: str, exc: BaseException) -> None:
         if not webhook:
             return
         hostname = socket.gethostname()
-        ts = _iso_utc_now()
         local = _local_time_str()
         tb = _clip_text(traceback.format_exc(), max_lines=20, max_chars=1500)
         msg = "\n".join([
-            f":fire: **SERVICE_CRASHED** `PancakeBot-{mode}` on `{hostname}` at `{ts}`",
-            f"Local: `{local}`",
+            f"[CRIT] **SERVICE_CRASHED** `PancakeBot-{mode}` on `{hostname}` at `{local}`",
             f"exc: `{type(exc).__name__}`",
             f"repr: `{exc!r}`",
             "```\n" + tb + "\n```" if tb else "",
