@@ -1,4 +1,4 @@
-"""Process-health instrumentation: PID file + crash dump.
+"""Supervisor artifacts: PID file + crash dump.
 
 Written by the runtime (dry/live) and consumed by the Windows Service
 supervisor.
@@ -122,16 +122,17 @@ def write_crash(path: Path, exc: BaseException, *, last_epoch: int | None) -> No
 # Default: 0 (always archive on startup). Any crash.json present when a
 # new bot is calling this helper must be from a previous bot incarnation;
 # the new bot has just acquired the PID file slot, so it isn't its own
-# crash. Leaving a stale crash.json in place caused 2026-04-25 false-CRASHED
-# events where the supervisor saw an old crash.json an hour after the
-# original crash and killed a healthy bot. The previous 60s threshold
-# was justified as "give the writer time to finish" -- but the writer
-# is the dead previous bot, and the supervisor's CRASHED alert (the only
-# other reader) has already fired by the time it triggers --restart.
-_STALE_CRASH_MIN_AGE_SECONDS: float = 0.0
+# crash. Leaving a lingering crash.json in place caused 2026-04-25
+# false-CRASHED events where the supervisor saw an old crash.json an
+# hour after the original crash and killed a healthy bot. The previous
+# 60s threshold was justified as "give the writer time to finish" --
+# but the writer is the dead previous bot, and the supervisor's CRASHED
+# alert (the only other reader) has already fired by the time it
+# triggers --restart.
+_LINGERING_CRASH_MIN_AGE_SECONDS: float = 0.0
 
 
-def archive_stale_crash(crash_path: Path, *, min_age_seconds: float = _STALE_CRASH_MIN_AGE_SECONDS) -> Path | None:
+def archive_lingering_crash_file(crash_path: Path, *, min_age_seconds: float = _LINGERING_CRASH_MIN_AGE_SECONDS) -> Path | None:
     """Rename an existing crash.json to crash_archive_<ts>.json on bot startup.
 
     Preserves forensic data (no deletion) while preventing the supervisor from

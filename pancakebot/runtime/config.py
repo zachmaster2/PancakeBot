@@ -46,7 +46,7 @@ class RuntimeConfig:
     # actual expected workload: ramp_1 catches up an 8s-periodic-interval
     # of blocks (worst case ~18), ramp_2 is a small incremental top-up
     # (~4 blocks). Replaces the uniform RPC_RAMP_POLL_INTERVAL_MS=1500
-    # that was sized for a stale 30s-periodic-era batch=15 assumption.
+    # that was sized for an outdated 30s-periodic-era batch=15 assumption.
     #
     # At canonical pool_cutoff=6 specifically: chronology is monotonic —
     # ramp_2 (5.850s) naturally falls AFTER bankroll (6.045s). At larger

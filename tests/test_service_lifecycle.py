@@ -567,7 +567,7 @@ def test_handle_unhealthy_restores_running_after_successful_respawn(monkeypatch,
         svc._bot_proc = FakeProc()
         svc._bot_started_at = time.time()
     svc._spawn_bot_child = stub_spawn
-    svc._archive_stale_crash = lambda crash: None
+    svc._archive_lingering_crash_file = lambda crash: None
 
     art = _make_mode_tree(tmp_path, "live")
     svc._handle_unhealthy("CRASHED", {}, art)
@@ -590,7 +590,7 @@ def test_handle_unhealthy_restores_running_after_fast_crashloop_suppression(monk
     svc.ReportServiceStatus = lambda s: status_log.append(s)
     svc._stop_bot_child = lambda reason: None
     svc._spawn_bot_child = lambda art: None
-    svc._archive_stale_crash = lambda crash: None
+    svc._archive_lingering_crash_file = lambda crash: None
 
     art = _make_mode_tree(tmp_path, "live")
     svc._handle_unhealthy("CRASHED", {}, art)
@@ -617,7 +617,7 @@ def test_handle_unhealthy_restores_running_after_spawn_failure(monkeypatch, tmp_
     def stub_spawn_fail(art):
         raise RuntimeError("simulated spawn failure")
     svc._spawn_bot_child = stub_spawn_fail
-    svc._archive_stale_crash = lambda crash: None
+    svc._archive_lingering_crash_file = lambda crash: None
 
     art = _make_mode_tree(tmp_path, "live")
     svc._handle_unhealthy("CRASHED", {}, art)  # must not raise on CRASHED unhealthy status
@@ -649,7 +649,7 @@ def test_handle_unhealthy_does_NOT_restore_running_when_stop_requested(monkeypat
         svc._bot_proc = FakeProc()
         svc._bot_started_at = time.time()
     svc._spawn_bot_child = stub_spawn
-    svc._archive_stale_crash = lambda crash: None
+    svc._archive_lingering_crash_file = lambda crash: None
 
     art = _make_mode_tree(tmp_path, "live")
     svc._handle_unhealthy("CRASHED", {}, art)
@@ -728,7 +728,7 @@ def _make_svc_with_stubs():
         svc._bot_proc = FakeProc()
         svc._bot_started_at = time.time()
     svc._spawn_bot_child = stub_spawn
-    svc._archive_stale_crash = lambda crash: None
+    svc._archive_lingering_crash_file = lambda crash: None
     return svc
 
 

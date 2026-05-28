@@ -632,7 +632,7 @@ class RpcPoller:
 
         Triggers cursor initialization on the first call (~1 RPC,
         non-blocking; daemon's periodic ticks drive the catch-up).
-        Subsequent calls drop stale-epoch state and update tracked
+        Subsequent calls drop previous-round state and update tracked
         epochs via _on_epoch_advance.
         """
         if current_epoch < 0:
@@ -663,14 +663,14 @@ class RpcPoller:
                 info("START", f"RPC poll initialized at epoch {current_epoch}")
                 self._current_epoch = current_epoch
             else:
-                # Drop stale epochs (strictly less than new current_epoch)
-                # from both _pools and _seen_tx. The "+1" next-epoch entries
-                # are kept.
-                stale_pools = [e for e in self._pools if e < current_epoch]
-                stale_seen = [e for e in self._seen_tx if e < current_epoch]
-                for e in stale_pools:
+                # Drop previous-round epochs (strictly less than new
+                # current_epoch) from both _pools and _seen_tx. The "+1"
+                # next-epoch entries are kept.
+                previous_round_pools = [e for e in self._pools if e < current_epoch]
+                previous_round_seen = [e for e in self._seen_tx if e < current_epoch]
+                for e in previous_round_pools:
                     del self._pools[e]
-                for e in stale_seen:
+                for e in previous_round_seen:
                     del self._seen_tx[e]
                 self._current_epoch = current_epoch
                 is_epoch_advance = True

@@ -190,7 +190,7 @@ def _safe_count_trades(path: Path) -> int | None:
 def _pid_is_our_bot(pid: int, mode: str) -> bool:
     """True iff PID is alive AND its cmdline contains ``run.py --<mode>``.
 
-    Windows aggressively reuses PIDs; a stale bot.pid could point at an
+    Windows aggressively reuses PIDs; a lingering bot.pid could point at an
     unrelated process. The cmdline check ensures we only report a PID as
     "our bot alive" when it actually is one. Retry-once on transient
     psutil failures.

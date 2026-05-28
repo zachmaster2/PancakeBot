@@ -684,7 +684,7 @@ def _validate_strict_schema(raw: dict, schema: dict[str, set[str]]) -> None:
 
     Sections are paths like ``"strategy.risk"``; keys are leaf names.
     Anything in ``raw`` that doesn't match the schema is a config error —
-    typo'd renamed key, stale knob from a removed feature, or section
+    typo'd renamed key, obsolete knob from a removed feature, or section
     misplaced under the wrong parent.
     """
     # Top-level: every key must be a known section (we have no top-level
@@ -733,7 +733,7 @@ def load_app_config(path: str) -> AppConfig:
 
     # Fail-fast on unknown keys/sections before per-field reads. The
     # loader's _opt_* helpers silently ignore unrecognized keys; this
-    # check is the safety floor that catches typos, stale renames, and
+    # check is the safety floor that catches typos, obsolete renames, and
     # operator-side misconfigurations that would otherwise go unnoticed.
     _validate_strict_schema(raw, _CONFIG_SCHEMA)
 
@@ -823,7 +823,7 @@ def load_app_config(path: str) -> AppConfig:
         + _tc.BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS
     )
     # OKX session warmup wake (2026-05-21): fires before bankroll_wake so
-    # any TLS handshake cost on a stale OkxClient connection is paid OUT
+    # any TLS handshake cost on an expired OkxClient connection is paid OUT
     # of the bet-decision critical path.
     okx_warmup_wakeup_offset_before_lock_ms = (
         _tc.OKX_WARMUP_WAKEUP_OFFSET_BEFORE_LOCK_MS
@@ -861,7 +861,7 @@ def load_app_config(path: str) -> AppConfig:
     # workload (catching up an 8s periodic interval = ~18 blocks) is
     # much larger than ramp_2's incremental top-up (~4 blocks). The
     # uniform RPC_RAMP_POLL_INTERVAL_MS=1500 it replaced was sized for a
-    # stale batch=15 assumption and under-provisioned ramp_1 while
+    # outdated batch=15 assumption and under-provisioned ramp_1 while
     # over-provisioning ramp_2/final.
     final_rpc_poll_wakeup_offset_before_lock_ms = (
         pool_cutoff_seconds * 1000
