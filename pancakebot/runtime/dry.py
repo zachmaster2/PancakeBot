@@ -39,7 +39,7 @@ class _ClosedState:
     # Process-health: incremented at top of each _run_one_iteration;
     # ``last_seen_epoch`` is the most-recent current_epoch the loop has
     # observed. Used by the crash handler to pinpoint where the bot
-    # "was" at failure. (Heartbeat infra removed 2026-05-27 Step 27a.)
+    # "was" at failure.
     iteration_count: int = 0
     last_seen_epoch: int | None = None
 

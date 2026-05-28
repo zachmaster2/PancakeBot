@@ -13,10 +13,8 @@ Two artifacts per mode:
 
 All writes are atomic (tempfile + fsync + os.replace) with a bounded retry
 on PermissionError (Windows file-lock race with antivirus / indexer).
-
-Heartbeat infrastructure removed 2026-05-27 (Step 27a full cleanup): the
-supervisor uses ``Popen.poll()`` as the authoritative liveness signal; no
-filesystem heartbeat is needed.
+The supervisor uses ``Popen.poll()`` as the authoritative liveness signal;
+these artifacts are passive forensic records, not heartbeat polls.
 """
 from __future__ import annotations
 

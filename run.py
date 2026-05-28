@@ -23,7 +23,6 @@ def _resolve_process_health_paths(dry: bool) -> tuple[Path, Path]:
 
     Only meaningful for dry/live (backtest and sync don't need runtime health
     artifacts). Live-mode pair mirrors the dry-mode layout under var/live/.
-    Heartbeat infra removed 2026-05-27 (Step 27a).
     """
     if dry:
         return (

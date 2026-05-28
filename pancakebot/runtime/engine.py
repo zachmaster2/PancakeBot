@@ -200,11 +200,6 @@ def _classify_kline_failure(
     return most_severe, ", ".join(body_parts)
 
 
-# Heartbeat infrastructure removed 2026-05-27 (Step 27a full cleanup).
-# The supervisor uses Popen.poll() as the authoritative liveness signal;
-# no filesystem heartbeat is needed.
-
-
 def _fetch_current_bnb_price_usd(cfg: RuntimeConfig) -> float:
     """Fetch approximate BNB/USD price from contract (best-effort; 0.0 on failure)."""
     # USD display fallback; any RPC/parse failure falls back to 0

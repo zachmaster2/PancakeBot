@@ -31,8 +31,8 @@ DRY_TRADES_PATH = "var/dry/trades.csv"
 DRY_SETTLED_EPOCHS_PATH = "var/dry/settled_epochs.txt"
 DRY_ARCHIVE_ROOT = "var/dry/archive"
 
-# Process-health artifacts (crash.json + PID file). Heartbeat infrastructure
-# removed 2026-05-27 (Step 27a); supervisor uses Popen.poll() for liveness.
+# Process-health artifacts (crash.json + PID file).
+# Supervisor uses Popen.poll() for liveness.
 DRY_CRASH_PATH = "var/dry/crash.json"
 DRY_PID_PATH = "var/dry/bot.pid"
 
