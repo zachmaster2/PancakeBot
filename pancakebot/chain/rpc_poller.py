@@ -663,14 +663,15 @@ class RpcPoller:
                 info("START", f"RPC poll initialized at epoch {current_epoch}")
                 self._current_epoch = current_epoch
             else:
-                # Drop previous-round epochs (strictly less than new
+                # Drop past-round epochs (strictly less than new
                 # current_epoch) from both _pools and _seen_tx. The "+1"
-                # next-epoch entries are kept.
-                previous_round_pools = [e for e in self._pools if e < current_epoch]
-                previous_round_seen = [e for e in self._seen_tx if e < current_epoch]
-                for e in previous_round_pools:
+                # next-epoch entries are kept. _pools and _seen_tx share
+                # the same epoch keyset by construction (see population
+                # site in _process_receipts_for_block), so a single key
+                # list suffices for both deletes.
+                epochs_to_drop = [e for e in self._pools if e < current_epoch]
+                for e in epochs_to_drop:
                     del self._pools[e]
-                for e in previous_round_seen:
                     del self._seen_tx[e]
                 self._current_epoch = current_epoch
                 is_epoch_advance = True
@@ -757,7 +758,7 @@ class RpcPoller:
            current round's start block (or just behind it). Forward-only —
            never rewinds, so normal in-round operation is a no-op. After
            a publicnode outage spanning N rounds, the clamp jumps the
-           cursor forward, skipping ~N*660 stale-round blocks; past
+           cursor forward, skipping ~N*660 past-round blocks; past
            rounds are archive-only.
 
         2. **Feasibility check**: compute estimated catch-up wallclock
@@ -774,7 +775,7 @@ class RpcPoller:
         # a past-round flag would carry forward into rounds where the
         # cursor has been clamped and catch-up is now feasible. Reset
         # the detail tuple too so a SKIP in a later round can't surface
-        # stale numbers from a prior infeasibility event.
+        # carried-over numbers from a past infeasibility event.
         with self._lock:
             self._catchup_infeasible_for_round = False
             self._last_catchup_detail = None
@@ -832,7 +833,7 @@ class RpcPoller:
         2. **RPC fallback**: ``eth_getBlockByNumber("latest", false)``
            returns ``(head_num, head_ts)``; extrapolate backward.
 
-        Returns None if RPC fails AND cache is empty/stale.
+        Returns None if RPC fails AND cache has no usable anchor.
         """
         # Method 1 — cache lookup.
         with self._lock:
