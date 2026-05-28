@@ -5,7 +5,7 @@ Covers:
 - is_pool_ready() reflects internal state correctly.
 - set_round_phase() idempotence + invariants (mirror PoolEventWatcher
   semantics so the engine integration remains compatible).
-- get_pool() filtering + dedup.
+- get_pool() filtering + log-id dedup.
 - Public-property contracts.
 
 Network-touching paths (cold-start, periodic poll, ramp poll) are NOT
@@ -241,9 +241,9 @@ def test_set_round_phase_advancing_epoch_drops_past_round_pools(monkeypatch):
              block_number=2, block_ts=1000),
     ])
     p._pools[101] = _EpochPool(bets=[])
-    p._seen_tx[99] = {"a:0"}
-    p._seen_tx[100] = {"b:0"}
-    p._seen_tx[101] = set()
+    p._processed_bet_log_ids[99] = {"a:0"}
+    p._processed_bet_log_ids[100] = {"b:0"}
+    p._processed_bet_log_ids[101] = set()
 
     # Don't actually try to fetch from test.example.com.
     monkeypatch.setattr(p, "_on_epoch_advance", lambda **kw: None)
@@ -253,9 +253,9 @@ def test_set_round_phase_advancing_epoch_drops_past_round_pools(monkeypatch):
     assert 99 not in p._pools, "past-round epoch should be dropped"
     assert 100 not in p._pools, "past-round epoch should be dropped"
     assert 101 in p._pools, "current epoch retained"
-    assert 99 not in p._seen_tx
-    assert 100 not in p._seen_tx
-    assert 101 in p._seen_tx
+    assert 99 not in p._processed_bet_log_ids
+    assert 100 not in p._processed_bet_log_ids
+    assert 101 in p._processed_bet_log_ids
 
 
 # ---------------------------------------------------------------------------

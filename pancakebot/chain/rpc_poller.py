@@ -388,7 +388,7 @@ class RpcPoller:
         # Pool state — same shapes as PoolEventWatcher for engine compat.
         self._pools: dict[int, _EpochPool] = {}
         self._block_ts: dict[int, int] = {}
-        self._seen_tx: dict[int, set[str]] = {}
+        self._processed_bet_log_ids: dict[int, set[str]] = {}
 
         # Round-phase state (set by engine).
         self._current_epoch: int = -1
@@ -398,7 +398,7 @@ class RpcPoller:
         # Cursor-init sets this to round_start_block - 1 on the first
         # set_round_phase; subsequent polls advance it. Periodic and
         # ramp/final polls all read+write under self._lock to keep
-        # dedup honest.
+        # log-id dedup honest.
         self._last_polled_block_number: int = 0
 
         # Connection / readiness state.
@@ -664,15 +664,16 @@ class RpcPoller:
                 self._current_epoch = current_epoch
             else:
                 # Drop past-round epochs (strictly less than new
-                # current_epoch) from both _pools and _seen_tx. The "+1"
-                # next-epoch entries are kept. _pools and _seen_tx share
-                # the same epoch keyset by construction (see population
-                # site in _process_receipts_for_block), so a single key
-                # list suffices for both deletes.
+                # current_epoch) from both _pools and
+                # _processed_bet_log_ids. The "+1" next-epoch entries
+                # are kept. The two dicts share the same epoch keyset
+                # by construction (see population site in
+                # _process_receipts_for_block), so a single key list
+                # suffices for both deletes.
                 epochs_to_drop = [e for e in self._pools if e < current_epoch]
                 for e in epochs_to_drop:
                     del self._pools[e]
-                    del self._seen_tx[e]
+                    del self._processed_bet_log_ids[e]
                 self._current_epoch = current_epoch
                 is_epoch_advance = True
 
@@ -1495,8 +1496,8 @@ class RpcPoller:
 
     def _process_receipts_for_block(self, block_number: int, receipts: list[dict]) -> None:
         """Extract BetBull/BetBear events from a block's receipts and
-        update the local pool state. Same dedup + epoch-gate behaviour
-        as the prior PoolEventWatcher._process_bet_event.
+        update the local pool state. Same log-id dedup + epoch-gate
+        behaviour as the prior PoolEventWatcher._process_bet_event.
 
         Bundle 5 v2 (2026-05-14): when a bet log is detected, resolve
         the block timestamp lazily via a single ``eth_getBlockByNumber``
@@ -1549,13 +1550,12 @@ class RpcPoller:
                 continue
             tx_hash = log.get("transactionHash", "")
             log_idx = log.get("logIndex", "")
-            dedup_key = f"{tx_hash}:{log_idx}"
+            bet_log_id = f"{tx_hash}:{log_idx}"
             with self._lock:
-                seen = self._seen_tx.setdefault(epoch, set())
-                if dedup_key and dedup_key in seen:
+                processed_log_ids = self._processed_bet_log_ids.setdefault(epoch, set())
+                if bet_log_id in processed_log_ids:
                     continue
-                if dedup_key:
-                    seen.add(dedup_key)
+                processed_log_ids.add(bet_log_id)
                 if epoch not in self._pools:
                     self._pools[epoch] = _EpochPool()
                 self._pools[epoch].bets.append(_Bet(
