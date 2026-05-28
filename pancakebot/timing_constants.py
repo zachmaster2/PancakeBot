@@ -416,7 +416,7 @@ RPC_POLL_DEADLINE_SAFETY_BUFFER_MS: int = 200
 # Per-leg fixed intervals between successive RPC polls. Replaces the
 # prior uniform ``RPC_RAMP_POLL_INTERVAL_MS=1500`` (2026-05-12) which
 # coupled both ramp gaps to the same constant and was sized for a
-# stale 30s-periodic-cadence assumption (batch=15 for both ramps).
+# outdated 30s-periodic-cadence assumption (batch=15 for both ramps).
 # With 8s periodic cadence (post 740328f), the actual expected ramp
 # workloads diverge sharply:
 #

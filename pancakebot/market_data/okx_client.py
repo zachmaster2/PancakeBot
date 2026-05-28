@@ -296,7 +296,7 @@ class OkxClient:
         ``InvariantError`` via PERMANENT classification (rare; only on
         explicit OKX rejection rather than network down).
         """
-        # Step 1: close the stale session (breaks any backend affinity from
+        # Step 1: close the expired session (breaks any backend affinity from
         # prior rounds). Best-effort -- a failed close just leaks a few
         # idle sockets that the OS will reap anyway. Don't crash on cleanup.
         try:

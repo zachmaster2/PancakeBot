@@ -153,7 +153,7 @@ rearchitecting the timing pipeline.**
 `dd14ec6` (`--kline-source captured` backtest replay):
 - ✓ Foundation for divergence A/B analysis. KEEP.
 
-`eeaad8f` (`archive_stale_crash` always-archive):
+`eeaad8f` (`archive_lingering_crash_file` always-archive policy):
 - ✓ Independent fix for false-CRASHED supervisor incident. KEEP.
 
 ## Recommended fix path

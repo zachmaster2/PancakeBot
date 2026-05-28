@@ -1,13 +1,13 @@
-"""Tests for supervisor_artifacts.archive_stale_crash.
+"""Tests for supervisor_artifacts.archive_lingering_crash_file.
 
 Verifies the bot-startup housekeeping that renames a leftover crash.json to
 a timestamped archive filename so the supervisor doesn't re-fire CRASHED
 alerts every 3 minutes after a previous bot's death.
 
 Run:
-    python -m pytest tests/test_archive_stale_crash.py -v
+    python -m pytest tests/test_archive_lingering_crash_file.py -v
     # or standalone:
-    python tests/test_archive_stale_crash.py
+    python tests/test_archive_lingering_crash_file.py
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from pancakebot.runtime.supervisor_artifacts import archive_stale_crash  # noqa: E402
+from pancakebot.runtime.supervisor_artifacts import archive_lingering_crash_file  # noqa: E402
 
 
 def _write_fake_crash(path: Path, *, age_s: float) -> None:
@@ -37,7 +37,7 @@ def test_missing_file_is_noop():
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "crash.json"
         assert not p.exists()
-        result = archive_stale_crash(p)
+        result = archive_lingering_crash_file(p)
         assert result is None
         assert not p.exists()  # no-op, no fake file created
 
@@ -46,7 +46,7 @@ def test_old_file_gets_archived():
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "crash.json"
         _write_fake_crash(p, age_s=3600)  # 1h old
-        result = archive_stale_crash(p)
+        result = archive_lingering_crash_file(p)
         assert result is not None, "old crash.json should have been archived"
         assert not p.exists(), "original crash.json should be gone"
         assert result.exists(), "archive file should exist"
@@ -67,14 +67,14 @@ def test_default_always_archives_regardless_of_age():
     caused 2026-04-25 false-CRASHED events: a bot crashed at T=0,
     auto-restart spawned a new bot at T=58s (under threshold), the
     crash.json sat un-archived, and the supervisor's next 3-minute cycle
-    classified the healthy new bot as CRASHED based on the stale file
+    classified the healthy new bot as CRASHED based on the lingering file
     and killed it. Always archiving fixes this without losing forensic
     data (the file is renamed, not deleted).
     """
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "crash.json"
         _write_fake_crash(p, age_s=5)  # 5s old -- under the OLD 60s threshold
-        result = archive_stale_crash(p)
+        result = archive_lingering_crash_file(p)
         assert result is not None, "default policy now archives unconditionally"
         assert not p.exists(), "original crash.json should have been renamed"
         assert result.exists(), "archive file should exist"
@@ -88,7 +88,7 @@ def test_explicit_min_age_still_preserves_young_file():
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "crash.json"
         _write_fake_crash(p, age_s=5)
-        result = archive_stale_crash(p, min_age_seconds=60.0)
+        result = archive_lingering_crash_file(p, min_age_seconds=60.0)
         assert result is None, "explicit min_age_seconds=60 should preserve a 5s-old file"
         assert p.exists(), "original crash.json should still be in place"
 
@@ -99,7 +99,7 @@ def test_custom_min_age_threshold():
         p = Path(tmp) / "crash.json"
         _write_fake_crash(p, age_s=10)  # 10s old
         # With a tight 5s threshold, the 10s-old file SHOULD archive.
-        result = archive_stale_crash(p, min_age_seconds=5.0)
+        result = archive_lingering_crash_file(p, min_age_seconds=5.0)
         assert result is not None
         assert result.name.startswith("crash_archive_")
 
@@ -110,13 +110,13 @@ def test_archive_collision_gets_numeric_suffix():
         p = Path(tmp) / "crash.json"
         # Two rounds: archive once, then put another fresh file with same mtime and archive again.
         _write_fake_crash(p, age_s=3600)
-        first = archive_stale_crash(p)
+        first = archive_lingering_crash_file(p)
         assert first is not None
         # Create a second crash.json with the SAME backdated mtime.
         _write_fake_crash(p, age_s=3600)
         old_stat = first.stat()
         os.utime(str(p), (old_stat.st_mtime, old_stat.st_mtime))
-        second = archive_stale_crash(p)
+        second = archive_lingering_crash_file(p)
         assert second is not None
         assert second != first, "second archive must not overwrite first"
         # Reviewer NIT: tighten the collision-suffix assertion. The suffix
@@ -129,7 +129,7 @@ def test_archive_collision_gets_numeric_suffix():
 
 
 def test_existing_archive_files_are_not_re_archived():
-    """Sanity: archive_stale_crash operates on the exact crash_path it's
+    """Sanity: archive_lingering_crash_file operates on the exact crash_path it's
     given. An existing ``crash_archive_*.json`` left in the directory from a
     prior startup must not itself be touched."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -138,8 +138,8 @@ def test_existing_archive_files_are_not_re_archived():
         prior_archive.write_text("prior", encoding="utf-8")
         past = time.time() - 86400  # very old
         os.utime(str(prior_archive), (past, past))
-        # No crash.json -> archive_stale_crash returns None and does nothing.
-        result = archive_stale_crash(p)
+        # No crash.json -> archive_lingering_crash_file returns None and does nothing.
+        result = archive_lingering_crash_file(p)
         assert result is None
         assert prior_archive.exists(), "prior archive must be untouched"
         assert prior_archive.read_text(encoding="utf-8") == "prior"
@@ -151,7 +151,7 @@ def test_archive_preserves_mtime_in_filename():
         p = Path(tmp) / "crash.json"
         _write_fake_crash(p, age_s=3600)
         stamp_expected = time.strftime("%Y%m%d-%H%M%S", time.localtime(p.stat().st_mtime))
-        result = archive_stale_crash(p)
+        result = archive_lingering_crash_file(p)
         assert result is not None
         assert stamp_expected in result.name, (
             f"filename {result.name} should contain the original mtime stamp {stamp_expected}"
@@ -163,7 +163,7 @@ def test_exception_does_not_propagate():
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "nonexistent_subdir" / "crash.json"
         # crash_path parent doesn't exist -- ``.exists()`` returns False -> noop.
-        result = archive_stale_crash(p)
+        result = archive_lingering_crash_file(p)
         assert result is None
 
 

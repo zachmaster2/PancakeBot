@@ -11,7 +11,7 @@ from pancakebot import paths
 from pancakebot.app import run_from_config
 from pancakebot.log import info
 from pancakebot.runtime.supervisor_artifacts import (
-    archive_stale_crash,
+    archive_lingering_crash_file,
     clear_pid_file,
     write_crash,
     write_pid_file,
@@ -106,9 +106,9 @@ def main() -> None:
         # on every invocation after a previous bot died. A crash.json newer
         # than 60s is left alone to avoid clobbering a report that's still
         # being processed by whatever wrote it.
-        archived = archive_stale_crash(crash_path)
+        archived = archive_lingering_crash_file(crash_path)
         if archived is not None:
-            info("START", f"archived stale crash.json -> {archived.name}")
+            info("START", f"archived lingering crash.json -> {archived.name}")
 
     try:
         run_from_config(

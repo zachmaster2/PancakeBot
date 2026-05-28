@@ -241,9 +241,9 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
         first_kind = self._classify_first_run(art)
         notifications.notify(mode=self._MODE, kind=first_kind, art=art)
 
-        # Archive any stale crash.json from the previous bot generation
-        # (matches run.py:archive_stale_crash policy — always archive).
-        self._archive_stale_crash(art["crash"])
+        # Archive any lingering crash.json from the previous bot generation
+        # (matches run.py:archive_lingering_crash_file policy — always archive).
+        self._archive_lingering_crash_file(art["crash"])
 
         # Spawn initial bot child.
         try:
@@ -543,7 +543,7 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
 
             # Drain dead child, archive crash, spawn new.
             self._stop_bot_child(reason=f"unhealthy:{status}")
-            self._archive_stale_crash(art["crash"])
+            self._archive_lingering_crash_file(art["crash"])
 
             try:
                 self._spawn_bot_child(art)
@@ -589,17 +589,17 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
 
     # -- Crash artifact archival ------------------------------------------
 
-    def _archive_stale_crash(self, crash_path: Path) -> None:
+    def _archive_lingering_crash_file(self, crash_path: Path) -> None:
         """Same policy as run.py: always archive any existing crash.json on (re)spawn.
 
-        Delegates to ``supervisor_artifacts.archive_stale_crash`` so the logic is
+        Delegates to ``supervisor_artifacts.archive_lingering_crash_file`` so the logic is
         single-source-of-truth with run.py.
         """
         try:
-            from pancakebot.runtime.supervisor_artifacts import archive_stale_crash
-            archive_stale_crash(crash_path)
+            from pancakebot.runtime.supervisor_artifacts import archive_lingering_crash_file
+            archive_lingering_crash_file(crash_path)
         except Exception as e:
             # Never block spawn on a cleanup failure.
             servicemanager.LogWarningMsg(
-                f"{self._svc_name_}: archive_stale_crash raised: {e!r}"
+                f"{self._svc_name_}: archive_lingering_crash_file raised: {e!r}"
             )
