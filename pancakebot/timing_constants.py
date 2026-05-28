@@ -406,7 +406,7 @@ RPC_PERIODIC_TO_RAMP_SAFETY_BUFFER_SECONDS: float = 0.05
 RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS: int = 200
 
 # Per-poll deadline cushion — if a poll's RTT exceeds (next_wake_offset
-# - this), the poll is marked stale (logged, _last_poll_too_slow=True
+# - this), the poll is marked slow (logged, _last_poll_too_slow=True
 # for diagnostics). The critical-path readiness gate no longer skips
 # on this alone; the round-aware feasibility check
 # (pool_not_ready_catchup_infeasible_for_round) is the canonical

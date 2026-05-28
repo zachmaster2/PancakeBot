@@ -220,16 +220,18 @@ def test_set_round_phase_same_epoch_same_lock_at_is_noop():
     assert p._lock_at == 1000
 
 
-def test_set_round_phase_advancing_epoch_drops_previous_round_pools(monkeypatch):
-    """When epoch advances, previous-round pool entries are dropped.
-    The newly-introduced _on_epoch_advance hook is mocked here — its
-    own behavior is covered by dedicated tests below."""
+def test_set_round_phase_advancing_epoch_drops_past_round_pools(monkeypatch):
+    """When epoch advances, past-round pool entries are dropped (covers
+    both the normal advance case AND the multi-round skip case where
+    intermediate epochs were never set as current). The newly-introduced
+    _on_epoch_advance hook is mocked here — its own behavior is covered
+    by dedicated tests below."""
     p = _make_poller()
     p._current_epoch = 100
     p._lock_at = 1000
     p._cold_start_done.set()
     p._connected = True
-    # Stuff in some previous-round + current + future epochs
+    # Stuff in some past-round + current + future epochs
     p._pools[99] = _EpochPool(bets=[
         _Bet(epoch=99, side="Bull", amount_wei=int(0.1 * 10**18),
              block_number=1, block_ts=900),
@@ -248,8 +250,8 @@ def test_set_round_phase_advancing_epoch_drops_previous_round_pools(monkeypatch)
 
     p.set_round_phase(current_epoch=101, lock_at=2000)
 
-    assert 99 not in p._pools, "previous-round epoch should be dropped"
-    assert 100 not in p._pools, "previous-round epoch should be dropped"
+    assert 99 not in p._pools, "past-round epoch should be dropped"
+    assert 100 not in p._pools, "past-round epoch should be dropped"
     assert 101 in p._pools, "current epoch retained"
     assert 99 not in p._seen_tx
     assert 100 not in p._seen_tx
