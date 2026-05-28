@@ -292,11 +292,8 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
                 continue
 
             if status in ("CRASHED", "DOWN"):
-                # Only process death triggers respawn (Step 27a):
-                # CRASHED = process dead with crash.json present, DOWN =
-                # process dead without crash signal. Heartbeat-staleness
-                # was removed as a respawn trigger because it produced
-                # too many false positives from transient network I/O.
+                # CRASHED = process dead with crash.json present;
+                # DOWN = process dead without crash signal.
                 self._handle_unhealthy(status, fields, art)
                 continue
 
@@ -528,12 +525,11 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
             slow_count = supervision.count_within(history, now, _SLOW_RESTART_WINDOW_S)
             escalate_slow = slow_count >= _SLOW_RESTART_MAX
 
-            # Restart-pattern aggregation (Step 27a policy b, 2026-05-27):
-            # Discord-notify the underlying status only when this is the 3rd+
-            # restart in a 1-hour rolling window. Single isolated restarts
-            # (process auto-recovered within seconds) go to log only; the
-            # SLOW_CRASHLOOP_WARNING below still fires at the 8/24h pattern
-            # for a separate severity signal.
+            # Restart-pattern aggregation: Discord-notify the underlying status
+            # only when this is the 3rd+ restart in a 1-hour rolling window.
+            # Single isolated restarts (process auto-recovered within seconds)
+            # go to log only; the SLOW_CRASHLOOP_WARNING below still fires at
+            # the 8/24h pattern for a separate severity signal.
             recent_restarts_1h = supervision.count_within(history, now, 3600.0)
             should_notify_status = recent_restarts_1h >= 2  # this would be the 3rd
             if should_notify_status:

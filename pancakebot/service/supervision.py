@@ -21,10 +21,7 @@ Status values returned by both:
   DOWN          - bot dead (or absent), no crash.json
   UNINSTRUMENTED- (classify_state only) legacy bot detected outside service
 
-Heartbeat-staleness STALE classification removed 2026-05-27 (Step 27a full
-cleanup). The 5s heartbeat-age threshold was firing on transient BSC RPC
-hedged-timeouts that auto-resolve next round (~12 false-positive restarts/24h
-with no real bot dysfunction). Process-death is the only restart trigger now.
+Process-death is the only restart trigger.
 
 Operational caveat: liveness is ``Popen.poll()``-based only. An in-loop wedge
 (synchronous blocking call with no timeout) will leave the supervisor
@@ -253,8 +250,7 @@ def classify_state(
     Pure function. Reads filesystem artifacts and process list. Never raises;
     fields populated best-effort.
 
-    Heartbeat reads removed 2026-05-27 (Step 27a). Liveness inferred from
-    bot.pid + crash.json + process-listing only.
+    Liveness inferred from bot.pid + crash.json + process-listing only.
     """
     art = artifacts_for_mode(mode)
     now = time.time()
@@ -400,8 +396,6 @@ def classify_running_bot(
     Returns:
         (status, fields) where status is one of UP, STARTING, CRASHED, DOWN.
         Fields are best-effort diagnostics.
-
-    Heartbeat-staleness STALE classification removed 2026-05-27 (Step 27a).
 
     Never raises.
     """
