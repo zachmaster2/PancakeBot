@@ -49,7 +49,6 @@ def _atomic_write_text(path: Path, content: str) -> None:
     """
     ensure_parent_dir(str(path))
     attempt = 0
-    last_exc: BaseException | None = None
     while True:
         fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
         try:
@@ -59,8 +58,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
                 os.fsync(f.fileno())
             os.replace(tmp_path, str(path))
             return
-        except PermissionError as e:
-            last_exc = e
+        except PermissionError:
             # Best-effort tempfile cleanup.
             try:
                 os.unlink(tmp_path)
@@ -76,9 +74,6 @@ def _atomic_write_text(path: Path, content: str) -> None:
             except OSError:
                 pass
             raise
-    # unreachable
-    if last_exc is not None:
-        raise last_exc
 
 
 # -- PID file ----------------------------------------------------------------
