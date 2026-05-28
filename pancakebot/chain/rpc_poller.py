@@ -632,7 +632,7 @@ class RpcPoller:
 
         Triggers cursor initialization on the first call (~1 RPC,
         non-blocking; daemon's periodic ticks drive the catch-up).
-        Subsequent calls drop previous-round state and update tracked
+        Subsequent calls drop past-round state and update tracked
         epochs via _on_epoch_advance.
         """
         if current_epoch < 0:
