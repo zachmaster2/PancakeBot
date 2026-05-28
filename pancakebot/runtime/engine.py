@@ -493,7 +493,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         # Generously off the critical path: 5000ms wake budget. On
         # live RPC error, SKIP the iteration with risk_bankroll_stale
-        # rather than betting on stale value.
+        # rather than sizing the bet from a potentially-outdated
+        # bankroll value (over-sizing risk if true bankroll has shrunk
+        # since last fetch).
         bankroll_wake_ts = lock_ts_t - cfg.bankroll_wakeup_offset_before_lock_ms / 1000.0
         _sleep_until_ts(
             bankroll_wake_ts,
@@ -547,11 +549,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             # gates read from the tracker in decide_open_round below.
             #
             # On TransientRpcError above we SKIP and do NOT update the
-            # tracker, so multi-iteration RPC outages leave it on stale
-            # peak. Net effect is conservative: we also refuse to bet
-            # (risk_bankroll_stale), so the breaker can't mis-fire on
-            # stale data because we're not betting in the first place.
-            # Tracker re-syncs on the next successful RPC fetch.
+            # tracker, so multi-iteration RPC outages leave it on an
+            # unrefreshed drawdown-peak. Net effect is conservative:
+            # we also refuse to bet (risk_bankroll_stale), so the
+            # breaker can't mis-fire on an unrefreshed bankroll value
+            # because we're not betting in the first place. Tracker
+            # re-syncs on the next successful RPC fetch.
             if closed.strategy_pipeline is not None:
                 closed.strategy_pipeline.record_settlement(
                     bankroll=bankroll_bnb,
