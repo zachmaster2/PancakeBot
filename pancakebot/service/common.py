@@ -592,11 +592,11 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
     def _archive_stale_crash(self, crash_path: Path) -> None:
         """Same policy as run.py: always archive any existing crash.json on (re)spawn.
 
-        Delegates to ``process_health.archive_stale_crash`` so the logic is
+        Delegates to ``supervisor_artifacts.archive_stale_crash`` so the logic is
         single-source-of-truth with run.py.
         """
         try:
-            from pancakebot.runtime.process_health import archive_stale_crash
+            from pancakebot.runtime.supervisor_artifacts import archive_stale_crash
             archive_stale_crash(crash_path)
         except Exception as e:
             # Never block spawn on a cleanup failure.

@@ -10,7 +10,7 @@ from pathlib import Path
 from pancakebot import paths
 from pancakebot.app import run_from_config
 from pancakebot.log import info
-from pancakebot.runtime.process_health import (
+from pancakebot.runtime.supervisor_artifacts import (
     archive_stale_crash,
     clear_pid_file,
     write_crash,
@@ -18,7 +18,7 @@ from pancakebot.runtime.process_health import (
 )
 
 
-def _resolve_process_health_paths(dry: bool) -> tuple[Path, Path]:
+def _resolve_supervisor_artifact_paths(dry: bool) -> tuple[Path, Path]:
     """Return (pid_path, crash_path) for the given mode.
 
     Only meaningful for dry/live (backtest and sync don't need runtime health
@@ -97,7 +97,7 @@ def main() -> None:
     pid_path: Path | None = None
     crash_path: Path | None = None
     if args.dry or args.live:
-        pid_path, crash_path = _resolve_process_health_paths(args.dry)
+        pid_path, crash_path = _resolve_supervisor_artifact_paths(args.dry)
         write_pid_file(pid_path, os.getpid())
         atexit.register(clear_pid_file, pid_path)
         # Archive any crash.json left behind by a previous bot (renamed with
