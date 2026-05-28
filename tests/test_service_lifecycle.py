@@ -620,7 +620,7 @@ def test_handle_unhealthy_restores_running_after_spawn_failure(monkeypatch, tmp_
     svc._archive_stale_crash = lambda crash: None
 
     art = _make_mode_tree(tmp_path, "live")
-    svc._handle_unhealthy("CRASHED", {}, art)  # must not raise (Step 27a renamed STALE→CRASHED)
+    svc._handle_unhealthy("CRASHED", {}, art)  # must not raise on CRASHED unhealthy status
 
     assert win32service.SERVICE_STOP_PENDING in status_log
     assert status_log[-1] == win32service.SERVICE_RUNNING, \
