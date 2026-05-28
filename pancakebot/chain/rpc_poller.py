@@ -1152,10 +1152,10 @@ class RpcPoller:
             loop iteration picks up State C (and shortly afterwards,
             the fresh anchor from the next set_round_phase).
 
-        State C — stale anchor (``now >= _lock_at``): round just locked,
-            engine is in _sleep_and_claim, set_round_phase for the next
-            round hasn't fired yet (~35-40s latency). Fall back to
-            wall-clock cadence — _poll_now still runs and the cursor
+        State C — post-lock fallback (``now >= _lock_at``): round just
+            locked, engine is in _sleep_and_claim, set_round_phase for
+            the next round hasn't fired yet (~35-40s latency). Fall back
+            to wall-clock cadence — _poll_now still runs and the cursor
             advances for round N+2, but the post-lock INFEAS gating in
             ``_poll_now`` suppresses false flag/WARN noise for ticks
             in this window.
@@ -1178,10 +1178,9 @@ class RpcPoller:
                     break
                 continue
 
-            timeout, state = self._compute_periodic_timeout(
+            timeout = self._compute_periodic_timeout(
                 now=now, lock_at=lock_at, period=period,
             )
-            del state  # informational; not used at runtime
 
             if self._stop_event.wait(timeout=timeout):
                 break
@@ -1199,18 +1198,17 @@ class RpcPoller:
 
     def _compute_periodic_timeout(
         self, *, now: float, lock_at: int, period: int,
-    ) -> tuple[float, str]:
-        """Return ``(wait_timeout_seconds, state_label)`` for the
-        lock-anchored periodic loop. Extracted from ``_periodic_loop``
-        so the cadence math is unit-testable without spinning up the
-        daemon thread.
+    ) -> float:
+        """Return the wait timeout (seconds) for the lock-anchored
+        periodic loop. Extracted from ``_periodic_loop`` so the cadence
+        math is unit-testable without spinning up the daemon thread.
 
         Caller is responsible for State A (``lock_at <= 0``) before
         invoking this helper.
 
-        Post-lock fallback (``now >= lock_at``) returns ``"stale"``:
-        wall-clock cadence while the engine is in ``_sleep_and_claim``
-        and ``set_round_phase`` hasn't yet advanced ``_lock_at``.
+        Post-lock fallback (``now >= lock_at``): wall-clock cadence
+        while the engine is in ``_sleep_and_claim`` and
+        ``set_round_phase`` hasn't yet advanced ``_lock_at``.
 
         Before lock, the periodic poll must not race ``ramp_poll_1``
         for ``_poll_lock``. The ramp wake fires at
@@ -1218,7 +1216,8 @@ class RpcPoller:
         if a periodic poll is still in flight at that moment, ramp_1 is
         silently dropped. Two distinct dangers:
 
-          * The anchored tick lands INSIDE the ramp window. Suspend it.
+          * The anchored tick lands INSIDE the ramp window. Suspend
+            (sleep past lock and let the post-lock branch resume).
             (Example: ramp_window_start=lock_at−7.5s, next_at=lock_at−4s.)
 
           * The anchored tick is just BEFORE the window, but its HTTP
@@ -1229,23 +1228,19 @@ class RpcPoller:
             fire time has already PASSED (the prior poll overran),
             suspend rather than fire a doomed poll.
 
-        Outcomes returned:
+        Branches:
 
-        - ``"steady"``: fire at the anchored ``round_open + k*period``.
-        - ``"reschedule"``: fire earlier than anchored, at the latest
+        - **steady**: fire at the anchored ``round_open + k*period``.
+        - **reschedule**: fire earlier than anchored, at the latest
           time a worst-case-RTT poll can complete before the ramp
           window opens.
-        - ``"suspend"``: skip this round's tick; sleep to
+        - **suspend**: skip this round's tick; sleep to
           ``lock_at + 0.1s`` so the next iteration falls into the
-          stale-anchor branch.
-        - ``"stale"``: post-lock wall-clock cadence.
-
-        ``"steady"`` and ``"reschedule"`` both fire a poll;
-        ``"suspend"`` and ``"stale"`` do not race ramp_1 (suspend
-        skips entirely; stale fires only after lock_at).
+          post-lock branch.
+        - **post-lock**: wall-clock cadence (returns ``period``).
         """
         if now >= lock_at:
-            return float(period), "stale"
+            return float(period)
         round_open = lock_at - self._interval_seconds
         ramp_window_start = (
             lock_at - self._ramp_poll_1_wakeup_offset_ms / 1000.0
@@ -1265,9 +1260,9 @@ class RpcPoller:
 
         # The anchored tick lands inside the ramp window itself —
         # firing here would either race ramp_1 directly or block it.
-        # Sleep past lock and let the stale-anchor branch resume.
+        # Sleep past lock and let the post-lock branch resume.
         if next_at >= ramp_window_start:
-            return max(0.1, lock_at + 0.1 - now), "suspend"
+            return max(0.1, lock_at + 0.1 - now)
 
         # The anchored tick is outside the ramp window but close
         # enough that its worst-case RTT could extend into ramp_1.
@@ -1284,11 +1279,11 @@ class RpcPoller:
         #   ramp_1+ramp_2 absorb the extra backlog.
         if next_at > safe_fire_latest:
             if safe_fire_latest > now:
-                return safe_fire_latest - now, "reschedule"
-            return max(0.1, lock_at + 0.1 - now), "suspend"
+                return safe_fire_latest - now
+            return max(0.1, lock_at + 0.1 - now)
 
         # Anchored tick has comfortable margin before the ramp window.
-        return max(0.0, next_at - now), "steady"
+        return max(0.0, next_at - now)
 
     def _latch_first_successful_poll_locked(self) -> None:
         """Flip ``_connected`` + ``_cold_start_done`` exactly once on the

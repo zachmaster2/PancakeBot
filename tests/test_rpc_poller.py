@@ -635,10 +635,9 @@ def test_periodic_timeout_state_b_anchored_to_round_open_plus_8():
     lock_at = 1_000_300
     round_open = lock_at - 300  # 1_000_000
     now = round_open + 5  # 5s into the open round
-    timeout, state = p._compute_periodic_timeout(
+    timeout = p._compute_periodic_timeout(
         now=float(now), lock_at=lock_at, period=8,
     )
-    assert state == "steady"
     assert timeout == pytest.approx(3.0, abs=1e-6)
 
 
@@ -650,10 +649,9 @@ def test_periodic_timeout_state_b_advances_k_after_each_tick():
     lock_at = 1_000_300
     round_open = lock_at - 300
     now = round_open + 17
-    timeout, state = p._compute_periodic_timeout(
+    timeout = p._compute_periodic_timeout(
         now=float(now), lock_at=lock_at, period=8,
     )
-    assert state == "steady"
     assert timeout == pytest.approx(7.0, abs=1e-6)
 
 
@@ -665,10 +663,9 @@ def test_periodic_timeout_state_b_suspend_in_ramp_window():
     p = _make_anchored_poller()
     lock_at = 1_000_300
     now = lock_at - 6
-    timeout, state = p._compute_periodic_timeout(
+    timeout = p._compute_periodic_timeout(
         now=float(now), lock_at=lock_at, period=8,
     )
-    assert state == "suspend"
     assert timeout == pytest.approx(6.1, abs=1e-6)
 
 
@@ -688,10 +685,9 @@ def test_periodic_timeout_reschedule_when_anchored_tick_in_rtt_safety_band():
     p = _make_anchored_poller()
     lock_at = 1_000_300
     now = lock_at - 13
-    timeout, state = p._compute_periodic_timeout(
+    timeout = p._compute_periodic_timeout(
         now=float(now), lock_at=lock_at, period=8,
     )
-    assert state == "reschedule"
     assert timeout == pytest.approx(0.45, abs=1e-6)
 
 
@@ -752,25 +748,23 @@ def test_periodic_timeout_suspend_when_safe_fire_latest_has_passed():
         "would hit the reschedule branch, not the overrun branch"
     )
 
-    timeout, state = p._compute_periodic_timeout(
+    timeout = p._compute_periodic_timeout(
         now=float(now), lock_at=lock_at, period=8,
     )
-    assert state == "suspend"
     # Suspend sleeps to lock_at + 0.1: timeout = 12.6.
     assert timeout == pytest.approx(12.6, abs=1e-6)
 
 
-def test_periodic_timeout_state_c_stale_anchor_wall_clock_fallback():
+def test_periodic_timeout_state_c_post_lock_wall_clock_fallback():
     """At now > lock_at (engine in _sleep_and_claim, set_round_phase
     hasn't fired for the next round yet), fall back to wall-clock
     cadence at the configured period — timeout = period seconds."""
     p = _make_anchored_poller()
     lock_at = 1_000_300
     now = lock_at + 2  # 2s past lock, mid-claim window
-    timeout, state = p._compute_periodic_timeout(
+    timeout = p._compute_periodic_timeout(
         now=float(now), lock_at=lock_at, period=8,
     )
-    assert state == "stale"
     assert timeout == pytest.approx(8.0, abs=1e-6)
 
 
@@ -785,10 +779,9 @@ def test_periodic_timeout_state_b_re_anchors_when_lock_at_advances():
 
     # Halfway through the new round at lock_old + 17s = round_open_new + 17.
     now = lock_at_old + 17
-    timeout, state = p._compute_periodic_timeout(
+    timeout = p._compute_periodic_timeout(
         now=float(now), lock_at=lock_at_new, period=8,
     )
-    assert state == "steady"
     # k=3, next_at = round_open_new + 24 = now + 7.
     assert timeout == pytest.approx(7.0, abs=1e-6)
 
@@ -817,14 +810,13 @@ def test_periodic_timeout_state_b_exact_boundary_suspends():
     # next_at = 100 * 8 = 800. ramp_window_start = 1000 - 200 = 800.
     # next_at == ramp_window_start exactly.
     now = 795.0
-    timeout, state = p._compute_periodic_timeout(
+    timeout = p._compute_periodic_timeout(
         now=now, lock_at=lock_at, period=8,
     )
-    assert state == "suspend", (
-        "exact-boundary tick must suspend under the >= predicate; "
-        "if this fails, the suspend predicate has regressed to >"
-    )
     # Suspend timeout sleeps past lock: lock_at + 0.1 - now = 205.1.
+    # If this fails, the suspend predicate (next_at >= ramp_window_start)
+    # may have regressed to >, in which case the boundary tick would have
+    # fired steady at lock_at-200 instead of suspending.
     assert timeout == pytest.approx(lock_at + 0.1 - now, abs=1e-6)
 
 
