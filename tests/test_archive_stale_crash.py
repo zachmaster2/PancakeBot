@@ -1,4 +1,4 @@
-"""Tests for process_health.archive_stale_crash.
+"""Tests for supervisor_artifacts.archive_stale_crash.
 
 Verifies the bot-startup housekeeping that renames a leftover crash.json to
 a timestamped archive filename so the supervisor doesn't re-fire CRASHED
@@ -22,7 +22,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from pancakebot.runtime.process_health import archive_stale_crash  # noqa: E402
+from pancakebot.runtime.supervisor_artifacts import archive_stale_crash  # noqa: E402
 
 
 def _write_fake_crash(path: Path, *, age_s: float) -> None:
