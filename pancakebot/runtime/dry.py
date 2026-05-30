@@ -538,8 +538,13 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         except Exception:
             continue
 
-        if not rd.oracle_called and rd.close_ts > time.time():
-            continue  # round not yet closed on-chain
+        # Match PCS V2 _refundable(): only refund-eligible past
+        # close_ts + bufferSeconds. Settling an oracle-pending round inside
+        # [close_ts, close_ts+buffer] would prematurely refund. (Reviewer
+        # Fix #3 — same gate as bet_ledger.reconcile.)
+        if not rd.oracle_called and (rd.close_ts + cfg.buffer_seconds) >= time.time():
+            continue  # round not yet refund-eligible on-chain (strict `>` in
+            #            PCS _refundable() -> NOT refundable AT the boundary)
 
         bet_bnb_raw = bet.get("bet_bnb", 0.0)
         if isinstance(bet_bnb_raw, (int, float)):
@@ -605,6 +610,23 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             )
 
         settled_ts = int(time.time())
+
+        # Bet-lifecycle ledger (dry): append the terminal SETTLED_* record for
+        # PnL-truth parity with live. No Discord (dry alerts silent, D1=(a)).
+        # Dry owns its bankroll/trades bookkeeping (above); this only adds the
+        # ledger record, via the SAME classify helper live reconcile uses so
+        # both modes agree on status+delta semantics (Fix #6 unification of
+        # the classification logic without refactoring this pipeline).
+        from pancakebot.runtime import bet_ledger as _bet_ledger
+        _dry_status, _dry_delta = _bet_ledger.classify_settlement(
+            outcome=outcome, bet_bnb=bet_bnb, credit_bnb=credit_bnb,
+        )
+        _bet_ledger.record_settled(
+            ledger_path=_paths.DRY_BETS_LEDGER_PATH,
+            epoch=int(e), side=str(bet.get("bet_side", "")), status=_dry_status,
+            delta_bnb=_dry_delta, outcome=outcome,
+            new_bankroll_bnb=bankroll_after_settle,
+        )
 
         placed_raw = bet.get("placed_ts")
         if isinstance(placed_raw, int):
