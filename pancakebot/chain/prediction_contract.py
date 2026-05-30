@@ -131,6 +131,13 @@ class TxSubmitResult:
     t_receipt_confirmed_mono_ms: float | None
     included_block_number: int | None
     included_block_timestamp: int | None
+    # On-chain receipt status: 1 = success, 0 = reverted, None = no receipt
+    # (timeout). Drives the bet-ledger CONFIRMED/LATE/REVERTED classification:
+    #   chain_status==1 & block_ts <  lock_ts -> CONFIRMED (bet registered)
+    #   chain_status==0 & block_ts >= lock_ts -> LATE (PCS late-lock revert)
+    #   chain_status==0 & block_ts <  lock_ts -> REVERTED (other revert)
+    # In all revert cases EVM rolled back msg.value, so only gas was spent.
+    chain_status: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,6 +338,22 @@ class Web3PredictionContract:
     def close_ts(self, epoch: int) -> int:
         r = self._rpc_call(op="close_ts", fn=lambda: self._contract.functions.rounds(int(epoch)).call())
         return int(r[3])
+
+    def read_bet_amount(self, epoch: int, wallet: str) -> int:
+        """Return the per-address bet amount (wei) registered on-chain for
+        (epoch, wallet) via the PredictionV2 ``ledger`` mapping.
+
+        ledger(epoch, addr) returns ``BetInfo {position, amount, claimed}``;
+        ``amount`` is at index 1. Returns 0 if the bet never registered
+        (reverted / dropped / never placed). This is the authoritative check
+        when our bet receipt timed out and we don't know whether the TX mined
+        cleanly, mined late (stake rolled back), or never mined at all.
+        """
+        r = self._rpc_call(
+            op="read_bet_amount",
+            fn=lambda: self._contract.functions.ledger(int(epoch), wallet).call(),
+        )
+        return int(r[1])
 
     def round_data(self, epoch: int) -> "RoundData":
         """Fetch structured round data for a given epoch.
@@ -651,6 +674,7 @@ class Web3PredictionContract:
         t_receipt = None
         block_number = None
         block_timestamp = None
+        chain_status: int | None = None
 
         if bool(wait_receipt):
             if int(receipt_timeout_seconds) <= 0:
@@ -664,10 +688,15 @@ class Web3PredictionContract:
                 t_receipt = float(time.perf_counter() * 1000.0)
                 block_number = int(receipt["blockNumber"])
                 block_timestamp = int(self.block_timestamp(int(block_number)))
+                # Receipt status: 1 = mined-success, 0 = mined-but-reverted.
+                # A revert (late-lock check or any other) rolls back msg.value,
+                # so the bet didn't register and only gas was consumed.
+                chain_status = int(receipt["status"])
             except TimeExhausted:
                 t_receipt = None
                 block_number = None
                 block_timestamp = None
+                chain_status = None
             except Exception as e:
                 raise TransientRpcError(f"tx_receipt_wait_failed: {e}") from e
 
@@ -678,6 +707,7 @@ class Web3PredictionContract:
             t_receipt_confirmed_mono_ms=float(t_receipt) if t_receipt is not None else None,
             included_block_number=int(block_number) if block_number is not None else None,
             included_block_timestamp=int(block_timestamp) if block_timestamp is not None else None,
+            chain_status=chain_status,
         )
 
     def _build_bet_tx(

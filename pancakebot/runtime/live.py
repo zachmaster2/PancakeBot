@@ -11,6 +11,7 @@ from pancakebot.chain.prediction_contract import Web3PredictionContract
 from pancakebot.constants import BNB_WEI, MAX_GAS_PRICE_WEI
 from pancakebot.util import GasPriceCapBreachedError, InvariantError
 from pancakebot.log import info, warn
+from pancakebot.runtime import bet_ledger
 
 _PAGE_SIZE_DEFAULT = 100
 
@@ -39,6 +40,16 @@ _MAX_CLAIM_EPOCHS_PER_TX = 10
 # ``_env_var_for_mode("live")`` definition so a misrouted webhook here would
 # produce the same operator-visible miss as a supervisor-side issue.
 _LIVE_ALERTS_WEBHOOK_ENV = "PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL"
+
+
+def _fmt_gwei(wei: int) -> str:
+    """Render a wei value in gwei for human-readable Discord display. Clean
+    integer multiples of 1e9 render as int (``8 gwei``); otherwise rounded to
+    2 decimals (``8.25 gwei``). The underlying config stays in wei."""
+    gwei = wei / 1e9
+    if gwei == int(gwei):
+        return f"{int(gwei)} gwei"
+    return f"{gwei:.2f} gwei"
 
 
 def _send_claim_failure_alert(
@@ -71,9 +82,8 @@ def _send_claim_failure_alert(
     payload = {
         "username": "PancakeBot-live",
         "content": (
-            f":rotating_light: **PancakeBot-live CLAIM FAILED** "
-            f"reason=`{reason}` tx=`{tx_hash}` "
-            f"epochs=`[{epoch_str}]` gas_limit=`{int(gas_limit)}`"
+            f"[CRIT] **CLAIM FAILED** reason=`{reason}`, tx=`{tx_hash}`, "
+            f"epochs=`[{epoch_str}]`, gas_limit=`{int(gas_limit)}`"
         ),
     }
     try:
@@ -117,24 +127,23 @@ def send_gas_cap_breach_alert(
         return
 
     if path == "bet":
-        severity = ":rotating_light: **CRITICAL**"
+        sev_tag = "[CRIT]"
         action_note = "Bet SKIPPED. OPERATOR ACTION REQUIRED: raise MAX_GAS_PRICE_WEI and review before resuming."
     else:
-        severity = ":warning:"
+        sev_tag = "[WARN]"
         action_note = "Claim skipped this round (retries next round). Raise MAX_GAS_PRICE_WEI before claims back up."
 
     epoch_str = ""
     if epoch is not None:
-        epoch_str = f" epoch=`{int(epoch)}`"
+        epoch_str = f"epoch=`{int(epoch)}`, "
     elif epochs:
-        epoch_str = " epochs=`[" + ",".join(str(int(e)) for e in epochs) + "]`"
+        epoch_str = "epochs=`[" + ",".join(str(int(e)) for e in epochs) + "]`, "
 
     payload = {
         "username": "PancakeBot-live",
         "content": (
-            f"{severity} **PancakeBot-live GAS CAP BREACHED** "
-            f"path=`{path}`{epoch_str} "
-            f"suggested=`{suggested_wei} wei` cap=`{cap_wei} wei` "
+            f"{sev_tag} **GAS CAP BREACHED** path=`{path}`, {epoch_str}"
+            f"suggested=`{_fmt_gwei(suggested_wei)}`, cap=`{_fmt_gwei(cap_wei)}`, "
             f"ratio=`{suggested_wei / cap_wei:.2f}x` — {action_note}"
         ),
     }
@@ -150,6 +159,180 @@ def send_gas_cap_breach_alert(
             f"GAS CAP BREACHED alert bad status "
             f"(path={path} http_status={r.status_code} body={body})",
         )
+
+
+def _post_live_alert(content: str, *, label: str, ctx: str) -> None:
+    """Shared best-effort POST to the live Discord webhook for bet-lifecycle
+    alerts. Swallows every failure (missing env, import, transport, non-2xx)
+    with a WARN log so the bot hot path never crashes on a webhook hiccup.
+    ``label`` is the alert name for log lines; ``ctx`` is extra context."""
+    webhook = os.environ.get(_LIVE_ALERTS_WEBHOOK_ENV, "").strip()
+    if not webhook:
+        warn("ALERT", f"{_LIVE_ALERTS_WEBHOOK_ENV} unset; {label} alert not sent ({ctx})")
+        return
+    try:
+        import requests
+    except Exception as e:  # noqa: BLE001
+        warn("ALERT", f"{label} alert import failed ({ctx} err={e})")
+        return
+    payload = {"username": "PancakeBot-live", "content": content}
+    try:
+        r = requests.post(webhook, json=payload, timeout=10)
+    except Exception as e:  # noqa: BLE001
+        warn("ALERT", f"{label} alert post failed ({ctx} err={e})")
+        return
+    if not (200 <= r.status_code < 300):
+        body = str(getattr(r, "text", ""))[:200]
+        warn("ALERT", f"{label} alert bad status ({ctx} http_status={r.status_code} body={body})")
+
+
+# Locked single-line alert format (Step 31 final). ASCII [SEV] tag, bolded
+# type, em-dash before details, comma-separated details, 4-decimal BNB,
+# backtick-fenced values, no gas (gas still goes to the ledger file for
+# forensics — only stripped from Discord display), no tx hashes.
+
+def send_bet_placed_alert(
+    *, epoch: int, side: str, amount_bnb: float, bankroll_bnb: float,
+) -> None:
+    """[INFO] BET PLACED — audit-log alert for any bet TX that mined
+    (CONFIRMED / LATE / REVERTED). ``bankroll_bnb`` is a fresh wallet read
+    reflecting whatever happened (stake+gas debited if CONFIRMED; only gas if
+    LATE/REVERTED). For LATE/REVERTED a follow-up alert fires."""
+    _post_live_alert(
+        f"[INFO] **BET PLACED** epoch `{int(epoch)}` — "
+        f"Bet `{amount_bnb:.4f}` BNB on {side}, bankroll `{bankroll_bnb:.4f}` BNB",
+        label="BET PLACED", ctx=f"epoch={epoch} side={side}",
+    )
+
+
+def send_bet_late_alert(*, epoch: int, bankroll_bnb: float) -> None:
+    """[WARN] BET LATE — bet TX mined at/after lock; PCS rejected it (stake
+    rolled back). The type tag is the failure signal."""
+    _post_live_alert(
+        f"[WARN] **BET LATE** epoch `{int(epoch)}` — bankroll `{bankroll_bnb:.4f}` BNB",
+        label="BET LATE", ctx=f"epoch={epoch}",
+    )
+
+
+def send_bet_reverted_alert(*, epoch: int, bankroll_bnb: float) -> None:
+    """[WARN] BET REVERTED — bet TX mined status=0 (paused / min-bet /
+    double-bet / etc). EVM rolled back the stake; nothing to claim."""
+    _post_live_alert(
+        f"[WARN] **BET REVERTED** epoch `{int(epoch)}` — bankroll `{bankroll_bnb:.4f}` BNB",
+        label="BET REVERTED", ctx=f"epoch={epoch}",
+    )
+
+
+def send_bet_settled_alert(
+    *, epoch: int, won: bool, delta_bnb: float, amount_bnb: float, new_bankroll_bnb: float,
+) -> None:
+    """[INFO] BET WON / BET LOST. WON fires from the claim path at
+    claim-tx-confirm; LOST from reconcile at settle-time. Amounts shown as
+    positive numbers (the verb communicates direction). Keyword signature
+    matches the LOST ``lost_alert_fn`` contract in ``bet_ledger.reconcile``."""
+    if won:
+        content = (
+            f"[INFO] **BET WON** epoch `{int(epoch)}` — "
+            f"Won `{delta_bnb:.4f}` BNB, bankroll `{new_bankroll_bnb:.4f}` BNB"
+        )
+    else:
+        content = (
+            f"[INFO] **BET LOST** epoch `{int(epoch)}` — "
+            f"Lost `{amount_bnb:.4f}` BNB, bankroll `{new_bankroll_bnb:.4f}` BNB"
+        )
+    _post_live_alert(content, label=("BET WON" if won else "BET LOST"), ctx=f"epoch={epoch}")
+
+
+def send_bet_won_batch_alert(
+    *, epochs: list[int], total_delta_bnb: float, new_bankroll_bnb: float,
+) -> None:
+    """[INFO] BET WON (multi-epoch) — combined alert for a rare multi-epoch
+    claim (startup / missed-iteration batch). Per-epoch detail is in the
+    ledger."""
+    ep_str = "[" + ", ".join(str(int(e)) for e in epochs) + "]"
+    _post_live_alert(
+        f"[INFO] **BET WON** epochs `{ep_str}` — "
+        f"Won `{total_delta_bnb:.4f}` BNB total, bankroll `{new_bankroll_bnb:.4f}` BNB",
+        label="BET WON batch", ctx=f"epochs={ep_str}",
+    )
+
+
+def send_bet_refund_alert(
+    *, epoch: int, refund_bnb: float, new_bankroll_bnb: float,
+) -> None:
+    """[INFO] BET REFUND — un-oracled-past-buffer round; stake refund-claimed.
+    Fires from the claim path at refund-claim-tx-confirm. ``refund_bnb`` is the
+    stake returned."""
+    _post_live_alert(
+        f"[INFO] **BET REFUND** epoch `{int(epoch)}` — "
+        f"Refunded `{refund_bnb:.4f}` BNB, bankroll `{new_bankroll_bnb:.4f}` BNB",
+        label="BET REFUND", ctx=f"epoch={epoch}",
+    )
+
+
+def fire_claim_settled_alerts(
+    *, ledger_path: str, claimed_epochs: list[int], contract: Web3PredictionContract,
+    wallet_address: str,
+) -> None:
+    """After a successful claim TX, fire BET WON / BET REFUND alerts for the
+    claimed epochs that belong to our ledger, and mark them CLAIMED.
+
+    Option B: this is where WON/REFUND alerts fire (at claim-tx-confirm), so
+    they carry a fresh wallet balance. Relies on reconcile having
+    already written the terminal SETTLED_WON / SETTLED_REFUND record (with its
+    per-bet ``delta_bnb``) — claim runs AFTER reconcile in the engine loop.
+
+    Non-ledgered claimed epochs (legacy / manual bets from before the ledger)
+    are skipped — we have no stake to attribute. Best-effort: never raises."""
+    # noinspection PyBroadException
+    try:
+        ledger = bet_ledger.load_ledger(ledger_path)
+        ours = [e for e in claimed_epochs
+                if e in ledger and ledger[e].get("status") != "CLAIMED"]
+        if not ours:
+            return
+        try:
+            fresh_bankroll = float(contract.wallet_balance_bnb(wallet_address))
+        except Exception:  # noqa: BLE001
+            fresh_bankroll = float(ledger[ours[0]].get("new_bankroll_bnb", 0.0) or 0.0)
+
+        # Only fire/claim-mark epochs reconcile has ALREADY settled. If
+        # reconcile failed transiently this iteration (RPC error -> epoch
+        # still PLACED/CONFIRMED) while the claim TX succeeded, defer: leave
+        # the epoch open so the next reconcile pass writes the real delta
+        # first. The on-chain claim already happened — only the ledger record
+        # + alert defer. Marking CLAIMED here would lose the real PnL and
+        # fire a bogus "+0.0000" WON. (Reviewer Fix #1.)
+        refunds = [e for e in ours if ledger[e].get("status") == "SETTLED_REFUND"]
+        wins = [e for e in ours if ledger[e].get("status") == "SETTLED_WON"]
+        deferred = [e for e in ours if e not in refunds and e not in wins]
+        if deferred:
+            warn(
+                "ALERT",
+                f"claim settled-alert deferred for un-reconciled epochs "
+                f"{deferred} (claim succeeded; awaiting reconcile to write delta)",
+            )
+
+        for e in refunds:
+            refund_bnb = float(ledger[e].get("amount_bnb", 0.0) or 0.0)
+            send_bet_refund_alert(epoch=e, refund_bnb=refund_bnb, new_bankroll_bnb=fresh_bankroll)
+            bet_ledger.record_claimed(ledger_path=ledger_path, epoch=e, amount_bnb=refund_bnb)
+
+        if len(wins) == 1:
+            e = wins[0]
+            delta = float(ledger[e].get("delta_bnb", 0.0) or 0.0)
+            send_bet_settled_alert(epoch=e, won=True, delta_bnb=delta, amount_bnb=0.0,
+                                   new_bankroll_bnb=fresh_bankroll)
+            bet_ledger.record_claimed(ledger_path=ledger_path, epoch=e)
+        elif len(wins) > 1:
+            # Combined alert for the rare multi-epoch batch (Fix #2a).
+            total_delta = sum(float(ledger[e].get("delta_bnb", 0.0) or 0.0) for e in wins)
+            send_bet_won_batch_alert(epochs=sorted(wins), total_delta_bnb=total_delta,
+                                     new_bankroll_bnb=fresh_bankroll)
+            for e in wins:
+                bet_ledger.record_claimed(ledger_path=ledger_path, epoch=e)
+    except Exception as e:  # noqa: BLE001
+        warn("ALERT", f"claim settled-alerts failed (epochs={claimed_epochs} err={e})")
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +373,7 @@ def claim_scan_cursor(
     page_size: int = _PAGE_SIZE_DEFAULT,
     gas_limit: int = 300_000,
     claim_tx_receipt_timeout_seconds: int = 35,
+    bets_ledger_path: str | None = None,
 ) -> ClaimScanResult:
     """Scan the user's rounds list and claim any claimable/refundable past epochs.
 
@@ -304,6 +488,16 @@ def claim_scan_cursor(
                         f"Claimed {amount_str} from {len(to_claim)} rounds "
                         f"(epochs {to_claim[0]}-{to_claim[-1]}, "
                         f"tx {_tx_short}, {claim_ms}ms)",
+                    )
+                # Option B: fire BET WON / BET REFUND alerts at claim-confirm
+                # (fresh balance available here). Live-only; the caller passes
+                # bets_ledger_path only in live mode.
+                if bets_ledger_path is not None:
+                    fire_claim_settled_alerts(
+                        ledger_path=bets_ledger_path,
+                        claimed_epochs=list(to_claim),
+                        contract=contract,
+                        wallet_address=wallet_address,
                     )
                 claimed_total += len(to_claim)
                 pending_claims = pending_claims[len(to_claim):]

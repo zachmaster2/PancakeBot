@@ -29,7 +29,15 @@ from pancakebot.runtime.dry import (
     _init_closed_state,
     _record_cycle_audit,
 )
-from pancakebot.runtime.live import claim_scan_cursor, send_gas_cap_breach_alert
+from pancakebot.runtime.live import (
+    claim_scan_cursor,
+    send_bet_late_alert,
+    send_bet_placed_alert,
+    send_bet_reverted_alert,
+    send_bet_settled_alert,
+    send_gas_cap_breach_alert,
+)
+from pancakebot.runtime import bet_ledger
 from pancakebot.chain.rpc_poller import (
     AnchorState,
     compute_submit_deadline_ms,
@@ -346,6 +354,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Step 2: Initial claim scan (one-time, live only) after first alignment.
         if not closed.claim_scan_initialized:
             if not cfg.dry:
+                # Crash recovery: reconcile any bets left open (PLACED/
+                # CONFIRMED) by a previous incarnation whose rounds have since
+                # closed — settles them (LOSS alert fires; WIN/REFUND recorded)
+                # BEFORE the claim scan, so the scan can fire the backlog
+                # WON/REFUND alerts off the fresh SETTLED_* records. Idempotent.
+                _reconcile_live_bets(cfg, closed)
                 try:
                     claim_scan_cursor(
                         contract=cfg.contract,
@@ -359,6 +373,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                         page_size=100,
                         gas_limit=GAS_LIMIT_CLAIM,
                         claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
+                        bets_ledger_path=paths.LIVE_BETS_LEDGER_PATH,
                     )
                 except TransientRpcError as e:
                     warn("ALERT", f"claim scan failed: rpc_transient err={e}")
@@ -1096,6 +1111,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 f"(tx {_truncate_tx_hash(tx_submit.tx_hash)}, "
                 f"bankroll: {bankroll_after_live:.4f} BNB)",
             )
+            # Bet-lifecycle ledger (live): PLACED record (audit trail; the
+            # CONFIRMED/LATE/REVERTED transition + the single outcome alert
+            # are emitted below once the receipt status is known).
+            bet_ledger.record_placed(
+                ledger_path=paths.LIVE_BETS_LEDGER_PATH,
+                epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
+                tx_hash=tx_submit.tx_hash, bankroll_after_bnb=bankroll_after_live,
+            )
             receipt_confirmed_ms = (
                 float(tx_submit.t_receipt_confirmed_mono_ms)
                 if tx_submit.t_receipt_confirmed_mono_ms is not None
@@ -1127,21 +1150,68 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 ),
             }
             _append_jsonl("var/live/latency.jsonl", latency_record)
-            # R1 inclusion-truth: was the bet TX mined before lock_at?
-            # PancakeSwap reverts late bets, so block-timestamp >= lock_ts
-            # means the TX wasted gas and the bet did NOT register.
-            if tx_submit.included_block_timestamp is not None:
-                included_late = (
-                    int(tx_submit.included_block_timestamp) >= int(lock_ts_t)
-                )
-                if included_late:
-                    warn(
-                        "ALERT",
-                        f"Bet TX included LATE for epoch {current_epoch}: "
-                        f"included_block_ts={int(tx_submit.included_block_timestamp)} "
-                        f"lock_ts={int(lock_ts_t)} "
-                        f"submit_offset_ms={bet_submit_offset_ms:.0f}",
+            # R1 inclusion-truth + revert classification. PancakeSwap reverts
+            # late bets (block_ts >= lock_ts); other reverts (paused, min-bet,
+            # double-bet) mine with status=0 before lock. Either revert rolls
+            # back msg.value — only gas is lost, the stake stays in the wallet.
+            # chain_status is None on a receipt timeout (TX may still mine);
+            # in that case classify_confirmation returns PLACED (open) and the
+            # bet stays reconcilable.
+            included_late = (
+                tx_submit.included_block_timestamp is not None
+                and int(tx_submit.included_block_timestamp) >= int(lock_ts_t)
+            )
+            conf_status = bet_ledger.record_confirmation(
+                ledger_path=paths.LIVE_BETS_LEDGER_PATH,
+                epoch=current_epoch,
+                chain_status=tx_submit.chain_status,
+                included_block_number=tx_submit.included_block_number,
+                included_late=included_late,
+                gas_paid_bnb=MAX_GAS_COST_BET_BNB,
+            )
+            # Lifecycle alerts for the mined TX. BET PLACED is the audit-log
+            # alert for ANY mined bet (CONFIRMED / LATE / REVERTED); LATE/
+            # REVERTED add a follow-up. A receipt timeout fires nothing.
+            # Sequence single-sourced in confirmation_alert_sequence. Gas is
+            # recorded to the ledger (record_confirmation above) but NOT shown
+            # in alerts (locked format). All three share one fresh wallet read.
+            alert_seq = bet_ledger.confirmation_alert_sequence(conf_status)
+            placement_bankroll = bankroll_after_live  # unconditionally bound
+            if alert_seq:
+                # Fresh wallet read for the displayed bankroll: CONFIRMED
+                # debited stake+gas, LATE/REVERTED debited only gas (stake
+                # rolled back) — a fresh read reflects whichever happened.
+                # Off the critical path (bet already submitted + mined).
+                # Defensive: fall back to the arithmetic estimate on RPC error.
+                try:
+                    placement_bankroll = float(
+                        cfg.contract.wallet_balance_bnb(cfg.wallet_address)
                     )
+                except Exception:  # noqa: BLE001
+                    placement_bankroll = bankroll_after_live
+            if "PLACED" in alert_seq:
+                send_bet_placed_alert(
+                    epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
+                    bankroll_bnb=placement_bankroll,
+                )
+            if "LATE" in alert_seq:
+                # Keep the WARN (journal) AND fire the follow-up Discord alert.
+                warn(
+                    "ALERT",
+                    f"Bet TX included LATE for epoch {current_epoch}: "
+                    f"included_block_ts={int(tx_submit.included_block_timestamp)} "
+                    f"lock_ts={int(lock_ts_t)} "
+                    f"submit_offset_ms={bet_submit_offset_ms:.0f}",
+                )
+                send_bet_late_alert(epoch=current_epoch, bankroll_bnb=placement_bankroll)
+            if "REVERTED" in alert_seq:
+                warn(
+                    "ALERT",
+                    f"Bet TX REVERTED for epoch {current_epoch} "
+                    f"(status=0, before lock): tx {_truncate_tx_hash(tx_submit.tx_hash)} "
+                    f"block={tx_submit.included_block_number}",
+                )
+                send_bet_reverted_alert(epoch=current_epoch, bankroll_bnb=placement_bankroll)
         else:
             # Step 14: Dry bookkeeping (including gas proxy) + record.
             if closed.simulated_bankroll_bnb is None:
@@ -1164,6 +1234,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 p_final=pred_p_final,
                 bankroll_before_bet_bnb=bankroll_before_bet,
                 bankroll_after_bet_bnb=bankroll_after_bet,
+            )
+            # Bet-lifecycle ledger (dry): PLACED record only — no Discord
+            # (dry alerts are silent by convention; D1=(a)). No tx_hash in
+            # dry mode (no on-chain submission).
+            bet_ledger.record_placed(
+                ledger_path=paths.DRY_BETS_LEDGER_PATH,
+                epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
+                tx_hash="", bankroll_after_bnb=bankroll_after_bet,
             )
             _record_cycle_audit(
                 cfg,
@@ -1275,6 +1353,55 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
     raise InvariantError("epoch_handshake_exhausted")
 
 
+def _current_bankroll_estimate(closed: _ClosedState) -> float:
+    """Best-effort current bankroll for the settled-alert "new bankroll"
+    display. Reads the pipeline's bankroll tracker if wired; falls back to
+    0.0 (the alert's delta is the load-bearing number — absolute is display
+    only). Never raises."""
+    # noinspection PyBroadException
+    try:
+        pipeline = closed.strategy_pipeline
+        if pipeline is not None:
+            tracker = getattr(pipeline, "_bankroll_tracker", None)
+            if tracker is not None:
+                return float(tracker.current_bankroll())
+    except Exception:
+        pass
+    return 0.0
+
+
+def _reconcile_live_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None:
+    """Reconcile open live bets against on-chain RoundData at settle-time.
+    Fires the LOSS alert only (Option B); WIN/REFUND alerts fire from the
+    claim-scan path at claim-tx-confirm. Reads a FRESH wallet balance for
+    the alert's "new bankroll" display so sequential in-flight bets don't
+    skew it (Fix #3). Fail-soft: never raises."""
+    if cfg.dry:
+        return
+    # Fresh wallet balance at fire-time (already reflects any prior bets'
+    # placement debits). Best-effort: fall back to the tracker estimate on
+    # RPC failure rather than block reconciliation.
+    try:
+        fresh_bankroll = float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
+    except Exception:  # noqa: BLE001
+        fresh_bankroll = _current_bankroll_estimate(closed)
+    # noinspection PyBroadException
+    try:
+        bet_ledger.reconcile(
+            ledger_path=paths.LIVE_BETS_LEDGER_PATH,
+            contract=cfg.contract,
+            treasury_fee_fraction=cfg.treasury_fee_fraction,
+            fresh_bankroll_bnb=fresh_bankroll,
+            buffer_seconds=cfg.buffer_seconds,
+            now_ts=int(_utc_now()),
+            wallet_address=cfg.wallet_address,
+            lost_alert_fn=send_bet_settled_alert,
+            reverted_alert_fn=send_bet_reverted_alert,
+        )
+    except Exception as e:  # noqa: BLE001
+        warn("ALERT", f"bet ledger reconcile failed: {e}")
+
+
 def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int) -> None:
     # Bounded local retry around ``contract.close_ts`` — the only RPC call
     # in this function with real budget before the claim wake. Mirrors the
@@ -1301,10 +1428,16 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     # Epoch handshake to refresh round state (both modes).
     locked_round2, _open_round2, current_epoch2, _open_rd2 = _epoch_handshake(cfg)
 
-    # Live only: claim scan to collect winnings. Fail-soft on transient RPC:
-    # the next iteration's claim scan will re-detect any still-claimable
-    # epochs naturally.
     if not cfg.dry:
+        # Reconcile FIRST so the ledger carries SETTLED_WON/SETTLED_REFUND
+        # (with per-bet delta) before the claim scan reads it — the claim
+        # path fires WON/REFUND alerts off those records (Option B). Reconcile
+        # fires the LOSS alert itself; it never moves money. Idempotent +
+        # crash-safe.
+        _reconcile_live_bets(cfg, closed)
+        # Claim scan collects winnings/refunds and fires WON/REFUND alerts at
+        # claim-tx-confirm (bets_ledger_path threads the ledger in). Fail-soft
+        # on transient RPC: the next iteration's scan re-detects.
         try:
             claim_scan_cursor(
                 contract=cfg.contract,
@@ -1318,6 +1451,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
                 page_size=100,
                 gas_limit=GAS_LIMIT_CLAIM,
                 claim_tx_receipt_timeout_seconds=cfg.claim_tx_receipt_timeout_seconds,
+                bets_ledger_path=paths.LIVE_BETS_LEDGER_PATH,
             )
         except TransientRpcError as e:
             warn("ALERT", f"claim scan failed: rpc_transient err={e}")

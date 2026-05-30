@@ -45,7 +45,12 @@ def settle_from_round_data(
     elif close_price_usd < lock_price_usd:
         winner_u = "BEAR"
     else:
-        return SettlementResult(outcome="refund", credit_bnb=bet_bnb - MAX_GAS_COST_CLAIM_BNB, payout_multiple_after_fee=0.0)
+        # Tie (closePrice == lockPrice) with oracle called: PCS V2's
+        # _claimable() returns false for both sides (no winnings), and
+        # _refundable() is false (oracle WAS called). The stake stays with
+        # the house — this is a LOSS, not a refund. Refund is reserved
+        # strictly for the !oracle_called-past-buffer case above.
+        return SettlementResult(outcome="loss", credit_bnb=0.0, payout_multiple_after_fee=0.0)
 
     if winner_u != bet_side_u:
         return SettlementResult(outcome="loss", credit_bnb=0.0, payout_multiple_after_fee=0.0)
