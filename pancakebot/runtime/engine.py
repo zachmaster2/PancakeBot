@@ -31,10 +31,13 @@ from pancakebot.runtime.dry import (
 )
 from pancakebot.runtime.live import (
     claim_scan_cursor,
+    send_bet_confirmed_alert,
+    send_bet_dropped_alert,
     send_bet_late_alert,
-    send_bet_placed_alert,
     send_bet_reverted_alert,
     send_bet_settled_alert,
+    send_bet_submitted_alert,
+    send_bot_ready_alert,
     send_gas_cap_breach_alert,
 )
 from pancakebot.runtime import bet_ledger
@@ -296,6 +299,12 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         "START",
         f"Starting bankroll: {format_bankroll(bankroll_bnb=bankroll_bnb, bnbusd_price=bnbusd_price)}",
     )
+    if not cfg.dry:
+        # BOT READY (Bundle 7): fired once per start after the first successful
+        # wallet-balance read, so the first BET SUBMITTED has a bankroll
+        # reference point. Bot-owned (distinct from the supervisor STARTED
+        # alert). Best-effort — the sender swallows all webhook errors.
+        send_bot_ready_alert(bankroll_bnb=bankroll_bnb)
 
     # Fresh-spawn-during-round-transition race is absorbed by the bare
     # _epoch_handshake retry loop, which retries on all three zero-state
@@ -354,7 +363,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Step 2: Initial claim scan (one-time, live only) after first alignment.
         if not closed.claim_scan_initialized:
             if not cfg.dry:
-                # Crash recovery: reconcile any bets left open (PLACED/
+                # Crash recovery: reconcile any bets left open (SUBMITTED/
                 # CONFIRMED) by a previous incarnation whose rounds have since
                 # closed — settles them (LOSS alert fires; WIN/REFUND recorded)
                 # BEFORE the claim scan, so the scan can fire the backlog
@@ -1096,28 +1105,27 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         amount_bnb = amount_wei / BNB_WEI
 
         if not cfg.dry:
-            # Derive post-bet bankroll arithmetically rather than re-querying
-            # the chain. The bet amount has been broadcast (TX wait_receipt=True
-            # confirmed inclusion above); gas cost is absorbed at the next
-            # round's bankroll wake fetch. Saves one RPC roundtrip per BET
-            # round and eliminates a TransientRpcError bubble path. Display
-            # value is accurate to within the gas fee (~1e-5 BNB).
-            bankroll_after_live = bankroll_bnb - amount_bnb
             if tx_submit is None:
                 raise InvariantError("live_bet_submit_missing")
+            # BET SUBMITTED: the TX broadcast (tx_hash exists). Projected
+            # bankroll = pre-bet wallet − stake − bet gas cap (what bankroll is
+            # IF the bet registers). The post-receipt alert below reports the
+            # actual fresh balance.
+            projected_bankroll = bankroll_bnb - amount_bnb - MAX_GAS_COST_BET_BNB
             info(
                 "BET",
                 f"Bet {amount_bnb:.4f} BNB on {bet_side} for epoch {current_epoch} "
                 f"(tx {_truncate_tx_hash(tx_submit.tx_hash)}, "
-                f"bankroll: {bankroll_after_live:.4f} BNB)",
+                f"projected bankroll: {projected_bankroll:.4f} BNB)",
             )
-            # Bet-lifecycle ledger (live): PLACED record (audit trail; the
-            # CONFIRMED/LATE/REVERTED transition + the single outcome alert
-            # are emitted below once the receipt status is known).
-            bet_ledger.record_placed(
+            bet_ledger.record_submitted(
                 ledger_path=paths.LIVE_BETS_LEDGER_PATH,
                 epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
-                tx_hash=tx_submit.tx_hash, bankroll_after_bnb=bankroll_after_live,
+                tx_hash=tx_submit.tx_hash, bankroll_after_bnb=projected_bankroll,
+            )
+            send_bet_submitted_alert(
+                epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
+                projected_bankroll_bnb=projected_bankroll,
             )
             receipt_confirmed_ms = (
                 float(tx_submit.t_receipt_confirmed_mono_ms)
@@ -1150,16 +1158,21 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 ),
             }
             _append_jsonl("var/live/latency.jsonl", latency_record)
-            # R1 inclusion-truth + revert classification. PancakeSwap reverts
-            # late bets (block_ts >= lock_ts); other reverts (paused, min-bet,
-            # double-bet) mine with status=0 before lock. Either revert rolls
-            # back msg.value — only gas is lost, the stake stays in the wallet.
-            # chain_status is None on a receipt timeout (TX may still mine);
-            # in that case classify_confirmation returns PLACED (open) and the
-            # bet stays reconcilable.
+            # Receipt classification → exactly ONE post-receipt alert.
+            #   CONFIRMED  : status=1, before lock (bet registered)
+            #   LATE       : status=0, at/after lock (PCS late-lock revert)
+            #   REVERTED   : status=0, before lock (other revert)
+            #   DROPPED    : no receipt within the wait window (TX gone)
+            # All revert/drop cases rolled back msg.value (gas-only loss).
             included_late = (
                 tx_submit.included_block_timestamp is not None
                 and int(tx_submit.included_block_timestamp) >= int(lock_ts_t)
+            )
+            # Actual gas (gasUsed x effectiveGasPrice), not the cap. None on
+            # DROPPED (no receipt) -> ledger gas field unwritten.
+            gas_bnb = bet_ledger.actual_gas_bnb(
+                gas_used=tx_submit.gas_used,
+                effective_gas_price_wei=tx_submit.effective_gas_price_wei,
             )
             conf_status = bet_ledger.record_confirmation(
                 ledger_path=paths.LIVE_BETS_LEDGER_PATH,
@@ -1167,35 +1180,19 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 chain_status=tx_submit.chain_status,
                 included_block_number=tx_submit.included_block_number,
                 included_late=included_late,
-                gas_paid_bnb=MAX_GAS_COST_BET_BNB,
+                gas_paid_bnb=gas_bnb,
             )
-            # Lifecycle alerts for the mined TX. BET PLACED is the audit-log
-            # alert for ANY mined bet (CONFIRMED / LATE / REVERTED); LATE/
-            # REVERTED add a follow-up. A receipt timeout fires nothing.
-            # Sequence single-sourced in confirmation_alert_sequence. Gas is
-            # recorded to the ledger (record_confirmation above) but NOT shown
-            # in alerts (locked format). All three share one fresh wallet read.
-            alert_seq = bet_ledger.confirmation_alert_sequence(conf_status)
-            placement_bankroll = bankroll_after_live  # unconditionally bound
-            if alert_seq:
-                # Fresh wallet read for the displayed bankroll: CONFIRMED
-                # debited stake+gas, LATE/REVERTED debited only gas (stake
-                # rolled back) — a fresh read reflects whichever happened.
-                # Off the critical path (bet already submitted + mined).
-                # Defensive: fall back to the arithmetic estimate on RPC error.
-                try:
-                    placement_bankroll = float(
-                        cfg.contract.wallet_balance_bnb(cfg.wallet_address)
-                    )
-                except Exception:  # noqa: BLE001
-                    placement_bankroll = bankroll_after_live
-            if "PLACED" in alert_seq:
-                send_bet_placed_alert(
-                    epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
-                    bankroll_bnb=placement_bankroll,
+            # Fresh wallet read for the post-receipt alert bankroll. Off the
+            # critical path; fall back to the projected estimate on RPC error.
+            try:
+                fresh_bankroll = float(
+                    cfg.contract.wallet_balance_bnb(cfg.wallet_address)
                 )
-            if "LATE" in alert_seq:
-                # Keep the WARN (journal) AND fire the follow-up Discord alert.
+            except Exception:  # noqa: BLE001
+                fresh_bankroll = projected_bankroll
+            if conf_status == "CONFIRMED":
+                send_bet_confirmed_alert(epoch=current_epoch, bankroll_bnb=fresh_bankroll)
+            elif conf_status == "LATE":
                 warn(
                     "ALERT",
                     f"Bet TX included LATE for epoch {current_epoch}: "
@@ -1203,15 +1200,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     f"lock_ts={int(lock_ts_t)} "
                     f"submit_offset_ms={bet_submit_offset_ms:.0f}",
                 )
-                send_bet_late_alert(epoch=current_epoch, bankroll_bnb=placement_bankroll)
-            if "REVERTED" in alert_seq:
+                send_bet_late_alert(epoch=current_epoch, bankroll_bnb=fresh_bankroll)
+            elif conf_status == "REVERTED":
                 warn(
                     "ALERT",
                     f"Bet TX REVERTED for epoch {current_epoch} "
                     f"(status=0, before lock): tx {_truncate_tx_hash(tx_submit.tx_hash)} "
                     f"block={tx_submit.included_block_number}",
                 )
-                send_bet_reverted_alert(epoch=current_epoch, bankroll_bnb=placement_bankroll)
+                send_bet_reverted_alert(epoch=current_epoch, bankroll_bnb=fresh_bankroll)
+            elif conf_status == "DROPPED":
+                warn(
+                    "ALERT",
+                    f"Bet TX DROPPED for epoch {current_epoch}: no receipt within "
+                    f"{cfg.bet_tx_receipt_timeout_seconds}s (tx {_truncate_tx_hash(tx_submit.tx_hash)})",
+                )
+                send_bet_dropped_alert(epoch=current_epoch, bankroll_bnb=fresh_bankroll)
         else:
             # Step 14: Dry bookkeeping (including gas proxy) + record.
             if closed.simulated_bankroll_bnb is None:
@@ -1235,10 +1239,10 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 bankroll_before_bet_bnb=bankroll_before_bet,
                 bankroll_after_bet_bnb=bankroll_after_bet,
             )
-            # Bet-lifecycle ledger (dry): PLACED record only — no Discord
+            # Bet-lifecycle ledger (dry): SUBMITTED record only — no Discord
             # (dry alerts are silent by convention; D1=(a)). No tx_hash in
             # dry mode (no on-chain submission).
-            bet_ledger.record_placed(
+            bet_ledger.record_submitted(
                 ledger_path=paths.DRY_BETS_LEDGER_PATH,
                 epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
                 tx_hash="", bankroll_after_bnb=bankroll_after_bet,
@@ -1396,7 +1400,7 @@ def _reconcile_live_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             now_ts=int(_utc_now()),
             wallet_address=cfg.wallet_address,
             lost_alert_fn=send_bet_settled_alert,
-            reverted_alert_fn=send_bet_reverted_alert,
+            dropped_alert_fn=send_bet_dropped_alert,
         )
     except Exception as e:  # noqa: BLE001
         warn("ALERT", f"bet ledger reconcile failed: {e}")
