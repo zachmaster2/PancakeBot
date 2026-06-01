@@ -356,13 +356,12 @@ RPC_HTTP_BATCH_TIMEOUT_SECONDS: int = 5
 # timeout for consistency.
 RPC_HTTP_SINGLE_TIMEOUT_SECONDS: int = 5
 
-# How long the bet path waits for its TX receipt before declaring the bet
-# DROPPED. Decoupled from buffer_seconds + padding (the refund-eligibility
-# math, ~35s) — the bet receipt has no reason to be tied to that. After
-# ~10s (~22 BSC blocks at 0.45s) without a receipt, the TX is realistically
-# dropped from the mempool; waiting longer just delays the DROPPED signal.
-# Claims keep the longer buffer+padding budget (set separately in app.py).
-BET_RECEIPT_WAIT_TIMEOUT_SECONDS: int = 10
+# How long either TX path (bet OR claim) waits for its receipt before giving
+# up. Decoupled from buffer_seconds + padding (the refund-eligibility math) —
+# a TX receipt has no reason to be tied to that. After ~10s (~22 BSC blocks at
+# 0.45s) without a receipt, the TX is realistically dropped from the mempool;
+# waiting longer just delays the signal. Bet and claim share this single value.
+TX_RECEIPT_WAIT_TIMEOUT_SECONDS: int = 10
 
 # Periodic poll cadence during the round. Was 30s (giving ~10 polls/round)
 # until 2026-05-12. Lowered to 8s after INFEAS rate analysis: at 30s
