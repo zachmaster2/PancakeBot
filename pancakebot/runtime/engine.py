@@ -52,13 +52,14 @@ from time import sleep as sleep_seconds
 
 # Padding for RPC alignment near chain transition boundaries. Used for:
 #   - post-close claim safety: claim_ts = close_at(N) + buffer_seconds + padding
-#   - TX receipt timeout sizing (bet + claim): buffer_seconds + padding
 #   - cumulative target for RETRY_BACKOFF_SECONDS: the runtime retry budget
 #     spans buffer_seconds + padding so the bare _epoch_handshake covers a
 #     full executeRound settlement window before raising the *_exhausted
 #     invariants.
-# All three contexts need a small extra window beyond the contract's
-# chain-level buffer_seconds to absorb RPC hedged-endpoint lag.
+# Both contexts need a small extra window beyond the contract's chain-level
+# buffer_seconds to absorb RPC hedged-endpoint lag. (TX receipt timeouts —
+# bet AND claim — are NOT sized from this; they use the flat
+# TX_RECEIPT_WAIT_TIMEOUT_SECONDS, set in app.py.)
 _RPC_ALIGNMENT_PADDING_SECONDS = 5
 
 

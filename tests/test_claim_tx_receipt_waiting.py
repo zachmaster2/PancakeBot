@@ -102,7 +102,7 @@ class _FakeContract:
         return self._claim_outcome
 
 
-def _scan_kwargs(*, contract, cursor_path: Path, claim_timeout: int = 35):
+def _scan_kwargs(*, contract, cursor_path: Path, claim_timeout: int = 10):
     return dict(
         contract=contract,
         wallet_address="0xdeadbeef",
@@ -151,7 +151,7 @@ def test_claim_success_advances_cursor_and_records_claimed(
     assert len(contract.claim_calls) == 1
     call = contract.claim_calls[0]
     assert call["wait_receipt"] is True
-    assert call["receipt_timeout_seconds"] == 35
+    assert call["receipt_timeout_seconds"] == 10
     assert call["epochs"] == [101, 102]
 
 

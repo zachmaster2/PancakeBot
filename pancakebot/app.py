@@ -69,14 +69,12 @@ def run_from_config(
         round_store = ClosedRoundsStore(paths.CLOSED_ROUNDS_PATH)
         # noinspection PyTypeChecker
         backtest_cfg: BacktestConfig = cfg.backtest
-        # Bet receipt wait: fixed short window (BET_RECEIPT_WAIT_TIMEOUT_SECONDS,
-        # 10s) — decoupled from refund math; a TX with no receipt by then is
-        # DROPPED. Claim receipt: chain-loaded buffer_seconds +
-        # _RPC_ALIGNMENT_PADDING_SECONDS (~35s) — claims have a longer budget.
-        from pancakebot.runtime.engine import _RPC_ALIGNMENT_PADDING_SECONDS
-        from pancakebot.timing_constants import BET_RECEIPT_WAIT_TIMEOUT_SECONDS
-        _bt_receipt_timeout = int(BET_RECEIPT_WAIT_TIMEOUT_SECONDS)
-        _claim_receipt_timeout = int(cc.buffer_seconds) + int(_RPC_ALIGNMENT_PADDING_SECONDS)
+        # TX receipt wait: a single fixed short window (TX_RECEIPT_WAIT_TIMEOUT_SECONDS,
+        # 10s) shared by both the bet and claim paths — decoupled from refund
+        # math; a TX with no receipt by then is treated as gone.
+        from pancakebot.timing_constants import TX_RECEIPT_WAIT_TIMEOUT_SECONDS
+        _bt_receipt_timeout = int(TX_RECEIPT_WAIT_TIMEOUT_SECONDS)
+        _claim_receipt_timeout = int(TX_RECEIPT_WAIT_TIMEOUT_SECONDS)
         # noinspection PyTypeChecker
         runtime_cfg = RuntimeConfig(
             round_store=round_store,
@@ -246,13 +244,12 @@ def run_from_config(
     )
     rpc_poller.start()
 
-    # Bet receipt wait: fixed short window (BET_RECEIPT_WAIT_TIMEOUT_SECONDS,
-    # 10s) — decoupled from refund math; no receipt by then -> DROPPED. Claim
-    # receipt: buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS (~35s).
-    from pancakebot.runtime.engine import _RPC_ALIGNMENT_PADDING_SECONDS
-    from pancakebot.timing_constants import BET_RECEIPT_WAIT_TIMEOUT_SECONDS
-    _bet_receipt_timeout = int(BET_RECEIPT_WAIT_TIMEOUT_SECONDS)
-    _claim_receipt_timeout = int(buffer_seconds) + int(_RPC_ALIGNMENT_PADDING_SECONDS)
+    # TX receipt wait: a single fixed short window (TX_RECEIPT_WAIT_TIMEOUT_SECONDS,
+    # 10s) shared by both the bet and claim paths — decoupled from refund math;
+    # a TX with no receipt by then is treated as gone.
+    from pancakebot.timing_constants import TX_RECEIPT_WAIT_TIMEOUT_SECONDS
+    _bet_receipt_timeout = int(TX_RECEIPT_WAIT_TIMEOUT_SECONDS)
+    _claim_receipt_timeout = int(TX_RECEIPT_WAIT_TIMEOUT_SECONDS)
 
     runtime_cfg = RuntimeConfig(
         round_store=None,

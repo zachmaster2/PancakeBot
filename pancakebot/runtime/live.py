@@ -426,7 +426,7 @@ def claim_scan_cursor(
     buffer_seconds: int,
     page_size: int = _PAGE_SIZE_DEFAULT,
     gas_limit: int = 300_000,
-    claim_tx_receipt_timeout_seconds: int = 35,
+    claim_tx_receipt_timeout_seconds: int = 10,
     bets_ledger_path: str | None = None,
 ) -> ClaimScanResult:
     """Scan the user's rounds list and claim any claimable/refundable past epochs.

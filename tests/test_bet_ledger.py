@@ -766,11 +766,11 @@ def test_sender_non_2xx_swallowed(monkeypatch):
 
 # --- Step 31 hotfix: 10s receipt wait, actual gas, post-claim fresh bankroll -
 
-def test_bet_receipt_wait_10s_constant():
-    """Bundle 1: the bet receipt wait is a fixed 10s constant, decoupled from
-    the claim receipt budget (buffer + padding ~35s)."""
-    from pancakebot.timing_constants import BET_RECEIPT_WAIT_TIMEOUT_SECONDS
-    assert BET_RECEIPT_WAIT_TIMEOUT_SECONDS == 10
+def test_tx_receipt_wait_10s_constant():
+    """The TX receipt wait is a single fixed 10s constant, shared by the bet
+    and claim paths and decoupled from the refund-eligibility math."""
+    from pancakebot.timing_constants import TX_RECEIPT_WAIT_TIMEOUT_SECONDS
+    assert TX_RECEIPT_WAIT_TIMEOUT_SECONDS == 10
 
 
 def test_won_alert_uses_post_claim_fresh_bankroll(tmp_path, monkeypatch):
