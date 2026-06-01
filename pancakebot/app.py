@@ -69,13 +69,14 @@ def run_from_config(
         round_store = ClosedRoundsStore(paths.CLOSED_ROUNDS_PATH)
         # noinspection PyTypeChecker
         backtest_cfg: BacktestConfig = cfg.backtest
-        # Receipt timeouts derived from chain-loaded buffer_seconds +
-        # _RPC_ALIGNMENT_PADDING_SECONDS (≈35s on canonical chain constants).
-        # Both bet and claim TX receipts share this timeout sizing.
+        # Bet receipt wait: fixed short window (BET_RECEIPT_WAIT_TIMEOUT_SECONDS,
+        # 10s) — decoupled from refund math; a TX with no receipt by then is
+        # DROPPED. Claim receipt: chain-loaded buffer_seconds +
+        # _RPC_ALIGNMENT_PADDING_SECONDS (~35s) — claims have a longer budget.
         from pancakebot.runtime.engine import _RPC_ALIGNMENT_PADDING_SECONDS
-        _bt_receipt_timeout = (
-            int(cc.buffer_seconds) + int(_RPC_ALIGNMENT_PADDING_SECONDS)
-        )
+        from pancakebot.timing_constants import BET_RECEIPT_WAIT_TIMEOUT_SECONDS
+        _bt_receipt_timeout = int(BET_RECEIPT_WAIT_TIMEOUT_SECONDS)
+        _claim_receipt_timeout = int(cc.buffer_seconds) + int(_RPC_ALIGNMENT_PADDING_SECONDS)
         # noinspection PyTypeChecker
         runtime_cfg = RuntimeConfig(
             round_store=round_store,
@@ -90,7 +91,7 @@ def run_from_config(
             critical_path_wakeup_offset_before_lock_ms=cfg.critical_path_wakeup_offset_before_lock_ms,
             bet_submit_deadline_offset_before_lock_ms=cfg.bet_submit_deadline_offset_before_lock_ms,
             bet_tx_receipt_timeout_seconds=_bt_receipt_timeout,
-            claim_tx_receipt_timeout_seconds=_bt_receipt_timeout,
+            claim_tx_receipt_timeout_seconds=_claim_receipt_timeout,
             max_consecutive_kline_fetch_failures=cfg.max_consecutive_kline_fetch_failures,
             pool_cutoff_seconds=cfg.pool_cutoff_seconds,
             dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,
@@ -245,13 +246,13 @@ def run_from_config(
     )
     rpc_poller.start()
 
-    # Receipt timeouts derived from chain-loaded buffer_seconds +
-    # _RPC_ALIGNMENT_PADDING_SECONDS (≈35s on canonical chain constants).
-    # Both bet and claim TX receipts share this timeout sizing.
+    # Bet receipt wait: fixed short window (BET_RECEIPT_WAIT_TIMEOUT_SECONDS,
+    # 10s) — decoupled from refund math; no receipt by then -> DROPPED. Claim
+    # receipt: buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS (~35s).
     from pancakebot.runtime.engine import _RPC_ALIGNMENT_PADDING_SECONDS
-    _runtime_receipt_timeout = (
-        int(buffer_seconds) + int(_RPC_ALIGNMENT_PADDING_SECONDS)
-    )
+    from pancakebot.timing_constants import BET_RECEIPT_WAIT_TIMEOUT_SECONDS
+    _bet_receipt_timeout = int(BET_RECEIPT_WAIT_TIMEOUT_SECONDS)
+    _claim_receipt_timeout = int(buffer_seconds) + int(_RPC_ALIGNMENT_PADDING_SECONDS)
 
     runtime_cfg = RuntimeConfig(
         round_store=None,
@@ -265,8 +266,8 @@ def run_from_config(
         okx_warmup_wakeup_offset_before_lock_ms=cfg.okx_warmup_wakeup_offset_before_lock_ms,
         critical_path_wakeup_offset_before_lock_ms=cfg.critical_path_wakeup_offset_before_lock_ms,
         bet_submit_deadline_offset_before_lock_ms=cfg.bet_submit_deadline_offset_before_lock_ms,
-        bet_tx_receipt_timeout_seconds=_runtime_receipt_timeout,
-        claim_tx_receipt_timeout_seconds=_runtime_receipt_timeout,
+        bet_tx_receipt_timeout_seconds=_bet_receipt_timeout,
+        claim_tx_receipt_timeout_seconds=_claim_receipt_timeout,
         max_consecutive_kline_fetch_failures=cfg.max_consecutive_kline_fetch_failures,
         pool_cutoff_seconds=cfg.pool_cutoff_seconds,
         dry_initial_bankroll_bnb=cfg.dry_initial_bankroll_bnb,

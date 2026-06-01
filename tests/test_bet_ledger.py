@@ -1,24 +1,30 @@
-"""Tests for the bet lifecycle ledger + reconciliation (Step 31, revised).
+"""Tests for the bet lifecycle ledger + reconciliation (Step 31 hotfix taxonomy).
 
 Covers:
   - append/read/replay (last-write-wins), corrupted final line, empty/missing
   - _append_record returns bool; failed persist defers alert + settlement
-  - classify_confirmation: CONFIRMED / LATE / REVERTED / PLACED(timeout)
+  - classify_confirmation: CONFIRMED / LATE / REVERTED / DROPPED(timeout)
   - classify_settlement mapping (win/loss/refund -> status, delta)
   - reconcile: LOSS alert fires; WIN/REFUND recorded SILENTLY (Option B)
   - tie = LOST (not refund)
   - LATE / REVERTED are terminal -> never settled
-  - permanent un-oracled PLACED -> refund-settles after close_ts
+  - SUBMITTED/DROPPED re-check via read_bet_amount (Bundle 4):
+      amount==0 -> DROPPED (alert on SUBMITTED->DROPPED; standing DROPPED silent)
+      amount>0  -> normal settlement (silent correction of premature DROPPED)
+  - permanent un-oracled CONFIRMED -> refund-settles after close_ts + buffer
   - idempotency (no double-settle / double-alert); transient RPC skip
-  - sequential-bets: alert uses FRESH bankroll passed in (not placed+delta)
-  - claim-path fire_claim_settled_alerts: WON single / REFUND / batch
-  - alert senders: happy / missing-webhook / non-2xx -> swallow, no raise
+  - sequential-bets: alert uses FRESH bankroll passed in (not stored+delta)
+  - claim-path fire_claim_settled_alerts: WON single / REFUND / batch / defer
+  - alert senders: 8 locked formats + BOT READY, happy / missing / non-2xx swallow
+  - 10s receipt-wait constant; actual gas in ledger; post-claim fresh bankroll
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 from unittest import mock
+
+import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
@@ -27,6 +33,7 @@ if str(_REPO) not in sys.path:
 from pancakebot.runtime import bet_ledger  # noqa: E402
 from pancakebot.runtime import live as live_mod  # noqa: E402
 from pancakebot.chain.prediction_contract import RoundData  # noqa: E402
+from pancakebot.util import InvariantError  # noqa: E402
 from pancakebot.constants import BNB_WEI  # noqa: E402
 
 
@@ -35,14 +42,18 @@ def _ledger(tmp_path) -> str:
 
 
 class _FakeContract:
-    def __init__(self, rounds=None, transient=None, balance=2.0, bet_amounts=None):
+    def __init__(self, rounds=None, transient=None, balance=2.0, bet_amounts=None,
+                 receipts=None):
         self._rounds = rounds or {}
         self._transient = transient or set()
         self._balance = balance
         # epoch -> on-chain registered bet amount (wei). Default: not set ->
-        # read_bet_amount returns a large positive (registered) so existing
-        # tests that don't exercise the timeout path are unaffected.
+        # read_bet_amount returns a large positive (registered) so settlement
+        # tests that don't exercise the unregistered path are unaffected.
         self._bet_amounts = bet_amounts or {}
+        # tx_hash -> raw receipt mapping for try_get_receipt. Default: not set
+        # -> None (no receipt = TX never mined). NIT 2 forensic gas path.
+        self._receipts = receipts or {}
         self.calls: list[int] = []
 
     def round_data(self, epoch):
@@ -57,6 +68,9 @@ class _FakeContract:
     def read_bet_amount(self, epoch, _wallet):
         return int(self._bet_amounts.get(int(epoch), 10**18))  # default registered
 
+    def try_get_receipt(self, tx_hash):
+        return self._receipts.get(str(tx_hash))  # None = no receipt (never mined)
+
 
 def _round(epoch, *, lock_price, close_price, bull_bnb, bear_bnb,
             oracle_called=True, close_ts=1_000_000):
@@ -68,27 +82,45 @@ def _round(epoch, *, lock_price, close_price, bull_bnb, bear_bnb,
     )
 
 
-def _place(lp, epoch, side="Bull", amount=0.05, bankroll=2.3):
-    bet_ledger.record_placed(ledger_path=lp, epoch=epoch, side=side,
-                              amount_bnb=amount, tx_hash="0xabc", bankroll_after_bnb=bankroll)
+def _submit(lp, epoch, side="Bull", amount=0.05, bankroll=2.3):
+    bet_ledger.record_submitted(ledger_path=lp, epoch=epoch, side=side,
+                                amount_bnb=amount, tx_hash="0xabc", bankroll_after_bnb=bankroll)
+
+
+def _confirm(lp, epoch):
+    """SUBMITTED -> CONFIRMED (status=1, before lock). The normal path for a
+    bet that registered cleanly; CONFIRMED settles directly (no recheck)."""
+    bet_ledger.record_confirmation(ledger_path=lp, epoch=epoch, chain_status=1,
+                                   included_block_number=5, included_late=False,
+                                   gas_paid_bnb=0.0001)
 
 
 # --- append / read / replay -------------------------------------------------
 
 def test_append_returns_true_on_success(tmp_path):
-    assert bet_ledger.record_placed(
+    assert bet_ledger.record_submitted(
         ledger_path=_ledger(tmp_path), epoch=1, side="Bull",
         amount_bnb=0.05, tx_hash="0x", bankroll_after_bnb=2.0) is True
 
 
+def test_record_submitted_writes_submitted(tmp_path):
+    """SUBMITTED is written at TX broadcast (Bundle 2 timing)."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bear", amount=0.05)
+    led = bet_ledger.load_ledger(lp)
+    assert led[100]["status"] == "SUBMITTED"
+    assert led[100]["side"] == "Bear"
+    assert led[100]["tx_hash"] == "0xabc"
+
+
 def test_load_roundtrip_and_last_write_wins(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100)
+    _submit(lp, 100)
     bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=1,
-                                    included_block_number=555, included_late=False)
+                                   included_block_number=555, included_late=False)
     led = bet_ledger.load_ledger(lp)
     assert led[100]["status"] == "CONFIRMED"
-    assert led[100]["side"] == "Bull"          # merged from PLACED
+    assert led[100]["side"] == "Bull"          # merged from SUBMITTED
     assert led[100]["included_block_number"] == 555
 
 
@@ -100,9 +132,9 @@ def test_missing_and_empty_file(tmp_path):
 
 def test_corrupted_final_line_skipped(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100)
+    _submit(lp, 100)
     with open(lp, "a", encoding="utf-8") as f:
-        f.write('{"status":"PLACED","epoch":101,"sid')  # truncated
+        f.write('{"status":"SUBMITTED","epoch":101,"sid')  # truncated
     led = bet_ledger.load_ledger(lp)
     assert 100 in led and 101 not in led
 
@@ -114,16 +146,30 @@ def test_classify_confirmation_matrix():
     assert c(chain_status=1, included_late=False) == "CONFIRMED"
     assert c(chain_status=0, included_late=True) == "LATE"
     assert c(chain_status=0, included_late=False) == "REVERTED"
-    assert c(chain_status=None, included_late=False) == "PLACED"  # timeout
-    assert c(chain_status=1, included_late=True) == "LATE"        # anomalous -> LATE
+    assert c(chain_status=None, included_late=False) == "DROPPED"  # timeout
+    assert c(chain_status=1, included_late=True) == "LATE"         # anomalous -> LATE
 
 
-def test_record_confirmation_late_is_terminal_open_set(tmp_path):
+def test_record_confirmation_dropped_on_timeout(tmp_path):
+    """No receipt (chain_status None) -> DROPPED record (Bundle 2/3)."""
     lp = _ledger(tmp_path)
-    _place(lp, 100)
+    _submit(lp, 100)
+    st = bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=None,
+                                        included_block_number=None, included_late=False,
+                                        gas_paid_bnb=None)
+    assert st == "DROPPED"
+    led = bet_ledger.load_ledger(lp)
+    assert led[100]["status"] == "DROPPED"
+    assert "gas_paid_bnb" in led[100]               # key ALWAYS present (Option B)
+    assert led[100]["gas_paid_bnb"] is None         # null = transient unknown at timeout
+
+
+def test_record_confirmation_late_is_terminal(tmp_path):
+    lp = _ledger(tmp_path)
+    _submit(lp, 100)
     st = bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=0,
-                                         included_block_number=9, included_late=True,
-                                         gas_paid_bnb=0.001)
+                                        included_block_number=9, included_late=True,
+                                        gas_paid_bnb=0.001)
     assert st == "LATE"
     assert bet_ledger.load_ledger(lp)[100]["status"] == "LATE"
 
@@ -139,11 +185,11 @@ def test_classify_settlement_mapping():
     assert s == "SETTLED_REFUND"
 
 
-# --- reconcile: Option B alert behavior ------------------------------------
+# --- reconcile: Option B alert behavior (CONFIRMED settles directly) -------
 
 def test_reconcile_win_records_silently_no_alert(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
+    _submit(lp, 100, side="Bull"); _confirm(lp, 100)
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=310,
                                           bull_bnb=10, bear_bnb=10)})
     lost_alerts = []
@@ -158,7 +204,7 @@ def test_reconcile_win_records_silently_no_alert(tmp_path):
 
 def test_reconcile_loss_fires_lost_alert(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
+    _submit(lp, 100, side="Bull"); _confirm(lp, 100)
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=290,
                                           bull_bnb=10, bear_bnb=10)})
     lost = []
@@ -172,7 +218,7 @@ def test_reconcile_loss_fires_lost_alert(tmp_path):
 
 def test_reconcile_tie_is_loss(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
+    _submit(lp, 100, side="Bull"); _confirm(lp, 100)
     # close == lock, oracle called -> tie -> LOSS (not refund).
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=300,
                                           bull_bnb=10, bear_bnb=10)})
@@ -186,8 +232,8 @@ def test_reconcile_tie_is_loss(tmp_path):
 
 def test_reconcile_refund_silent(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
-    # un-oracled, past close_ts -> refund. Silent (claim path alerts).
+    _submit(lp, 100, side="Bull"); _confirm(lp, 100)
+    # un-oracled, past close_ts + buffer -> refund. Silent (claim path alerts).
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=0,
                                           bull_bnb=10, bear_bnb=10,
                                           oracle_called=False, close_ts=1_000_000)})
@@ -200,59 +246,129 @@ def test_reconcile_refund_silent(tmp_path):
     assert lost == []
 
 
-# --- LATE / REVERTED must NOT settle ---------------------------------------
+# --- SUBMITTED / DROPPED re-check (Bundle 4) -------------------------------
 
-def test_reconcile_timeout_then_registered(tmp_path):
-    """Reviewer Fix #2: a still-PLACED entry (receipt timed out) whose bet
-    DID register on-chain (read_bet_amount > 0) settles normally via pool
-    math."""
+def test_submitted_timeout_then_registered(tmp_path):
+    """A still-SUBMITTED entry (crash before classification) whose bet DID
+    register on-chain (read_bet_amount > 0) settles normally via pool math."""
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")  # stays PLACED (no CONFIRMED transition)
+    _submit(lp, 100, side="Bull")  # stays SUBMITTED (no CONFIRMED transition)
     contract = _FakeContract(
         rounds={100: _round(100, lock_price=300, close_price=290, bull_bnb=10, bear_bnb=10)},
         bet_amounts={100: 5 * 10**16},  # registered
     )
-    lost = []
+    lost, dropped = [], []
     settled = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
                                    buffer_seconds=30, fresh_bankroll_bnb=2.25, now_ts=2_000_000,
                                    wallet_address="0xme",
                                    lost_alert_fn=lambda **kw: lost.append(kw),
-                                   reverted_alert_fn=lambda **kw: None)
+                                   dropped_alert_fn=lambda **kw: dropped.append(kw))
     assert settled[0]["status"] == "SETTLED_LOST"   # normal pool settlement
-    assert len(lost) == 1
+    assert len(lost) == 1 and dropped == []
 
 
-def test_reconcile_timeout_then_reverted(tmp_path):
-    """Reviewer Fix #2: a still-PLACED entry whose bet NEVER registered
-    (read_bet_amount == 0 — timed out then mined late/reverted/dropped) is
-    marked terminal REVERTED, fires BET REVERTED, and is NOT pool-settled."""
+def test_submitted_unregistered_becomes_dropped(tmp_path):
+    """A still-SUBMITTED entry whose bet NEVER registered (read_bet_amount==0)
+    is marked terminal DROPPED, fires BET DROPPED, and is NOT pool-settled."""
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
+    _submit(lp, 100, side="Bull")
     contract = _FakeContract(
         rounds={100: _round(100, lock_price=300, close_price=310, bull_bnb=10, bear_bnb=10)},
         bet_amounts={100: 0},  # never registered
     )
-    reverted = []
-    lost = []
+    dropped, lost = [], []
     settled = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
                                    buffer_seconds=30, fresh_bankroll_bnb=2.30, now_ts=2_000_000,
                                    wallet_address="0xme",
                                    lost_alert_fn=lambda **kw: lost.append(kw),
-                                   reverted_alert_fn=lambda **kw: reverted.append(kw))
-    assert settled[0]["status"] == "REVERTED"
-    assert reverted and reverted[0]["epoch"] == 100
+                                   dropped_alert_fn=lambda **kw: dropped.append(kw))
+    assert settled[0]["status"] == "DROPPED"
+    assert dropped and dropped[0]["epoch"] == 100
+    assert dropped[0]["bankroll_bnb"] == 2.30
     assert lost == []                                       # NOT pool-settled
     assert contract.calls == []                             # round_data never read
-    assert bet_ledger.load_ledger(lp)[100]["status"] == "REVERTED"
+    assert bet_ledger.load_ledger(lp)[100]["status"] == "DROPPED"
 
 
-def test_confirmed_skips_timeout_guard(tmp_path):
+def test_dropped_stays_silent_when_unregistered(tmp_path):
+    """A standing DROPPED whose bet is still unregistered (no receipt) stays
+    DROPPED and fires NO Discord alert (the DROPPED alert already fired at the
+    receipt timeout). Its gas is resolved from null to 0 ONCE (Option B); a
+    second pass is fully idempotent."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull")
+    bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=None,
+                                   included_block_number=None, included_late=False)
+    assert bet_ledger.load_ledger(lp)[100]["status"] == "DROPPED"
+    assert bet_ledger.load_ledger(lp)[100]["gas_paid_bnb"] is None   # unknown at timeout
+    contract = _FakeContract(
+        rounds={100: _round(100, lock_price=300, close_price=310, bull_bnb=10, bear_bnb=10)},
+        bet_amounts={100: 0},  # still unregistered
+        receipts={},           # no receipt -> never mined
+    )
+    dropped = []
+    settled = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
+                                   buffer_seconds=30, fresh_bankroll_bnb=2.30, now_ts=2_000_000,
+                                   wallet_address="0xme",
+                                   dropped_alert_fn=lambda **kw: dropped.append(kw))
+    assert dropped == []                                    # no Discord re-alert
+    assert contract.calls == []                             # round_data never read
+    led = bet_ledger.load_ledger(lp)
+    assert led[100]["status"] == "DROPPED"
+    assert led[100]["gas_paid_bnb"] == 0                    # resolved null -> 0 (Option B)
+    assert settled and settled[0]["outcome"] == "dropped_gas_resolved"
+    # Idempotent: gas now concrete -> second pass does nothing.
+    settled2 = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
+                                    buffer_seconds=30, fresh_bankroll_bnb=2.30, now_ts=2_000_000,
+                                    wallet_address="0xme", dropped_alert_fn=lambda **kw: dropped.append(kw))
+    assert settled2 == [] and dropped == []
+
+
+def test_dropped_silently_corrected_when_amount_nonzero(tmp_path):
+    """Bundle 4: a DROPPED entry whose bet DID register (mined just after the
+    10s timeout) settles normally — the settlement alert is the implicit
+    correction; NO explicit 'we were wrong' alert, NO duplicate DROPPED."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull")
+    bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=None,
+                                   included_block_number=None, included_late=False)
+    assert bet_ledger.load_ledger(lp)[100]["status"] == "DROPPED"
+    contract = _FakeContract(
+        rounds={100: _round(100, lock_price=300, close_price=290, bull_bnb=10, bear_bnb=10)},
+        bet_amounts={100: 5 * 10**16},  # actually registered after all
+    )
+    lost, dropped = [], []
+    settled = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
+                                   buffer_seconds=30, fresh_bankroll_bnb=2.25, now_ts=2_000_000,
+                                   wallet_address="0xme",
+                                   lost_alert_fn=lambda **kw: lost.append(kw),
+                                   dropped_alert_fn=lambda **kw: dropped.append(kw))
+    assert settled[0]["status"] == "SETTLED_LOST"   # silent correction -> settles
+    assert len(lost) == 1                            # settlement alert IS the correction
+    assert dropped == []                             # no explicit "wrong" alert
+    assert bet_ledger.load_ledger(lp)[100]["status"] == "SETTLED_LOST"
+
+
+def test_submitted_recheck_requires_wallet(tmp_path):
+    """Without a wallet_address the re-check can't run; the SUBMITTED entry is
+    left untouched (never fabricate a settlement)."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull")
+    contract = _FakeContract({100: _round(100, lock_price=300, close_price=290,
+                                          bull_bnb=10, bear_bnb=10)})
+    settled = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
+                                   buffer_seconds=30, fresh_bankroll_bnb=2.25, now_ts=2_000_000,
+                                   wallet_address=None, lost_alert_fn=None)
+    assert settled == []
+    assert contract.calls == []                             # round_data never read
+    assert bet_ledger.load_ledger(lp)[100]["status"] == "SUBMITTED"
+
+
+def test_confirmed_skips_recheck(tmp_path):
     """A CONFIRMED entry (receipt was good) does NOT trigger the on-chain
     read_bet_amount check — it settles directly via pool math."""
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
-    bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=1,
-                                    included_block_number=5, included_late=False)
+    _submit(lp, 100, side="Bull"); _confirm(lp, 100)
     # bet_amounts says 0, but CONFIRMED should NOT consult it.
     contract = _FakeContract(
         rounds={100: _round(100, lock_price=300, close_price=290, bull_bnb=10, bear_bnb=10)},
@@ -261,15 +377,17 @@ def test_confirmed_skips_timeout_guard(tmp_path):
     settled = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
                                    buffer_seconds=30, fresh_bankroll_bnb=2.25, now_ts=2_000_000,
                                    wallet_address="0xme", lost_alert_fn=lambda **kw: None,
-                                   reverted_alert_fn=lambda **kw: None)
-    assert settled[0]["status"] == "SETTLED_LOST"   # pool-settled, guard skipped
+                                   dropped_alert_fn=lambda **kw: None)
+    assert settled[0]["status"] == "SETTLED_LOST"   # pool-settled, recheck skipped
 
+
+# --- LATE / REVERTED must NOT settle ---------------------------------------
 
 def test_late_never_settles(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100)
+    _submit(lp, 100)
     bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=0,
-                                    included_block_number=9, included_late=True)
+                                   included_block_number=9, included_late=True)
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=310,
                                           bull_bnb=10, bear_bnb=10)})
     settled = bet_ledger.reconcile(ledger_path=lp, contract=contract,
@@ -282,9 +400,9 @@ def test_late_never_settles(tmp_path):
 
 def test_reverted_never_settles(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100)
+    _submit(lp, 100)
     bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=0,
-                                    included_block_number=9, included_late=False)
+                                   included_block_number=9, included_late=False)
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=310,
                                           bull_bnb=10, bear_bnb=10)})
     settled = bet_ledger.reconcile(ledger_path=lp, contract=contract,
@@ -294,9 +412,9 @@ def test_reverted_never_settles(tmp_path):
     assert bet_ledger.load_ledger(lp)[100]["status"] == "REVERTED"
 
 
-def test_permanent_unoracled_placed_refunds_after_close(tmp_path):
+def test_permanent_unoracled_confirmed_refunds_after_close(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
+    _submit(lp, 100, side="Bull"); _confirm(lp, 100)
     # never oracled; close_ts in the past relative to now_ts -> refund-settles.
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=0,
                                           bull_bnb=10, bear_bnb=10,
@@ -304,7 +422,7 @@ def test_permanent_unoracled_placed_refunds_after_close(tmp_path):
     # Before close: skipped.
     s1 = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03, buffer_seconds=30,
                               fresh_bankroll_bnb=2.3, now_ts=999_000, lost_alert_fn=None)
-    assert s1 == [] and bet_ledger.load_ledger(lp)[100]["status"] == "PLACED"
+    assert s1 == [] and bet_ledger.load_ledger(lp)[100]["status"] == "CONFIRMED"
     # After close: refund-settles.
     s2 = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03, buffer_seconds=30,
                               fresh_bankroll_bnb=2.3, now_ts=2_000_000, lost_alert_fn=None)
@@ -315,7 +433,7 @@ def test_permanent_unoracled_placed_refunds_after_close(tmp_path):
 
 def test_reconcile_idempotent(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
+    _submit(lp, 100, side="Bull"); _confirm(lp, 100)
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=290,
                                           bull_bnb=10, bear_bnb=10)})
     lost = []
@@ -330,18 +448,18 @@ def test_reconcile_idempotent(tmp_path):
 
 def test_reconcile_transient_rpc_skips(tmp_path):
     lp = _ledger(tmp_path)
-    _place(lp, 100)
+    _submit(lp, 100); _confirm(lp, 100)
     contract = _FakeContract({}, transient={100})
     assert bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03, buffer_seconds=30,
                                 fresh_bankroll_bnb=2.3, now_ts=2_000_000, lost_alert_fn=None) == []
-    assert bet_ledger.load_ledger(lp)[100]["status"] == "PLACED"
+    assert bet_ledger.load_ledger(lp)[100]["status"] == "CONFIRMED"
 
 
 def test_failed_persist_defers_alert_and_settlement(tmp_path):
     """Fix #7: if the terminal append fails, neither the alert nor the
     settled-list entry happen — both defer to the next pass."""
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
+    _submit(lp, 100, side="Bull"); _confirm(lp, 100)
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=290,
                                           bull_bnb=10, bear_bnb=10)})
     lost = []
@@ -352,16 +470,15 @@ def test_failed_persist_defers_alert_and_settlement(tmp_path):
     assert settled == []       # not appended
     assert lost == []          # not alerted
     # Ledger still open -> next pass retries.
-    assert bet_ledger.load_ledger(lp)[100]["status"] == "PLACED"
+    assert bet_ledger.load_ledger(lp)[100]["status"] == "CONFIRMED"
 
 
 def test_sequential_bets_use_fresh_bankroll(tmp_path):
-    """Fix #3: two bets placed back-to-back; settling bet #1 shows the FRESH
-    bankroll passed in (which already reflects bet #2's placement debit), not
-    placed_bankroll + delta."""
+    """Fix #3: two bets back-to-back; settling bet #1 shows the FRESH bankroll
+    passed in (which already reflects bet #2's debit), not stored + delta."""
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull", bankroll=2.30)  # after bet #1 placement
-    _place(lp, 101, side="Bull", bankroll=2.25)  # after bet #2 placement (debited again)
+    _submit(lp, 100, side="Bull", bankroll=2.30); _confirm(lp, 100)  # after bet #1
+    _submit(lp, 101, side="Bull", bankroll=2.25); _confirm(lp, 101)  # after bet #2
     # Bet #1 (epoch 100) loses; bet #2 (101) not yet closed.
     contract = _FakeContract({
         100: _round(100, lock_price=300, close_price=290, bull_bnb=10, bear_bnb=10),
@@ -374,7 +491,7 @@ def test_sequential_bets_use_fresh_bankroll(tmp_path):
                          fresh_bankroll_bnb=2.25, now_ts=2_000_000,
                          lost_alert_fn=lambda **kw: lost.append(kw))
     assert len(lost) == 1 and lost[0]["epoch"] == 100
-    # Fresh balance shown, NOT placed_bankroll(2.30) + delta.
+    # Fresh balance shown, NOT stored bankroll(2.30) + delta.
     assert lost[0]["new_bankroll_bnb"] == 2.25
 
 
@@ -382,7 +499,7 @@ def test_sequential_bets_use_fresh_bankroll(tmp_path):
 
 def test_fire_claim_won_single(tmp_path, monkeypatch):
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull", amount=0.05)
+    _submit(lp, 100, side="Bull", amount=0.05)
     # reconcile marked it SETTLED_WON with a delta.
     bet_ledger.record_settled(ledger_path=lp, epoch=100, side="Bull", status="SETTLED_WON",
                               delta_bnb=0.04, outcome="win", new_bankroll_bnb=2.34)
@@ -400,7 +517,7 @@ def test_fire_claim_won_single(tmp_path, monkeypatch):
 
 def test_fire_claim_refund(tmp_path, monkeypatch):
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull", amount=0.05)
+    _submit(lp, 100, side="Bull", amount=0.05)
     bet_ledger.record_settled(ledger_path=lp, epoch=100, side="Bull", status="SETTLED_REFUND",
                               delta_bnb=-0.001, outcome="refund", new_bankroll_bnb=2.30)
     sent = []
@@ -415,7 +532,7 @@ def test_fire_claim_refund(tmp_path, monkeypatch):
 def test_fire_claim_batch_combined(tmp_path, monkeypatch):
     lp = _ledger(tmp_path)
     for ep, d in ((100, 0.04), (101, 0.03)):
-        _place(lp, ep, side="Bull", amount=0.05)
+        _submit(lp, ep, side="Bull", amount=0.05)
         bet_ledger.record_settled(ledger_path=lp, epoch=ep, side="Bull", status="SETTLED_WON",
                                   delta_bnb=d, outcome="win", new_bankroll_bnb=2.4)
     batch = []
@@ -430,25 +547,25 @@ def test_fire_claim_batch_combined(tmp_path, monkeypatch):
 
 
 def test_fire_claim_unreconciled_epoch_defers(tmp_path, monkeypatch):
-    """Reviewer Fix #1: a claimed epoch still PLACED/CONFIRMED (reconcile
+    """Reviewer Fix #1: a claimed epoch still SUBMITTED/CONFIRMED (reconcile
     failed transiently this iteration) must NOT fire a premature WON or mark
     CLAIMED — it stays open until the next reconcile writes the real delta."""
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull", amount=0.05)  # status PLACED, never reconciled
+    _submit(lp, 100, side="Bull", amount=0.05); _confirm(lp, 100)  # CONFIRMED, never reconciled
     won = []
     monkeypatch.setattr(live_mod, "send_bet_settled_alert", lambda **kw: won.append(kw))
     contract = _FakeContract(balance=2.39)
     live_mod.fire_claim_settled_alerts(ledger_path=lp, claimed_epochs=[100],
                                        contract=contract, wallet_address="0xme")
-    assert won == []                                            # no premature WON
-    assert bet_ledger.load_ledger(lp)[100]["status"] == "PLACED"  # stays open
+    assert won == []                                              # no premature WON
+    assert bet_ledger.load_ledger(lp)[100]["status"] == "CONFIRMED"  # stays open
 
 
 def test_reconcile_defers_in_buffer_window(tmp_path):
     """Reviewer Fix #3: an oracle-pending round inside [close_ts,
     close_ts+buffer] must NOT settle as refund — defer until past buffer."""
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
+    _submit(lp, 100, side="Bull"); _confirm(lp, 100)
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=0,
                                           bull_bnb=10, bear_bnb=10,
                                           oracle_called=False, close_ts=1_000_000)})
@@ -457,7 +574,7 @@ def test_reconcile_defers_in_buffer_window(tmp_path):
                              buffer_seconds=30, fresh_bankroll_bnb=2.3, now_ts=1_000_015,
                              lost_alert_fn=None)
     assert s == []                                              # deferred
-    assert bet_ledger.load_ledger(lp)[100]["status"] == "PLACED"
+    assert bet_ledger.load_ledger(lp)[100]["status"] == "CONFIRMED"
     # Past buffer: now > close_ts + buffer -> refund-settles.
     s2 = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
                               buffer_seconds=30, fresh_bankroll_bnb=2.3, now_ts=1_000_031,
@@ -470,7 +587,7 @@ def test_reconcile_defers_at_exact_buffer_boundary(tmp_path):
     AT now == close_ts + buffer the round is NOT yet refundable (defer);
     at now == close_ts + buffer + 1 it settles."""
     lp = _ledger(tmp_path)
-    _place(lp, 100, side="Bull")
+    _submit(lp, 100, side="Bull"); _confirm(lp, 100)
     contract = _FakeContract({100: _round(100, lock_price=300, close_price=0,
                                           bull_bnb=10, bear_bnb=10,
                                           oracle_called=False, close_ts=1_000_000)})
@@ -479,7 +596,7 @@ def test_reconcile_defers_at_exact_buffer_boundary(tmp_path):
                                       buffer_seconds=30, fresh_bankroll_bnb=2.3, now_ts=1_000_030,
                                       lost_alert_fn=None)
     assert s_boundary == []
-    assert bet_ledger.load_ledger(lp)[100]["status"] == "PLACED"
+    assert bet_ledger.load_ledger(lp)[100]["status"] == "CONFIRMED"
     # One second past the boundary -> settles.
     s_past = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
                                   buffer_seconds=30, fresh_bankroll_bnb=2.3, now_ts=1_000_031,
@@ -498,7 +615,7 @@ def test_fire_claim_skips_non_ledgered(tmp_path, monkeypatch):
     assert sent == []
 
 
-# --- alert senders: happy / missing / non-2xx ------------------------------
+# --- alert senders: 8 locked formats + BOT READY ---------------------------
 
 class _FakeResp:
     def __init__(self, code): self.status_code = code; self.text = ""
@@ -515,49 +632,68 @@ def _content(fake):
     return fake.captured["json"]["content"]
 
 
-def test_placed_format_exact(monkeypatch):
-    fake = _FakeRequests(204)
+def _wire(monkeypatch, code=204):
+    fake = _FakeRequests(code)
     monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
     monkeypatch.setitem(sys.modules, "requests", fake)
-    live_mod.send_bet_placed_alert(epoch=999, side="Bull", amount_bnb=0.05, bankroll_bnb=2.3463)
+    return fake
+
+
+def test_bot_ready_format_exact(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_bot_ready_alert(bankroll_bnb=2.345)
     assert _content(fake) == (
-        "[INFO] **BET PLACED** epoch `999` — Bet `0.0500` BNB on Bull, bankroll `2.3463` BNB"
+        "[INFO] **BOT READY** `PancakeBot-live` — bankroll `2.3450` BNB"
     )
 
 
+def test_submitted_format_exact(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_bet_submitted_alert(epoch=999, side="Bull", amount_bnb=0.05,
+                                      projected_bankroll_bnb=2.3463)
+    assert _content(fake) == (
+        "[INFO] **BET SUBMITTED** epoch `999` — Bet `0.0500` BNB on Bull, "
+        "projected bankroll `2.3463` BNB"
+    )
+
+
+def test_confirmed_format_exact(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_bet_confirmed_alert(epoch=999, bankroll_bnb=2.2950)
+    assert _content(fake) == "[INFO] **BET CONFIRMED** epoch `999` — bankroll `2.2950` BNB"
+
+
 def test_late_format_exact(monkeypatch):
-    fake = _FakeRequests(204)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
+    fake = _wire(monkeypatch)
     live_mod.send_bet_late_alert(epoch=999, bankroll_bnb=2.3452)
     assert _content(fake) == "[WARN] **BET LATE** epoch `999` — bankroll `2.3452` BNB"
 
 
 def test_reverted_format_exact(monkeypatch):
-    fake = _FakeRequests(204)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
+    fake = _wire(monkeypatch)
     live_mod.send_bet_reverted_alert(epoch=999, bankroll_bnb=2.3452)
     assert _content(fake) == "[WARN] **BET REVERTED** epoch `999` — bankroll `2.3452` BNB"
 
 
+def test_dropped_format_exact(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_bet_dropped_alert(epoch=999, bankroll_bnb=2.3452)
+    assert _content(fake) == "[WARN] **BET DROPPED** epoch `999` — bankroll `2.3452` BNB"
+
+
 def test_won_format_exact(monkeypatch):
-    fake = _FakeRequests(204)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
+    fake = _wire(monkeypatch)
     live_mod.send_bet_settled_alert(epoch=999, won=True, delta_bnb=0.0423, amount_bnb=0.05,
-                                     new_bankroll_bnb=2.3886)
+                                    new_bankroll_bnb=2.3886)
     assert _content(fake) == (
         "[INFO] **BET WON** epoch `999` — Won `0.0423` BNB, bankroll `2.3886` BNB"
     )
 
 
 def test_lost_format_exact(monkeypatch):
-    fake = _FakeRequests(204)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
+    fake = _wire(monkeypatch)
     live_mod.send_bet_settled_alert(epoch=999, won=False, delta_bnb=-0.05, amount_bnb=0.05,
-                                     new_bankroll_bnb=2.2963)
+                                    new_bankroll_bnb=2.2963)
     # Lost amount shown positive; the verb conveys direction.
     assert _content(fake) == (
         "[INFO] **BET LOST** epoch `999` — Lost `0.0500` BNB, bankroll `2.2963` BNB"
@@ -565,9 +701,7 @@ def test_lost_format_exact(monkeypatch):
 
 
 def test_refund_format_exact(monkeypatch):
-    fake = _FakeRequests(204)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
+    fake = _wire(monkeypatch)
     live_mod.send_bet_refund_alert(epoch=999, refund_bnb=0.05, new_bankroll_bnb=2.3455)
     assert _content(fake) == (
         "[INFO] **BET REFUND** epoch `999` — Refunded `0.0500` BNB, bankroll `2.3455` BNB"
@@ -575,11 +709,9 @@ def test_refund_format_exact(monkeypatch):
 
 
 def test_won_batch_format_exact(monkeypatch):
-    fake = _FakeRequests(204)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
+    fake = _wire(monkeypatch)
     live_mod.send_bet_won_batch_alert(epochs=[101, 102, 103], total_delta_bnb=0.12,
-                                       new_bankroll_bnb=2.50)
+                                      new_bankroll_bnb=2.50)
     assert _content(fake) == (
         "[INFO] **BET WON** epochs `[101, 102, 103]` — Won `0.1200` BNB total, "
         "bankroll `2.5000` BNB"
@@ -588,12 +720,15 @@ def test_won_batch_format_exact(monkeypatch):
 
 def test_no_gas_in_any_alert(monkeypatch):
     """Locked format drops all gas values from Discord display."""
-    fake = _FakeRequests(204)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
-    live_mod.send_bet_placed_alert(epoch=1, side="Bear", amount_bnb=0.05, bankroll_bnb=2.0)
+    fake = _wire(monkeypatch)
+    live_mod.send_bet_submitted_alert(epoch=1, side="Bear", amount_bnb=0.05,
+                                      projected_bankroll_bnb=2.0)
+    assert "gas" not in _content(fake).lower()
+    live_mod.send_bet_confirmed_alert(epoch=1, bankroll_bnb=2.0)
     assert "gas" not in _content(fake).lower()
     live_mod.send_bet_late_alert(epoch=1, bankroll_bnb=2.0)
+    assert "gas" not in _content(fake).lower()
+    live_mod.send_bet_dropped_alert(epoch=1, bankroll_bnb=2.0)
     assert "gas" not in _content(fake).lower()
     live_mod.send_bet_settled_alert(epoch=1, won=True, delta_bnb=0.04, amount_bnb=0.05, new_bankroll_bnb=2.0)
     assert "gas" not in _content(fake).lower()
@@ -601,41 +736,348 @@ def test_no_gas_in_any_alert(monkeypatch):
     assert "gas" not in _content(fake).lower()
 
 
-def test_confirmation_alert_sequence():
-    """BET PLACED fires for any mined TX; LATE/REVERTED add a follow-up;
-    a receipt timeout (PLACED status) fires nothing."""
-    seq = bet_ledger.confirmation_alert_sequence
-    assert seq("CONFIRMED") == ("PLACED",)
-    assert seq("LATE") == ("PLACED", "LATE")
-    assert seq("REVERTED") == ("PLACED", "REVERTED")
-    assert seq("PLACED") == ()  # timeout -> no alert
-
-
-def test_classify_confirmation_late_fires_placed_alert():
-    """LATE classification -> BOTH PLACED and LATE alerts, PLACED first."""
-    assert bet_ledger.classify_confirmation(chain_status=0, included_late=True) == "LATE"
-    assert bet_ledger.confirmation_alert_sequence("LATE") == ("PLACED", "LATE")
-
-
-def test_classify_confirmation_reverted_fires_placed_alert():
-    """REVERTED classification -> BOTH PLACED and REVERTED alerts, PLACED first."""
-    assert bet_ledger.classify_confirmation(chain_status=0, included_late=False) == "REVERTED"
-    assert bet_ledger.confirmation_alert_sequence("REVERTED") == ("PLACED", "REVERTED")
+def test_no_amount_or_side_on_post_receipt_alerts(monkeypatch):
+    """CONFIRMED / LATE / REVERTED / DROPPED carry only epoch + bankroll —
+    bet amount + side live on BET SUBMITTED (Bundle 2 locked format)."""
+    fake = _wire(monkeypatch)
+    for fn in (live_mod.send_bet_confirmed_alert, live_mod.send_bet_late_alert,
+               live_mod.send_bet_reverted_alert, live_mod.send_bet_dropped_alert):
+        fn(epoch=5, bankroll_bnb=2.0)
+        c = _content(fake)
+        assert "Bull" not in c and "Bear" not in c
+        assert "Bet `" not in c
 
 
 def test_senders_missing_webhook_no_raise(monkeypatch):
     monkeypatch.delenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", raising=False)
-    live_mod.send_bet_placed_alert(epoch=1, side="Bull", amount_bnb=0.05, bankroll_bnb=2.0)
+    live_mod.send_bot_ready_alert(bankroll_bnb=2.0)
+    live_mod.send_bet_submitted_alert(epoch=1, side="Bull", amount_bnb=0.05, projected_bankroll_bnb=2.0)
+    live_mod.send_bet_confirmed_alert(epoch=1, bankroll_bnb=2.0)
     live_mod.send_bet_late_alert(epoch=1, bankroll_bnb=2.0)
     live_mod.send_bet_reverted_alert(epoch=1, bankroll_bnb=2.0)
+    live_mod.send_bet_dropped_alert(epoch=1, bankroll_bnb=2.0)
     live_mod.send_bet_refund_alert(epoch=1, refund_bnb=0.05, new_bankroll_bnb=2.3)
 
 
 def test_sender_non_2xx_swallowed(monkeypatch):
-    fake = _FakeRequests(500)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
-    live_mod.send_bet_placed_alert(epoch=1, side="Bull", amount_bnb=0.05, bankroll_bnb=2.0)
+    _wire(monkeypatch, code=500)
+    live_mod.send_bet_submitted_alert(epoch=1, side="Bull", amount_bnb=0.05, projected_bankroll_bnb=2.0)
+
+
+# --- Step 31 hotfix: 10s receipt wait, actual gas, post-claim fresh bankroll -
+
+def test_bet_receipt_wait_10s_constant():
+    """Bundle 1: the bet receipt wait is a fixed 10s constant, decoupled from
+    the claim receipt budget (buffer + padding ~35s)."""
+    from pancakebot.timing_constants import BET_RECEIPT_WAIT_TIMEOUT_SECONDS
+    assert BET_RECEIPT_WAIT_TIMEOUT_SECONDS == 10
+
+
+def test_won_alert_uses_post_claim_fresh_bankroll(tmp_path, monkeypatch):
+    """Bundle 5: BET WON alert + the CLAIMED record use a fresh POST-claim
+    wallet read; the SETTLED_WON settle-time snapshot is preserved distinct."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull", amount=0.001)
+    # reconcile wrote SETTLED_WON at settle-time (pre-claim, understated).
+    bet_ledger.record_settled(ledger_path=lp, epoch=100, side="Bull", status="SETTLED_WON",
+                              delta_bnb=0.000317, outcome="win", new_bankroll_bnb=2.344724)
+    sent = []
+    monkeypatch.setattr(live_mod, "send_bet_settled_alert", lambda **kw: sent.append(kw))
+    # Post-claim wallet now reflects the credited winnings.
+    contract = _FakeContract(balance=2.346197)
+    live_mod.fire_claim_settled_alerts(ledger_path=lp, claimed_epochs=[100],
+                                       contract=contract, wallet_address="0xme")
+    # Alert shows the post-claim fresh read, not the settle-time snapshot.
+    assert sent[0]["new_bankroll_bnb"] == 2.346197
+    led = bet_ledger.load_ledger(lp)
+    assert led[100]["status"] == "CLAIMED"
+    assert led[100]["new_bankroll_bnb"] == 2.346197       # CLAIMED = post-claim
+    # SETTLED_WON snapshot preserved in the append-only log (not overwritten).
+    import json as _json
+    settled_snaps = [
+        _json.loads(ln)["new_bankroll_bnb"]
+        for ln in open(lp, encoding="utf-8") if '"SETTLED_WON"' in ln
+    ]
+    assert settled_snaps == [2.344724]                    # distinct settle-time value
+
+
+def test_lost_alert_uses_fresh_wallet_read_not_arithmetic(tmp_path, monkeypatch):
+    """Bundle 5 (LOSS parity): the BET LOST alert bankroll AND the SETTLED_LOST
+    ledger record's new_bk both come VERBATIM from the fresh wallet read the
+    caller passes as fresh_bankroll_bnb — never from arithmetic
+    (estimate - delta / bk_after - delta). Mirrors _reconcile_live_bets, which
+    reads wallet_balance_bnb() and forwards it unchanged. The sentinel balance
+    (999.9999) is unrelated to ANY 2.x projection, so its presence proves the
+    fresh read is used; a regression to arithmetic would surface ~2.25 instead."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull", bankroll=2.30); _confirm(lp, 100)
+    # Bull bet, price fell (310 -> 290 vs lock 300) -> LOSS.
+    contract = _FakeContract(
+        {100: _round(100, lock_price=300, close_price=290, bull_bnb=10, bear_bnb=10)},
+        balance=999.9999,  # sentinel fresh read, unrelated to any arithmetic
+    )
+    fake = _wire(monkeypatch)  # real send_bet_settled_alert -> captured POST
+    # Caller reads the fresh wallet balance and forwards it (exactly what
+    # _reconcile_live_bets does); reconcile must NOT recompute it.
+    fresh = float(contract.wallet_balance_bnb("0xme"))
+    bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
+                         buffer_seconds=30, fresh_bankroll_bnb=fresh, now_ts=2_000_000,
+                         wallet_address="0xme",
+                         lost_alert_fn=live_mod.send_bet_settled_alert,
+                         dropped_alert_fn=None)
+    # 1) LOSS alert string carries the fresh read verbatim.
+    c = _content(fake)
+    assert c == (
+        "[INFO] **BET LOST** epoch `100` — Lost `0.0500` BNB, bankroll `999.9999` BNB"
+    )
+    assert "2.25" not in c and "2.30" not in c             # no arithmetic projection
+    # 2) SETTLED_LOST ledger record new_bk == fresh read (not arithmetic).
+    led = bet_ledger.load_ledger(lp)
+    assert led[100]["status"] == "SETTLED_LOST"
+    assert led[100]["new_bankroll_bnb"] == 999.9999
+
+
+def test_record_confirmation_stores_actual_gas(tmp_path):
+    """Bundle 6: record_confirmation stores the actual gas (gasUsed x price),
+    not the MAX_GAS_COST_BET_BNB cap."""
+    gas = bet_ledger.actual_gas_bnb(gas_used=100_000, effective_gas_price_wei=10**9)
+    assert gas == 0.0001
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull")
+    bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=1,
+                                   included_block_number=5, included_late=False,
+                                   gas_paid_bnb=gas)
+    assert bet_ledger.load_ledger(lp)[100]["gas_paid_bnb"] == 0.0001  # not 0.0002 cap
+
+
+def test_actual_gas_none_on_timeout():
+    """No receipt (timeout) -> None gas, so the ledger field stays unwritten."""
+    assert bet_ledger.actual_gas_bnb(gas_used=None, effective_gas_price_wei=10**9) is None
+    assert bet_ledger.actual_gas_bnb(gas_used=100_000, effective_gas_price_wei=None) is None
+
+
+# --- NIT 1: settlement "previously reported as DROPPED" correction suffix ----
+
+_SUFFIX = " (previously reported as DROPPED)"
+
+
+def _make_dropped(lp, epoch, side="Bull", amount=0.05, bankroll=2.30):
+    """Submit then DROP an epoch (receipt timeout) so its history carries a
+    DROPPED record — the precondition for the correction suffix."""
+    _submit(lp, epoch, side=side, amount=amount, bankroll=bankroll)
+    bet_ledger.record_confirmation(ledger_path=lp, epoch=epoch, chain_status=None,
+                                   included_block_number=None, included_late=False)
+
+
+def test_won_alert_correction_suffix_after_drop(tmp_path, monkeypatch):
+    """A WON that corrects a prior DROPPED appends the suffix (claim path)."""
+    lp = _ledger(tmp_path)
+    _make_dropped(lp, 100, side="Bull", amount=0.05)
+    # reconcile later corrected DROPPED -> SETTLED_WON (its delta written).
+    bet_ledger.record_settled(ledger_path=lp, epoch=100, side="Bull", status="SETTLED_WON",
+                              delta_bnb=0.04, outcome="win", new_bankroll_bnb=2.34)
+    fake = _wire(monkeypatch)  # real send_bet_settled_alert -> captured POST
+    contract = _FakeContract(balance=2.39)
+    live_mod.fire_claim_settled_alerts(ledger_path=lp, claimed_epochs=[100],
+                                       contract=contract, wallet_address="0xme")
+    c = _content(fake)
+    assert c == (
+        "[INFO] **BET WON** epoch `100` — Won `0.0400` BNB, bankroll `2.3900` BNB" + _SUFFIX
+    )
+
+
+def test_lost_alert_correction_suffix_after_drop(tmp_path, monkeypatch):
+    """A LOST that corrects a prior DROPPED appends the suffix (reconcile path).
+    The DROPPED entry's TX in fact registered (read_bet_amount > 0) -> reconcile
+    reclassifies + settles LOST, and epoch_was_dropped sees the prior DROPPED."""
+    lp = _ledger(tmp_path)
+    _make_dropped(lp, 100, side="Bull", amount=0.05)
+    contract = _FakeContract(
+        {100: _round(100, lock_price=300, close_price=290, bull_bnb=10, bear_bnb=10)},
+        balance=2.2949,                 # fresh read
+        bet_amounts={100: 5 * 10**16},  # registered after all
+    )
+    fake = _wire(monkeypatch)
+    fresh = float(contract.wallet_balance_bnb("0xme"))
+    bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
+                         buffer_seconds=30, fresh_bankroll_bnb=fresh, now_ts=2_000_000,
+                         wallet_address="0xme",
+                         lost_alert_fn=live_mod.send_bet_settled_alert,
+                         dropped_alert_fn=None)
+    c = _content(fake)
+    assert c == (
+        "[INFO] **BET LOST** epoch `100` — Lost `0.0500` BNB, bankroll `2.2949` BNB" + _SUFFIX
+    )
+
+
+def test_refund_alert_correction_suffix_after_drop(tmp_path, monkeypatch):
+    """A REFUND that corrects a prior DROPPED appends the suffix (claim path)."""
+    lp = _ledger(tmp_path)
+    _make_dropped(lp, 100, side="Bull", amount=0.05)
+    bet_ledger.record_settled(ledger_path=lp, epoch=100, side="Bull", status="SETTLED_REFUND",
+                              delta_bnb=-0.001, outcome="refund", new_bankroll_bnb=2.30)
+    fake = _wire(monkeypatch)
+    contract = _FakeContract(balance=2.3455)
+    live_mod.fire_claim_settled_alerts(ledger_path=lp, claimed_epochs=[100],
+                                       contract=contract, wallet_address="0xme")
+    c = _content(fake)
+    assert c == (
+        "[INFO] **BET REFUND** epoch `100` — Refunded `0.0500` BNB, bankroll `2.3455` BNB" + _SUFFIX
+    )
+
+
+def test_won_alert_no_suffix_when_no_prior_drop(tmp_path, monkeypatch):
+    """A normal WON (no DROPPED in history) carries NO suffix."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull", amount=0.05); _confirm(lp, 100)
+    bet_ledger.record_settled(ledger_path=lp, epoch=100, side="Bull", status="SETTLED_WON",
+                              delta_bnb=0.04, outcome="win", new_bankroll_bnb=2.34)
+    fake = _wire(monkeypatch)
+    contract = _FakeContract(balance=2.39)
+    live_mod.fire_claim_settled_alerts(ledger_path=lp, claimed_epochs=[100],
+                                       contract=contract, wallet_address="0xme")
+    c = _content(fake)
+    assert c == "[INFO] **BET WON** epoch `100` — Won `0.0400` BNB, bankroll `2.3900` BNB"
+    assert "previously reported as DROPPED" not in c
+
+
+# --- NIT 2: DROPPED gas accuracy — never-mined vs mined-and-reverted ---------
+
+def test_dropped_initial_record_has_null_gas(tmp_path):
+    """Option B: at the 10s receipt timeout the FIRST DROPPED record carries
+    gas_paid_bnb = null — the gas spent is genuinely unknown at that moment
+    (the key is present, value null — distinct from a confirmed 0)."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull", amount=0.05)
+    bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=None,
+                                   included_block_number=None, included_late=False)
+    led = bet_ledger.load_ledger(lp)
+    assert led[100]["status"] == "DROPPED"
+    assert "gas_paid_bnb" in led[100] and led[100]["gas_paid_bnb"] is None
+
+
+def test_dropped_with_revert_receipt_updates_gas(tmp_path):
+    """A standing DROPPED whose TX mined-and-reverted (receipt present) keeps
+    the DROPPED status but has its forensic gas resolved from null to the
+    receipt's actual gasUsed x effectiveGasPrice. No settlement, no re-alert."""
+    lp = _ledger(tmp_path)
+    _make_dropped(lp, 100, side="Bull", amount=0.05)
+    assert bet_ledger.load_ledger(lp)[100]["gas_paid_bnb"] is None   # null pre-resolve
+    contract = _FakeContract(
+        bet_amounts={100: 0},  # never registered (PCS rejected the revert)
+        receipts={"0xabc": {"status": 0, "gasUsed": 100_000,
+                            "effectiveGasPrice": 10**9, "blockNumber": 50}},
+    )
+    dropped = []
+    settled = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
+                                   buffer_seconds=30, fresh_bankroll_bnb=2.30, now_ts=2_000_000,
+                                   wallet_address="0xme",
+                                   dropped_alert_fn=lambda **kw: dropped.append(kw))
+    led = bet_ledger.load_ledger(lp)
+    assert led[100]["status"] == "DROPPED"                 # status unchanged
+    assert led[100]["gas_paid_bnb"] == 0.0001              # actual gas resolved in
+    assert dropped == []                                   # standing DROPPED -> silent
+    assert contract.calls == []                            # round_data never read
+    assert settled and settled[0]["outcome"] == "dropped_gas_resolved"
+    # Idempotent: a second pass sees gas non-null and does NOT re-resolve.
+    settled2 = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
+                                    buffer_seconds=30, fresh_bankroll_bnb=2.30, now_ts=2_000_000,
+                                    wallet_address="0xme", dropped_alert_fn=lambda **kw: dropped.append(kw))
+    assert settled2 == [] and dropped == []
+
+
+def test_dropped_with_no_receipt_writes_zero_gas(tmp_path):
+    """A standing DROPPED with no receipt (truly never mined) keeps the DROPPED
+    status AND has gas_paid_bnb resolved to 0 — NOT null, NOT absent (Option B:
+    0 = confirmed no gas spent)."""
+    lp = _ledger(tmp_path)
+    _make_dropped(lp, 100, side="Bull", amount=0.05)
+    contract = _FakeContract(bet_amounts={100: 0}, receipts={})  # try_get_receipt -> None
+    dropped = []
+    settled = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
+                                   buffer_seconds=30, fresh_bankroll_bnb=2.30, now_ts=2_000_000,
+                                   wallet_address="0xme",
+                                   dropped_alert_fn=lambda **kw: dropped.append(kw))
+    led = bet_ledger.load_ledger(lp)
+    assert led[100]["status"] == "DROPPED"
+    assert "gas_paid_bnb" in led[100]                      # key present
+    assert led[100]["gas_paid_bnb"] == 0                   # confirmed zero (not null, not absent)
+    assert dropped == []                                   # no Discord re-alert
+    assert contract.calls == []
+    assert settled and settled[0]["outcome"] == "dropped_gas_resolved"
+
+
+def test_dropped_with_success_receipt_reclassifies(tmp_path):
+    """A standing DROPPED whose TX actually registered (receipt status=1 AND
+    read_bet_amount > 0) is reclassified to CONFIRMED with the receipt's actual
+    gas, then falls through to settlement (here a LOSS). The LOSS alert is the
+    implicit correction (previously_dropped True)."""
+    lp = _ledger(tmp_path)
+    _make_dropped(lp, 100, side="Bull", amount=0.05)
+    contract = _FakeContract(
+        rounds={100: _round(100, lock_price=300, close_price=290, bull_bnb=10, bear_bnb=10)},
+        bet_amounts={100: 5 * 10**16},  # registered
+        receipts={"0xabc": {"status": 1, "gasUsed": 100_000,
+                            "effectiveGasPrice": 10**9, "blockNumber": 50}},
+    )
+    lost = []
+    settled = bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
+                                   buffer_seconds=30, fresh_bankroll_bnb=2.25, now_ts=2_000_000,
+                                   wallet_address="0xme",
+                                   lost_alert_fn=lambda **kw: lost.append(kw),
+                                   dropped_alert_fn=lambda **kw: None)
+    assert settled[0]["status"] == "SETTLED_LOST"          # fell through to settle
+    led = bet_ledger.load_ledger(lp)
+    assert led[100]["status"] == "SETTLED_LOST"
+    assert led[100]["gas_paid_bnb"] == 0.0001              # actual gas from CONFIRMED reclassify
+    # A CONFIRMED reclassify record was appended to the raw history.
+    raw = Path(lp).read_text(encoding="utf-8")
+    assert '"status":"CONFIRMED"' in raw
+    # LOSS alert flagged as a DROPPED correction.
+    assert len(lost) == 1 and lost[0]["previously_dropped"] is True
+
+
+def test_gas_field_schema_invariant_on_tx_state_records(tmp_path):
+    """Option B contract: every bet-TX-outcome record (SUBMITTED / CONFIRMED /
+    LATE / REVERTED / DROPPED) carries gas_paid_bnb with a value in
+    {null, 0, positive}. SETTLED_*/CLAIMED records do NOT carry the field."""
+    import json as _json
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull")                                  # SUBMITTED -> null
+    bet_ledger.record_confirmation(ledger_path=lp, epoch=100, chain_status=1,
+                                   included_block_number=5, included_late=False,
+                                   gas_paid_bnb=0.0001)            # CONFIRMED -> positive
+    bet_ledger.record_confirmation(ledger_path=lp, epoch=101, chain_status=0,
+                                   included_block_number=6, included_late=True,
+                                   gas_paid_bnb=0.0002)            # LATE -> positive
+    bet_ledger.record_confirmation(ledger_path=lp, epoch=102, chain_status=0,
+                                   included_block_number=7, included_late=False,
+                                   gas_paid_bnb=0.0003)            # REVERTED -> positive
+    bet_ledger.record_confirmation(ledger_path=lp, epoch=103, chain_status=None,
+                                   included_block_number=None, included_late=False)  # DROPPED -> null
+    bet_ledger.record_settled(ledger_path=lp, epoch=100, side="Bull", status="SETTLED_WON",
+                              delta_bnb=0.04, outcome="win", new_bankroll_bnb=2.4)
+    bet_ledger.record_claimed(ledger_path=lp, epoch=100, new_bankroll_bnb=2.45)
+    gas_bearing = {"SUBMITTED", "CONFIRMED", "LATE", "REVERTED", "DROPPED"}
+    for line in Path(lp).read_text(encoding="utf-8").splitlines():
+        rec = _json.loads(line)
+        if rec["status"] in gas_bearing:
+            assert "gas_paid_bnb" in rec, f"{rec['status']} missing gas key"
+            g = rec["gas_paid_bnb"]
+            assert g is None or (isinstance(g, (int, float)) and g >= 0), f"bad gas {g!r}"
+        else:  # SETTLED_*/CLAIMED: PnL records, no gas field
+            assert "gas_paid_bnb" not in rec
+
+
+def test_append_record_rejects_gasless_tx_state_record(tmp_path):
+    """The invariant is enforced at write time: a gas-bearing record without
+    the gas_paid_bnb key is a programming error -> hard stop (InvariantError)."""
+    lp = _ledger(tmp_path)
+    with pytest.raises(InvariantError):
+        bet_ledger._append_record(lp, {"ts": "t", "status": "CONFIRMED", "epoch": 1})
+    # A PnL record (SETTLED_*/CLAIMED) without the key is fine.
+    assert bet_ledger._append_record(
+        lp, {"ts": "t", "status": "SETTLED_LOST", "epoch": 1}) is True
 
 
 # --- migrated existing alerts: claim-failure + gas-cap (ASCII + gwei) -------
@@ -650,9 +1092,7 @@ def test_gwei_formatting():
 
 
 def test_claim_failure_alert_ascii_format(monkeypatch):
-    fake = _FakeRequests(204)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
+    fake = _wire(monkeypatch)
     live_mod._send_claim_failure_alert(reason="revert", tx_hash="0xabc123",
                                        epochs=[401, 402, 403], gas_limit=900_000)
     assert _content(fake) == (
@@ -663,9 +1103,7 @@ def test_claim_failure_alert_ascii_format(monkeypatch):
 
 
 def test_gas_cap_breach_bet_path_crit(monkeypatch):
-    fake = _FakeRequests(204)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
+    fake = _wire(monkeypatch)
     live_mod.send_gas_cap_breach_alert(path="bet", suggested_wei=8_000_000_000,
                                        cap_wei=5_000_000_000, epoch=12345)
     c = _content(fake)
@@ -677,9 +1115,7 @@ def test_gas_cap_breach_bet_path_crit(monkeypatch):
 
 
 def test_gas_cap_breach_claim_path_warn(monkeypatch):
-    fake = _FakeRequests(204)
-    monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
-    monkeypatch.setitem(sys.modules, "requests", fake)
+    fake = _wire(monkeypatch)
     live_mod.send_gas_cap_breach_alert(path="claim", suggested_wei=8_250_000_000,
                                        cap_wei=5_000_000_000, epochs=[401, 402])
     c = _content(fake)

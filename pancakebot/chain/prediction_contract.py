@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, Sequence, TypeVar
 
 from web3 import Web3
-from web3.exceptions import TimeExhausted
+from web3.exceptions import TimeExhausted, TransactionNotFound
 
 from pancakebot.constants import (
     BNB_WEI,
@@ -138,6 +138,11 @@ class TxSubmitResult:
     #   chain_status==0 & block_ts <  lock_ts -> REVERTED (other revert)
     # In all revert cases EVM rolled back msg.value, so only gas was spent.
     chain_status: int | None = None
+    # Actual gas consumed by the mined TX (gasUsed) and the effective gas
+    # price paid (wei). Both None on timeout (no receipt). Used to record the
+    # REAL gas cost to the bet ledger instead of the MAX_GAS_COST_BET_BNB cap.
+    gas_used: int | None = None
+    effective_gas_price_wei: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +359,25 @@ class Web3PredictionContract:
             fn=lambda: self._contract.functions.ledger(int(epoch), wallet).call(),
         )
         return int(r[1])
+
+    def try_get_receipt(self, tx_hash: str) -> dict | None:
+        """Single non-blocking receipt lookup for reconcile-time forensics.
+
+        Unlike the bet/claim submit paths (which WAIT for the receipt), this
+        fetches an already-available receipt or returns None if the node has
+        none (TX never mined / still pending / dropped from mempool). Used to
+        recover the actual gas spent by a TX that mined-and-reverted AFTER our
+        receipt-wait window (NIT 2). Returns the raw receipt mapping (keys:
+        ``status``, ``gasUsed``, ``effectiveGasPrice``, ``blockNumber``).
+
+        Raises ``TransientRpcError`` on RPC failure so the caller DEFERS rather
+        than mistaking a node outage for 'never mined'."""
+        try:
+            return self._w3.eth.get_transaction_receipt(tx_hash)
+        except TransactionNotFound:
+            return None
+        except Exception as e:
+            raise TransientRpcError(f"try_get_receipt_failed: {e}") from e
 
     def round_data(self, epoch: int) -> "RoundData":
         """Fetch structured round data for a given epoch.
@@ -675,6 +699,8 @@ class Web3PredictionContract:
         block_number = None
         block_timestamp = None
         chain_status: int | None = None
+        gas_used: int | None = None
+        effective_gas_price_wei: int | None = None
 
         if bool(wait_receipt):
             if int(receipt_timeout_seconds) <= 0:
@@ -692,11 +718,21 @@ class Web3PredictionContract:
                 # A revert (late-lock check or any other) rolls back msg.value,
                 # so the bet didn't register and only gas was consumed.
                 chain_status = int(receipt["status"])
+                # Actual gas cost: gasUsed x effectiveGasPrice. The bot sends a
+                # legacy TX with an explicit gasPrice, so effectiveGasPrice
+                # equals it; fall back to the tx's own gasPrice if the node
+                # omits effectiveGasPrice.
+                gas_used = int(receipt["gasUsed"])
+                effective_gas_price_wei = int(
+                    receipt.get("effectiveGasPrice", tx.get("gasPrice", 0))
+                )
             except TimeExhausted:
                 t_receipt = None
                 block_number = None
                 block_timestamp = None
                 chain_status = None
+                gas_used = None
+                effective_gas_price_wei = None
             except Exception as e:
                 raise TransientRpcError(f"tx_receipt_wait_failed: {e}") from e
 
@@ -708,6 +744,8 @@ class Web3PredictionContract:
             included_block_number=int(block_number) if block_number is not None else None,
             included_block_timestamp=int(block_timestamp) if block_timestamp is not None else None,
             chain_status=chain_status,
+            gas_used=gas_used,
+            effective_gas_price_wei=effective_gas_price_wei,
         )
 
     def _build_bet_tx(
