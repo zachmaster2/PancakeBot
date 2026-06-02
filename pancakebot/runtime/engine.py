@@ -1217,6 +1217,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     f"{cfg.bet_tx_receipt_timeout_seconds}s (tx {_truncate_tx_hash(tx_submit.tx_hash)})",
                 )
                 send_bet_dropped_alert(epoch=current_epoch, bankroll_bnb=fresh_bankroll)
+            # Bankroll pair for the mode-agnostic BET audit row hoisted below
+            # the dry/live split. Live records the PROJECTED bankroll (wallet −
+            # stake − gas cap) — defined regardless of CONFIRMED/LATE/REVERTED/
+            # DROPPED, mirroring the dry branch's post-debit value.
+            _audit_bk_before = bankroll_bnb
+            _audit_bk_after = projected_bankroll
         else:
             # Step 14: Dry bookkeeping (including gas proxy) + record.
             if closed.simulated_bankroll_bnb is None:
@@ -1248,32 +1254,40 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
                 tx_hash="", bankroll_after_bnb=bankroll_after_bet,
             )
-            _record_cycle_audit(
-                cfg,
-                closed,
-                current_epoch=current_epoch,
-                locked_epoch=locked_epoch,
-                lock_ts=lock_ts_t,
-                cutoff_ts=cutoff_ts_t,
-                locked_price_bnbusd=bnbusd_price,
-                action="BET",
-                decision_stage="pipeline",
-                open_round=open_round,
-                bankroll_before_action_bnb=bankroll_before_bet,
-                bankroll_after_action_bnb=bankroll_after_bet,
-                decision=decision,
-                decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
-                pool_bull_bnb=pool_bull_bnb,
-                pool_bear_bnb=pool_bear_bnb,
-                btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
-                eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
-                sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
-                wake_mode=wake_mode,
-                kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
-                btc_fetch_result=_kline_result_get(gate, "btc"),
-                eth_fetch_result=_kline_result_get(gate, "eth"),
-                sol_fetch_result=_kline_result_get(gate, "sol"),
-            )
+            # Bankroll pair for the mode-agnostic BET audit row (hoisted below).
+            _audit_bk_before = bankroll_before_bet
+            _audit_bk_after = bankroll_after_bet
+
+        # Step 14b: BET cycle-audit row — SINGLE mode-agnostic write site so
+        # live and dry both emit it. Previously this lived only inside the dry
+        # branch, leaving live cycle_audit.csv with zero BET rows (the bankroll
+        # pair is mode-selected above: live=projected, dry=post-debit sim).
+        _record_cycle_audit(
+            cfg,
+            closed,
+            current_epoch=current_epoch,
+            locked_epoch=locked_epoch,
+            lock_ts=lock_ts_t,
+            cutoff_ts=cutoff_ts_t,
+            locked_price_bnbusd=bnbusd_price,
+            action="BET",
+            decision_stage="pipeline",
+            open_round=open_round,
+            bankroll_before_action_bnb=_audit_bk_before,
+            bankroll_after_action_bnb=_audit_bk_after,
+            decision=decision,
+            decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
+            pool_bull_bnb=pool_bull_bnb,
+            pool_bear_bnb=pool_bear_bnb,
+            btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
+            eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
+            sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
+            wake_mode=wake_mode,
+            kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+            btc_fetch_result=_kline_result_get(gate, "btc"),
+            eth_fetch_result=_kline_result_get(gate, "eth"),
+            sol_fetch_result=_kline_result_get(gate, "sol"),
+        )
 
         # Per-round GATE FETCH TIMING + GATE SIGNAL FIRE info emissions
         # were dropped at Phase B v2 (2026-05-18): cycle_audit.csv captures

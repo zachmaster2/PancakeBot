@@ -171,3 +171,120 @@ def test_live_mode_includes_observability_columns(tmp_path, monkeypatch):
     assert row["btc_fetch_result"] == "ok"
     assert row["eth_fetch_result"] == "ok"
     assert row["sol_fetch_result"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Live-mode BET audit row (the hoist fix: BET write moved out of the dry-only
+# branch to a mode-agnostic site so live bets land an action=BET row).
+# ---------------------------------------------------------------------------
+
+class _StubDecision:
+    """Minimal decision stub — record_cycle_audit reads bet_side / bet_size_bnb
+    via getattr (audit.py:339-340)."""
+    bet_side = "Bull"
+    bet_size_bnb = 0.001
+    skip_reason = None
+
+
+def test_live_bet_writes_cycle_audit_row(tmp_path, monkeypatch):
+    """A live-mode BET writes exactly one action='BET' row to
+    LIVE_CYCLE_AUDIT_PATH. Drives the audit wrapper the way the engine's live
+    bet path now does: cfg.dry=False, action='BET', live bankroll pair
+    (pre-bet wallet read -> projected = wallet - stake - gas cap).
+
+    Before the hoist, the BET ``_record_cycle_audit`` call lived only inside
+    the dry ``else:`` branch, so live bets produced zero BET rows. The
+    structural guarantee that the engine now reaches this call in BOTH modes
+    is asserted separately in ``test_bet_audit_callsite_is_mode_agnostic``."""
+    from pancakebot import paths as _paths_mod
+    dry_path = tmp_path / "dry" / "cycle_audit.csv"
+    live_path = tmp_path / "live" / "cycle_audit.csv"
+    monkeypatch.setattr(_paths_mod, "DRY_CYCLE_AUDIT_PATH", str(dry_path), raising=True)
+    monkeypatch.setattr(_paths_mod, "LIVE_CYCLE_AUDIT_PATH", str(live_path), raising=True)
+
+    closed = _ClosedState()  # strategy_pipeline defaults to None (router_mode skipped)
+    cfg = _make_cfg(dry=False)
+    _record_cycle_audit(
+        cfg, closed,
+        current_epoch=999, locked_epoch=998, lock_ts=1300, cutoff_ts=1298,
+        locked_price_bnbusd=600.0,
+        action="BET", decision_stage="pipeline",
+        open_round=None,
+        bankroll_before_action_bnb=2.3471,   # live: pre-bet wallet read
+        bankroll_after_action_bnb=2.3451,    # live: projected (wallet - stake - gas)
+        decision=_StubDecision(),
+        decision_latency_ms=281.0,
+        pool_bull_bnb=3.0, pool_bear_bnb=2.5,
+        btc_fetch_ms=270, eth_fetch_ms=265, sol_fetch_ms=275,
+        wake_mode="dynamic", kline_fire_offset_before_lock_ms=990,
+        btc_fetch_result="ok", eth_fetch_result="ok", sol_fetch_result="ok",
+    )
+
+    assert live_path.exists(), "live BET must write LIVE_CYCLE_AUDIT_PATH"
+    assert not dry_path.exists(), "live BET must NOT touch DRY_CYCLE_AUDIT_PATH"
+    with open(live_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1, f"expected exactly 1 BET row, got {len(rows)}"
+    r = rows[0]
+    assert r["action"] == "BET"
+    assert r["bet_side"] == "Bull"
+    assert float(r["bet_size_bnb"]) == 0.001
+    assert float(r["bankroll_before_action_bnb"]) == 2.3471
+    assert float(r["bankroll_after_action_bnb"]) == 2.3451
+
+
+def test_bet_audit_callsite_is_mode_agnostic():
+    """Structural guard for the hoist fix: in engine.py ``_run_one_iteration``
+    there is exactly ONE ``_record_cycle_audit(action="BET")`` call, and it is
+    NOT nested inside any ``cfg.dry``-conditioned ``if/else`` block — so both
+    the live and dry bet branches reach it. This directly guards against the
+    original regression (BET audit trapped in the dry-only branch) recurring."""
+    import ast
+
+    src = (_REPO_ROOT / "pancakebot" / "runtime" / "engine.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_run_one_iteration"),
+        None,
+    )
+    assert fn is not None, "engine._run_one_iteration not found"
+
+    # Parent map for the function subtree.
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(fn):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+
+    def _is_bet_audit_call(node: ast.AST) -> bool:
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_record_cycle_audit"):
+            return False
+        for kw in node.keywords:
+            if (kw.arg == "action" and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == "BET"):
+                return True
+        return False
+
+    bet_calls = [n for n in ast.walk(fn) if _is_bet_audit_call(n)]
+    assert len(bet_calls) == 1, (
+        f"expected exactly 1 _record_cycle_audit(action='BET') call in "
+        f"_run_one_iteration, found {len(bet_calls)}"
+    )
+
+    def _references_dry(test: ast.AST) -> bool:
+        return any(isinstance(d, ast.Attribute) and d.attr == "dry"
+                   for d in ast.walk(test))
+
+    # Walk ancestors of the BET call; none may be an `if ... cfg.dry ...` block.
+    node: ast.AST | None = bet_calls[0]
+    while node is not None and id(node) in parents:
+        parent = parents[id(node)]
+        if isinstance(parent, ast.If) and _references_dry(parent.test):
+            raise AssertionError(
+                "BET cycle_audit call is nested inside a cfg.dry-conditioned "
+                "if/else — it must be hoisted to a mode-agnostic site so live "
+                "bets also write a BET row."
+            )
+        node = parent
