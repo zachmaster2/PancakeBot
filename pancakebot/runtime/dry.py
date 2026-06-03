@@ -405,7 +405,16 @@ def _fetch_wallet_balance_bnb_with_retries(
                 f"retrying after delay={delay_seconds}s err={e}",
             )
             sleep_seconds(delay_seconds)
-    return float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
+    # Terminal attempt after the backoff schedule is exhausted. Raise a
+    # NAMED exhaustion invariant (consistent with _epoch_handshake's
+    # epoch_handshake_exhausted and _sleep_and_claim's
+    # close_ts_retry_exhausted) instead of leaking the raw TransientRpcError.
+    try:
+        return float(cfg.contract.wallet_balance_bnb(cfg.wallet_address))
+    except TransientRpcError as e:
+        raise InvariantError(
+            f"wallet_balance_retry_exhausted: {reason} err={e}"
+        ) from e
 
 
 def _append_dry_settled_epoch(path: str, epoch: int) -> None:
@@ -533,11 +542,13 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             continue
 
         # Fetch round data from contract; skip if not yet finalized.
-        # Transient RPC failure -- will retry next iteration.
-        # noinspection PyBroadException
+        # Transient RPC failure -- will retry next iteration. Narrowed to
+        # TransientRpcError (guard audit 4.6): a broad ``except Exception``
+        # here silently masked any genuine round_data bug for an epoch; a
+        # non-transient error should surface (dry-only, no live money).
         try:
             rd = cfg.contract.round_data(e)
-        except Exception:
+        except TransientRpcError:
             continue
 
         # Match PCS V2 _refundable(): only refund-eligible past

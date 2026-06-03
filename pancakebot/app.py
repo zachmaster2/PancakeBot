@@ -208,7 +208,14 @@ def run_from_config(
     interval_seconds = _cc.interval_seconds
     buffer_seconds = _cc.buffer_seconds
 
-    okx_client = OkxClient(timeout_seconds=10.0)
+    _okx_timeout_seconds = 10.0
+    okx_client = OkxClient(timeout_seconds=_okx_timeout_seconds)
+    # Observability (guard audit 4.1): the OKX REST timeout is the one
+    # fetch-path timeout NOT centralized in timing_constants.py. Surface it
+    # at startup. It is a transport CEILING (a hung socket skips the round
+    # long before it elapses), not a per-round budget — but a too-low value
+    # would convert slow-but-valid fetches into skips.
+    info("START", f"OKX REST fetch timeout_seconds={_okx_timeout_seconds}s (transport ceiling)")
     okx_client.warmup()
 
     # Per-round REST kline fetch path: the gate fires 3 parallel

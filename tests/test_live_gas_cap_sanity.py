@@ -29,15 +29,18 @@ class _FakeContract:
 
     def __init__(self, suggested_wei_or_exc):
         self._suggested = suggested_wei_or_exc
+        # Mirror the real object's gas-cap-bypass streak state (guard audit 4.3).
+        self._gas_cap_bypass_streak = 0
 
     def suggest_gas_price_wei(self) -> int:
         if isinstance(self._suggested, BaseException):
             raise self._suggested
         return int(self._suggested)
 
-    # Bind the real method so tests exercise production code, not a clone.
+    # Bind the real methods so tests exercise production code, not a clone.
     from pancakebot.chain.prediction_contract import Web3PredictionContract
     assert_gas_cap_not_breached = Web3PredictionContract.assert_gas_cap_not_breached
+    _note_gas_cap_bypass = Web3PredictionContract._note_gas_cap_bypass
 
 
 def test_suggested_below_max_passes():

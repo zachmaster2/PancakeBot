@@ -47,6 +47,7 @@ from pancakebot.chain.rpc_poller import (
     predict_predecessor_milli_ts,
 )
 from pancakebot import timing_constants as _tc
+from pancakebot.runtime.regime_telemetry import RollingP99Monitor
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
 
@@ -61,6 +62,31 @@ from time import sleep as sleep_seconds
 # bet AND claim — are NOT sized from this; they use the flat
 # TX_RECEIPT_WAIT_TIMEOUT_SECONDS, set in app.py.)
 _RPC_ALIGNMENT_PADDING_SECONDS = 5
+
+
+# Regime-drift monitor (guard audit Tier 2 / item 5.3). Module-level
+# singleton: the bot is one long-lived process, so the rolling window
+# accumulates across the whole run. Compares the live per-round max-of-3
+# OKX kline fetch RTT against OKX_KLINE_FETCH_RTT_P99_MS — a stale-LOW
+# constant silently lets the dynamic-wake walk-back fire too late.
+# Telemetry only; reset for tests via _reset_regime_monitors().
+def _build_okx_kline_rtt_monitor() -> RollingP99Monitor:
+    return RollingP99Monitor(
+        name="okx_kline_rtt_p99",
+        constant_ms=_tc.OKX_KLINE_FETCH_RTT_P99_MS,
+        tolerance_ms=50.0,
+        window=100,
+        min_samples=30,
+    )
+
+
+_OKX_KLINE_RTT_MONITOR = _build_okx_kline_rtt_monitor()
+
+
+def _reset_regime_monitors() -> None:
+    """Test hook: rebuild the module-level monitors with empty windows."""
+    global _OKX_KLINE_RTT_MONITOR
+    _OKX_KLINE_RTT_MONITOR = _build_okx_kline_rtt_monitor()
 
 
 # -- NTP clock sync ----------------------------------------------------------
@@ -248,6 +274,53 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
     )
 
 
+def _assert_critical_path_timing_sane(cfg: RuntimeConfig) -> None:
+    """Fail loud at startup if the wake-offset ladder is misordered.
+
+    Every per-round wake fires at ``lock - offset_ms``; a larger offset
+    fires earlier. The ladder MUST be strictly decreasing (each stage
+    after the one before it) or a misconfigured ``timing_constants.py``
+    silently mis-sequences polls / zeroes a poll budget every round via
+    the ``max(0, ...)`` clamps. This invariant catches the misconfig at
+    boot instead. (We assert strict ordering, not a uniform >200ms gap:
+    the bankroll->ramp_2 leg is ~120ms by design.)
+
+    Also asserts the anchor poll can complete before the critical-path
+    wake: it fires at ``lock - ANCHOR_POLL_OFFSET`` and is awaited up to
+    ``ANCHOR_POLL_TIMEOUT``; if that response can't land before the
+    static critical-path wake, the dynamic-wake path is structurally
+    dead (every round silently falls back to static).
+    """
+    ladder = [
+        ("ramp_poll_1", cfg.ramp_poll_1_wakeup_offset_before_lock_ms),
+        ("okx_warmup", cfg.okx_warmup_wakeup_offset_before_lock_ms),
+        ("bankroll", cfg.bankroll_wakeup_offset_before_lock_ms),
+        ("ramp_poll_2", cfg.ramp_poll_2_wakeup_offset_before_lock_ms),
+        ("final_rpc_poll", cfg.final_rpc_poll_wakeup_offset_before_lock_ms),
+        ("anchor_poll", _tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS),
+        ("critical_path", cfg.critical_path_wakeup_offset_before_lock_ms),
+        ("bet_submit_deadline", cfg.bet_submit_deadline_offset_before_lock_ms),
+    ]
+    for (name_a, off_a), (name_b, off_b) in zip(ladder, ladder[1:]):
+        if not off_a > off_b:
+            raise InvariantError(
+                f"timing_ladder_not_strictly_decreasing: {name_a}={off_a}ms "
+                f"must be > {name_b}={off_b}ms (both are ms-before-lock; "
+                f"larger fires earlier)"
+            )
+    anchor_response_by = (
+        _tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS - _tc.ANCHOR_POLL_TIMEOUT_MS
+    )
+    if anchor_response_by < cfg.critical_path_wakeup_offset_before_lock_ms:
+        raise InvariantError(
+            f"anchor_slack_negative: anchor response by lock-{anchor_response_by}ms "
+            f"(offset {_tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS} - timeout "
+            f"{_tc.ANCHOR_POLL_TIMEOUT_MS}) must land before the static "
+            f"critical-path wake at lock-{cfg.critical_path_wakeup_offset_before_lock_ms}ms; "
+            f"otherwise the dynamic-wake path is structurally dead"
+        )
+
+
 def run_realtime_loop(cfg: RuntimeConfig) -> None:
     # Wallet address is only required for live mode (signing transactions).
     # Dry mode reads from chain via public RPC, no signing needed.
@@ -257,6 +330,7 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         raise InvariantError("runtime_min_bet_amount_nonpositive")
 
     _log_runtime_timing_summary(cfg)
+    _assert_critical_path_timing_sane(cfg)
 
     closed_state = _init_closed_state(cfg)
 
@@ -847,6 +921,23 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         if _p_bull_legacy is not None:
             pred_p_final = _p_bull_legacy
         t_decision_ready_ms = _mono_ms()
+        # Regime-drift telemetry (guard audit 5.3): feed this round's
+        # max-of-3 kline fetch RTT into the rolling p99 monitor vs
+        # OKX_KLINE_FETCH_RTT_P99_MS. Observe only on clean 3-symbol
+        # fetches (all positive). Wrapped so a monitor bug can never break
+        # the bet path.
+        try:
+            _rtts = [
+                _kline_timing_get(gate, "btc_ms"),
+                _kline_timing_get(gate, "eth_ms"),
+                _kline_timing_get(gate, "sol_ms"),
+            ]
+            if all(r is not None and r > 0 for r in _rtts):
+                _rtt_alert = _OKX_KLINE_RTT_MONITOR.observe(max(_rtts))
+                if _rtt_alert is not None:
+                    warn("ALERT", _rtt_alert)
+        except Exception:  # noqa: BLE001 — telemetry must never break betting
+            pass
 
         if decision.action != "BET":
             reason = decision.skip_reason or ""
@@ -972,6 +1063,21 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 predicted_predecessor_milli_ts=predecessor_ms, lock_ms=lock_ms,
             )
             deadline_source = "dynamic"
+            # Observability (guard audit 5.1): the quantum-shift guard inside
+            # compute_submit_deadline_ms backs the deadline off a FULL block
+            # (~450ms) when the predicted predecessor lands within one 50ms
+            # quantum of lock. That is a large discrete tightening — surface
+            # each time it fires so an operator can see how often a full-block
+            # penalty is paid (and whether the 450/50 pairing still matches
+            # the live block time).
+            if (predecessor_ms + _tc.BSC_QUANTUM_MS) >= lock_ms:
+                warn(
+                    "ALERT",
+                    f"QUANTUM_BACKOFF epoch={current_epoch} "
+                    f"predicted_predecessor_gap_ms={lock_ms - predecessor_ms} "
+                    f"quantum_ms={_tc.BSC_QUANTUM_MS} backoff_ms={_tc.BSC_BLOCK_TIME_MS} "
+                    f"reason=predecessor_within_one_quantum_of_lock",
+                )
         else:
             deadline_ms = lock_ms - cfg.bet_submit_deadline_offset_before_lock_ms
             deadline_source = "static"
@@ -1508,6 +1614,12 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
 # COMPUTED dynamic-wake offset before an ALERT fires. ~0 when the wake is
 # honored (Regime A); the tolerance absorbs pool-read jitter between waking
 # and the t_features_start capture.
+#
+# This is a FIXED absolute epsilon, NOT scaled to the dynamic-wake lead
+# (typically ~880-930ms before lock). It MUST stay well below the minimum
+# expected dynamic lead — if a future regime tightens the lead toward this
+# value, 50ms could begin to mask a real bypass and this should become a
+# fraction-of-lead check or a config knob. Safe today (50ms << ~900ms lead).
 _WAKE_DIVERGENCE_ALERT_TOLERANCE_MS: float = 50.0
 
 
