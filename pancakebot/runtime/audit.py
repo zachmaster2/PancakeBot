@@ -118,6 +118,16 @@ def ensure_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         #   paths.
         "wake_mode",
         "kline_fire_offset_before_lock_ms",
+        # ACTUAL fetch-fire offset (Added 2026-06-02): ms before ``lock_at`` at
+        # which ``decide_open_round`` was actually called (= lock_ts -
+        # wall-clock at the decide call). ``kline_fire_offset_before_lock_ms``
+        # above is the COMPUTED dynamic-wake target; this is what really
+        # happened. When the dynamic wake is honored the two match within a few
+        # ms; when ``_sleep_until_ts(critical_path_wake)`` no-ops (wake already
+        # past — "Regime B"), this is GREATER than the computed value (the fetch
+        # fired earlier than the formula targeted). Surfaces the dynamic-wake
+        # bypass. Empty for early-skip paths before the decide call.
+        "t_features_start_offset_ms",
         # Per-symbol kline-fetch RESULT codes for the joint
         # fail-rate-vs-fire-time distribution. Added 2026-05-17.
         # Codes (see MomentumGate.last_fetch_results docstring):
@@ -295,6 +305,7 @@ def record_cycle_audit(
     sol_fetch_ms: int | None = None,
     wake_mode: str = "",
     kline_fire_offset_before_lock_ms: int | None = None,
+    t_features_start_offset_ms: float | None = None,
     btc_fetch_result: str = "not_fetched",
     eth_fetch_result: str = "not_fetched",
     sol_fetch_result: str = "not_fetched",
@@ -393,6 +404,10 @@ def record_cycle_audit(
             "kline_fire_offset_before_lock_ms": (
                 "" if kline_fire_offset_before_lock_ms is None
                 else kline_fire_offset_before_lock_ms
+            ),
+            "t_features_start_offset_ms": (
+                "" if t_features_start_offset_ms is None
+                else round(float(t_features_start_offset_ms), 1)
             ),
             "btc_fetch_result": btc_fetch_result,
             "eth_fetch_result": eth_fetch_result,

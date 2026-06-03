@@ -174,6 +174,58 @@ def test_live_mode_includes_observability_columns(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Actual fetch-fire offset (Regime A/B telemetry, added 2026-06-02): the
+# t_features_start_offset_ms column surfaces when the dynamic wake is bypassed.
+# ---------------------------------------------------------------------------
+
+def test_cycle_audit_schema_has_actual_fetch_fire_column(tmp_path):
+    """The t_features_start_offset_ms column exists and sits adjacent to the
+    computed kline_fire_offset_before_lock_ms for easy A/B reading."""
+    from pancakebot.runtime.audit import ensure_cycle_audit_csv
+    p = tmp_path / "c.csv"
+    ensure_cycle_audit_csv(str(p))
+    with open(p, newline="") as f:
+        cols = next(csv.reader(f))
+    assert "t_features_start_offset_ms" in cols
+    assert (cols.index("t_features_start_offset_ms")
+            == cols.index("kline_fire_offset_before_lock_ms") + 1)
+
+
+def test_cycle_audit_logs_actual_fetch_fire_time(tmp_path, monkeypatch):
+    """A BET row (both dry and live) records t_features_start_offset_ms — the
+    ACTUAL fetch-fire offset — distinct from the COMPUTED kline_fire_offset. The
+    Regime-B signature (actual > computed = dynamic wake bypassed) round-trips."""
+    from pancakebot import paths as _paths_mod
+    dry_path = tmp_path / "dry" / "cycle_audit.csv"
+    live_path = tmp_path / "live" / "cycle_audit.csv"
+    monkeypatch.setattr(_paths_mod, "DRY_CYCLE_AUDIT_PATH", str(dry_path), raising=True)
+    monkeypatch.setattr(_paths_mod, "LIVE_CYCLE_AUDIT_PATH", str(live_path), raising=True)
+
+    for dry, path in ((True, dry_path), (False, live_path)):
+        _CYCLE_AUDIT_HEADER_OK_PATHS.clear()
+        closed = _ClosedState()
+        _record_cycle_audit(
+            _make_cfg(dry=dry), closed,
+            current_epoch=486441, locked_epoch=486440, lock_ts=1780411538, cutoff_ts=1780411536,
+            locked_price_bnbusd=600.0, action="BET", decision_stage="pipeline",
+            open_round=None, bankroll_before_action_bnb=2.0, bankroll_after_action_bnb=2.0,
+            decision=None, decision_latency_ms=274.0, pool_bull_bnb=3.0, pool_bear_bnb=2.5,
+            wake_mode="dynamic",
+            kline_fire_offset_before_lock_ms=927,      # COMPUTED dynamic wake
+            t_features_start_offset_ms=1253.4,         # ACTUAL fire (Regime B: earlier)
+            btc_fetch_ms=250, eth_fetch_ms=260, sol_fetch_ms=270,
+            btc_fetch_result="ok", eth_fetch_result="ok", sol_fetch_result="ok",
+        )
+        with open(path, newline="") as f:
+            row = list(csv.DictReader(f))[0]
+        assert row["action"] == "BET"
+        assert row["t_features_start_offset_ms"] == "1253.4"
+        assert row["kline_fire_offset_before_lock_ms"] == "927"
+        # Regime B: actual fetch fired EARLIER than the computed wake target.
+        assert float(row["t_features_start_offset_ms"]) > float(row["kline_fire_offset_before_lock_ms"])
+
+
+# ---------------------------------------------------------------------------
 # Live-mode BET audit row (the hoist fix: BET write moved out of the dry-only
 # branch to a mode-agnostic site so live bets land an action=BET row).
 # ---------------------------------------------------------------------------

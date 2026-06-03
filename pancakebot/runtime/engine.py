@@ -810,6 +810,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # lock_at - (critical_path_wakeup_offset_before_lock_ms - POOL_READ_TIME_MS)
         # ~= lock - 1090ms.
         t_features_start_ms = _mono_ms()
+        # ACTUAL fetch-fire offset (wall-clock), vs the COMPUTED
+        # kline_fire_offset_before_lock_ms above. Equal when the dynamic wake is
+        # honored; GREATER when _sleep_until_ts(critical_path_wake) no-oped (wake
+        # already past) and the fetch fired earlier than the formula targeted
+        # ("Regime B"). _utc_now() is skew-corrected, same frame as lock_ts_t.
+        t_features_start_offset_ms = lock_ts_t * 1000.0 - _utc_now() * 1000.0
         pred_p_final = 0.5
 
         if closed.strategy_pipeline is None:
@@ -1117,7 +1123,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 "BET",
                 f"Bet {amount_bnb:.4f} BNB on {bet_side} for epoch {current_epoch} "
                 f"(tx {_truncate_tx_hash(tx_submit.tx_hash)}, "
-                f"projected bankroll: {projected_bankroll:.4f} BNB)",
+                f"projected bankroll: {projected_bankroll:.4f} BNB, "
+                f"fetch_fire={t_features_start_offset_ms:.0f}ms vs "
+                f"computed={kline_fire_offset_before_lock_ms}ms before lock)",
             )
             bet_ledger.record_submitted(
                 ledger_path=paths.LIVE_BETS_LEDGER_PATH,
@@ -1235,7 +1243,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             info(
                 "BET",
                 f"Bet {amount_bnb:.4f} BNB on {bet_side} for epoch {current_epoch} "
-                f"(bankroll: {bankroll_after_bet:.4f} BNB)",
+                f"(bankroll: {bankroll_after_bet:.4f} BNB, "
+                f"fetch_fire={t_features_start_offset_ms:.0f}ms vs "
+                f"computed={kline_fire_offset_before_lock_ms}ms before lock)",
             )
             _dry_record_bet(
                 closed,
@@ -1284,6 +1294,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
             wake_mode=wake_mode,
             kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+            t_features_start_offset_ms=t_features_start_offset_ms,
             btc_fetch_result=_kline_result_get(gate, "btc"),
             eth_fetch_result=_kline_result_get(gate, "eth"),
             sol_fetch_result=_kline_result_get(gate, "sol"),
