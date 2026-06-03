@@ -322,17 +322,20 @@ def _clear_header_cache():
 
 
 def test_cycle_audit_header_has_new_columns(tmp_path):
-    """The 5 new columns appear at the END of the cycle_audit header."""
+    """The observability columns appear at the END of the cycle_audit header.
+    t_features_start_offset_ms (added 2026-06-02) sits between the computed
+    kline_fire_offset and the per-symbol result codes."""
     csv_path = tmp_path / "cycle_audit.csv"
     header = ensure_cycle_audit_csv(str(csv_path))
     expected_tail = [
         "wake_mode",
         "kline_fire_offset_before_lock_ms",
+        "t_features_start_offset_ms",
         "btc_fetch_result",
         "eth_fetch_result",
         "sol_fetch_result",
     ]
-    assert header[-5:] == expected_tail
+    assert header[-6:] == expected_tail
 
 
 def test_record_cycle_audit_writes_new_fields_partial_has_rtt(tmp_path):
