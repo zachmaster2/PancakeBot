@@ -696,10 +696,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     + _tc.SIGNAL_COMPUTE_TIME_MS
                     + _tc.POOL_READ_TIME_MS
                 )
-                # The dynamic wake should be slightly AFTER the anchor poll
-                # response landed (which was lock - ~1100ms by design).
-                # Even at boundary-zone rounds dynamic_wake_ms >= lock-1057ms,
-                # i.e. >= anchor_poll_fire_ts + 200ms slack. Take it as-is.
+                # The dynamic wake lands AFTER the anchor poll response: the
+                # anchor fires at lock - ANCHOR_POLL_OFFSET (1300ms) and returns
+                # in ~30-60ms RTT, while the dynamic target is typically
+                # lock - ~880-930ms. _sleep_until_ts honors the resulting
+                # ~350-420ms gap (it sleeps until any target still in the
+                # future, with no minimum-sleep short-circuit). Take as-is.
                 critical_path_wake_ts = dynamic_wake_ms / 1000.0
                 _dynamic_lead_ms = int(round(
                     (lock_ts_t - critical_path_wake_ts) * 1000
@@ -812,10 +814,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         t_features_start_ms = _mono_ms()
         # ACTUAL fetch-fire offset (wall-clock), vs the COMPUTED
         # kline_fire_offset_before_lock_ms above. Equal when the dynamic wake is
-        # honored; GREATER when _sleep_until_ts(critical_path_wake) no-oped (wake
-        # already past) and the fetch fired earlier than the formula targeted
-        # ("Regime B"). _utc_now() is skew-corrected, same frame as lock_ts_t.
+        # honored; GREATER when the critical-path wake target is already past on
+        # arrival and the fetch fires earlier than the formula targeted. Both
+        # _utc_now() and lock_ts_t are the same OS wall-clock UTC frame, so the
+        # subtraction is a like-for-like offset.
         t_features_start_offset_ms = lock_ts_t * 1000.0 - _utc_now() * 1000.0
+        # Live divergence guard: when the fetch fires meaningfully EARLIER than
+        # the computed dynamic-wake target, the critical-path wake is being
+        # bypassed and the dynamic timing optimization is inert for the round.
+        # Surface it as an ALERT (routes to Discord) so a future regression
+        # shows up in real time, not just in cycle_audit forensics.
+        _wake_alert = _wake_divergence_alert_message(
+            actual_offset_ms=t_features_start_offset_ms,
+            computed_offset_ms=kline_fire_offset_before_lock_ms,
+        )
+        if _wake_alert is not None:
+            warn("ALERT", _wake_alert)
         pred_p_final = 0.5
 
         if closed.strategy_pipeline is None:
@@ -1490,16 +1504,47 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     _dry_settle_available_bets(cfg, closed)
 
 
+# Divergence tolerance (ms) between the ACTUAL fetch-fire offset and the
+# COMPUTED dynamic-wake offset before an ALERT fires. ~0 when the wake is
+# honored (Regime A); the tolerance absorbs pool-read jitter between waking
+# and the t_features_start capture.
+_WAKE_DIVERGENCE_ALERT_TOLERANCE_MS: float = 50.0
+
+
+def _wake_divergence_alert_message(
+    *, actual_offset_ms: float, computed_offset_ms: float
+) -> str | None:
+    """ALERT prose when the kline fetch fired EARLIER than the dynamic-wake
+    target, else ``None``.
+
+    Both args are ms-before-lock offsets. A positive divergence (actual >
+    computed beyond the tolerance) means the critical-path wake was bypassed
+    and the dynamic timing optimization was inert for the round. Returns
+    ``None`` when aligned within ``_WAKE_DIVERGENCE_ALERT_TOLERANCE_MS``.
+    """
+    divergence_ms = actual_offset_ms - computed_offset_ms
+    if divergence_ms <= _WAKE_DIVERGENCE_ALERT_TOLERANCE_MS:
+        return None
+    return (
+        f"DYNAMIC_WAKE_BYPASS divergence_ms={divergence_ms:.0f} "
+        f"wake_target_offset={computed_offset_ms:.0f} "
+        f"actual_offset={actual_offset_ms:.0f} "
+        f"reason=sleep_threshold_or_late_arrival"
+    )
+
+
 def _sleep_until_ts(target_ts: float, *, reason: str, epoch: int | None = None) -> None:
     """Sleep until OKX/UTC time hits ``target_ts``.
 
-    *target_ts* is treated as a chain-anchored / OKX-frame UTC second.
-    The comparison uses ``_utc_now()`` (skew-corrected) instead of
-    ``time.time()`` so a skewed local clock doesn't make the bot fire
-    early. See ``_clock_skew_seconds`` docs above.
+    *target_ts* is treated as a chain-anchored / OKX-frame UTC second,
+    compared against ``_utc_now()`` (the OS wall clock, kept tight by
+    W32Time per the README setup). There is no minimum-sleep
+    short-circuit: any target still in the future is slept until, so
+    sub-second dynamic wakes are honored exactly. A target already at or
+    past now returns immediately.
     """
     remaining = target_ts - _utc_now()
-    if remaining <= 0.5:
+    if remaining <= 0:
         return
 
     while True:
