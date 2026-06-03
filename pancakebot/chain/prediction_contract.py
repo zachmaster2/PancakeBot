@@ -17,7 +17,14 @@ from pancakebot.constants import (
     TREASURY_FEE_DIVISOR,
 )
 from pancakebot.chain.contract_config import Web3ContractConfig
+from pancakebot.log import warn
 from pancakebot.util import GasPriceCapBreachedError, InvariantError, TransientRpcError
+
+# Gas-cap-bypass observability (guard audit 4.3): WARN after this many
+# CONSECUTIVE rounds where the gas-cap check could not validate and the
+# bet proceeded at MAX. A single bypass is a transient hiccup; a sustained
+# streak means the cap is silently un-enforced every round.
+_GAS_CAP_BYPASS_WARN_STREAK = 3
 
 _T = TypeVar("_T")
 
@@ -231,6 +238,9 @@ class Web3PredictionContract:
         self._contract = self._providers[0][1]
         # Account is optional -- only needed for live mode (signing transactions).
         self._account: Any = w3_primary.eth.account.from_key(pk) if len(pk) == 64 else None
+        # Consecutive gas-cap-bypass counter (guard audit 4.3). Reset to 0
+        # on any clean validation; WARN once the streak crosses the threshold.
+        self._gas_cap_bypass_streak: int = 0
 
     def _rotate_rpc(self) -> None:
         """Round-robin to next RPC URL, switching to its warm session."""
@@ -505,15 +515,32 @@ class Web3PredictionContract:
             # Don't crash the round on a transient RPC hiccup; proceed with MAX.
             # The check repeats next round; sustained outages surface elsewhere
             # (bankroll wake fetch, etc.).
+            self._note_gas_cap_bypass("rpc_error")
             return
         if suggested == 0:
             # Misbehaving node returned 0 — can't validate. Proceed with MAX;
             # the bet still goes out at the ceiling.
+            self._note_gas_cap_bypass("node_returned_zero")
             return
         if suggested > MAX_GAS_PRICE_WEI:
             raise GasPriceCapBreachedError(
                 f"eth.gas_price={suggested} > MAX_GAS_PRICE_WEI={MAX_GAS_PRICE_WEI}; "
                 f"raise the cap and review before resuming"
+            )
+        # Clean validation (valid, under cap): reset the bypass streak.
+        self._gas_cap_bypass_streak = 0
+
+    def _note_gas_cap_bypass(self, reason: str) -> None:
+        """Increment the consecutive gas-cap-bypass streak and WARN once it
+        crosses the threshold (guard audit 4.3). Telemetry only — the bet
+        still proceeds at MAX in the calling branch."""
+        self._gas_cap_bypass_streak += 1
+        if self._gas_cap_bypass_streak >= _GAS_CAP_BYPASS_WARN_STREAK:
+            warn(
+                "ALERT",
+                f"GAS_CAP_BYPASS streak={self._gas_cap_bypass_streak} reason={reason}; "
+                f"gas-cap check un-enforced — bets proceeding at MAX_GAS_PRICE_WEI "
+                f"without validation",
             )
 
     def get_user_rounds_length(self, wallet_address: str) -> int:

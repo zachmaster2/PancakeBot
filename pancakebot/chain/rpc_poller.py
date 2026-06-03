@@ -66,6 +66,10 @@ import urllib3
 from pancakebot import timing_constants as _tc
 from pancakebot.constants import BNB_WEI, PREDICTION_V2_CONTRACT_ADDRESS
 from pancakebot.log import info, warn
+from pancakebot.runtime.regime_telemetry import (
+    RollingMedianDriftMonitor,
+    RollingRateMonitor,
+)
 from pancakebot.util import InvariantError
 
 
@@ -449,6 +453,37 @@ class RpcPoller:
         self._total_events: int = 0
         self._poll_count: int = 0
 
+        # -- Observability monitors (guard audit Tier 1+2) --
+        # Anchor static-fallback rate (3.1): each round records True if the
+        # anchor poll returned None (round fell back to the static wake) or
+        # False if it produced a dynamic anchor. A sustained high rate means
+        # the dynamic-wake optimization is silently inert.
+        self._anchor_fallback_monitor = RollingRateMonitor(
+            name="anchor_static_fallback",
+            max_rate=0.10,
+            window=50,
+            min_samples=50,
+        )
+        # Observed block-time drift (5.2): per-round average block time from
+        # consecutive anchor polls (delta_milli_ts / delta_block_number).
+        # Confirms BSC_BLOCK_TIME_MS still holds (the load-bearing assumption
+        # behind the no-margin predecessor extrapolation).
+        self._block_time_monitor = RollingMedianDriftMonitor(
+            name="bsc_block_time",
+            expected=_tc.BSC_BLOCK_TIME_MS,
+            tolerance=20.0,
+            window=20,
+            min_samples=10,
+        )
+        self._prev_anchor_block: int = 0
+        self._prev_anchor_milli_ts: int = 0
+        # Pool-understatement counters (2.1 / 3.2): blocks dropped from the
+        # pool aggregate because a receipt fetch errored, or a bet's block
+        # timestamp could not be resolved. Both silently understate a side's
+        # pool — surface them.
+        self._block_receipt_skips_total: int = 0
+        self._pool_block_ts_zero_drops_total: int = 0
+
     # ------------------------------------------------------------------
     # Public properties (mirror PoolEventWatcher)
     # ------------------------------------------------------------------
@@ -523,28 +558,66 @@ class RpcPoller:
                 timeout_s=timeout_s,
             )
         except Exception:  # noqa: BLE001
-            # Anchor poll timeout / malformed response: fallback to static
-            # wake. wake_mode="static" in cycle_audit signals this happened;
-            # operator-facing emit is dropped at Phase B v2 (was per-round
-            # noise, not anomaly-worthy in isolation).
+            # Anchor poll timeout / transport error: fallback to static wake.
+            # Per round this is silent (wake_mode="static" in cycle_audit);
+            # the rolling-rate monitor surfaces a sustained-fallback regime.
+            self._record_anchor_outcome(fell_back=True, reason="timeout_or_transport")
             return None
         if not isinstance(block, dict):
+            self._record_anchor_outcome(fell_back=True, reason="malformed_response")
             return None
         bn_hex = block.get("number")
         if not isinstance(bn_hex, str):
+            self._record_anchor_outcome(fell_back=True, reason="malformed_block_number")
             return None
         try:
             bn = int(bn_hex, 16)
         except ValueError:
+            self._record_anchor_outcome(fell_back=True, reason="malformed_block_number")
             return None
         milli_ts = compute_milli_ts(block)
         if milli_ts is None:
+            self._record_anchor_outcome(fell_back=True, reason="malformed_milli_ts")
             return None
+        self._record_anchor_outcome(
+            fell_back=False, reason="ok", block_number=bn, milli_ts=milli_ts,
+        )
         return AnchorState(
             block_number=bn,
             milli_ts=milli_ts,
             observed_at_local_ms=int(time.time() * 1000),
         )
+
+    def _record_anchor_outcome(
+        self, *, fell_back: bool, reason: str,
+        block_number: int | None = None, milli_ts: int | None = None,
+    ) -> None:
+        """Update anchor observability monitors (guard audit 3.1 / 5.2).
+
+        ``fell_back`` True means the anchor poll returned None and the round
+        will use the static wake; the rolling-rate monitor alerts when that
+        rate is sustained. On success, the average block time since the
+        previous anchor (delta_milli_ts / delta_block_number) feeds the
+        block-time drift monitor confirming BSC_BLOCK_TIME_MS still holds.
+        Telemetry only; wrapped so it can never affect the poll result.
+        """
+        try:
+            alert = self._anchor_fallback_monitor.observe(
+                fell_back, detail=f"reason={reason}"
+            )
+            if alert is not None:
+                warn("ALERT", alert)
+            if not fell_back and block_number is not None and milli_ts is not None:
+                if self._prev_anchor_block and block_number > self._prev_anchor_block:
+                    span_blocks = block_number - self._prev_anchor_block
+                    avg_block_ms = (milli_ts - self._prev_anchor_milli_ts) / span_blocks
+                    bt_alert = self._block_time_monitor.observe(avg_block_ms)
+                    if bt_alert is not None:
+                        warn("ALERT", bt_alert)
+                self._prev_anchor_block = block_number
+                self._prev_anchor_milli_ts = milli_ts
+        except Exception:  # noqa: BLE001 — telemetry must never affect polling
+            pass
 
     def is_pool_ready(self, epoch: int | None = None) -> tuple[bool, str]:
         """Engine gate. Returns ``(True, "")`` when the bot can place a
@@ -717,6 +790,7 @@ class RpcPoller:
         bull_wei = 0
         bear_wei = 0
 
+        _ts_zero_drops = 0
         with self._lock:
             pool = self._pools.get(epoch)
             if pool is None:
@@ -729,6 +803,9 @@ class RpcPoller:
                         bet.block_ts = ts
 
                 if bet.block_ts == 0:
+                    # Block timestamp never resolved -> bet silently excluded
+                    # from the aggregate (guard audit 3.2). Count + surface.
+                    _ts_zero_drops += 1
                     continue
                 if bet.block_ts >= max_ts:
                     continue
@@ -737,6 +814,15 @@ class RpcPoller:
                     bull_wei += bet.amount_wei
                 else:
                     bear_wei += bet.amount_wei
+
+        if _ts_zero_drops > 0:
+            self._pool_block_ts_zero_drops_total += _ts_zero_drops
+            warn(
+                "ALERT",
+                f"pool aggregate dropped {_ts_zero_drops} bet(s) with unresolved "
+                f"block_ts for epoch {epoch}; understates a side's pool "
+                f"(cumulative={self._pool_block_ts_zero_drops_total})",
+            )
 
         return bull_wei / BNB_WEI, bear_wei / BNB_WEI
 
@@ -1321,7 +1407,16 @@ class RpcPoller:
         if not self._poll_lock.acquire(blocking=False):
             # Another poll is in flight; skip this one. Periodic polls
             # are advisory; if a ramp/final poll is concurrent, they
-            # share the same data anyway.
+            # share the same data anyway. A dropped ramp/final poll IS a
+            # critical-path event (cursor advance skipped on the wake the
+            # engine scheduled), so surface it (guard audit 1.2); periodic
+            # drops stay silent by design.
+            if label in ("ramp", "final"):
+                warn(
+                    "ALERT",
+                    f"{label} poll dropped: poll-lock contended (another poll "
+                    f"in flight); critical-path cursor advance skipped this wake",
+                )
             return
         with self._lock:
             self._poll_in_progress = True
@@ -1483,16 +1578,31 @@ class RpcPoller:
             raise InvariantError(
                 f"rpc_batch_length_mismatch: expected={len(calls)} got={len(results)}"
             )
+        _block_skips = 0
         for i, bn in enumerate(block_numbers):
             receipts, recv_err = results[i]
             if recv_err is not None:
                 # Single-block error: skip; the next periodic/ramp poll
                 # will retry. Don't raise here because the rest of the
                 # batch might be valid.
+                _block_skips += 1
                 continue
             if not isinstance(receipts, list):
+                _block_skips += 1
                 continue
             self._process_receipts_for_block(bn, receipts)
+        if _block_skips > 0:
+            # Pool-understatement signal (guard audit 2.1): bets in the
+            # skipped blocks are absent from the pool aggregate until a
+            # later poll re-fetches them — surface so a corrupted bull/bear
+            # ratio doesn't go unnoticed.
+            self._block_receipt_skips_total += _block_skips
+            warn(
+                "ALERT",
+                f"block receipt fetch skipped {_block_skips}/{len(block_numbers)} "
+                f"blocks (receipt error); their bets are missing from the pool "
+                f"aggregate this read (cumulative={self._block_receipt_skips_total})",
+            )
 
     def _process_receipts_for_block(self, block_number: int, receipts: list[dict]) -> None:
         """Extract BetBull/BetBear events from a block's receipts and
