@@ -496,12 +496,25 @@ def compute_signal_from_klines(
         )
 
     btc_closes = [float(k[4]) for k in btc_klines]
-    eth_closes = None
-    if eth_klines is not None and len(eth_klines) >= candle_count:
-        eth_closes = [float(k[4]) for k in eth_klines]
-    sol_closes = None
-    if sol_klines is not None and len(sol_klines) >= candle_count:
-        sol_closes = [float(k[4]) for k in sol_klines]
+    # Symbol-shortfall parity with the live path (see memory
+    # project-btc-only-degrade-holdout): live SKIPS the round when ANY of
+    # BTC/ETH/SOL is unavailable. This backtest path previously DEGRADED to a
+    # BTC-only signal here (leaving eth_closes/sol_closes None) — but that
+    # degrade is -EV and was never shippable, and it diverged from live. Skip
+    # on any ETH/SOL shortfall instead of degrading. (The historical dataset
+    # has no ETH/SOL gaps within the bet-bearing rounds, so this does not move
+    # the canonical hash; the change is structural parity, not a behavior
+    # change on the baseline.)
+    if eth_klines is None or len(eth_klines) < candle_count:
+        return MomentumGateResult(
+            signal=None, tier=None, skip_reason="gate_eth_klines_unavailable",
+        )
+    if sol_klines is None or len(sol_klines) < candle_count:
+        return MomentumGateResult(
+            signal=None, tier=None, skip_reason="gate_sol_klines_unavailable",
+        )
+    eth_closes = [float(k[4]) for k in eth_klines]
+    sol_closes = [float(k[4]) for k in sol_klines]
 
     return _compute_signal(
         btc_closes, eth_closes, sol_closes,
