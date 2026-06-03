@@ -329,60 +329,6 @@ class OkxClient:
                          f"{type(e).__name__}: {e}")
 
     # ----------------------------------------------------------------
-    # Clock skew measurement
-    # ----------------------------------------------------------------
-
-    def measure_clock_skew(self, samples: int = 5, timeout_seconds: float | None = None) -> float | None:
-        """Measure (local - OKX) clock skew via /api/v5/public/time.
-
-        Returns the median observed skew in SECONDS (positive = local clock
-        ahead of OKX). Each sample takes the midpoint of the local-time
-        bracket around the request as the local-clock value at the moment
-        OKX timestamped its response, RTT-correcting naturally.
-
-        Returns None if every sample fails (network down, OKX unreachable,
-        invalid response). Caller should fall back to skew=0 with a logged
-        warning -- the bot must keep running on a best-effort basis.
-
-        Cost: typically 50-200ms per sample, run sequentially. With 5
-        samples and ~100ms each, total ~500ms. Designed for off-critical-
-        path use (housekeeping phase, not the bet-submission window).
-        """
-        import requests
-        import statistics
-        timeout = float(timeout_seconds) if timeout_seconds is not None else self._timeout_seconds
-        url = f"{_OKX_BASE_URL}/api/v5/public/time"
-        skews_s: list[float] = []
-        for _ in range(max(1, int(samples))):
-            try:
-                t0 = time.time()
-                resp = requests.get(url, timeout=timeout)
-                t1 = time.time()
-                if resp.status_code != 200:
-                    continue
-                body = resp.json()
-                if not isinstance(body, dict):
-                    continue
-                data = body.get("data") or []
-                if not data or not isinstance(data[0], dict):
-                    continue
-                ts_str = data[0].get("ts")
-                if not ts_str:
-                    continue
-                okx_ms = int(ts_str)
-                # Local time at the moment OKX served the response: use the
-                # midpoint of the local-bracket around the request to
-                # roughly RTT-correct (assumes symmetric network latency).
-                local_ms_at_response = (t0 + t1) / 2.0 * 1000.0
-                skews_s.append((local_ms_at_response - okx_ms) / 1000.0)
-            except (requests.RequestException, ValueError, KeyError, OSError):
-                # Best-effort. Keep going for the remaining samples.
-                continue
-        if not skews_s:
-            return None
-        return float(statistics.median(skews_s))
-
-    # ----------------------------------------------------------------
     # Canonical primitive: explicit-window /history-candles fetch.
     # ----------------------------------------------------------------
 
