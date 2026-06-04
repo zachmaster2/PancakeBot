@@ -104,7 +104,7 @@ def test_service_specs_build():
     sys.path.insert(0, str(_BOOT))
     from common.service_specs import build_spec
     spec = build_spec(mode="live", repo_root=_REPO_ROOT, venv_python=Path("/x/python"))
-    assert spec.args == ("-u", "run.py", "--live")
+    assert spec.args == ("-m", "pancakebot.service.supervise", "--mode", "live")
     assert spec.conflicts_with  # live conflicts with dry
     assert spec.restart_max_attempts == 3
     # name differs by OS convention

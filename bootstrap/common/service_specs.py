@@ -35,7 +35,9 @@ def build_spec(*, mode: str, repo_root: Path, venv_python: Path) -> ServiceSpec:
         name=name,
         description=f"PancakeBot {'Live Trading' if mode == 'live' else 'Dry Paper Trading'}",
         exe_path=str(venv_python),
-        args=("-u", "run.py", f"--{mode}"),
+        # Run the cross-platform SUPERVISOR (spawns + monitors run.py, emits the
+        # full Discord alert taxonomy). systemd is the OUTER supervisor.
+        args=("-m", "pancakebot.service.supervise", "--mode", mode),
         working_dir=str(repo_root),
         # Discord webhooks come from machine env (Windows) / EnvironmentFile
         # (Linux); not embedded in the spec.

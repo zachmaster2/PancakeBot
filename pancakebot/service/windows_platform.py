@@ -18,6 +18,7 @@ import subprocess
 import time
 from typing import Callable
 
+import win32event
 import win32job
 import win32service
 
@@ -27,7 +28,26 @@ from pancakebot.service.platform_base import (
     ServicePlatform,
     ServiceSpec,
     ServiceState,
+    StopEvent,
 )
+
+
+class _Win32StopEvent(StopEvent):
+    """Windows stop signal — a Win32 event so an SCM SvcStop on another thread
+    wakes the supervision loop's timed wait."""
+
+    def __init__(self) -> None:
+        self._h = win32event.CreateEvent(None, 0, 0, None)
+
+    def wait(self, timeout_s: float) -> bool:
+        rc = win32event.WaitForSingleObject(self._h, int(timeout_s * 1000))
+        return rc == win32event.WAIT_OBJECT_0
+
+    def set(self) -> None:
+        win32event.SetEvent(self._h)
+
+    def is_set(self) -> bool:
+        return win32event.WaitForSingleObject(self._h, 0) == win32event.WAIT_OBJECT_0
 
 # SCM CurrentState -> normalized ServiceState.
 _SCM_STATE_MAP = {
@@ -185,6 +205,9 @@ class WindowsServicePlatform(ServicePlatform):
 
     def create_kill_tree(self) -> KillTree:
         return _JobObjectKillTree(log=self._log)
+
+    def create_stop_event(self) -> StopEvent:
+        return _Win32StopEvent()
 
     def spawn_kwargs(self) -> dict:
         return {
