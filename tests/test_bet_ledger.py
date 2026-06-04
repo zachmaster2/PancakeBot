@@ -33,7 +33,7 @@ if str(_REPO) not in sys.path:
 from pancakebot.runtime import bet_ledger  # noqa: E402
 from pancakebot.runtime import live as live_mod  # noqa: E402
 from pancakebot.chain.prediction_contract import RoundData  # noqa: E402
-from pancakebot.util import InvariantError  # noqa: E402
+from pancakebot.util import InvariantError, TransientRpcError  # noqa: E402
 from pancakebot.constants import BNB_WEI  # noqa: E402
 
 
@@ -43,10 +43,17 @@ def _ledger(tmp_path) -> str:
 
 class _FakeContract:
     def __init__(self, rounds=None, transient=None, balance=2.0, bet_amounts=None,
-                 receipts=None):
+                 receipts=None, no_rotate_balance=None, no_rotate_raises=False,
+                 balance_raises=False):
         self._rounds = rounds or {}
         self._transient = transient or set()
         self._balance = balance
+        # Read-your-writes no-rotate read (BET WON stale-bankroll fix). Defaults
+        # to the same balance; tests can make it differ or raise to exercise
+        # the non-rotating-primary / rotating-fallback / ledger-snapshot chain.
+        self._no_rotate_balance = balance if no_rotate_balance is None else no_rotate_balance
+        self._no_rotate_raises = no_rotate_raises
+        self._balance_raises = balance_raises
         # epoch -> on-chain registered bet amount (wei). Default: not set ->
         # read_bet_amount returns a large positive (registered) so settlement
         # tests that don't exercise the unregistered path are unaffected.
@@ -63,7 +70,14 @@ class _FakeContract:
         return self._rounds[int(epoch)]
 
     def wallet_balance_bnb(self, _addr):
+        if self._balance_raises:
+            raise TransientRpcError("rotating read failed")
         return self._balance
+
+    def wallet_balance_bnb_no_rotate(self, _addr):
+        if self._no_rotate_raises:
+            raise TransientRpcError("no_rotate node unreachable")
+        return self._no_rotate_balance
 
     def read_bet_amount(self, epoch, _wallet):
         return int(self._bet_amounts.get(int(epoch), 10**18))  # default registered
@@ -513,6 +527,58 @@ def test_fire_claim_won_single(tmp_path, monkeypatch):
     assert sent[0][1]["new_bankroll_bnb"] == 2.39        # fresh wallet balance
     assert "claim_gas_bnb" not in sent[0][1]             # gas dropped from display
     assert bet_ledger.load_ledger(lp)[100]["status"] == "CLAIMED"
+
+
+def test_fire_claim_won_uses_no_rotate_value_not_rotating(tmp_path, monkeypatch):
+    """Read-your-writes: the PRIMARY read is the non-rotating one. no_rotate
+    (fresh, confirming node) = 2.40; rotating (stale sibling) = 2.34. The alert
+    must show 2.40, proving the fix uses the non-rotating read."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull", amount=0.05)
+    bet_ledger.record_settled(ledger_path=lp, epoch=100, side="Bull", status="SETTLED_WON",
+                              delta_bnb=0.04, outcome="win", new_bankroll_bnb=2.30)
+    sent = []
+    monkeypatch.setattr(live_mod, "send_bet_settled_alert", lambda **kw: sent.append(kw))
+    contract = _FakeContract(balance=2.34, no_rotate_balance=2.40)
+    live_mod.fire_claim_settled_alerts(ledger_path=lp, claimed_epochs=[100],
+                                       contract=contract, wallet_address="0xme")
+    assert len(sent) == 1
+    assert sent[0]["new_bankroll_bnb"] == 2.40   # fresh no-rotate value, NOT stale 2.34
+
+
+def test_fire_claim_won_falls_back_to_rotating_when_no_rotate_fails(tmp_path, monkeypatch):
+    """If the non-rotating read throws (confirming node briefly unreachable),
+    fall back to the rotating read."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull", amount=0.05)
+    bet_ledger.record_settled(ledger_path=lp, epoch=100, side="Bull", status="SETTLED_WON",
+                              delta_bnb=0.04, outcome="win", new_bankroll_bnb=2.30)
+    sent = []
+    monkeypatch.setattr(live_mod, "send_bet_settled_alert", lambda **kw: sent.append(kw))
+    contract = _FakeContract(balance=2.39, no_rotate_raises=True)
+    live_mod.fire_claim_settled_alerts(ledger_path=lp, claimed_epochs=[100],
+                                       contract=contract, wallet_address="0xme")
+    assert len(sent) == 1
+    assert sent[0]["new_bankroll_bnb"] == 2.39   # rotating fallback value
+
+
+def test_fire_claim_won_falls_back_to_ledger_snapshot_when_both_fail(tmp_path, monkeypatch):
+    """If BOTH reads throw (total RPC failure), fall back to the ledger snapshot
+    and WARN."""
+    lp = _ledger(tmp_path)
+    _submit(lp, 100, side="Bull", amount=0.05)
+    bet_ledger.record_settled(ledger_path=lp, epoch=100, side="Bull", status="SETTLED_WON",
+                              delta_bnb=0.04, outcome="win", new_bankroll_bnb=2.34)
+    sent = []
+    warns = []
+    monkeypatch.setattr(live_mod, "send_bet_settled_alert", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(live_mod, "warn", lambda action, msg: warns.append((action, msg)))
+    contract = _FakeContract(no_rotate_raises=True, balance_raises=True)
+    live_mod.fire_claim_settled_alerts(ledger_path=lp, claimed_epochs=[100],
+                                       contract=contract, wallet_address="0xme")
+    assert len(sent) == 1
+    assert sent[0]["new_bankroll_bnb"] == 2.34   # ledger snapshot (SETTLED_WON new_bankroll_bnb)
+    assert any("post-claim balance read failed" in m for _, m in warns)
 
 
 def test_fire_claim_refund(tmp_path, monkeypatch):
