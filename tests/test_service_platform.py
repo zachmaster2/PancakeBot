@@ -60,6 +60,7 @@ def test_linux_render_unit_has_key_directives():
     p = LinuxServicePlatform(runner=_FakeRunner())
     unit = p.render_unit(_spec())
     assert "Type=simple" in unit       # systemd supervises run.py directly
+    assert "EnvironmentFile=-/etc/pancakebot/pancakebot.env" in unit
     assert "ExecStart=/opt/pb/.venv/bin/python run.py --live" in unit
     assert "KillMode=control-group" in unit                  # Job Object equivalent
     assert "Restart=on-failure" in unit
