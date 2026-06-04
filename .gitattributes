@@ -1,0 +1,5 @@
+# Shell scripts MUST be LF — a CRLF in the shebang line breaks execution on
+# Linux (the VM bootstrap runs these). core.autocrlf=true would otherwise risk
+# CRLF leaking into these.
+*.sh text eol=lf
+bootstrap/linux/install_python313.sh text eol=lf
