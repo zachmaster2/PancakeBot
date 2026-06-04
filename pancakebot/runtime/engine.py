@@ -1312,13 +1312,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 gas_paid_bnb=gas_bnb,
             )
             # Fresh wallet read for the post-receipt alert bankroll. Off the
-            # critical path; fall back to the projected estimate on RPC error.
+            # critical path. Read-your-writes: the bet TX was sent + confirmed
+            # on the CURRENT node, so read on THAT node (no rotate) to avoid a
+            # sibling node lagging the bet block and returning pre-bet state
+            # (BET WON stale-bankroll fix, 2026-06-03). Fall back: non-rotating
+            # -> rotating -> projected estimate.
             try:
-                fresh_bankroll = float(
-                    cfg.contract.wallet_balance_bnb(cfg.wallet_address)
+                fresh_bankroll = cfg.contract.wallet_balance_bnb_no_rotate(
+                    cfg.wallet_address
                 )
             except Exception:  # noqa: BLE001
-                fresh_bankroll = projected_bankroll
+                try:
+                    fresh_bankroll = float(
+                        cfg.contract.wallet_balance_bnb(cfg.wallet_address)
+                    )
+                except Exception:  # noqa: BLE001
+                    fresh_bankroll = projected_bankroll
             if conf_status == "CONFIRMED":
                 send_bet_confirmed_alert(epoch=current_epoch, bankroll_bnb=fresh_bankroll)
             elif conf_status == "LATE":

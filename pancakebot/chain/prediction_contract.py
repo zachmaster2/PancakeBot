@@ -326,6 +326,36 @@ class Web3PredictionContract:
         )
         return float(wei) / float(BNB_WEI)
 
+    def wallet_balance_bnb_no_rotate(self, wallet_address: str) -> float:
+        """Native BNB balance read on the CURRENT provider, WITHOUT rotating.
+
+        ``wallet_balance_bnb`` rotates to the next RPC endpoint before every
+        call (load-spreading + failover). That breaks read-your-writes: a
+        balance read immediately after one of OUR transactions lands on a
+        sibling node that may lag the just-mined block by ~1 BSC block
+        (~0.45s) and return PRE-tx state.
+
+        Use this variant ONLY immediately after a confirmed TX on the current
+        node — i.e. right after ``claim()`` or ``_submit_tx_with_timing``,
+        both of which send + await the receipt on ``self._w3`` and leave
+        ``_rpc_index`` at the confirming node. That node provably holds the
+        just-mined block (it returned the receipt), so the read reflects the
+        claim/bet credit. Do NOT use it for general balance reads unrelated to
+        a just-confirmed local TX — those should keep rotating.
+
+        Raises ``TransientRpcError`` on failure; callers fall back to the
+        rotating read, then to a ledger snapshot. (BET WON stale-bankroll
+        fix, 2026-06-03.)
+        """
+        checksum_address = Web3.to_checksum_address(str(wallet_address))
+        try:
+            wei = Web3.to_int(self._w3.eth.get_balance(checksum_address))
+        except (InvariantError, TransientRpcError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise TransientRpcError(f"wallet_balance_bnb_no_rotate_failed: {e}") from e
+        return float(wei) / float(BNB_WEI)
+
     # ---- Read calls ----
 
     def current_epoch(self) -> int:

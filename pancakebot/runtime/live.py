@@ -334,10 +334,24 @@ def fire_claim_settled_alerts(
                 if e in ledger and ledger[e].get("status") != "CLAIMED"]
         if not ours:
             return
+        # Read-your-writes: claim() sent + confirmed on the CURRENT node, so
+        # read the post-claim balance on THAT node (no rotate). A rotating read
+        # can land on a sibling node lagging the claim block (~1 BSC block) and
+        # return pre-claim state — the BET WON stale-bankroll bug (2026-06-03).
+        # Fall back: non-rotating -> rotating (node N briefly unreachable) ->
+        # ledger snapshot (total RPC failure).
         try:
-            fresh_bankroll = float(contract.wallet_balance_bnb(wallet_address))
+            fresh_bankroll = contract.wallet_balance_bnb_no_rotate(wallet_address)
         except Exception:  # noqa: BLE001
-            fresh_bankroll = float(ledger[ours[0]].get("new_bankroll_bnb", 0.0) or 0.0)
+            try:
+                fresh_bankroll = float(contract.wallet_balance_bnb(wallet_address))
+            except Exception:  # noqa: BLE001
+                fresh_bankroll = float(ledger[ours[0]].get("new_bankroll_bnb", 0.0) or 0.0)
+                warn(
+                    "ALERT",
+                    f"post-claim balance read failed (epochs={ours}); using "
+                    f"ledger snapshot {fresh_bankroll:.4f} BNB for settled alert",
+                )
 
         # Only fire/claim-mark epochs reconcile has ALREADY settled. If
         # reconcile failed transiently this iteration (RPC error -> epoch
