@@ -31,17 +31,18 @@ from __future__ import annotations
 import datetime
 import os
 import subprocess
-import sys
 import time
 import traceback
 from pathlib import Path
 from typing import Any
 
 # Win32 / pywin32 imports. Module-load failure on non-Windows is intentional
-# — this module is only imported in service hosts.
+# — this module is only imported in service hosts. The Job Object + SCM
+# mechanics now live in WindowsServicePlatform (windows_platform.py); this
+# module keeps only win32event (stop signal) + win32service (status constants)
+# + servicemanager (Event Log) + win32serviceutil (ServiceFramework base).
 import servicemanager
 import win32event
-import win32job
 import win32service
 import win32serviceutil
 
@@ -86,64 +87,16 @@ _MUTEX_EVICT_TIMEOUT_S: float = 30.0
 
 
 # ---------------------------------------------------------------------------
-# SCM helpers (used by mode mutex)
+# SCM helpers + supervisor primitives are owned by WindowsServicePlatform
+# (windows_platform.py) — the cross-platform ServicePlatform adapter. They are
+# re-bound here under the prior private names so the call sites below are
+# unchanged; the bodies are verbatim extractions (behaviour-identical).
 # ---------------------------------------------------------------------------
-
-def _query_service_state(svc_name: str) -> int | None:
-    """Return the current state of ``svc_name`` (a SERVICE_* constant) or None if absent."""
-    try:
-        scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
-    except Exception:
-        return None
-    try:
-        try:
-            svc = win32service.OpenService(scm, svc_name, win32service.SERVICE_QUERY_STATUS)
-        except Exception:
-            return None
-        try:
-            status = win32service.QueryServiceStatusEx(svc)
-            return int(status["CurrentState"])
-        finally:
-            win32service.CloseServiceHandle(svc)
-    finally:
-        win32service.CloseServiceHandle(scm)
-
-
-def _stop_service_and_wait(svc_name: str, timeout_s: float) -> bool:
-    """ControlService(STOP) on ``svc_name`` and poll until STOPPED or timeout."""
-    try:
-        scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
-    except Exception:
-        return False
-    try:
-        try:
-            svc = win32service.OpenService(
-                scm, svc_name,
-                win32service.SERVICE_STOP | win32service.SERVICE_QUERY_STATUS,
-            )
-        except Exception:
-            return False
-        try:
-            try:
-                win32service.ControlService(svc, win32service.SERVICE_CONTROL_STOP)
-            except Exception:
-                # May already be stopping; fall through to the poll loop.
-                pass
-            deadline = time.time() + timeout_s
-            while time.time() < deadline:
-                try:
-                    status = win32service.QueryServiceStatusEx(svc)
-                    state = int(status["CurrentState"])
-                    if state == win32service.SERVICE_STOPPED:
-                        return True
-                except Exception:
-                    return False
-                time.sleep(0.5)
-            return False
-        finally:
-            win32service.CloseServiceHandle(svc)
-    finally:
-        win32service.CloseServiceHandle(scm)
+from pancakebot.service.windows_platform import (  # noqa: E402
+    WindowsServicePlatform,
+    query_service_state as _query_service_state,
+    stop_service_and_wait as _stop_service_and_wait,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -165,29 +118,20 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
         self._bot_proc: subprocess.Popen | None = None
         self._bot_started_at: float | None = None
         self._stop_requested: bool = False
-        # Job Object with KILL_ON_JOB_CLOSE — when this service process
-        # exits for ANY reason (clean SvcStop, crash, force-kill), Windows
-        # closes the job handle and automatically kills every child
-        # process in the job. This is what guarantees we never orphan a
-        # bot subprocess if the supervisor dies (the symptom we hit on
-        # 2026-05-23 when an unguarded sys.stderr.write crashed SvcDoRun
-        # and left bot PID 7480 running detached).
-        self._job = self._create_kill_on_close_job()
-
-    @staticmethod
-    def _create_kill_on_close_job():
-        """Create a Job Object configured to kill all members on close."""
-        job = win32job.CreateJobObject(None, "")  # unnamed; held by us only
-        info = win32job.QueryInformationJobObject(
-            job, win32job.JobObjectExtendedLimitInformation,
+        # Cross-platform service primitives. On Windows this wraps the SCM /
+        # Job Object mechanics; the supervisor calls through it instead of
+        # touching pywin32 directly.
+        self._platform = WindowsServicePlatform(
+            status_reporter=self.ReportServiceStatus,
+            log=lambda m: servicemanager.LogWarningMsg(f"{self._svc_name_}: {m}"),
         )
-        info["BasicLimitInformation"]["LimitFlags"] |= (
-            win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        )
-        win32job.SetInformationJobObject(
-            job, win32job.JobObjectExtendedLimitInformation, info,
-        )
-        return job
+        # Kill-on-supervisor-exit guarantee: a Job Object with
+        # KILL_ON_JOB_CLOSE. When this service process exits for ANY reason
+        # (clean SvcStop, crash, force-kill), Windows kills every enrolled
+        # child — so we never orphan a bot subprocess if the supervisor dies
+        # (the symptom hit 2026-05-23 when an unguarded sys.stderr.write
+        # crashed SvcDoRun and left bot PID 7480 running detached).
+        self._kill_tree = self._platform.create_kill_tree()
 
     # -- SCM entry points --------------------------------------------------
 
@@ -387,13 +331,6 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
         out_log = logs_dir / f"{self._MODE}-svc-{ts}.log"
         err_log = logs_dir / f"{self._MODE}-svc-{ts}_err.log"
 
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = (
-                subprocess.CREATE_NEW_PROCESS_GROUP
-                | getattr(subprocess, "DETACHED_PROCESS", 0)
-            )
-
         out_f = open(out_log, "w", encoding="utf-8")
         err_f = open(err_log, "w", encoding="utf-8")
         try:
@@ -402,26 +339,17 @@ class _PancakeBotServiceBase(win32serviceutil.ServiceFramework):
                 cwd=str(_REPO_ROOT),
                 stdout=out_f,
                 stderr=err_f,
-                creationflags=creationflags,
+                **self._platform.spawn_kwargs(),
             )
         finally:
             out_f.close()
             err_f.close()
 
-        # Immediately enroll the child in the kill-on-close job. Uses
-        # Popen._handle (a pywin32 PyHANDLE wrapping the process HANDLE
-        # returned by CreateProcess) — converted to int because
-        # AssignProcessToJobObject accepts either. Failure here is
-        # logged but non-fatal: a child outside the job loses the
-        # auto-kill safety net but is otherwise functional.
-        try:
-            win32job.AssignProcessToJobObject(self._job, int(proc._handle))
-        except Exception as e:
-            servicemanager.LogWarningMsg(
-                f"{self._svc_name_}: AssignProcessToJobObject failed for "
-                f"pid={proc.pid}: {type(e).__name__}: {e} — child will be "
-                f"orphaned if supervisor crashes"
-            )
+        # Immediately enroll the child in the kill-on-close tree (the Job
+        # Object). The adapter logs (non-fatal) if enrolment fails — a child
+        # outside the tree loses the auto-kill safety net but is otherwise
+        # functional.
+        self._kill_tree.adopt(proc)
 
         self._bot_proc = proc
         self._bot_started_at = time.time()
