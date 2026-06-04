@@ -92,7 +92,11 @@ class LinuxServicePlatform(ServicePlatform):
         lines += [
             "",
             "[Service]",
-            "Type=notify",                       # supervisor uses sd_notify(READY=1)
+            # systemd supervises run.py directly (Restart=on-failure replaces
+            # the Windows in-process supervisor). Type=simple: the bot does not
+            # sd_notify, so 'active' == process spawned. (signal_health/sd_notify
+            # remains available for a future Type=notify Linux supervisor.)
+            "Type=simple",
             f"WorkingDirectory={spec.working_dir}",
             f"ExecStart={exec_start}",
             "Restart=on-failure",
