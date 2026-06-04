@@ -98,6 +98,9 @@ class LinuxServicePlatform(ServicePlatform):
             # remains available for a future Type=notify Linux supervisor.)
             "Type=simple",
             f"WorkingDirectory={spec.working_dir}",
+            # Discord webhooks (+ any future secrets) live here; '-' => optional
+            # so the unit still starts if the file is absent (e.g. dry soak).
+            "EnvironmentFile=-/etc/pancakebot/pancakebot.env",
             f"ExecStart={exec_start}",
             "Restart=on-failure",
             f"RestartSec={spec.restart_delay_s}",
