@@ -309,8 +309,13 @@ def test_common_module_imports():
     import importlib
     mod = importlib.import_module("pancakebot.service.common")
     assert hasattr(mod, "_PancakeBotServiceBase")
-    assert hasattr(mod, "_query_service_state")
-    assert hasattr(mod, "_stop_service_and_wait")
+    # The SCM helpers moved to windows_platform (the adapter is the SSOT); the
+    # supervision logic moved to supervisor_core. common.py is now a thin shell.
+    wp = importlib.import_module("pancakebot.service.windows_platform")
+    assert hasattr(wp, "query_service_state")
+    assert hasattr(wp, "stop_service_and_wait")
+    sc = importlib.import_module("pancakebot.service.supervisor_core")
+    assert hasattr(sc, "SupervisorCore")
 
 
 def test_live_and_dry_service_classes_importable():
@@ -520,18 +525,31 @@ time.sleep(0.5)
 # on every exit path (suppressed/respawn-success/spawn-failed), guarded by
 # self._stop_requested to avoid racing genuine SvcStop.
 
+class _FakeHealthPlatform:
+    """Records signal_health() calls (the cross-platform replacement for the
+    Windows ReportServiceStatus reports these tests used to assert on)."""
+    def __init__(self):
+        self.health = []
+
+    def signal_health(self, state):
+        self.health.append(state)
+
+
 def _make_fake_service_instance(svc_name="PancakeBotTest", mode="live", stop_requested=False):
-    """Build a _PancakeBotServiceBase without invoking pywin32 __init__
-    (ServiceFramework needs SCM context which we don't have in tests)."""
-    from pancakebot.service.common import _PancakeBotServiceBase
-    svc = _PancakeBotServiceBase.__new__(_PancakeBotServiceBase)
-    svc._MODE = mode
-    svc._OTHER_SERVICE = "PancakeBotDry" if mode == "live" else "PancakeBotLive"
-    svc._svc_name_ = svc_name
-    svc._stop_requested = stop_requested
-    svc._bot_proc = None
-    svc._bot_started_at = None
-    return svc
+    """Build a SupervisorCore (where the supervision logic now lives) without
+    invoking its __init__ (which would create a real platform stop-event /
+    kill-tree). The OS-agnostic _handle_unhealthy etc. are exercised directly."""
+    from pancakebot.service.supervisor_core import SupervisorCore
+    core = SupervisorCore.__new__(SupervisorCore)
+    core._mode = mode
+    core._other = "PancakeBotDry" if mode == "live" else "PancakeBotLive"
+    core._svc_name = svc_name
+    core._stop_requested = stop_requested
+    core._bot_proc = None
+    core._bot_started_at = None
+    core._platform = _FakeHealthPlatform()
+    core._log = lambda lvl, m: None
+    return core
 
 
 def _mock_supervision_and_notifications(monkeypatch, fast_count=0, slow_count=0):
@@ -547,16 +565,14 @@ def test_handle_unhealthy_restores_running_after_successful_respawn(monkeypatch,
     """The exact regression scenario: CRASHED detected -> _stop_bot_child
     (pushes STOP_PENDING) -> _spawn_bot_child (success) -> finally restores
     SERVICE_RUNNING. Last ReportServiceStatus must be SERVICE_RUNNING."""
-    import win32service
+    from pancakebot.service.platform_base import HealthState
     svc = _make_fake_service_instance()
     _mock_supervision_and_notifications(monkeypatch)
+    health = svc._platform.health
 
-    status_log = []
-    svc.ReportServiceStatus = lambda s: status_log.append(s)
-
-    # _stop_bot_child stub: simulate what the real one does to SCM
+    # _stop_bot_child stub: simulate the reap's EXTEND health pump.
     def stub_stop(reason):
-        svc.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+        svc._platform.signal_health(HealthState.EXTEND)
         svc._bot_proc = None
         svc._bot_started_at = None
     svc._stop_bot_child = stub_stop
@@ -572,22 +588,20 @@ def test_handle_unhealthy_restores_running_after_successful_respawn(monkeypatch,
     art = _make_mode_tree(tmp_path, "live")
     svc._handle_unhealthy("CRASHED", {}, art)
 
-    assert win32service.SERVICE_STOP_PENDING in status_log, \
-        "_stop_bot_child stub should have logged STOP_PENDING"
-    assert status_log[-1] == win32service.SERVICE_RUNNING, \
-        f"last ReportServiceStatus must be SERVICE_RUNNING, got {status_log[-1]}; full: {status_log}"
+    assert HealthState.EXTEND in health, \
+        "_stop_bot_child stub should have pumped EXTEND health"
+    assert health[-1] == HealthState.READY, \
+        f"last signal_health must be READY, got {health[-1]}; full: {health}"
 
 
 def test_handle_unhealthy_restores_running_after_fast_crashloop_suppression(monkeypatch, tmp_path):
     """Even on the fast-crashloop suppression branch (no respawn attempted),
     the finally block must restore SERVICE_RUNNING so SCM doesn't drift if
     a prior respawn left it in STOP_PENDING."""
-    import win32service
+    from pancakebot.service.platform_base import HealthState
     svc = _make_fake_service_instance()
     _mock_supervision_and_notifications(monkeypatch, fast_count=10)  # well past _FAST_RESTART_MAX=3
-
-    status_log = []
-    svc.ReportServiceStatus = lambda s: status_log.append(s)
+    health = svc._platform.health
     svc._stop_bot_child = lambda reason: None
     svc._spawn_bot_child = lambda art: None
     svc._archive_lingering_crash_file = lambda crash: None
@@ -595,23 +609,21 @@ def test_handle_unhealthy_restores_running_after_fast_crashloop_suppression(monk
     art = _make_mode_tree(tmp_path, "live")
     svc._handle_unhealthy("CRASHED", {}, art)
 
-    assert status_log[-1] == win32service.SERVICE_RUNNING, \
-        f"fast-suppress path must still end with SERVICE_RUNNING; got {status_log}"
+    assert health[-1] == HealthState.READY, \
+        f"fast-suppress path must still end with READY; got {health}"
 
 
 def test_handle_unhealthy_restores_running_after_spawn_failure(monkeypatch, tmp_path):
     """If _spawn_bot_child raises, supervisor is still alive and will retry
     next tick — SCM must reflect that with SERVICE_RUNNING, not stay in
     the STOP_PENDING set by the preceding _stop_bot_child."""
-    import win32service
+    from pancakebot.service.platform_base import HealthState
     svc = _make_fake_service_instance()
     _mock_supervision_and_notifications(monkeypatch)
-
-    status_log = []
-    svc.ReportServiceStatus = lambda s: status_log.append(s)
+    health = svc._platform.health
 
     def stub_stop(reason):
-        svc.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+        svc._platform.signal_health(HealthState.EXTEND)
         svc._bot_proc = None
     svc._stop_bot_child = stub_stop
     def stub_spawn_fail(art):
@@ -622,9 +634,9 @@ def test_handle_unhealthy_restores_running_after_spawn_failure(monkeypatch, tmp_
     art = _make_mode_tree(tmp_path, "live")
     svc._handle_unhealthy("CRASHED", {}, art)  # must not raise on CRASHED unhealthy status
 
-    assert win32service.SERVICE_STOP_PENDING in status_log
-    assert status_log[-1] == win32service.SERVICE_RUNNING, \
-        f"spawn-failed path must still end with SERVICE_RUNNING; got {status_log}"
+    assert HealthState.EXTEND in health
+    assert health[-1] == HealthState.READY, \
+        f"spawn-failed path must still end with READY; got {health}"
 
 
 def test_handle_unhealthy_does_NOT_restore_running_when_stop_requested(monkeypatch, tmp_path):
@@ -632,15 +644,13 @@ def test_handle_unhealthy_does_NOT_restore_running_when_stop_requested(monkeypat
     concurrently with _handle_unhealthy, the finally block must NOT flip
     SCM back to SERVICE_RUNNING — the framework will report STOPPED when
     SvcDoRun returns, and we don't want to fight that."""
-    import win32service
+    from pancakebot.service.platform_base import HealthState
     svc = _make_fake_service_instance(stop_requested=True)
     _mock_supervision_and_notifications(monkeypatch)
-
-    status_log = []
-    svc.ReportServiceStatus = lambda s: status_log.append(s)
+    health = svc._platform.health
 
     def stub_stop(reason):
-        svc.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+        svc._platform.signal_health(HealthState.EXTEND)
         svc._bot_proc = None
     svc._stop_bot_child = stub_stop
     class FakeProc:
@@ -654,10 +664,9 @@ def test_handle_unhealthy_does_NOT_restore_running_when_stop_requested(monkeypat
     art = _make_mode_tree(tmp_path, "live")
     svc._handle_unhealthy("CRASHED", {}, art)
 
-    # The finally block's guard should have skipped the RUNNING report.
-    # Last status is therefore the STOP_PENDING from _stop_bot_child.
-    assert win32service.SERVICE_RUNNING not in status_log, \
-        f"finally must not flip to RUNNING when _stop_requested=True; got {status_log}"
+    # The finally block's guard should have skipped the READY restore.
+    assert HealthState.READY not in health, \
+        f"finally must not restore READY when _stop_requested=True; got {health}"
 
 
 # ---------------------------------------------------------------------------
@@ -713,10 +722,8 @@ def _patch_for_aggregation(monkeypatch, recent_1h_count: int, slow_24h_count: in
 
 
 def _make_svc_with_stubs():
-    """Common service instance + stubs for aggregation tests."""
-    import win32service
+    """Common SupervisorCore instance + stubs for aggregation tests."""
     svc = _make_fake_service_instance()
-    svc.ReportServiceStatus = lambda s: None  # don't care about SCM here
 
     def stub_stop(reason):
         svc._bot_proc = None

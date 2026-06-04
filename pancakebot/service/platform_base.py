@@ -90,6 +90,25 @@ class KillTree(abc.ABC):
         """
 
 
+class StopEvent(abc.ABC):
+    """A settable, timed-wait stop signal for the supervision loop.
+
+    Windows: a Win32 event (``CreateEvent``/``SetEvent``/``WaitForSingleObject``)
+    so an SCM ``SvcStop`` on a different thread wakes the loop. Linux: a
+    ``threading.Event`` set from a SIGTERM handler.
+    """
+
+    @abc.abstractmethod
+    def wait(self, timeout_s: float) -> bool:
+        """Block up to ``timeout_s``; return True if set, False on timeout."""
+
+    @abc.abstractmethod
+    def set(self) -> None: ...
+
+    @abc.abstractmethod
+    def is_set(self) -> bool: ...
+
+
 class ServicePlatform(abc.ABC):
     """OS-agnostic service-supervision contract. See module docstring."""
 
@@ -137,6 +156,10 @@ class ServicePlatform(abc.ABC):
     @abc.abstractmethod
     def create_kill_tree(self) -> KillTree:
         """Construct the kill-all-children-on-supervisor-exit primitive."""
+
+    @abc.abstractmethod
+    def create_stop_event(self) -> StopEvent:
+        """Construct the supervision-loop stop signal."""
 
     @abc.abstractmethod
     def spawn_kwargs(self) -> dict:

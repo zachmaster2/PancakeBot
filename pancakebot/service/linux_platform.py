@@ -18,6 +18,7 @@ import contextlib
 import os
 import socket
 import subprocess
+import threading
 from pathlib import Path
 
 from pancakebot.service.platform_base import (
@@ -26,7 +27,24 @@ from pancakebot.service.platform_base import (
     ServicePlatform,
     ServiceSpec,
     ServiceState,
+    StopEvent,
 )
+
+
+class _ThreadingStopEvent(StopEvent):
+    """Linux stop signal — a threading.Event set from the SIGTERM handler."""
+
+    def __init__(self) -> None:
+        self._e = threading.Event()
+
+    def wait(self, timeout_s: float) -> bool:
+        return self._e.wait(timeout_s)
+
+    def set(self) -> None:
+        self._e.set()
+
+    def is_set(self) -> bool:
+        return self._e.is_set()
 
 _UNIT_DIR = Path("/etc/systemd/system")
 
@@ -211,6 +229,9 @@ class LinuxServicePlatform(ServicePlatform):
 
     def create_kill_tree(self) -> KillTree:
         return _LinuxKillTree()
+
+    def create_stop_event(self) -> StopEvent:
+        return _ThreadingStopEvent()
 
     def spawn_kwargs(self) -> dict:
         # New session so the standalone (non-systemd) fallback can killpg;
