@@ -89,6 +89,10 @@ class LinuxServicePlatform(ServicePlatform):
             lines.append(f"Wants={' '.join(wants)}")
         if spec.conflicts_with:
             lines.append(f"Conflicts={self._unit_name(spec.conflicts_with)}")
+        # Start-rate limiting lives in [Unit] (systemd >= 230 ignores these in
+        # [Service]). Pairs with Restart=on-failure in [Service].
+        lines.append(f"StartLimitIntervalSec={spec.restart_reset_window_s}")
+        lines.append(f"StartLimitBurst={spec.restart_max_attempts}")
         lines += [
             "",
             "[Service]",
@@ -104,8 +108,6 @@ class LinuxServicePlatform(ServicePlatform):
             f"ExecStart={exec_start}",
             "Restart=on-failure",
             f"RestartSec={spec.restart_delay_s}",
-            f"StartLimitIntervalSec={spec.restart_reset_window_s}",
-            f"StartLimitBurst={spec.restart_max_attempts}",
             "KillMode=control-group",            # cgroup tree-kill (Job Object equiv)
             "TimeoutStopSec=25",
         ]

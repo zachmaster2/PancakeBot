@@ -13,7 +13,14 @@ set -euo pipefail
 
 log() { echo "[install_python313] $*"; }
 
-PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
+# Default to /opt/pyenv for a root/system install: SELinux (Enforcing on
+# AlmaLinux) denies systemd from exec'ing binaries under /root
+# (admin_home_t context) -> 203/EXEC. /opt is usr_t (service-exec'able).
+# Override with PYENV_ROOT=... for a user install.
+if [ -z "${PYENV_ROOT:-}" ]; then
+    if [ "$(id -u)" = "0" ]; then PYENV_ROOT="/opt/pyenv"; else PYENV_ROOT="$HOME/.pyenv"; fi
+fi
+export PYENV_ROOT
 
 log "installing build dependencies (dnf)"
 dnf install -y gcc make patch git zlib-devel bzip2 bzip2-devel readline-devel \
