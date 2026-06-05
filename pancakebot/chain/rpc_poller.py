@@ -483,6 +483,18 @@ class RpcPoller:
         # pool — surface them.
         self._block_receipt_skips_total: int = 0
         self._pool_block_ts_zero_drops_total: int = 0
+        # Failed-block retry queue (2.1 fix): a block whose receipts errored is
+        # re-fetched on later periodic polls (off the critical path) instead of
+        # being permanently dropped from the pool aggregate. ``{block: attempts}``.
+        # Idempotent — ``_process_receipts_for_block`` dedups by log-id, so a
+        # recovered block can never double-count, and a retry can only ADD the
+        # block's real (previously-missed) bets (conservative-direction safe).
+        # Bounded by ``_retry_max_attempts`` and a block-age window so the queue
+        # cannot grow without bound; exhausted/aged blocks are dropped with a WARN.
+        self._pending_retry_blocks: dict[int, int] = {}
+        self._block_receipts_recovered_total: int = 0
+        self._retry_max_attempts: int = 4
+        self._retry_window_blocks: int = 900
 
     # ------------------------------------------------------------------
     # Public properties (mirror PoolEventWatcher)
@@ -1482,6 +1494,27 @@ class RpcPoller:
             blocks_polled = 0
             error_seen: str | None = None
 
+            # Retry previously-skipped blocks (2.1 fix): periodic only, off the
+            # critical path. The retry is one extra batched call; only run it
+            # when an extra batch's worst-case lock-hold still finishes before
+            # ramp_poll_1 (the periodic cadence budgets ONE batch before the
+            # ramp window — this adds at most one more). Pre-init / post-lock
+            # (_lock_at<=0) runs wall-clock with ample margin.
+            if label == "period" and self._pending_retry_blocks:
+                if lock_at_local <= 0:
+                    self._retry_pending_receipt_blocks()
+                else:
+                    ramp_window_start = (
+                        lock_at_local - self._ramp_poll_1_wakeup_offset_ms / 1000.0
+                    )
+                    extra_batch_safe_latest = (
+                        ramp_window_start
+                        - 2 * _tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS
+                        - _tc.RPC_PERIODIC_TO_RAMP_SAFETY_BUFFER_SECONDS
+                    )
+                    if time.time() < extra_batch_safe_latest:
+                        self._retry_pending_receipt_blocks()
+
             # Batch in chunks. Deadline check is total-RTT-based: if
             # the cumulative time since poll start exceeds deadline_ms
             # at any point, abort remaining batches (we'll process
@@ -1579,30 +1612,85 @@ class RpcPoller:
                 f"rpc_batch_length_mismatch: expected={len(calls)} got={len(results)}"
             )
         _block_skips = 0
+        _skipped_bns: list[int] = []
         for i, bn in enumerate(block_numbers):
             receipts, recv_err = results[i]
             if recv_err is not None:
-                # Single-block error: skip; the next periodic/ramp poll
-                # will retry. Don't raise here because the rest of the
+                # Single-block error: queue for retry on a later periodic
+                # poll (2.1 fix). Don't raise here because the rest of the
                 # batch might be valid.
                 _block_skips += 1
+                _skipped_bns.append(bn)
                 continue
             if not isinstance(receipts, list):
                 _block_skips += 1
+                _skipped_bns.append(bn)
                 continue
             self._process_receipts_for_block(bn, receipts)
+            # Recovered (or never-failed) block: clear any pending retry. If
+            # it WAS pending, this read recovered its previously-missed bets.
+            with self._lock:
+                if self._pending_retry_blocks.pop(bn, None) is not None:
+                    self._block_receipts_recovered_total += 1
+        if _skipped_bns:
+            # Queue skipped blocks for retry (forward-only cursor is untouched;
+            # these blocks are re-fetched explicitly, not via the cursor).
+            with self._lock:
+                for bn in _skipped_bns:
+                    self._pending_retry_blocks[bn] = self._pending_retry_blocks.get(bn, 0) + 1
         if _block_skips > 0:
             # Pool-understatement signal (guard audit 2.1): bets in the
-            # skipped blocks are absent from the pool aggregate until a
-            # later poll re-fetches them — surface so a corrupted bull/bear
-            # ratio doesn't go unnoticed.
+            # skipped blocks are absent from the pool aggregate UNTIL the
+            # retry queue recovers them on a later periodic poll — surface so
+            # a corrupted bull/bear ratio doesn't go unnoticed in the interim.
             self._block_receipt_skips_total += _block_skips
+            with self._lock:
+                _pending_n = len(self._pending_retry_blocks)
             warn(
                 "ALERT",
                 f"block receipt fetch skipped {_block_skips}/{len(block_numbers)} "
-                f"blocks (receipt error); their bets are missing from the pool "
-                f"aggregate this read (cumulative={self._block_receipt_skips_total})",
+                f"blocks (receipt error); queued for retry "
+                f"(pending={_pending_n}, cumulative_skips={self._block_receipt_skips_total}, "
+                f"recovered={self._block_receipts_recovered_total})",
             )
+
+    def _retry_pending_receipt_blocks(self) -> None:
+        """Re-fetch blocks whose receipts errored on an earlier poll (2.1 fix).
+
+        Called only from periodic polls, off the critical path. Recovers bets
+        that would otherwise be permanently missing from the pool aggregate
+        (the cursor already advanced past these blocks, so nothing else
+        re-fetches them). ``_fetch_and_process_blocks`` itself maintains the
+        queue: a recovered block is popped (and counted), a still-failing one
+        is re-incremented. Idempotent — log-id dedup means a partially-counted
+        block can't double-count, and the retry only ever ADDS real missed bets.
+
+        Bounded two ways so the queue can't grow without limit:
+          * attempts >= ``_retry_max_attempts`` -> give up, drop with a WARN.
+          * block older than ``_retry_window_blocks`` behind the cursor -> drop
+            (its bets are epoch-gated out of the current round anyway).
+        Both drops are surfaced (no silent truncation of the understatement)."""
+        with self._lock:
+            floor = self._last_polled_block_number - self._retry_window_blocks
+            retry: list[int] = []
+            dropped: list[int] = []
+            for bn, attempts in list(self._pending_retry_blocks.items()):
+                if attempts >= self._retry_max_attempts or bn < floor:
+                    dropped.append(bn)
+                    del self._pending_retry_blocks[bn]
+                else:
+                    retry.append(bn)
+        if dropped:
+            warn(
+                "ALERT",
+                f"pool understatement: dropped {len(dropped)} block(s) after "
+                f"exhausting receipt retries (blocks={sorted(dropped)[:10]}); "
+                f"their bets remain missing from the pool aggregate",
+            )
+        if retry:
+            # Single extra batched call; success/failure bookkeeping happens
+            # inside _fetch_and_process_blocks (pop-on-recover, increment-on-fail).
+            self._fetch_and_process_blocks(sorted(retry))
 
     def _process_receipts_for_block(self, block_number: int, receipts: list[dict]) -> None:
         """Extract BetBull/BetBear events from a block's receipts and
