@@ -128,6 +128,13 @@ class LinuxServicePlatform(ServicePlatform):
             f"RestartSec={spec.restart_delay_s}",
             "KillMode=control-group",            # cgroup tree-kill (Job Object equiv)
             "TimeoutStopSec=25",
+            # glibc allocator tuning (Linux-specific): the multi-threaded
+            # hedged-RPC pattern spins up many malloc arenas that retain freed
+            # memory, ratcheting RSS up over time (diagnosed in the 2026-06-04
+            # dry soak: ~385MB anon across 64MB arenas + THP). Cap arenas + trim
+            # eagerly. No effect on Windows (different heap manager).
+            "Environment=MALLOC_ARENA_MAX=2",
+            "Environment=MALLOC_TRIM_THRESHOLD_=131072",
         ]
         if spec.env:
             for k, v in spec.env.items():
