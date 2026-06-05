@@ -26,7 +26,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from pancakebot import timing_constants as _tc  # noqa: E402
-from pancakebot.chain.rpc_poller import RpcPoller, _Bet, _EpochPool  # noqa: E402
+from pancakebot.chain.rpc_poller import (  # noqa: E402
+    RpcPoller,
+    _Bet,
+    _EpochPool,
+    _BET_BULL_TOPIC,
+)
 from pancakebot.util import InvariantError  # noqa: E402
 
 
@@ -1956,6 +1961,124 @@ def test_fetch_and_process_blocks_empty_input_no_rpc(monkeypatch):
     monkeypatch.setattr(p, "_rpc_batch", _track)
     p._fetch_and_process_blocks([])
     assert rpc_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Pool-understatement fix (2.1): failed-block receipt retry queue
+# ---------------------------------------------------------------------------
+
+def _ok(receipts=None):
+    return (receipts if receipts is not None else [], None)
+
+
+def _err(msg="receipt error"):
+    return (None, msg)
+
+
+def test_skipped_block_is_queued_for_retry(monkeypatch):
+    """A per-block receipt error queues that block for retry instead of
+    dropping it permanently. Other blocks in the batch still process."""
+    p = _make_poller()
+    monkeypatch.setattr(p, "_rpc_batch", lambda calls: [_ok(), _err(), _ok()])
+    p._fetch_and_process_blocks([100, 101, 102])
+    assert p._pending_retry_blocks == {101: 1}      # only the errored block
+    assert p._block_receipt_skips_total == 1
+    assert p._block_receipts_recovered_total == 0
+
+
+def test_non_list_receipts_also_queued(monkeypatch):
+    p = _make_poller()
+    monkeypatch.setattr(p, "_rpc_batch", lambda calls: [("not_a_list", None)])
+    p._fetch_and_process_blocks([100])
+    assert p._pending_retry_blocks == {100: 1}
+
+
+def test_retry_recovers_block_and_pops_queue(monkeypatch):
+    """A queued block that succeeds on retry is re-fetched, processed, popped,
+    and counted as recovered."""
+    p = _make_poller()
+    p._last_polled_block_number = 200               # floor = 200-900 < 101: not aged
+    p._pending_retry_blocks = {101: 1}
+    seen: list[int] = []
+    monkeypatch.setattr(p, "_process_receipts_for_block", lambda bn, r: seen.append(bn))
+    monkeypatch.setattr(p, "_rpc_batch", lambda calls: [_ok([])])
+    p._retry_pending_receipt_blocks()
+    assert seen == [101]                            # re-fetched + processed
+    assert 101 not in p._pending_retry_blocks       # popped on recovery
+    assert p._block_receipts_recovered_total == 1
+
+
+def test_retry_failure_reincrements_attempts(monkeypatch):
+    p = _make_poller()
+    p._last_polled_block_number = 200
+    p._pending_retry_blocks = {101: 1}
+    monkeypatch.setattr(p, "_rpc_batch", lambda calls: [_err()])
+    p._retry_pending_receipt_blocks()
+    assert p._pending_retry_blocks == {101: 2}      # still failing -> attempt++
+
+
+def test_retry_drops_block_after_max_attempts(monkeypatch):
+    """An exhausted block is dropped with a WARN and NOT re-fetched
+    (no silent truncation of the understatement)."""
+    import pancakebot.chain.rpc_poller as mod
+    p = _make_poller()
+    p._last_polled_block_number = 200
+    p._pending_retry_blocks = {101: p._retry_max_attempts}
+    called: list = []
+    monkeypatch.setattr(p, "_rpc_batch", lambda calls: called.append(calls) or [_ok()])
+    warns: list[str] = []
+    monkeypatch.setattr(mod, "warn", lambda action, msg: warns.append(msg))
+    p._retry_pending_receipt_blocks()
+    assert 101 not in p._pending_retry_blocks       # dropped
+    assert called == []                             # NOT re-fetched
+    assert any("pool understatement: dropped" in m for m in warns)
+
+
+def test_retry_drops_aged_out_block(monkeypatch):
+    """A block older than the retry window is dropped — its bets are
+    epoch-gated out of the current round anyway."""
+    p = _make_poller()
+    p._last_polled_block_number = 10_000            # floor = 9100
+    p._pending_retry_blocks = {100: 1}              # 100 < 9100 -> aged
+    called: list = []
+    monkeypatch.setattr(p, "_rpc_batch", lambda calls: called.append(calls) or [_ok()])
+    p._retry_pending_receipt_blocks()
+    assert 100 not in p._pending_retry_blocks
+    assert called == []
+
+
+def test_retry_does_not_advance_cursor(monkeypatch):
+    """The retry re-fetches specific blocks; it must NOT move the forward-only
+    cursor (_last_polled_block_number) or reorder it."""
+    p = _make_poller()
+    p._last_polled_block_number = 200
+    p._pending_retry_blocks = {101: 1}
+    monkeypatch.setattr(p, "_process_receipts_for_block", lambda bn, r: None)
+    monkeypatch.setattr(p, "_rpc_batch", lambda calls: [_ok([])])
+    p._retry_pending_receipt_blocks()
+    assert p._last_polled_block_number == 200       # unchanged
+
+
+def test_retry_is_idempotent_no_double_count(monkeypatch):
+    """Re-processing a recovered block does NOT double-count its bets
+    (log-id dedup). Conservative-direction invariant: a retry only ADDS
+    previously-missed real bets, never duplicates and never invents."""
+    p = _make_poller()
+    p._current_epoch = 500                          # epoch gate: 500 / 501 allowed
+    monkeypatch.setattr(p, "_resolve_block_ts", lambda bn: 1)
+    receipt = {
+        "logs": [{
+            "address": p._contract_addr,
+            "topics": [_BET_BULL_TOPIC, "0x" + "0" * 64, hex(500)],
+            "data": hex(5 * 10**16),
+            "transactionHash": "0xabc",
+            "logIndex": "0x0",
+        }]
+    }
+    # First read counted it; the retry recover re-processes the same block.
+    p._process_receipts_for_block(101, [receipt])
+    p._process_receipts_for_block(101, [receipt])
+    assert len(p._pools[500].bets) == 1             # deduped, not 2
 
 
 # ---------------------------------------------------------------------------
