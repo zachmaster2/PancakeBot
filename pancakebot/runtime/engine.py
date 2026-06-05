@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import time
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ from pancakebot.runtime.dry import (
     _record_cycle_audit,
 )
 from pancakebot.runtime.live import (
+    DRY_CHANNEL,
+    LIVE_CHANNEL,
     claim_scan_cursor,
     send_bet_confirmed_alert,
     send_bet_dropped_alert,
@@ -379,7 +382,7 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         # wallet-balance read, so the first BET SUBMITTED has a bankroll
         # reference point. Bot-owned (distinct from the supervisor STARTED
         # alert). Best-effort — the sender swallows all webhook errors.
-        send_bot_ready_alert(bankroll_bnb=bankroll_bnb)
+        send_bot_ready_alert(channel=LIVE_CHANNEL, bankroll_bnb=bankroll_bnb)
 
     # Fresh-spawn-during-round-transition race is absorbed by the bare
     # _epoch_handshake retry loop, which retries on all three zero-state
@@ -1253,7 +1256,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 tx_hash=tx_submit.tx_hash, bankroll_after_bnb=projected_bankroll,
             )
             send_bet_submitted_alert(
-                epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
+                channel=LIVE_CHANNEL, epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
                 projected_bankroll_bnb=projected_bankroll,
             )
             receipt_confirmed_ms = (
@@ -1329,7 +1332,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 except Exception:  # noqa: BLE001
                     fresh_bankroll = projected_bankroll
             if conf_status == "CONFIRMED":
-                send_bet_confirmed_alert(epoch=current_epoch, bankroll_bnb=fresh_bankroll)
+                send_bet_confirmed_alert(channel=LIVE_CHANNEL, epoch=current_epoch, bankroll_bnb=fresh_bankroll)
             elif conf_status == "LATE":
                 warn(
                     "ALERT",
@@ -1338,7 +1341,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     f"lock_ts={int(lock_ts_t)} "
                     f"submit_offset_ms={bet_submit_offset_ms:.0f}",
                 )
-                send_bet_late_alert(epoch=current_epoch, bankroll_bnb=fresh_bankroll)
+                send_bet_late_alert(channel=LIVE_CHANNEL, epoch=current_epoch, bankroll_bnb=fresh_bankroll)
             elif conf_status == "REVERTED":
                 warn(
                     "ALERT",
@@ -1346,14 +1349,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     f"(status=0, before lock): tx {_truncate_tx_hash(tx_submit.tx_hash)} "
                     f"block={tx_submit.included_block_number}",
                 )
-                send_bet_reverted_alert(epoch=current_epoch, bankroll_bnb=fresh_bankroll)
+                send_bet_reverted_alert(channel=LIVE_CHANNEL, epoch=current_epoch, bankroll_bnb=fresh_bankroll)
             elif conf_status == "DROPPED":
                 warn(
                     "ALERT",
                     f"Bet TX DROPPED for epoch {current_epoch}: no receipt within "
                     f"{cfg.bet_tx_receipt_timeout_seconds}s (tx {_truncate_tx_hash(tx_submit.tx_hash)})",
                 )
-                send_bet_dropped_alert(epoch=current_epoch, bankroll_bnb=fresh_bankroll)
+                send_bet_dropped_alert(channel=LIVE_CHANNEL, epoch=current_epoch, bankroll_bnb=fresh_bankroll)
             # Bankroll pair for the mode-agnostic BET audit row hoisted below
             # the dry/live split. Live records the PROJECTED bankroll (wallet −
             # stake − gas cap) — defined regardless of CONFIRMED/LATE/REVERTED/
@@ -1385,13 +1388,20 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 bankroll_before_bet_bnb=bankroll_before_bet,
                 bankroll_after_bet_bnb=bankroll_after_bet,
             )
-            # Bet-lifecycle ledger (dry): SUBMITTED record only — no Discord
-            # (dry alerts are silent by convention; D1=(a)). No tx_hash in
+            # Bet-lifecycle ledger (dry): SUBMITTED record only. No tx_hash in
             # dry mode (no on-chain submission).
             bet_ledger.record_submitted(
                 ledger_path=paths.DRY_BETS_LEDGER_PATH,
                 epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
                 tx_hash="", bankroll_after_bnb=bankroll_after_bet,
+            )
+            # Discord (dry): placement alert on the dry channel, same body as
+            # live's BET SUBMITTED. Dry placement is atomic (no separate
+            # confirm), so this is the dry analog of live's placement alert;
+            # the simulated post-debit bankroll stands in for live's projected.
+            send_bet_submitted_alert(
+                channel=DRY_CHANNEL, epoch=current_epoch, side=bet_side, amount_bnb=amount_bnb,
+                projected_bankroll_bnb=bankroll_after_bet,
             )
             # Bankroll pair for the mode-agnostic BET audit row (hoisted below).
             _audit_bk_before = bankroll_before_bet
@@ -1554,8 +1564,8 @@ def _reconcile_live_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             buffer_seconds=cfg.buffer_seconds,
             now_ts=int(_utc_now()),
             wallet_address=cfg.wallet_address,
-            lost_alert_fn=send_bet_settled_alert,
-            dropped_alert_fn=send_bet_dropped_alert,
+            lost_alert_fn=functools.partial(send_bet_settled_alert, channel=LIVE_CHANNEL),
+            dropped_alert_fn=functools.partial(send_bet_dropped_alert, channel=LIVE_CHANNEL),
         )
     except Exception as e:  # noqa: BLE001
         warn("ALERT", f"bet ledger reconcile failed: {e}")
