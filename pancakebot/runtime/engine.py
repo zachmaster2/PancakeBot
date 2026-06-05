@@ -35,6 +35,8 @@ from pancakebot.runtime.live import (
     LIVE_CHANNEL,
     claim_scan_cursor,
     send_bet_confirmed_alert,
+    send_cooldown_entered_alert,
+    send_cooldown_lifted_alert,
     send_bet_dropped_alert,
     send_bet_late_alert,
     send_bet_reverted_alert,
@@ -942,6 +944,21 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         except Exception:  # noqa: BLE001 — telemetry must never break betting
             pass
 
+        # D3: COOLDOWN LIFTED edge-detect — runs for every decision (bet OR
+        # skip). If we WERE in a drawdown cooldown and this round is no longer a
+        # cooldown skip (betting resumed, or a different skip reason), fire the
+        # LIFTED alert once and clear the flag. Cooldown gates only NEW bets, so
+        # this is purely an operator-visibility signal.
+        _cd_reason = decision.skip_reason or ""
+        if closed.in_cooldown and _cd_reason not in (
+            "risk_cooldown_active", "risk_drawdown_breaker_fired",
+        ):
+            closed.in_cooldown = False
+            send_cooldown_lifted_alert(
+                channel=(DRY_CHANNEL if cfg.dry else LIVE_CHANNEL),
+                bankroll_bnb=bankroll_bnb,
+            )
+
         if decision.action != "BET":
             reason = decision.skip_reason or ""
             if reason == "":
@@ -1014,8 +1031,21 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     f"({_ctx['drawdown_pct']:.1f}% from peak, "
                     f"threshold {_ctx['threshold_pct']:.0f}%)",
                 )
+                # D3: COOLDOWN ENTERED alert on the trip edge (once per entry).
+                if not closed.in_cooldown:
+                    closed.in_cooldown = True
+                    _cd_rounds = int(cfg.strategy.risk.cooldown_rounds)
+                    send_cooldown_entered_alert(
+                        channel=(DRY_CHANNEL if cfg.dry else LIVE_CHANNEL),
+                        drawdown_pct=float(_ctx["drawdown_pct"]),
+                        threshold_pct=float(_ctx["threshold_pct"]),
+                        bankroll_bnb=bankroll_bnb,
+                        cooldown_rounds=_cd_rounds,
+                        approx_hours=_cd_rounds * cfg.interval_seconds / 3600.0,
+                    )
             elif reason == "risk_cooldown_active":
                 _ctx = decision.skip_context
+                closed.in_cooldown = True  # D3: stay marked until LIFTED edge
                 info(
                     "SKIP",
                     f"Skipped epoch {current_epoch}: cooldown active "

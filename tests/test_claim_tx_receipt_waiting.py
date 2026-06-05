@@ -263,8 +263,8 @@ def test_send_claim_failure_alert_posts_expected_payload(monkeypatch):
     payload = captured["json"]
     assert payload["username"] == "PancakeBot-live"
     content = payload["content"]
-    # Step 31: migrated to [CRIT] ASCII tag (no emoji, no bot-id prefix).
-    assert content.startswith("[CRIT] **CLAIM FAILED**")
+    # Step 31: [CRIT] ASCII tag (no emoji). D5: [LIVE] mode prefix on all alerts.
+    assert content.startswith("[LIVE] [CRIT] **CLAIM FAILED**")
     assert ":rotating_light:" not in content
     assert "reason=`revert`" in content
     assert "tx=`0xabc123`" in content

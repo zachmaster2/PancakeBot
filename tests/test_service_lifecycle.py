@@ -282,6 +282,34 @@ def test_build_message_with_detail_string():
     assert "stopping PancakeBotDry" in msg
 
 
+# D5: every supervisor alert carries the [MODE] prefix (matches bet-alert channels)
+def test_build_message_has_mode_prefix_live():
+    msg = notifications.build_message(mode="live", kind="STARTED", fields={"pid": 1})
+    assert msg.startswith("[LIVE] [INFO] **STARTED**")
+
+
+def test_build_message_has_mode_prefix_dry():
+    msg = notifications.build_message(mode="dry", kind="REBOOTED", fields={"pid": 1})
+    assert msg.startswith("[DRY] [INFO] **REBOOTED**")
+
+
+# D4: STOPPED is INFO when intentional, CRIT when unexpected
+def test_stopped_intentional_is_info():
+    msg = notifications.build_message(mode="dry", kind="STOPPED", fields={"intentional": True})
+    assert msg.startswith("[DRY] [INFO] **STOPPED**")
+
+
+def test_stopped_unintentional_is_crit():
+    msg = notifications.build_message(mode="dry", kind="STOPPED", fields={"intentional": False})
+    assert msg.startswith("[DRY] [CRIT] **STOPPED**")
+
+
+def test_stopped_missing_intent_defaults_crit():
+    # No 'intentional' field -> treated as unexpected -> CRIT (fail-safe).
+    msg = notifications.build_message(mode="live", kind="STOPPED")
+    assert msg.startswith("[LIVE] [CRIT] **STOPPED**")
+
+
 # ---------------------------------------------------------------------------
 # notifications.notify — DISABLED path (no HTTP made)
 # ---------------------------------------------------------------------------
