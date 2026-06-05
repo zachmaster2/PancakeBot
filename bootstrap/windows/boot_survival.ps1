@@ -19,10 +19,12 @@
        elevation), then stamps the window AUMID via
        C:\Tools\stamp_claude_aumid.exe.
 
-  The C:\Tools payload (Autologon, the .vbs launchers, stamp_claude_aumid.exe +
-  src) currently lives OUTSIDE the repo. This script does not recreate those
-  binaries — it verifies they exist and wires the scheduled task. See
-  bootstrap\windows\AUMID_stamper\README.md for how to rebuild the stamper.
+  The launcher VBS (launch_claude_admin_direct.vbs) is repo-tracked under
+  bootstrap\windows\ and is DEPLOYED to ToolsDir by this script, so a fresh
+  clone + install.ps1 -IncludeOperatorUI reproduces it. The AUMID stamper
+  (stamp_claude_aumid.exe) + Autologon remain out-of-repo binaries — this
+  script verifies the stamper exists. See bootstrap\windows\AUMID_stamper\
+  README.md for how to rebuild the stamper.
 #>
 [CmdletBinding()]
 param(
@@ -37,13 +39,19 @@ $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $vbs = Join-Path $ToolsDir "launch_claude_admin_direct.vbs"
 $stamper = Join-Path $ToolsDir "stamp_claude_aumid.exe"
 
-# 1. Verify the out-of-repo Tools payload.
-foreach ($p in @($vbs, $stamper)) {
-    if (-not (Test-Path $p)) {
-        throw "missing operator-UI artifact: $p (see bootstrap\windows\AUMID_stamper\README.md)"
-    }
+# 1. Deploy the repo-tracked launcher VBS to ToolsDir; verify the (out-of-repo,
+#    binary) AUMID stamper is present.
+$repoVbs = Join-Path $Here "launch_claude_admin_direct.vbs"
+if (-not (Test-Path $repoVbs)) {
+    throw "missing repo launcher: $repoVbs"
 }
-Log "Tools payload present: $vbs, $stamper"
+New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
+Copy-Item $repoVbs $vbs -Force
+Log "deployed launcher: $repoVbs -> $vbs"
+if (-not (Test-Path $stamper)) {
+    throw "missing AUMID stamper: $stamper (out-of-repo binary; see bootstrap\windows\AUMID_stamper\README.md to rebuild)"
+}
+Log "AUMID stamper present: $stamper"
 
 # 2. Autologon (delegated).
 Log "configuring autologon"

@@ -3,3 +3,6 @@
 # CRLF leaking into these.
 *.sh text eol=lf
 bootstrap/linux/install_python313.sh text eol=lf
+# Windows Script Host launcher: keep CRLF (Windows convention; cscript reads
+# either, but this avoids autocrlf churn).
+*.vbs text eol=crlf
