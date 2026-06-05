@@ -55,7 +55,7 @@ class AlertChannel:
     prefix: str
 
 
-LIVE_CHANNEL = AlertChannel(_LIVE_ALERTS_WEBHOOK_ENV, "PancakeBot-live", "")
+LIVE_CHANNEL = AlertChannel(_LIVE_ALERTS_WEBHOOK_ENV, "PancakeBot-live", "[LIVE] ")
 DRY_CHANNEL = AlertChannel(_DRY_ALERTS_WEBHOOK_ENV, "PancakeBot-dry", "[DRY] ")
 
 
@@ -99,7 +99,7 @@ def _send_claim_failure_alert(
     payload = {
         "username": "PancakeBot-live",
         "content": (
-            f"[CRIT] **CLAIM FAILED** reason=`{reason}`, tx=`{tx_hash}`, "
+            f"[LIVE] [CRIT] **CLAIM FAILED** reason=`{reason}`, tx=`{tx_hash}`, "
             f"epochs=`[{epoch_str}]`, gas_limit=`{int(gas_limit)}`"
         ),
     }
@@ -159,7 +159,7 @@ def send_gas_cap_breach_alert(
     payload = {
         "username": "PancakeBot-live",
         "content": (
-            f"{sev_tag} **GAS CAP BREACHED** path=`{path}`, {epoch_str}"
+            f"[LIVE] {sev_tag} **GAS CAP BREACHED** path=`{path}`, {epoch_str}"
             f"suggested=`{_fmt_gwei(suggested_wei)}`, cap=`{_fmt_gwei(cap_wei)}`, "
             f"ratio=`{suggested_wei / cap_wei:.2f}x` — {action_note}"
         ),
@@ -218,6 +218,32 @@ def send_bot_ready_alert(*, channel: AlertChannel, bankroll_bnb: float) -> None:
         channel,
         f"[INFO] **BOT READY** `{channel.username}` — bankroll `{bankroll_bnb:.4f}` BNB",
         label="BOT READY", ctx="startup",
+    )
+
+
+def send_cooldown_entered_alert(
+    *, channel: AlertChannel, drawdown_pct: float, threshold_pct: float,
+    bankroll_bnb: float, cooldown_rounds: int, approx_hours: float,
+) -> None:
+    """[WARN] COOLDOWN ENTERED — the drawdown-from-peak breaker fired; NEW bet
+    placement pauses for ``cooldown_rounds`` rounds. Settlement, claim, and
+    alerts for already-placed bets keep running (cooldown gates new bets only)."""
+    _post_mode_alert(
+        channel,
+        f"[WARN] **COOLDOWN ENTERED** — drawdown `{drawdown_pct:.1f}%`, "
+        f"threshold `{threshold_pct:.0f}%`, bankroll `{bankroll_bnb:.4f}` BNB, "
+        f"`{int(cooldown_rounds)}` rounds (~`{approx_hours:.1f}h`)",
+        label="COOLDOWN ENTERED", ctx=f"drawdown={drawdown_pct:.1f}%",
+    )
+
+
+def send_cooldown_lifted_alert(*, channel: AlertChannel, bankroll_bnb: float) -> None:
+    """[INFO] COOLDOWN LIFTED — the drawdown cooldown elapsed; bet placement
+    resumes."""
+    _post_mode_alert(
+        channel,
+        f"[INFO] **COOLDOWN LIFTED** — bankroll `{bankroll_bnb:.4f}` BNB, betting resumes",
+        label="COOLDOWN LIFTED", ctx="resume",
     )
 
 

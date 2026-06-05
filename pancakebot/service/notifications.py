@@ -207,7 +207,16 @@ def build_message(
     local = _local_time_str()
 
     severity = _SEVERITY_BY_KIND.get(kind, "INFO")
-    header = f"[{severity}] **{kind}** `PancakeBot-{mode}` on `{hostname}` at `{local}`"
+    # D4: STOPPED is INFO when intentional (admin/SCM stop, mode mutex, deploy)
+    # and CRIT otherwise. The supervisor passes ``intentional=True`` on the clean
+    # stop path; any future unintentional STOPPED stays CRIT.
+    if kind == "STOPPED":
+        severity = "INFO" if fields.get("intentional") else "CRIT"
+    # D5: [MODE] prefix on EVERY alert (matches the bet-alert channel prefix) —
+    # consistent visual scan + a guard against webhook misconfiguration (a
+    # misrouted alert is obvious by its mode tag).
+    mode_tag = f"[{mode.upper()}] "
+    header = f"{mode_tag}[{severity}] **{kind}** `PancakeBot-{mode}` on `{hostname}` at `{local}`"
     lines: list[str] = [header]
 
     if detail:

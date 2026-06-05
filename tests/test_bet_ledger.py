@@ -710,13 +710,14 @@ def _wire(monkeypatch, code=204):
     return fake
 
 
-# The locked live message bodies (no prefix). Dry posts the SAME body with a
-# "[DRY] " prefix on the dry channel — asserted byte-for-byte below.
+# The locked message bodies. Each mode carries its channel prefix: "[LIVE] "
+# for live, "[DRY] " for dry. Body after the prefix is byte-identical across
+# modes (asserted below).
 def test_bot_ready_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
     live_mod.send_bot_ready_alert(channel=live_mod.LIVE_CHANNEL, bankroll_bnb=2.345)
     assert _content(fake) == (
-        "[INFO] **BOT READY** `PancakeBot-live` — bankroll `2.3450` BNB"
+        "[LIVE] [INFO] **BOT READY** `PancakeBot-live` — bankroll `2.3450` BNB"
     )
     assert _username(fake) == "PancakeBot-live"
 
@@ -726,7 +727,7 @@ def test_submitted_format_exact(monkeypatch):
     live_mod.send_bet_submitted_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, side="Bull",
                                       amount_bnb=0.05, projected_bankroll_bnb=2.3463)
     assert _content(fake) == (
-        "[INFO] **BET SUBMITTED** epoch `999` — Bet `0.0500` BNB on Bull, "
+        "[LIVE] [INFO] **BET SUBMITTED** epoch `999` — Bet `0.0500` BNB on Bull, "
         "projected bankroll `2.3463` BNB"
     )
 
@@ -734,25 +735,25 @@ def test_submitted_format_exact(monkeypatch):
 def test_confirmed_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
     live_mod.send_bet_confirmed_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, bankroll_bnb=2.2950)
-    assert _content(fake) == "[INFO] **BET CONFIRMED** epoch `999` — bankroll `2.2950` BNB"
+    assert _content(fake) == "[LIVE] [INFO] **BET CONFIRMED** epoch `999` — bankroll `2.2950` BNB"
 
 
 def test_late_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
     live_mod.send_bet_late_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, bankroll_bnb=2.3452)
-    assert _content(fake) == "[WARN] **BET LATE** epoch `999` — bankroll `2.3452` BNB"
+    assert _content(fake) == "[LIVE] [WARN] **BET LATE** epoch `999` — bankroll `2.3452` BNB"
 
 
 def test_reverted_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
     live_mod.send_bet_reverted_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, bankroll_bnb=2.3452)
-    assert _content(fake) == "[WARN] **BET REVERTED** epoch `999` — bankroll `2.3452` BNB"
+    assert _content(fake) == "[LIVE] [WARN] **BET REVERTED** epoch `999` — bankroll `2.3452` BNB"
 
 
 def test_dropped_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
     live_mod.send_bet_dropped_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, bankroll_bnb=2.3452)
-    assert _content(fake) == "[WARN] **BET DROPPED** epoch `999` — bankroll `2.3452` BNB"
+    assert _content(fake) == "[LIVE] [WARN] **BET DROPPED** epoch `999` — bankroll `2.3452` BNB"
 
 
 def test_won_format_exact(monkeypatch):
@@ -760,7 +761,7 @@ def test_won_format_exact(monkeypatch):
     live_mod.send_bet_settled_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, won=True,
                                     delta_bnb=0.0423, amount_bnb=0.05, new_bankroll_bnb=2.3886)
     assert _content(fake) == (
-        "[INFO] **BET WON** epoch `999` — Won `0.0423` BNB, bankroll `2.3886` BNB"
+        "[LIVE] [INFO] **BET WON** epoch `999` — Won `0.0423` BNB, bankroll `2.3886` BNB"
     )
 
 
@@ -770,7 +771,7 @@ def test_lost_format_exact(monkeypatch):
                                     delta_bnb=-0.05, amount_bnb=0.05, new_bankroll_bnb=2.2963)
     # Lost amount shown positive; the verb conveys direction.
     assert _content(fake) == (
-        "[INFO] **BET LOST** epoch `999` — Lost `0.0500` BNB, bankroll `2.2963` BNB"
+        "[LIVE] [INFO] **BET LOST** epoch `999` — Lost `0.0500` BNB, bankroll `2.2963` BNB"
     )
 
 
@@ -779,7 +780,7 @@ def test_refund_format_exact(monkeypatch):
     live_mod.send_bet_refund_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, refund_bnb=0.05,
                                    new_bankroll_bnb=2.3455)
     assert _content(fake) == (
-        "[INFO] **BET REFUND** epoch `999` — Refunded `0.0500` BNB, bankroll `2.3455` BNB"
+        "[LIVE] [INFO] **BET REFUND** epoch `999` — Refunded `0.0500` BNB, bankroll `2.3455` BNB"
     )
 
 
@@ -788,7 +789,7 @@ def test_won_batch_format_exact(monkeypatch):
     live_mod.send_bet_won_batch_alert(channel=live_mod.LIVE_CHANNEL, epochs=[101, 102, 103],
                                       total_delta_bnb=0.12, new_bankroll_bnb=2.50)
     assert _content(fake) == (
-        "[INFO] **BET WON** epochs `[101, 102, 103]` — Won `0.1200` BNB total, "
+        "[LIVE] [INFO] **BET WON** epochs `[101, 102, 103]` — Won `0.1200` BNB total, "
         "bankroll `2.5000` BNB"
     )
 
@@ -836,17 +837,52 @@ def test_dry_refund_is_live_body_with_dry_prefix(monkeypatch):
 
 
 def test_dry_and_live_bodies_identical_modulo_prefix(monkeypatch):
-    """The dry message body equals the live body with the channel prefix
-    stripped — the ONLY difference between modes is webhook+username+prefix."""
+    """Dry and live share an identical BODY; the only difference is the channel
+    prefix (+ webhook/username). Stripping each prefix yields the same body."""
     fake = _wire(monkeypatch)
     live_mod.send_bet_settled_alert(channel=live_mod.LIVE_CHANNEL, epoch=42, won=True,
                                     delta_bnb=0.01, amount_bnb=0.05, new_bankroll_bnb=3.0)
-    live_body = _content(fake)
+    live_content = _content(fake)
     live_mod.send_bet_settled_alert(channel=live_mod.DRY_CHANNEL, epoch=42, won=True,
                                     delta_bnb=0.01, amount_bnb=0.05, new_bankroll_bnb=3.0)
-    dry_body = _content(fake)
-    assert dry_body == live_mod.DRY_CHANNEL.prefix + live_body
-    assert live_mod.LIVE_CHANNEL.prefix == ""        # live carries no prefix
+    dry_content = _content(fake)
+    live_body = live_content[len(live_mod.LIVE_CHANNEL.prefix):]
+    dry_body = dry_content[len(live_mod.DRY_CHANNEL.prefix):]
+    assert live_body == dry_body                     # identical body across modes
+    assert live_content.startswith("[LIVE] ")
+    assert dry_content.startswith("[DRY] ")
+
+
+# --- D3: COOLDOWN ENTERED / LIFTED alerts ----------------------------------
+def test_cooldown_entered_format_exact(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_cooldown_entered_alert(
+        channel=live_mod.LIVE_CHANNEL, drawdown_pct=19.2, threshold_pct=15.0,
+        bankroll_bnb=4.3581, cooldown_rounds=72, approx_hours=6.0,
+    )
+    assert _content(fake) == (
+        "[LIVE] [WARN] **COOLDOWN ENTERED** — drawdown `19.2%`, threshold `15%`, "
+        "bankroll `4.3581` BNB, `72` rounds (~`6.0h`)"
+    )
+
+
+def test_cooldown_lifted_format_exact(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_cooldown_lifted_alert(channel=live_mod.LIVE_CHANNEL, bankroll_bnb=5.0)
+    assert _content(fake) == (
+        "[LIVE] [INFO] **COOLDOWN LIFTED** — bankroll `5.0000` BNB, betting resumes"
+    )
+
+
+def test_cooldown_dry_prefix_and_channel(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_cooldown_entered_alert(
+        channel=live_mod.DRY_CHANNEL, drawdown_pct=19.2, threshold_pct=15.0,
+        bankroll_bnb=4.3581, cooldown_rounds=72, approx_hours=6.0,
+    )
+    assert _content(fake).startswith("[DRY] [WARN] **COOLDOWN ENTERED**")
+    assert _username(fake) == "PancakeBot-dry"
+    assert fake.captured["url"] == "https://d/dry"
 
 
 def test_no_gas_in_any_alert(monkeypatch):
@@ -969,7 +1005,7 @@ def test_lost_alert_uses_fresh_wallet_read_not_arithmetic(tmp_path, monkeypatch)
     # 1) LOSS alert string carries the fresh read verbatim.
     c = _content(fake)
     assert c == (
-        "[INFO] **BET LOST** epoch `100` — Lost `0.0500` BNB, bankroll `999.9999` BNB"
+        "[LIVE] [INFO] **BET LOST** epoch `100` — Lost `0.0500` BNB, bankroll `999.9999` BNB"
     )
     assert "2.25" not in c and "2.30" not in c             # no arithmetic projection
     # 2) SETTLED_LOST ledger record new_bk == fresh read (not arithmetic).
@@ -1023,7 +1059,7 @@ def test_won_alert_correction_suffix_after_drop(tmp_path, monkeypatch):
                                        contract=contract, wallet_address="0xme")
     c = _content(fake)
     assert c == (
-        "[INFO] **BET WON** epoch `100` — Won `0.0400` BNB, bankroll `2.3900` BNB" + _SUFFIX
+        "[LIVE] [INFO] **BET WON** epoch `100` — Won `0.0400` BNB, bankroll `2.3900` BNB" + _SUFFIX
     )
 
 
@@ -1048,7 +1084,7 @@ def test_lost_alert_correction_suffix_after_drop(tmp_path, monkeypatch):
                          dropped_alert_fn=None)
     c = _content(fake)
     assert c == (
-        "[INFO] **BET LOST** epoch `100` — Lost `0.0500` BNB, bankroll `2.2949` BNB" + _SUFFIX
+        "[LIVE] [INFO] **BET LOST** epoch `100` — Lost `0.0500` BNB, bankroll `2.2949` BNB" + _SUFFIX
     )
 
 
@@ -1064,7 +1100,7 @@ def test_refund_alert_correction_suffix_after_drop(tmp_path, monkeypatch):
                                        contract=contract, wallet_address="0xme")
     c = _content(fake)
     assert c == (
-        "[INFO] **BET REFUND** epoch `100` — Refunded `0.0500` BNB, bankroll `2.3455` BNB" + _SUFFIX
+        "[LIVE] [INFO] **BET REFUND** epoch `100` — Refunded `0.0500` BNB, bankroll `2.3455` BNB" + _SUFFIX
     )
 
 
@@ -1079,7 +1115,7 @@ def test_won_alert_no_suffix_when_no_prior_drop(tmp_path, monkeypatch):
     live_mod.fire_claim_settled_alerts(ledger_path=lp, claimed_epochs=[100],
                                        contract=contract, wallet_address="0xme")
     c = _content(fake)
-    assert c == "[INFO] **BET WON** epoch `100` — Won `0.0400` BNB, bankroll `2.3900` BNB"
+    assert c == "[LIVE] [INFO] **BET WON** epoch `100` — Won `0.0400` BNB, bankroll `2.3900` BNB"
     assert "previously reported as DROPPED" not in c
 
 
@@ -1238,7 +1274,7 @@ def test_claim_failure_alert_ascii_format(monkeypatch):
     live_mod._send_claim_failure_alert(reason="revert", tx_hash="0xabc123",
                                        epochs=[401, 402, 403], gas_limit=900_000)
     assert _content(fake) == (
-        "[CRIT] **CLAIM FAILED** reason=`revert`, tx=`0xabc123`, "
+        "[LIVE] [CRIT] **CLAIM FAILED** reason=`revert`, tx=`0xabc123`, "
         "epochs=`[401,402,403]`, gas_limit=`900000`"
     )
     assert ":rotating_light:" not in _content(fake)
@@ -1249,7 +1285,7 @@ def test_gas_cap_breach_bet_path_crit(monkeypatch):
     live_mod.send_gas_cap_breach_alert(path="bet", suggested_wei=8_000_000_000,
                                        cap_wei=5_000_000_000, epoch=12345)
     c = _content(fake)
-    assert c.startswith("[CRIT] **GAS CAP BREACHED** path=`bet`, epoch=`12345`, ")
+    assert c.startswith("[LIVE] [CRIT] **GAS CAP BREACHED** path=`bet`, epoch=`12345`, ")
     assert "suggested=`8 gwei`, cap=`5 gwei`, ratio=`1.60x`" in c
     assert "Bet SKIPPED" in c
     # gwei units (raw wei value absent); no double-crit marker.
@@ -1261,7 +1297,7 @@ def test_gas_cap_breach_claim_path_warn(monkeypatch):
     live_mod.send_gas_cap_breach_alert(path="claim", suggested_wei=8_250_000_000,
                                        cap_wei=5_000_000_000, epochs=[401, 402])
     c = _content(fake)
-    assert c.startswith("[WARN] **GAS CAP BREACHED** path=`claim`, epochs=`[401,402]`, ")
+    assert c.startswith("[LIVE] [WARN] **GAS CAP BREACHED** path=`claim`, epochs=`[401,402]`, ")
     assert "suggested=`8.25 gwei`, cap=`5 gwei`" in c
     assert "Claim skipped this round" in c
     assert ":warning:" not in c

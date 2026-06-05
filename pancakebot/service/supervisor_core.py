@@ -132,8 +132,15 @@ class SupervisorCore:
 
         # Stop path: drain the child (kept here, not in request_stop, so a
         # SIGTERM handler stays minimal/re-entrancy-safe), then notify STOPPED.
+        # This path is only reached when the run loop exits via _stop_requested
+        # (SIGTERM/SCM stop / mode mutex / deploy) -> intentional (D4: INFO). A
+        # child crash triggers CRASHED+restart, not STOPPED; a supervisor crash
+        # is caught by the entrypoint wrapper as SERVICE_CRASHED.
         self._stop_bot_child(reason="stop")
-        notifications.notify(mode=self._mode, kind="STOPPED", art=art)
+        notifications.notify(
+            mode=self._mode, kind="STOPPED",
+            fields={"intentional": self._stop_requested}, art=art,
+        )
         self._log("INFO", f"{self._svc_name}: clean exit")
 
     # -- mode mutex --------------------------------------------------------

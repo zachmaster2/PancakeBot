@@ -42,6 +42,10 @@ class _ClosedState:
     # "was" at failure.
     iteration_count: int = 0
     last_seen_epoch: int | None = None
+    # D3: tracks whether the bot is currently in a drawdown cooldown, so the
+    # engine can fire COOLDOWN ENTERED / LIFTED alerts on the transition (the
+    # pipeline only emits per-round SKIP verdicts; the edge-detect lives here).
+    in_cooldown: bool = False
 
 
 @dataclass(frozen=True, slots=True)
