@@ -177,6 +177,14 @@ class LinuxServicePlatform(ServicePlatform):
     def disable_auto_start(self, service_name: str) -> None:
         self._systemctl("disable", self._unit_name(service_name))
 
+    def clear_restart_counter(self, service_name: str) -> None:
+        # systemd's StartLimit counts EVERY start (manual + Restart=on-failure),
+        # so an intentional restart would otherwise consume the burst budget.
+        # reset-failed zeroes both the failure state and the start-rate counter.
+        # The supervisor calls this only after a start that followed an
+        # intentional stop (crash restarts are NOT cleared -> crashloop guard).
+        self._systemctl("reset-failed", self._unit_name(service_name))
+
     def set_restart_on_failure(
         self, service_name: str, *, max_attempts: int, reset_window_s: int, delay_s: int = 60,
     ) -> None:

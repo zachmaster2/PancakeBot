@@ -114,6 +114,25 @@ def test_linux_enable_disable():
     assert ["systemctl", "disable", "pancakebot-live.service"] in r.calls
 
 
+def test_linux_clear_restart_counter_calls_reset_failed():
+    # E: intentional-restart handshake — Linux clears systemd's start counter.
+    r = _FakeRunner()
+    p = LinuxServicePlatform(runner=r)
+    p.clear_restart_counter("pancakebot-live")
+    assert ["systemctl", "reset-failed", "pancakebot-live.service"] in r.calls
+
+
+@pytest.mark.skipif(not _IS_WIN, reason="Windows adapter needs pywin32")
+def test_windows_clear_restart_counter_is_noop():
+    # E: Windows inherits the base no-op — SCM `failureflag 1` already counts
+    # only non-clean exits, so an intentional stop never increments the counter.
+    from pancakebot.service.windows_platform import WindowsServicePlatform
+    r = _FakeRunner()
+    p = WindowsServicePlatform(runner=r)
+    p.clear_restart_counter("PancakeBotLive")
+    assert r.calls == []          # nothing to reset -> no sc.exe call
+
+
 def test_linux_signal_health_payload_mapping():
     p = LinuxServicePlatform(runner=_FakeRunner())
     seen = []

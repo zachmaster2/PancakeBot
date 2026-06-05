@@ -147,6 +147,16 @@ class ServicePlatform(abc.ABC):
     @abc.abstractmethod
     def set_service_dependencies(self, service_name: str, *, requires_network: bool) -> None: ...
 
+    def clear_restart_counter(self, service_name: str) -> None:
+        """Reset the OUTER-supervisor restart/start counter to zero. Called by
+        the supervisor after a start that followed an INTENTIONAL stop, so
+        deploys / admin restarts don't exhaust the start limit (crash restarts
+        are never cleared). Default: no-op — only a platform whose limiter
+        counts intentional restarts needs to override this. systemd's StartLimit
+        counts every start (Linux overrides -> ``reset-failed``); Windows SCM
+        uses ``failureflag 1`` so intentional ``sc stop`` never counts (no-op)."""
+        return
+
     # -- supervisor runtime primitives (used by the supervision loop) ------
 
     @abc.abstractmethod
