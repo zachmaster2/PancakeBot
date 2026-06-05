@@ -36,10 +36,27 @@ def _truncate_tx_hash(tx_hash: str) -> str:
 # verification that larger TXs land reliably across all WRITE_PATH_RPC_URLS.
 _MAX_CLAIM_EPOCHS_PER_TX = 10
 
-# Env var holding the live-mode Discord webhook URL. Mirrors the supervisor's
-# ``_env_var_for_mode("live")`` definition so a misrouted webhook here would
+# Env vars holding the per-mode Discord webhook URLs. Mirror the supervisor's
+# ``_env_var_for_mode(...)`` definitions so a misrouted webhook here would
 # produce the same operator-visible miss as a supervisor-side issue.
 _LIVE_ALERTS_WEBHOOK_ENV = "PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL"
+_DRY_ALERTS_WEBHOOK_ENV = "PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL"
+
+
+@dataclass(frozen=True, slots=True)
+class AlertChannel:
+    """Discord routing target for a bet-lifecycle alert. Live and dry are
+    symmetric: each mode owns a ``(webhook env var, bot username, message
+    prefix)`` triple, and both pass their channel to ``_post_mode_alert``. The
+    alert body is mode-agnostic — only the channel differs (webhook + username
+    + a ``[DRY] ``/``""`` prefix)."""
+    webhook_env: str
+    username: str
+    prefix: str
+
+
+LIVE_CHANNEL = AlertChannel(_LIVE_ALERTS_WEBHOOK_ENV, "PancakeBot-live", "")
+DRY_CHANNEL = AlertChannel(_DRY_ALERTS_WEBHOOK_ENV, "PancakeBot-dry", "[DRY] ")
 
 
 def _fmt_gwei(wei: int) -> str:
@@ -161,21 +178,23 @@ def send_gas_cap_breach_alert(
         )
 
 
-def _post_live_alert(content: str, *, label: str, ctx: str) -> None:
-    """Shared best-effort POST to the live Discord webhook for bet-lifecycle
-    alerts. Swallows every failure (missing env, import, transport, non-2xx)
-    with a WARN log so the bot hot path never crashes on a webhook hiccup.
-    ``label`` is the alert name for log lines; ``ctx`` is extra context."""
-    webhook = os.environ.get(_LIVE_ALERTS_WEBHOOK_ENV, "").strip()
+def _post_mode_alert(channel: AlertChannel, content: str, *, label: str, ctx: str) -> None:
+    """The single best-effort POST for bet-lifecycle alerts, called directly by
+    both live and dry. ``channel`` supplies the routing triple (webhook env,
+    username, message prefix); ``content`` is the mode-agnostic body. Swallows
+    every failure (missing env, import, transport, non-2xx) with a WARN log so
+    the bot hot path never crashes on a webhook hiccup. ``label`` is the alert
+    name for log lines; ``ctx`` is extra context."""
+    webhook = os.environ.get(channel.webhook_env, "").strip()
     if not webhook:
-        warn("ALERT", f"{_LIVE_ALERTS_WEBHOOK_ENV} unset; {label} alert not sent ({ctx})")
+        warn("ALERT", f"{channel.webhook_env} unset; {label} alert not sent ({ctx})")
         return
     try:
         import requests
     except Exception as e:  # noqa: BLE001
         warn("ALERT", f"{label} alert import failed ({ctx} err={e})")
         return
-    payload = {"username": "PancakeBot-live", "content": content}
+    payload = {"username": channel.username, "content": channel.prefix + content}
     try:
         r = requests.post(webhook, json=payload, timeout=10)
     except Exception as e:  # noqa: BLE001
@@ -191,64 +210,73 @@ def _post_live_alert(content: str, *, label: str, ctx: str) -> None:
 # backtick-fenced values, no gas (gas still goes to the ledger file for
 # forensics — only stripped from Discord display), no tx hashes.
 
-def send_bot_ready_alert(*, bankroll_bnb: float) -> None:
+def send_bot_ready_alert(*, channel: AlertChannel, bankroll_bnb: float) -> None:
     """[INFO] BOT READY — fired once per bot start after the first successful
     wallet-balance read, so the first BET SUBMITTED has a reference point.
     Bot-owned (not the supervisor's STARTED alert)."""
-    _post_live_alert(
-        f"[INFO] **BOT READY** `PancakeBot-live` — bankroll `{bankroll_bnb:.4f}` BNB",
+    _post_mode_alert(
+        channel,
+        f"[INFO] **BOT READY** `{channel.username}` — bankroll `{bankroll_bnb:.4f}` BNB",
         label="BOT READY", ctx="startup",
     )
 
 
 def send_bet_submitted_alert(
-    *, epoch: int, side: str, amount_bnb: float, projected_bankroll_bnb: float,
+    *, channel: AlertChannel, epoch: int, side: str, amount_bnb: float, projected_bankroll_bnb: float,
 ) -> None:
-    """[INFO] BET SUBMITTED — fired at TX broadcast (before the receipt wait).
-    ``projected_bankroll_bnb`` = pre_bet_wallet − stake − bet gas cap (the
-    bankroll if the bet registers). The post-receipt alert (CONFIRMED / LATE /
-    REVERTED / DROPPED) reports the actual fresh balance."""
-    _post_live_alert(
+    """[INFO] BET SUBMITTED — fired at bet placement (live: TX broadcast before
+    the receipt wait; dry: simulated placement, no TX). ``projected_bankroll_bnb``
+    = pre_bet_wallet − stake − bet gas cap (the bankroll if the bet registers;
+    in dry this equals the post-debit simulated bankroll). Live's post-receipt
+    alert (CONFIRMED / LATE / REVERTED / DROPPED) reports the actual fresh
+    balance; dry's placement is atomic so SUBMITTED is its single placement
+    event."""
+    _post_mode_alert(
+        channel,
         f"[INFO] **BET SUBMITTED** epoch `{int(epoch)}` — "
         f"Bet `{amount_bnb:.4f}` BNB on {side}, projected bankroll `{projected_bankroll_bnb:.4f}` BNB",
         label="BET SUBMITTED", ctx=f"epoch={epoch} side={side}",
     )
 
 
-def send_bet_confirmed_alert(*, epoch: int, bankroll_bnb: float) -> None:
+def send_bet_confirmed_alert(*, channel: AlertChannel, epoch: int, bankroll_bnb: float) -> None:
     """[INFO] BET CONFIRMED — bet TX mined before lock, stake registered.
     Bankroll is the fresh post-confirm wallet read (stake+gas debited).
-    Amount/side already shown in BET SUBMITTED."""
-    _post_live_alert(
+    Amount/side already shown in BET SUBMITTED. Live-only (dry has no receipt)."""
+    _post_mode_alert(
+        channel,
         f"[INFO] **BET CONFIRMED** epoch `{int(epoch)}` — bankroll `{bankroll_bnb:.4f}` BNB",
         label="BET CONFIRMED", ctx=f"epoch={epoch}",
     )
 
 
-def send_bet_late_alert(*, epoch: int, bankroll_bnb: float) -> None:
+def send_bet_late_alert(*, channel: AlertChannel, epoch: int, bankroll_bnb: float) -> None:
     """[WARN] BET LATE — bet TX mined at/after lock; PCS rejected it (stake
     rolled back). Bankroll is the fresh read (gas-only debit)."""
-    _post_live_alert(
+    _post_mode_alert(
+        channel,
         f"[WARN] **BET LATE** epoch `{int(epoch)}` — bankroll `{bankroll_bnb:.4f}` BNB",
         label="BET LATE", ctx=f"epoch={epoch}",
     )
 
 
-def send_bet_reverted_alert(*, epoch: int, bankroll_bnb: float) -> None:
+def send_bet_reverted_alert(*, channel: AlertChannel, epoch: int, bankroll_bnb: float) -> None:
     """[WARN] BET REVERTED — bet TX mined status=0 (paused / min-bet /
     double-bet / etc). EVM rolled back the stake; nothing to claim."""
-    _post_live_alert(
+    _post_mode_alert(
+        channel,
         f"[WARN] **BET REVERTED** epoch `{int(epoch)}` — bankroll `{bankroll_bnb:.4f}` BNB",
         label="BET REVERTED", ctx=f"epoch={epoch}",
     )
 
 
-def send_bet_dropped_alert(*, epoch: int, bankroll_bnb: float) -> None:
+def send_bet_dropped_alert(*, channel: AlertChannel, epoch: int, bankroll_bnb: float) -> None:
     """[WARN] BET DROPPED — no receipt within the bet receipt-wait window
     (~10s); the TX is realistically dropped from the mempool. Bankroll is the
     fresh read. If the TX in fact mined late, reconcile silently corrects this
     to a settlement (BET WON/LOST/REFUND follows)."""
-    _post_live_alert(
+    _post_mode_alert(
+        channel,
         f"[WARN] **BET DROPPED** epoch `{int(epoch)}` — bankroll `{bankroll_bnb:.4f}` BNB",
         label="BET DROPPED", ctx=f"epoch={epoch}",
     )
@@ -262,13 +290,15 @@ _DROPPED_CORRECTION_SUFFIX = " (previously reported as DROPPED)"
 
 
 def send_bet_settled_alert(
-    *, epoch: int, won: bool, delta_bnb: float, amount_bnb: float, new_bankroll_bnb: float,
-    previously_dropped: bool = False,
+    *, channel: AlertChannel, epoch: int, won: bool, delta_bnb: float, amount_bnb: float,
+    new_bankroll_bnb: float, previously_dropped: bool = False,
 ) -> None:
-    """[INFO] BET WON / BET LOST. WON fires from the claim path at
-    claim-tx-confirm; LOST from reconcile at settle-time. Amounts shown as
+    """[INFO] BET WON / BET LOST. Live: WON fires from the claim path at
+    claim-tx-confirm, LOST from reconcile at settle-time. Dry: both fire from
+    ``_dry_settle_available_bets`` at simulated settlement. Amounts shown as
     positive numbers (the verb communicates direction). Keyword signature
-    matches the LOST ``lost_alert_fn`` contract in ``bet_ledger.reconcile``.
+    matches the LOST ``lost_alert_fn`` contract in ``bet_ledger.reconcile``
+    (the live reconcile call binds ``channel`` via ``functools.partial``).
     ``previously_dropped`` appends the correction suffix (NIT 1)."""
     suffix = _DROPPED_CORRECTION_SUFFIX if previously_dropped else ""
     if won:
@@ -281,17 +311,18 @@ def send_bet_settled_alert(
             f"[INFO] **BET LOST** epoch `{int(epoch)}` — "
             f"Lost `{amount_bnb:.4f}` BNB, bankroll `{new_bankroll_bnb:.4f}` BNB{suffix}"
         )
-    _post_live_alert(content, label=("BET WON" if won else "BET LOST"), ctx=f"epoch={epoch}")
+    _post_mode_alert(channel, content, label=("BET WON" if won else "BET LOST"), ctx=f"epoch={epoch}")
 
 
 def send_bet_won_batch_alert(
-    *, epochs: list[int], total_delta_bnb: float, new_bankroll_bnb: float,
+    *, channel: AlertChannel, epochs: list[int], total_delta_bnb: float, new_bankroll_bnb: float,
 ) -> None:
     """[INFO] BET WON (multi-epoch) — combined alert for a rare multi-epoch
     claim (startup / missed-iteration batch). Per-epoch detail is in the
-    ledger."""
+    ledger. Live-only (dry settles each epoch individually)."""
     ep_str = "[" + ", ".join(str(int(e)) for e in epochs) + "]"
-    _post_live_alert(
+    _post_mode_alert(
+        channel,
         f"[INFO] **BET WON** epochs `{ep_str}` — "
         f"Won `{total_delta_bnb:.4f}` BNB total, bankroll `{new_bankroll_bnb:.4f}` BNB",
         label="BET WON batch", ctx=f"epochs={ep_str}",
@@ -299,14 +330,16 @@ def send_bet_won_batch_alert(
 
 
 def send_bet_refund_alert(
-    *, epoch: int, refund_bnb: float, new_bankroll_bnb: float,
+    *, channel: AlertChannel, epoch: int, refund_bnb: float, new_bankroll_bnb: float,
     previously_dropped: bool = False,
 ) -> None:
     """[INFO] BET REFUND — un-oracled-past-buffer round; stake refund-claimed.
-    Fires from the claim path at refund-claim-tx-confirm. ``refund_bnb`` is the
-    stake returned. ``previously_dropped`` appends the correction suffix (NIT 1)."""
+    Live: fires from the claim path at refund-claim-tx-confirm. Dry: fires from
+    simulated settlement. ``refund_bnb`` is the stake returned.
+    ``previously_dropped`` appends the correction suffix (NIT 1)."""
     suffix = _DROPPED_CORRECTION_SUFFIX if previously_dropped else ""
-    _post_live_alert(
+    _post_mode_alert(
+        channel,
         f"[INFO] **BET REFUND** epoch `{int(epoch)}` — "
         f"Refunded `{refund_bnb:.4f}` BNB, bankroll `{new_bankroll_bnb:.4f}` BNB{suffix}",
         label="BET REFUND", ctx=f"epoch={epoch}",
@@ -378,7 +411,8 @@ def fire_claim_settled_alerts(
         # DROPPED)` suffix (NIT 1). Scanned from the raw ledger history.
         for e in refunds:
             refund_bnb = float(ledger[e].get("amount_bnb", 0.0) or 0.0)
-            send_bet_refund_alert(epoch=e, refund_bnb=refund_bnb, new_bankroll_bnb=fresh_bankroll,
+            send_bet_refund_alert(channel=LIVE_CHANNEL, epoch=e, refund_bnb=refund_bnb,
+                                  new_bankroll_bnb=fresh_bankroll,
                                   previously_dropped=bet_ledger.epoch_was_dropped(ledger_path, e))
             bet_ledger.record_claimed(ledger_path=ledger_path, epoch=e, amount_bnb=refund_bnb,
                                       new_bankroll_bnb=fresh_bankroll)
@@ -386,16 +420,16 @@ def fire_claim_settled_alerts(
         if len(wins) == 1:
             e = wins[0]
             delta = float(ledger[e].get("delta_bnb", 0.0) or 0.0)
-            send_bet_settled_alert(epoch=e, won=True, delta_bnb=delta, amount_bnb=0.0,
-                                   new_bankroll_bnb=fresh_bankroll,
+            send_bet_settled_alert(channel=LIVE_CHANNEL, epoch=e, won=True, delta_bnb=delta,
+                                   amount_bnb=0.0, new_bankroll_bnb=fresh_bankroll,
                                    previously_dropped=bet_ledger.epoch_was_dropped(ledger_path, e))
             bet_ledger.record_claimed(ledger_path=ledger_path, epoch=e,
                                       new_bankroll_bnb=fresh_bankroll)
         elif len(wins) > 1:
             # Combined alert for the rare multi-epoch batch (Fix #2a).
             total_delta = sum(float(ledger[e].get("delta_bnb", 0.0) or 0.0) for e in wins)
-            send_bet_won_batch_alert(epochs=sorted(wins), total_delta_bnb=total_delta,
-                                     new_bankroll_bnb=fresh_bankroll)
+            send_bet_won_batch_alert(channel=LIVE_CHANNEL, epochs=sorted(wins),
+                                     total_delta_bnb=total_delta, new_bankroll_bnb=fresh_bankroll)
             for e in wins:
                 bet_ledger.record_claimed(ledger_path=ledger_path, epoch=e,
                                           new_bankroll_bnb=fresh_bankroll)

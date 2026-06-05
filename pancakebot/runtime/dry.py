@@ -625,11 +625,11 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         settled_ts = int(time.time())
 
         # Bet-lifecycle ledger (dry): append the terminal SETTLED_* record for
-        # PnL-truth parity with live. No Discord (dry alerts silent, D1=(a)).
-        # Dry owns its bankroll/trades bookkeeping (above); this only adds the
-        # ledger record, via the SAME classify helper live reconcile uses so
-        # both modes agree on status+delta semantics (Fix #6 unification of
-        # the classification logic without refactoring this pipeline).
+        # PnL-truth parity with live. Dry owns its bankroll/trades bookkeeping
+        # (above); this only adds the ledger record, via the SAME classify
+        # helper live reconcile uses so both modes agree on status+delta
+        # semantics (Fix #6 unification of the classification logic without
+        # refactoring this pipeline).
         from pancakebot.runtime import bet_ledger as _bet_ledger
         _dry_status, _dry_delta = _bet_ledger.classify_settlement(
             outcome=outcome, bet_bnb=bet_bnb, credit_bnb=credit_bnb,
@@ -640,6 +640,31 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
             delta_bnb=_dry_delta, outcome=outcome,
             new_bankroll_bnb=bankroll_after_settle,
         )
+
+        # Discord (dry): settlement alert on the dry channel — the SAME message
+        # body as live's settled alerts (WON uses the net ``_dry_delta``, LOST
+        # the stake, REFUND the returned stake); only the channel differs
+        # (DRY_CHANNEL: dry webhook + ``PancakeBot-dry`` + ``[DRY] `` prefix).
+        from pancakebot.runtime.live import (
+            DRY_CHANNEL as _DRY_CHANNEL,
+            send_bet_refund_alert as _send_bet_refund_alert,
+            send_bet_settled_alert as _send_bet_settled_alert,
+        )
+        if outcome == "win":
+            _send_bet_settled_alert(
+                channel=_DRY_CHANNEL, epoch=int(e), won=True, delta_bnb=_dry_delta,
+                amount_bnb=0.0, new_bankroll_bnb=bankroll_after_settle,
+            )
+        elif outcome == "refund":
+            _send_bet_refund_alert(
+                channel=_DRY_CHANNEL, epoch=int(e), refund_bnb=credit_bnb,
+                new_bankroll_bnb=bankroll_after_settle,
+            )
+        else:
+            _send_bet_settled_alert(
+                channel=_DRY_CHANNEL, epoch=int(e), won=False, delta_bnb=0.0,
+                amount_bnb=bet_bnb, new_bankroll_bnb=bankroll_after_settle,
+            )
 
         placed_raw = bet.get("placed_ts")
         if isinstance(placed_raw, int):

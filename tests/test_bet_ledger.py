@@ -698,25 +698,33 @@ def _content(fake):
     return fake.captured["json"]["content"]
 
 
+def _username(fake):
+    return fake.captured["json"]["username"]
+
+
 def _wire(monkeypatch, code=204):
     fake = _FakeRequests(code)
     monkeypatch.setenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", "https://d/w")
+    monkeypatch.setenv("PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL", "https://d/dry")
     monkeypatch.setitem(sys.modules, "requests", fake)
     return fake
 
 
+# The locked live message bodies (no prefix). Dry posts the SAME body with a
+# "[DRY] " prefix on the dry channel — asserted byte-for-byte below.
 def test_bot_ready_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
-    live_mod.send_bot_ready_alert(bankroll_bnb=2.345)
+    live_mod.send_bot_ready_alert(channel=live_mod.LIVE_CHANNEL, bankroll_bnb=2.345)
     assert _content(fake) == (
         "[INFO] **BOT READY** `PancakeBot-live` — bankroll `2.3450` BNB"
     )
+    assert _username(fake) == "PancakeBot-live"
 
 
 def test_submitted_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
-    live_mod.send_bet_submitted_alert(epoch=999, side="Bull", amount_bnb=0.05,
-                                      projected_bankroll_bnb=2.3463)
+    live_mod.send_bet_submitted_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, side="Bull",
+                                      amount_bnb=0.05, projected_bankroll_bnb=2.3463)
     assert _content(fake) == (
         "[INFO] **BET SUBMITTED** epoch `999` — Bet `0.0500` BNB on Bull, "
         "projected bankroll `2.3463` BNB"
@@ -725,32 +733,32 @@ def test_submitted_format_exact(monkeypatch):
 
 def test_confirmed_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
-    live_mod.send_bet_confirmed_alert(epoch=999, bankroll_bnb=2.2950)
+    live_mod.send_bet_confirmed_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, bankroll_bnb=2.2950)
     assert _content(fake) == "[INFO] **BET CONFIRMED** epoch `999` — bankroll `2.2950` BNB"
 
 
 def test_late_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
-    live_mod.send_bet_late_alert(epoch=999, bankroll_bnb=2.3452)
+    live_mod.send_bet_late_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, bankroll_bnb=2.3452)
     assert _content(fake) == "[WARN] **BET LATE** epoch `999` — bankroll `2.3452` BNB"
 
 
 def test_reverted_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
-    live_mod.send_bet_reverted_alert(epoch=999, bankroll_bnb=2.3452)
+    live_mod.send_bet_reverted_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, bankroll_bnb=2.3452)
     assert _content(fake) == "[WARN] **BET REVERTED** epoch `999` — bankroll `2.3452` BNB"
 
 
 def test_dropped_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
-    live_mod.send_bet_dropped_alert(epoch=999, bankroll_bnb=2.3452)
+    live_mod.send_bet_dropped_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, bankroll_bnb=2.3452)
     assert _content(fake) == "[WARN] **BET DROPPED** epoch `999` — bankroll `2.3452` BNB"
 
 
 def test_won_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
-    live_mod.send_bet_settled_alert(epoch=999, won=True, delta_bnb=0.0423, amount_bnb=0.05,
-                                    new_bankroll_bnb=2.3886)
+    live_mod.send_bet_settled_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, won=True,
+                                    delta_bnb=0.0423, amount_bnb=0.05, new_bankroll_bnb=2.3886)
     assert _content(fake) == (
         "[INFO] **BET WON** epoch `999` — Won `0.0423` BNB, bankroll `2.3886` BNB"
     )
@@ -758,8 +766,8 @@ def test_won_format_exact(monkeypatch):
 
 def test_lost_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
-    live_mod.send_bet_settled_alert(epoch=999, won=False, delta_bnb=-0.05, amount_bnb=0.05,
-                                    new_bankroll_bnb=2.2963)
+    live_mod.send_bet_settled_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, won=False,
+                                    delta_bnb=-0.05, amount_bnb=0.05, new_bankroll_bnb=2.2963)
     # Lost amount shown positive; the verb conveys direction.
     assert _content(fake) == (
         "[INFO] **BET LOST** epoch `999` — Lost `0.0500` BNB, bankroll `2.2963` BNB"
@@ -768,7 +776,8 @@ def test_lost_format_exact(monkeypatch):
 
 def test_refund_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
-    live_mod.send_bet_refund_alert(epoch=999, refund_bnb=0.05, new_bankroll_bnb=2.3455)
+    live_mod.send_bet_refund_alert(channel=live_mod.LIVE_CHANNEL, epoch=999, refund_bnb=0.05,
+                                   new_bankroll_bnb=2.3455)
     assert _content(fake) == (
         "[INFO] **BET REFUND** epoch `999` — Refunded `0.0500` BNB, bankroll `2.3455` BNB"
     )
@@ -776,29 +785,87 @@ def test_refund_format_exact(monkeypatch):
 
 def test_won_batch_format_exact(monkeypatch):
     fake = _wire(monkeypatch)
-    live_mod.send_bet_won_batch_alert(epochs=[101, 102, 103], total_delta_bnb=0.12,
-                                      new_bankroll_bnb=2.50)
+    live_mod.send_bet_won_batch_alert(channel=live_mod.LIVE_CHANNEL, epochs=[101, 102, 103],
+                                      total_delta_bnb=0.12, new_bankroll_bnb=2.50)
     assert _content(fake) == (
         "[INFO] **BET WON** epochs `[101, 102, 103]` — Won `0.1200` BNB total, "
         "bankroll `2.5000` BNB"
     )
 
 
+# --- dry/live parity: identical body, [DRY] prefix, PancakeBot-dry username --
+def test_dry_submitted_is_live_body_with_dry_prefix(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_bet_submitted_alert(channel=live_mod.DRY_CHANNEL, epoch=999, side="Bull",
+                                      amount_bnb=0.05, projected_bankroll_bnb=2.3463)
+    live_body = (
+        "[INFO] **BET SUBMITTED** epoch `999` — Bet `0.0500` BNB on Bull, "
+        "projected bankroll `2.3463` BNB"
+    )
+    assert _content(fake) == "[DRY] " + live_body
+    assert _username(fake) == "PancakeBot-dry"
+    assert fake.captured["url"] == "https://d/dry"   # dry webhook, not live
+
+
+def test_dry_won_is_live_body_with_dry_prefix(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_bet_settled_alert(channel=live_mod.DRY_CHANNEL, epoch=999, won=True,
+                                    delta_bnb=0.0423, amount_bnb=0.05, new_bankroll_bnb=2.3886)
+    assert _content(fake) == (
+        "[DRY] [INFO] **BET WON** epoch `999` — Won `0.0423` BNB, bankroll `2.3886` BNB"
+    )
+    assert _username(fake) == "PancakeBot-dry"
+
+
+def test_dry_lost_is_live_body_with_dry_prefix(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_bet_settled_alert(channel=live_mod.DRY_CHANNEL, epoch=999, won=False,
+                                    delta_bnb=-0.05, amount_bnb=0.05, new_bankroll_bnb=2.2963)
+    assert _content(fake) == (
+        "[DRY] [INFO] **BET LOST** epoch `999` — Lost `0.0500` BNB, bankroll `2.2963` BNB"
+    )
+
+
+def test_dry_refund_is_live_body_with_dry_prefix(monkeypatch):
+    fake = _wire(monkeypatch)
+    live_mod.send_bet_refund_alert(channel=live_mod.DRY_CHANNEL, epoch=999, refund_bnb=0.05,
+                                   new_bankroll_bnb=2.3455)
+    assert _content(fake) == (
+        "[DRY] [INFO] **BET REFUND** epoch `999` — Refunded `0.0500` BNB, bankroll `2.3455` BNB"
+    )
+
+
+def test_dry_and_live_bodies_identical_modulo_prefix(monkeypatch):
+    """The dry message body equals the live body with the channel prefix
+    stripped — the ONLY difference between modes is webhook+username+prefix."""
+    fake = _wire(monkeypatch)
+    live_mod.send_bet_settled_alert(channel=live_mod.LIVE_CHANNEL, epoch=42, won=True,
+                                    delta_bnb=0.01, amount_bnb=0.05, new_bankroll_bnb=3.0)
+    live_body = _content(fake)
+    live_mod.send_bet_settled_alert(channel=live_mod.DRY_CHANNEL, epoch=42, won=True,
+                                    delta_bnb=0.01, amount_bnb=0.05, new_bankroll_bnb=3.0)
+    dry_body = _content(fake)
+    assert dry_body == live_mod.DRY_CHANNEL.prefix + live_body
+    assert live_mod.LIVE_CHANNEL.prefix == ""        # live carries no prefix
+
+
 def test_no_gas_in_any_alert(monkeypatch):
     """Locked format drops all gas values from Discord display."""
     fake = _wire(monkeypatch)
-    live_mod.send_bet_submitted_alert(epoch=1, side="Bear", amount_bnb=0.05,
-                                      projected_bankroll_bnb=2.0)
+    live_mod.send_bet_submitted_alert(channel=live_mod.LIVE_CHANNEL, epoch=1, side="Bear",
+                                      amount_bnb=0.05, projected_bankroll_bnb=2.0)
     assert "gas" not in _content(fake).lower()
-    live_mod.send_bet_confirmed_alert(epoch=1, bankroll_bnb=2.0)
+    live_mod.send_bet_confirmed_alert(channel=live_mod.LIVE_CHANNEL, epoch=1, bankroll_bnb=2.0)
     assert "gas" not in _content(fake).lower()
-    live_mod.send_bet_late_alert(epoch=1, bankroll_bnb=2.0)
+    live_mod.send_bet_late_alert(channel=live_mod.LIVE_CHANNEL, epoch=1, bankroll_bnb=2.0)
     assert "gas" not in _content(fake).lower()
-    live_mod.send_bet_dropped_alert(epoch=1, bankroll_bnb=2.0)
+    live_mod.send_bet_dropped_alert(channel=live_mod.LIVE_CHANNEL, epoch=1, bankroll_bnb=2.0)
     assert "gas" not in _content(fake).lower()
-    live_mod.send_bet_settled_alert(epoch=1, won=True, delta_bnb=0.04, amount_bnb=0.05, new_bankroll_bnb=2.0)
+    live_mod.send_bet_settled_alert(channel=live_mod.LIVE_CHANNEL, epoch=1, won=True,
+                                    delta_bnb=0.04, amount_bnb=0.05, new_bankroll_bnb=2.0)
     assert "gas" not in _content(fake).lower()
-    live_mod.send_bet_refund_alert(epoch=1, refund_bnb=0.05, new_bankroll_bnb=2.0)
+    live_mod.send_bet_refund_alert(channel=live_mod.LIVE_CHANNEL, epoch=1, refund_bnb=0.05,
+                                   new_bankroll_bnb=2.0)
     assert "gas" not in _content(fake).lower()
 
 
@@ -808,26 +875,33 @@ def test_no_amount_or_side_on_post_receipt_alerts(monkeypatch):
     fake = _wire(monkeypatch)
     for fn in (live_mod.send_bet_confirmed_alert, live_mod.send_bet_late_alert,
                live_mod.send_bet_reverted_alert, live_mod.send_bet_dropped_alert):
-        fn(epoch=5, bankroll_bnb=2.0)
+        fn(channel=live_mod.LIVE_CHANNEL, epoch=5, bankroll_bnb=2.0)
         c = _content(fake)
         assert "Bull" not in c and "Bear" not in c
         assert "Bet `" not in c
 
 
 def test_senders_missing_webhook_no_raise(monkeypatch):
+    """Both modes fail-soft when their webhook env is unset (no raise, no post)."""
     monkeypatch.delenv("PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL", raising=False)
-    live_mod.send_bot_ready_alert(bankroll_bnb=2.0)
-    live_mod.send_bet_submitted_alert(epoch=1, side="Bull", amount_bnb=0.05, projected_bankroll_bnb=2.0)
-    live_mod.send_bet_confirmed_alert(epoch=1, bankroll_bnb=2.0)
-    live_mod.send_bet_late_alert(epoch=1, bankroll_bnb=2.0)
-    live_mod.send_bet_reverted_alert(epoch=1, bankroll_bnb=2.0)
-    live_mod.send_bet_dropped_alert(epoch=1, bankroll_bnb=2.0)
-    live_mod.send_bet_refund_alert(epoch=1, refund_bnb=0.05, new_bankroll_bnb=2.3)
+    monkeypatch.delenv("PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL", raising=False)
+    for channel in (live_mod.LIVE_CHANNEL, live_mod.DRY_CHANNEL):
+        live_mod.send_bot_ready_alert(channel=channel, bankroll_bnb=2.0)
+        live_mod.send_bet_submitted_alert(channel=channel, epoch=1, side="Bull",
+                                          amount_bnb=0.05, projected_bankroll_bnb=2.0)
+        live_mod.send_bet_confirmed_alert(channel=channel, epoch=1, bankroll_bnb=2.0)
+        live_mod.send_bet_late_alert(channel=channel, epoch=1, bankroll_bnb=2.0)
+        live_mod.send_bet_reverted_alert(channel=channel, epoch=1, bankroll_bnb=2.0)
+        live_mod.send_bet_dropped_alert(channel=channel, epoch=1, bankroll_bnb=2.0)
+        live_mod.send_bet_settled_alert(channel=channel, epoch=1, won=False, delta_bnb=-0.05,
+                                        amount_bnb=0.05, new_bankroll_bnb=2.0)
+        live_mod.send_bet_refund_alert(channel=channel, epoch=1, refund_bnb=0.05, new_bankroll_bnb=2.3)
 
 
 def test_sender_non_2xx_swallowed(monkeypatch):
     _wire(monkeypatch, code=500)
-    live_mod.send_bet_submitted_alert(epoch=1, side="Bull", amount_bnb=0.05, projected_bankroll_bnb=2.0)
+    live_mod.send_bet_submitted_alert(channel=live_mod.LIVE_CHANNEL, epoch=1, side="Bull",
+                                      amount_bnb=0.05, projected_bankroll_bnb=2.0)
 
 
 # --- Step 31 hotfix: 10s receipt wait, actual gas, post-claim fresh bankroll -
@@ -889,7 +963,8 @@ def test_lost_alert_uses_fresh_wallet_read_not_arithmetic(tmp_path, monkeypatch)
     bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
                          buffer_seconds=30, fresh_bankroll_bnb=fresh, now_ts=2_000_000,
                          wallet_address="0xme",
-                         lost_alert_fn=live_mod.send_bet_settled_alert,
+                         lost_alert_fn=lambda **kw: live_mod.send_bet_settled_alert(
+                             channel=live_mod.LIVE_CHANNEL, **kw),
                          dropped_alert_fn=None)
     # 1) LOSS alert string carries the fresh read verbatim.
     c = _content(fake)
@@ -968,7 +1043,8 @@ def test_lost_alert_correction_suffix_after_drop(tmp_path, monkeypatch):
     bet_ledger.reconcile(ledger_path=lp, contract=contract, treasury_fee_fraction=0.03,
                          buffer_seconds=30, fresh_bankroll_bnb=fresh, now_ts=2_000_000,
                          wallet_address="0xme",
-                         lost_alert_fn=live_mod.send_bet_settled_alert,
+                         lost_alert_fn=lambda **kw: live_mod.send_bet_settled_alert(
+                             channel=live_mod.LIVE_CHANNEL, **kw),
                          dropped_alert_fn=None)
     c = _content(fake)
     assert c == (
