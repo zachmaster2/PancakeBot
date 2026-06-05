@@ -17,8 +17,11 @@ bootstrap/
   windows/
     setup_service.py   register (pythonservice host) + adapter policy
     setup_autologon.ps1 -> scripts\setup_autologon.ps1 (Sysinternals)
-    boot_survival.ps1  OPERATOR-UI opt-in: autologon + Claude relaunch + AUMID
-    AUMID_stamper/     how to rebuild the out-of-repo C:\Tools stamper
+    boot_survival.ps1  OPERATOR-UI opt-in: autologon + Claude relaunch + AUMID;
+                       deploys launch_claude_admin_direct.vbs to C:\Tools
+    launch_claude_admin_direct.vbs  elevated Claude launcher (Status pre-flight,
+                       short retry, AppXSvc recovery, guarded auto-reboot)
+    AUMID_stamper/     how to rebuild the out-of-repo C:\Tools stamper (binary)
   linux/
     setup_service.py   install systemd units (live + dry) via the adapter
     install_python313.sh  pyenv build of 3.13 (additive; system py untouched)

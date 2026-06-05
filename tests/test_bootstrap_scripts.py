@@ -44,8 +44,26 @@ def test_all_expected_files_exist():
     for f in _SH_SCRIPTS + _PS1_SCRIPTS + _PY_HELPERS + [
         _BOOT / "README.md", _BOOT / "MIGRATION.md",
         _BOOT / "windows" / "AUMID_stamper" / "README.md",
+        _BOOT / "windows" / "launch_claude_admin_direct.vbs",
     ]:
         assert f.exists(), f"missing bootstrap file: {f}"
+
+
+def test_vbs_launcher_structure():
+    """The repo-tracked Claude launcher keeps its Task-F hardening + the core
+    elevated CreateProcess-on-exe path. (No VBScript linter exists; this is a
+    content sanity check — runtime behavior is validated via its /check mode.)"""
+    vbs = _BOOT / "windows" / "launch_claude_admin_direct.vbs"
+    text = vbs.read_text(encoding="utf-8", errors="replace")
+    for marker in (
+        "Option Explicit",
+        "PACKAGE_FAMILY_NAME",
+        "LAUNCH_FAIL_AUTO_REBOOT_ENABLED",   # auto-reboot toggle
+        "MAX_REBOOTS_PER_DAY",                # per-day reboot cap
+        "Restart-Service AppXSvc",            # AppXSvc recovery step
+        "candidateExe",                       # core direct-launch path preserved
+    ):
+        assert marker in text, f"VBS launcher missing expected marker: {marker!r}"
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
