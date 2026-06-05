@@ -53,14 +53,9 @@ services — autologon/AUMID are operator-UI only and off by default.
 
 ## Linux (AlmaLinux 9.x)
 
-**Clone under `/opt`, NOT `/root`.** SELinux (Enforcing) gives binaries under
-`/root` the `admin_home_t` context, which systemd is denied from exec'ing
-(`203/EXEC`). `/opt` is `usr_t` (service-exec'able). `install_python313.sh`
-likewise builds pyenv under `/opt/pyenv` for root installs.
-
 ```bash
-sudo git clone <repo> /opt/pancakebot && cd /opt/pancakebot
-sudo bash bootstrap/install.sh          # python3.13 (pyenv@/opt) + venv + units (disabled)
+sudo git clone <repo> /root/pancakebot && cd /root/pancakebot
+sudo bash bootstrap/install.sh          # python3.13 (pyenv) + venv + units (disabled)
 # fill /etc/pancakebot/pancakebot.env with the 3 webhook URLs, then:
 sudo systemctl enable --now pancakebot-dry      # dry soak
 ```
