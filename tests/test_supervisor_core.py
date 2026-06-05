@@ -122,26 +122,27 @@ def _make_core(tmp_path, monkeypatch, *, mode="dry", active=()):
     return core, plat, alerts, art
 
 
-# -- intentional-restart marker (start-limit handshake) --------------------
+# -- start-limit reset on intentional stop ---------------------------------
 
 
-def test_intentional_restart_marker_write_and_consume(tmp_path, monkeypatch):
-    core, plat, _alerts, art = _make_core(tmp_path, monkeypatch)
-    core._write_intentional_restart_marker(art)
-    marker = tmp_path / ".intentional_restart"
-    assert marker.exists()
-    # Consume: deletes the marker AND clears the OUTER start-limit counter.
-    core._consume_intentional_restart_marker(art)
-    assert not marker.exists()
+def test_clear_start_limit_on_intentional_stop(tmp_path, monkeypatch):
+    # The intentional-stop path resets the OUTER start-limit counter so the
+    # NEXT start is guaranteed a full budget (deploys/admin restarts don't
+    # exhaust it).
+    core, plat, _alerts, _art = _make_core(tmp_path, monkeypatch)
+    core._clear_start_limit_after_intentional_stop()
     assert plat.restart_counter_cleared == [core._svc_name]
 
 
-def test_consume_marker_absent_does_not_clear(tmp_path, monkeypatch):
-    # No marker => prior shutdown was a crash (or first run) => counter is NOT
-    # cleared, so the crash restart still counts toward the start limit.
-    core, plat, _alerts, art = _make_core(tmp_path, monkeypatch)
-    core._consume_intentional_restart_marker(art)
-    assert plat.restart_counter_cleared == []
+def test_clear_start_limit_is_fail_soft(tmp_path, monkeypatch):
+    # A reset failure must NOT raise — a clean shutdown can't be blocked by it.
+    core, plat, _alerts, _art = _make_core(tmp_path, monkeypatch)
+
+    def boom(_name):
+        raise RuntimeError("systemctl unavailable")
+
+    plat.clear_restart_counter = boom
+    core._clear_start_limit_after_intentional_stop()   # must not raise
 
 
 # -- mode mutex ------------------------------------------------------------

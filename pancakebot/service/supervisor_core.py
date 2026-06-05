@@ -110,11 +110,6 @@ class SupervisorCore:
             )
             raise
 
-        # E: if the prior shutdown left an intentional-restart marker, this
-        # start is a deploy / admin restart (not a crash recovery) — clear the
-        # OUTER start-limit counter so intentional restarts don't exhaust it.
-        self._consume_intentional_restart_marker(art)
-
         while not self._stop_requested:
             if self._stop_event.wait(_POLL_INTERVAL_S):
                 break  # stop signaled
@@ -141,10 +136,12 @@ class SupervisorCore:
         # (SIGTERM/SCM stop / mode mutex / deploy) -> intentional (D4: INFO). A
         # child crash triggers CRASHED+restart, not STOPPED; a supervisor crash
         # is caught by the entrypoint wrapper as SERVICE_CRASHED.
-        # E: mark this as an intentional stop so the NEXT start clears the
-        # OUTER start-limit counter (deploys/admin restarts don't count toward
-        # it; only crashes do, which leave no marker).
-        self._write_intentional_restart_marker(art)
+        # E: this is an intentional stop (the loop exits ONLY via _stop_requested
+        # -> SIGTERM/SCM stop / mode mutex / deploy). Reset the OUTER start-limit
+        # counter NOW, before exit, so the next start is guaranteed a full budget
+        # (deploys/admin restarts never exhaust it). No marker, no start-side
+        # race. A crash never reaches here, so crash restarts still count.
+        self._clear_start_limit_after_intentional_stop()
         self._stop_bot_child(reason="stop")
         notifications.notify(
             mode=self._mode, kind="STOPPED",
@@ -152,31 +149,18 @@ class SupervisorCore:
         )
         self._log("INFO", f"{self._svc_name}: clean exit")
 
-    # -- intentional-restart marker (start-limit handshake) ----------------
+    # -- start-limit reset on intentional stop -----------------------------
 
-    def _restart_marker_path(self, art: dict) -> Path:
-        # Sits beside the crash artifact in var/<mode>/.
-        return art["crash"].parent / ".intentional_restart"
-
-    def _write_intentional_restart_marker(self, art: dict) -> None:
-        marker = self._restart_marker_path(art)
-        try:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text("intentional", encoding="utf-8")
-        except OSError as e:  # noqa: BLE001
-            self._log("WARN", f"{self._svc_name}: could not write restart marker: {e!r}")
-
-    def _consume_intentional_restart_marker(self, art: dict) -> None:
-        marker = self._restart_marker_path(art)
-        if not marker.exists():
-            return  # prior shutdown was a crash (or first run) -> count it
-        try:
-            marker.unlink()
-        except OSError:  # noqa: BLE001
-            pass
+    def _clear_start_limit_after_intentional_stop(self) -> None:
+        """Reset the OUTER-supervisor start-limit counter on the intentional
+        stop path so the next start always has a full budget (deploys / admin
+        restarts never exhaust it). Reached only when the run loop exits via
+        _stop_requested; a crash never gets here, so crash restarts still count
+        (crashloop guard). Best-effort — a reset failure must not block the
+        clean shutdown."""
         try:
             self._platform.clear_restart_counter(self._svc_name)
-            self._log("INFO", f"{self._svc_name}: intentional restart — start-limit counter cleared")
+            self._log("INFO", f"{self._svc_name}: intentional stop — start-limit counter cleared")
         except Exception as e:  # noqa: BLE001
             self._log("WARN", f"{self._svc_name}: clear_restart_counter failed: {e!r}")
 
