@@ -12,9 +12,15 @@ from pathlib import Path
 
 from pancakebot.service import ServiceSpec
 
-# Crashloop policy mirrors common.py's _FAST_RESTART_* and install_services.ps1.
-_RESTART_MAX = 3
-_RESTART_RESET_WINDOW_S = 86400
+# OUTER-supervisor restart policy (systemd StartLimit / Windows SCM failure
+# actions). Relaxed from 3/24h so intentional restarts (deploys, admin
+# stop+start) don't exhaust it: on Linux the supervisor calls
+# ``systemctl reset-failed`` after a start that followed an intentional stop
+# (marker handshake); on Windows SCM's ``failureflag 1`` already counts only
+# non-clean exits. The INNER crashloop limiter (SupervisorCore
+# _FAST_RESTART_MAX=3 / _SLOW_RESTART_MAX=8) remains the real crashloop guard.
+_RESTART_MAX = 5
+_RESTART_RESET_WINDOW_S = 3600
 _RESTART_DELAY_S = 60
 
 

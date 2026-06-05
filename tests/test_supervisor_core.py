@@ -52,6 +52,10 @@ class FakePlatform:
         self.health = []
         self.stopped = []
         self.stop_event = FakeStopEvent()
+        self.restart_counter_cleared = []
+
+    def clear_restart_counter(self, name):
+        self.restart_counter_cleared.append(name)
 
     def create_stop_event(self):
         return self.stop_event
@@ -116,6 +120,28 @@ def _make_core(tmp_path, monkeypatch, *, mode="dry", active=()):
         log=lambda lvl, m: None,
     )
     return core, plat, alerts, art
+
+
+# -- intentional-restart marker (start-limit handshake) --------------------
+
+
+def test_intentional_restart_marker_write_and_consume(tmp_path, monkeypatch):
+    core, plat, _alerts, art = _make_core(tmp_path, monkeypatch)
+    core._write_intentional_restart_marker(art)
+    marker = tmp_path / ".intentional_restart"
+    assert marker.exists()
+    # Consume: deletes the marker AND clears the OUTER start-limit counter.
+    core._consume_intentional_restart_marker(art)
+    assert not marker.exists()
+    assert plat.restart_counter_cleared == [core._svc_name]
+
+
+def test_consume_marker_absent_does_not_clear(tmp_path, monkeypatch):
+    # No marker => prior shutdown was a crash (or first run) => counter is NOT
+    # cleared, so the crash restart still counts toward the start limit.
+    core, plat, _alerts, art = _make_core(tmp_path, monkeypatch)
+    core._consume_intentional_restart_marker(art)
+    assert plat.restart_counter_cleared == []
 
 
 # -- mode mutex ------------------------------------------------------------

@@ -106,7 +106,9 @@ def test_service_specs_build():
     spec = build_spec(mode="live", repo_root=_REPO_ROOT, venv_python=Path("/x/python"))
     assert spec.args == ("-m", "pancakebot.service.supervise", "--mode", "live")
     assert spec.conflicts_with  # live conflicts with dry
-    assert spec.restart_max_attempts == 3
+    # E: relaxed OUTER restart policy — 5 starts / hour (was 3 / 24h).
+    assert spec.restart_max_attempts == 5
+    assert spec.restart_reset_window_s == 3600
     # name differs by OS convention
     assert spec.name in ("PancakeBotLive", "pancakebot-live")
 
