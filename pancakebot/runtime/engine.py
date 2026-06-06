@@ -665,6 +665,18 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     start_at=int(open_round.start_at),
                 )
 
+        # -- Pre-cache refresh (2026-06-06): off-critical-path nonce + gas --
+        # The bet send reads these from cache so its critical path is just
+        # build-encode + sign + send_raw (~50ms) instead of two cold rotated
+        # RPCs (~270ms). Warm ALL write endpoints (keep-alive >=30s) so the
+        # rotated send lands hot. nonce prefetch is live-only (needs the signing
+        # account); gas refresh + warm also exercise in dry (validates populate).
+        cfg.contract.warm_write_endpoints()
+        cfg.contract.refresh_gas_price()
+        if not cfg.dry:
+            cfg.contract.prefetch_nonce()
+        info("PREFLIGHT", f"send-cache refreshed: {cfg.contract.send_cache_summary()}")
+
         # -- Ramp poll #2 (Era 11) --
         # Second RPC poll. Fires at lock_at -
         # ramp_poll_2_wakeup_offset_before_lock_ms (= ~5.800s at canonical
@@ -1187,6 +1199,46 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         tx_submit = None
         if not cfg.dry:
+            # Pre-send cache readiness (2026-06-06): nonce + gas were fetched
+            # OFF the critical path at the preflight wake. Fail-LOUD SKIP (never
+            # a silent live-fetch) if a cache is unpopulated/stale — that means
+            # the preflight refresh did not run (a wiring bug to surface), not a
+            # condition to paper over on the hot path.
+            if not cfg.contract.send_caches_ready():
+                warn(
+                    "SKIP",
+                    f"Skipped epoch {current_epoch}: send caches not ready "
+                    f"({cfg.contract.send_cache_summary()})",
+                )
+                _record_cycle_audit(
+                    cfg,
+                    closed,
+                    current_epoch=current_epoch,
+                    locked_epoch=locked_epoch,
+                    lock_ts=lock_ts_t,
+                    cutoff_ts=cutoff_ts_t,
+                    locked_price_bnbusd=bnbusd_price,
+                    action="SKIP",
+                    decision_stage="send_cache_check",
+                    open_round=open_round,
+                    bankroll_before_action_bnb=bankroll_bnb,
+                    bankroll_after_action_bnb=bankroll_bnb,
+                    decision=decision,
+                    skip_reason="risk_send_cache_unready",
+                    decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
+                    pool_bull_bnb=pool_bull_bnb,
+                    pool_bear_bnb=pool_bear_bnb,
+                    btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
+                    eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
+                    sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
+                    wake_mode=wake_mode,
+                    kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                    btc_fetch_result=_kline_result_get(gate, "btc"),
+                    eth_fetch_result=_kline_result_get(gate, "eth"),
+                    sol_fetch_result=_kline_result_get(gate, "sol"),
+                )
+                _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
+                return
             # Gas-cap sanity check: skip the bet if eth.gas_price has run
             # away from MAX_GAS_PRICE_WEI. Submitting a bet at the cap
             # while the network is much higher would land at the back of

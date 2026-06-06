@@ -563,6 +563,15 @@ def claim_scan_cursor(
             to_claim = [ep for ep, _ in chunk_pairs]
             chunk_gas_limit = gas_limit * len(to_claim)
             t0 = time.perf_counter()
+            # Pre-cache (2026-06-06): claims aren't latency-critical, so refresh
+            # the gas cache live here (keeps the shared cache-based cap check
+            # fresh for the claim path). The nonce comes from the running send
+            # cache (prefetched at the preflight wake, advanced by each send).
+            contract.refresh_gas_price()
+            if not contract.send_caches_ready():
+                warn("CLAIM", f"Skipping {len(to_claim)} claim(s): send caches not ready "
+                              f"({contract.send_cache_summary()}); retry next round")
+                return
             # Gas-cap sanity check: bail the entire flush if eth.gas_price
             # has run away from MAX_GAS_PRICE_WEI. Claims retry next round
             # naturally; this is lower-severity than the bet-side breach.

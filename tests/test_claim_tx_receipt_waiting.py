@@ -80,6 +80,17 @@ class _FakeContract:
         is exercised in dedicated tests, not here."""
         return None
 
+    # Pre-cache (2026-06-06): the claim flush refreshes gas + checks send-cache
+    # readiness off the critical path. Fakes report ready on the happy path.
+    def refresh_gas_price(self) -> None:
+        return None
+
+    def send_caches_ready(self) -> bool:
+        return True
+
+    def send_cache_summary(self) -> str:
+        return "nonce=fake gas_price_wei=50000000 gas_age=0ms"
+
     def wallet_balance_bnb(self, _wallet: str) -> float:
         return self._wallet_balance
 

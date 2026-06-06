@@ -1,115 +1,98 @@
-"""Tests for Web3PredictionContract.assert_gas_cap_not_breached().
+"""Tests for Web3PredictionContract.assert_gas_cap_not_breached() (cache-based).
 
-The bot posts live bet/claim TXs at MAX_GAS_PRICE_WEI (the worst-case
-ceiling). If eth.gas_price exceeds the ceiling, the cap is below
-current network reality — the operator must lift it before resuming.
-The check is invoked before each bet/claim TX; breach is fatal for
-THAT TX (raises GasPriceCapBreachedError) but the bot keeps running.
+The bot posts live bet/claim TXs at MAX_GAS_PRICE_WEI. The gas price is fetched
+OFF the critical path (refresh_gas_price at the preflight wake) and CACHED; the
+cap check reads the cache so the bet path makes no gas RPC. The check is
+fail-LOUD: it raises GasPriceCapBreachedError (caller skips + alerts) on a real
+breach (cached > MAX) AND on a broken cache (unpopulated / stale / zero) — never
+a silent proceed-at-MAX, which would re-mask the latency the cache removes and
+paper over a broken refresh (pre-cache rework, 2026-06-06).
 
 These tests pin:
-  - strict > comparison (cap == suggested passes)
-  - graceful degradation on transient RPC errors and zero readings
-  - the FLOOR < CEIL invariant (constants are sane)
+  - strict > comparison (cap == cached passes)
+  - fail-loud on unpopulated, stale, and zero caches (was: graceful proceed)
+  - the freshness bound is honored just under / just over
+  - the MAX_GAS_PRICE_WEI sanity invariant
 """
 from __future__ import annotations
 
-from unittest.mock import patch
+import time
 
 import pytest
 
+from pancakebot.chain.prediction_contract import _GAS_CACHE_MAX_AGE_MS
 from pancakebot.constants import MAX_GAS_PRICE_WEI
-from pancakebot.util import GasPriceCapBreachedError, TransientRpcError
+from pancakebot.util import GasPriceCapBreachedError
 
 
 class _FakeContract:
-    """Minimal stand-in for Web3PredictionContract that exposes the two
-    methods under test. We bind ``assert_gas_cap_not_breached`` from the
-    real class so we exercise the real implementation (only
-    ``suggest_gas_price_wei`` is mocked per test case)."""
+    """Minimal stand-in exposing the cache fields the real
+    assert_gas_cap_not_breached + gas_cache_age_ms read. Binds the real methods
+    so tests exercise production code, not a clone."""
 
-    def __init__(self, suggested_wei_or_exc):
-        self._suggested = suggested_wei_or_exc
-        # Mirror the real object's gas-cap-bypass streak state (guard audit 4.3).
-        self._gas_cap_bypass_streak = 0
+    def __init__(self, cached_wei, *, age_ms: float = 0.0):
+        self._cached_gas_price_wei = cached_wei
+        if cached_wei is None:
+            # Never populated: leave the timestamp None too.
+            self._cached_gas_price_mono_ms = None
+        else:
+            self._cached_gas_price_mono_ms = time.perf_counter() * 1000.0 - age_ms
 
-    def suggest_gas_price_wei(self) -> int:
-        if isinstance(self._suggested, BaseException):
-            raise self._suggested
-        return int(self._suggested)
-
-    # Bind the real methods so tests exercise production code, not a clone.
     from pancakebot.chain.prediction_contract import Web3PredictionContract
     assert_gas_cap_not_breached = Web3PredictionContract.assert_gas_cap_not_breached
-    _note_gas_cap_bypass = Web3PredictionContract._note_gas_cap_bypass
+    gas_cache_age_ms = Web3PredictionContract.gas_cache_age_ms
 
 
-def test_suggested_below_max_passes():
-    """When eth.gas_price < MAX_GAS_PRICE_WEI, the assertion returns
-    silently. This is the steady-state expected path on BSC (today's
-    mainnet floor is ~0.05 Gwei = 5e7 wei; cap is 1 Gwei = 1e9 wei)."""
-    c = _FakeContract(MAX_GAS_PRICE_WEI - 1)
-    # No exception expected.
-    c.assert_gas_cap_not_breached()
+def test_cached_below_max_passes():
+    _FakeContract(MAX_GAS_PRICE_WEI - 1).assert_gas_cap_not_breached()  # no raise
 
 
-def test_suggested_equals_max_passes():
-    """Strict greater-than: eth.gas_price == cap is on the boundary, not
-    over. The assertion passes — submitting at MAX_GAS_PRICE_WEI matches
-    the network exactly, which is still competitive."""
-    c = _FakeContract(MAX_GAS_PRICE_WEI)
-    c.assert_gas_cap_not_breached()  # No exception.
+def test_cached_equals_max_passes():
+    """Strict greater-than: cached == cap is on the boundary, not over."""
+    _FakeContract(MAX_GAS_PRICE_WEI).assert_gas_cap_not_breached()  # no raise
 
 
-def test_suggested_above_max_raises():
-    """eth.gas_price > cap is the breach condition. Raises with a clear
-    operator-action message in the exception text."""
+def test_cached_above_max_raises():
     c = _FakeContract(MAX_GAS_PRICE_WEI + 1)
     with pytest.raises(GasPriceCapBreachedError) as excinfo:
         c.assert_gas_cap_not_breached()
     msg = str(excinfo.value)
-    assert "eth.gas_price" in msg
     assert str(MAX_GAS_PRICE_WEI) in msg
-    assert "raise the cap" in msg.lower() or "raise the cap" in msg
+    assert "raise the cap" in msg.lower()
 
 
-def test_suggested_zero_warns_and_returns():
-    """eth.gas_price == 0 is node misbehavior. Don't raise — proceed
-    with MAX (the bet still goes out at the ceiling, no worse than
-    steady state). Single-round transient; the next round repeats the
-    check."""
-    c = _FakeContract(0)
-    # No exception expected.
-    c.assert_gas_cap_not_breached()
+def test_unpopulated_cache_raises_fail_loud():
+    """None cache (refresh never ran) => fail-loud skip, NOT a silent proceed."""
+    with pytest.raises(GasPriceCapBreachedError) as excinfo:
+        _FakeContract(None).assert_gas_cap_not_breached()
+    assert "unpopulated" in str(excinfo.value)
 
 
-def test_transient_rpc_error_returns_silently():
-    """A TransientRpcError fetching eth.gas_price (network timeout,
-    parse failure, etc.) does NOT raise. The bet/claim proceeds at MAX
-    rather than skip-this-round on a single-round hiccup; sustained
-    outages surface via other paths (preflight wake fetch, etc.)."""
-    c = _FakeContract(TransientRpcError("simulated_rpc_failure"))
-    # No exception expected.
-    c.assert_gas_cap_not_breached()
-
-
-def test_unrelated_exception_propagates():
-    """Only TransientRpcError is swallowed; any other exception
-    propagates so we don't accidentally mask a real bug. This is a
-    correctness pin against future broadening of the except clause."""
-    class _UnexpectedError(RuntimeError):
-        pass
-
-    c = _FakeContract(_UnexpectedError("not a transient rpc error"))
-    with pytest.raises(_UnexpectedError):
+def test_stale_cache_raises_fail_loud():
+    """A cache older than the freshness bound (sustained refresh outage) =>
+    fail-loud skip rather than bet on an ancient gas price."""
+    c = _FakeContract(MAX_GAS_PRICE_WEI - 1, age_ms=_GAS_CACHE_MAX_AGE_MS + 1000.0)
+    with pytest.raises(GasPriceCapBreachedError) as excinfo:
         c.assert_gas_cap_not_breached()
+    assert "stale" in str(excinfo.value)
 
 
-def test_constants_satisfy_floor_lt_max_invariant():
-    """MAX_GAS_PRICE_WEI must be a positive integer. Pin so a future
-    edit doesn't accidentally invert or zero it."""
+def test_fresh_cache_just_under_bound_passes():
+    """A cache within the freshness bound is honored (no raise)."""
+    c = _FakeContract(MAX_GAS_PRICE_WEI - 1, age_ms=_GAS_CACHE_MAX_AGE_MS - 1000.0)
+    c.assert_gas_cap_not_breached()
+
+
+def test_zero_cache_raises_fail_loud():
+    """A cached 0 (misbehaving node) can't validate the cap => fail-loud."""
+    with pytest.raises(GasPriceCapBreachedError) as excinfo:
+        _FakeContract(0).assert_gas_cap_not_breached()
+    assert "zero" in str(excinfo.value)
+
+
+def test_constants_satisfy_positive_invariant():
+    """MAX_GAS_PRICE_WEI must be a sane positive integer. Pin so a future edit
+    doesn't accidentally invert or zero it."""
     assert isinstance(MAX_GAS_PRICE_WEI, int)
     assert MAX_GAS_PRICE_WEI > 0
-    # Sanity: cap is well above what BSC charges in 2026 (0.05 Gwei = 5e7).
-    # If this fails, either the constant has decayed catastrophically or
-    # network economics have changed enough to warrant a doc update.
     assert MAX_GAS_PRICE_WEI >= 100_000_000  # >= 0.1 Gwei
