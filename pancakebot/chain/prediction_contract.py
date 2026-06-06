@@ -544,7 +544,7 @@ class Web3PredictionContract:
         except TransientRpcError:
             # Don't crash the round on a transient RPC hiccup; proceed with MAX.
             # The check repeats next round; sustained outages surface elsewhere
-            # (bankroll wake fetch, etc.).
+            # (preflight wake fetch, etc.).
             self._note_gas_cap_bypass("rpc_error")
             return
         if suggested == 0:

@@ -111,7 +111,7 @@ def ensure_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         # ``wake_mode``: "dynamic" (Bundle 5 v2 anchor-driven) or
         #   "static" (anchor poll timed out / not wired). Empty string
         #   when an early-skip path (e.g. risk_bankroll_stale at the
-        #   bankroll wake) fired before the anchor poll resolved.
+        #   preflight wake) fired before the anchor poll resolved.
         # ``kline_fire_offset_before_lock_ms``: ms before ``lock_at`` at
         #   which the parallel kline GETs fired (= critical_path lead -
         #   POOL_READ_TIME_MS). Empty string for the same early-skip

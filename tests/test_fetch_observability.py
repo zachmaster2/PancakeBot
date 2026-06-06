@@ -436,7 +436,7 @@ def test_record_cycle_audit_pre_response_failure_blanks_rtt(tmp_path):
 
 
 def test_record_cycle_audit_defaults_when_not_fetched(tmp_path):
-    """Early-skip path (e.g. risk_bankroll_stale at the bankroll wake)
+    """Early-skip path (e.g. risk_bankroll_stale at the preflight wake)
     that calls record_cycle_audit without fetch context produces empty
     wake_mode + empty fire_offset + "not_fetched" results."""
     csv_path = tmp_path / "cycle_audit.csv"

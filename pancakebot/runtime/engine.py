@@ -269,7 +269,7 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
         f"pool_cutoff={cfg.pool_cutoff_seconds}s "
         f"ramp_poll_1_wakeup={cfg.ramp_poll_1_wakeup_offset_before_lock_ms}ms "
         f"okx_warmup_wakeup={cfg.okx_warmup_wakeup_offset_before_lock_ms}ms "
-        f"bankroll_wakeup={cfg.bankroll_wakeup_offset_before_lock_ms}ms "
+        f"preflight_wakeup={cfg.preflight_wakeup_offset_before_lock_ms}ms "
         f"ramp_poll_2_wakeup={cfg.ramp_poll_2_wakeup_offset_before_lock_ms}ms "
         f"final_rpc_poll_wakeup={cfg.final_rpc_poll_wakeup_offset_before_lock_ms}ms "
         f"critical_path_wakeup={cfg.critical_path_wakeup_offset_before_lock_ms}ms "
@@ -299,7 +299,7 @@ def _assert_critical_path_timing_sane(cfg: RuntimeConfig) -> None:
     ladder = [
         ("ramp_poll_1", cfg.ramp_poll_1_wakeup_offset_before_lock_ms),
         ("okx_warmup", cfg.okx_warmup_wakeup_offset_before_lock_ms),
-        ("bankroll", cfg.bankroll_wakeup_offset_before_lock_ms),
+        ("preflight", cfg.preflight_wakeup_offset_before_lock_ms),
         ("ramp_poll_2", cfg.ramp_poll_2_wakeup_offset_before_lock_ms),
         ("final_rpc_poll", cfg.final_rpc_poll_wakeup_offset_before_lock_ms),
         ("anchor_poll", _tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS),
@@ -395,7 +395,7 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
     while True:
         # Per-subsystem TransientRpcError handling lives at each callsite:
         #   - _epoch_handshake: bounded local retry
-        #   - bankroll wake: SKIP round with risk_bankroll_stale
+        #   - preflight wake: SKIP round with risk_bankroll_stale
         #   - _sleep_and_claim close_ts: bounded local retry (same pattern as handshake)
         #   - claim_scan_cursor callers: fail-soft (log warn + continue)
         #   - bet submission: crash → supervisor restart (round was lost anyway)
@@ -507,7 +507,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Per-round wake-mode + kline-fire-offset for offline analysis. Filled
         # in at critical_path resolution (lines ~585-630) once the anchor
         # poll result is known. Early-skip paths (e.g. risk_bankroll_stale,
-        # which fires at the bankroll wake before the anchor poll) leave
+        # which fires at the preflight wake before the anchor poll) leave
         # these empty -- the bot never decided which mode to use.
         wake_mode: str = ""
         kline_fire_offset_before_lock_ms: int | None = None
@@ -600,10 +600,10 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # rather than sizing the bet from a potentially-outdated
         # bankroll value (over-sizing risk if true bankroll has shrunk
         # since last fetch).
-        bankroll_wake_ts = lock_ts_t - cfg.bankroll_wakeup_offset_before_lock_ms / 1000.0
+        preflight_wake_ts = lock_ts_t - cfg.preflight_wakeup_offset_before_lock_ms / 1000.0
         _sleep_until_ts(
-            bankroll_wake_ts,
-            reason="wait_for_bankroll",
+            preflight_wake_ts,
+            reason="wait_for_preflight",
             epoch=current_epoch,
         )
         if cfg.dry:
@@ -820,7 +820,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             #   math says we cannot catch up in time)
             # Single-poll failures and slow polls do NOT trigger skips —
             # they're informational and the next poll might recover.
-            # bankroll_bnb was already resolved at the bankroll wake;
+            # bankroll_bnb was already resolved at the preflight wake;
             # reuse for audit on the skip path.
             ready, ready_reason = cfg.rpc_poller.is_pool_ready(current_epoch)
             if not ready:

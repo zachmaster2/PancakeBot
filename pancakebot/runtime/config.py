@@ -60,7 +60,7 @@ class RuntimeConfig:
     # lock - 11.095s) is retired. The bot trusts the OS clock directly
     # (W32Time tightening per README); no application-level NTP layer.
     #
-    # bankroll_wake refreshes wallet balance (live: BSC RPC; dry: in-memory).
+    # preflight_wake refreshes wallet balance (live: BSC RPC; dry: in-memory).
     # ramp + final RPC polls catch up bet events from BSC via batched
     #   eth_getBlockReceipts so the critical_path snapshot is fresh.
     # critical_path_wake reads the local pool aggregate, runs the gate,
@@ -68,7 +68,7 @@ class RuntimeConfig:
     ramp_poll_1_wakeup_offset_before_lock_ms: int
     ramp_poll_2_wakeup_offset_before_lock_ms: int
     final_rpc_poll_wakeup_offset_before_lock_ms: int
-    bankroll_wakeup_offset_before_lock_ms: int
+    preflight_wakeup_offset_before_lock_ms: int
     okx_warmup_wakeup_offset_before_lock_ms: int
     critical_path_wakeup_offset_before_lock_ms: int
     bet_submit_deadline_offset_before_lock_ms: int

@@ -108,23 +108,23 @@ def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
     assert cfg.critical_path_wakeup_offset_before_lock_ms == 970  # 2026-05-20 re-measurement
 
 
-def test_bankroll_wakeup_offset_derived_correctly(tmp_path):
+def test_preflight_wakeup_offset_derived_correctly(tmp_path):
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     expected = (
         cfg.critical_path_wakeup_offset_before_lock_ms
-        + tc.BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS
+        + tc.PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS
     )
-    assert cfg.bankroll_wakeup_offset_before_lock_ms == expected
-    assert cfg.bankroll_wakeup_offset_before_lock_ms == 5970  # 2026-05-20 re-measurement
+    assert cfg.preflight_wakeup_offset_before_lock_ms == expected
+    assert cfg.preflight_wakeup_offset_before_lock_ms == 5970  # 2026-05-20 re-measurement
 
 
 def test_wake_chain_strictly_increasing(tmp_path):
     """Bundle 5 v2 (2026-05-14): wake offsets must be ordered
-    bankroll > critical_path > bet_submit_deadline. The prior
+    preflight > critical_path > bet_submit_deadline. The prior
     ``ntp_sync_wakeup_offset_ms`` is retired alongside the
     application-level NTP layer."""
     cfg = load_app_config(str(_write_cfg(tmp_path)))
-    assert cfg.bankroll_wakeup_offset_before_lock_ms > cfg.critical_path_wakeup_offset_before_lock_ms
+    assert cfg.preflight_wakeup_offset_before_lock_ms > cfg.critical_path_wakeup_offset_before_lock_ms
     assert cfg.critical_path_wakeup_offset_before_lock_ms > cfg.bet_submit_deadline_offset_before_lock_ms
 
 

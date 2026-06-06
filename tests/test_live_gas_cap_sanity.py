@@ -86,7 +86,7 @@ def test_transient_rpc_error_returns_silently():
     """A TransientRpcError fetching eth.gas_price (network timeout,
     parse failure, etc.) does NOT raise. The bet/claim proceeds at MAX
     rather than skip-this-round on a single-round hiccup; sustained
-    outages surface via other paths (bankroll wake fetch, etc.)."""
+    outages surface via other paths (preflight wake fetch, etc.)."""
     c = _FakeContract(TransientRpcError("simulated_rpc_failure"))
     # No exception expected.
     c.assert_gas_cap_not_breached()
