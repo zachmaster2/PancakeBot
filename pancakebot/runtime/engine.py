@@ -267,11 +267,9 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
         "START",
         f"timing config: kline_cutoff={cfg.kline_cutoff_seconds}s "
         f"pool_cutoff={cfg.pool_cutoff_seconds}s "
-        f"ramp_poll_1_wakeup={cfg.ramp_poll_1_wakeup_offset_before_lock_ms}ms "
         f"okx_warmup_wakeup={cfg.okx_warmup_wakeup_offset_before_lock_ms}ms "
         f"preflight_wakeup={cfg.preflight_wakeup_offset_before_lock_ms}ms "
-        f"ramp_poll_2_wakeup={cfg.ramp_poll_2_wakeup_offset_before_lock_ms}ms "
-        f"final_rpc_poll_wakeup={cfg.final_rpc_poll_wakeup_offset_before_lock_ms}ms "
+        f"single_poll_wakeup={cfg.single_poll_wakeup_offset_before_lock_ms}ms "
         f"critical_path_wakeup={cfg.critical_path_wakeup_offset_before_lock_ms}ms "
         f"bet_submit_deadline={cfg.bet_submit_deadline_offset_before_lock_ms}ms "
         f"bet_tx_receipt_timeout={cfg.bet_tx_receipt_timeout_seconds}s "
@@ -288,7 +286,7 @@ def _assert_critical_path_timing_sane(cfg: RuntimeConfig) -> None:
     silently mis-sequences polls / zeroes a poll budget every round via
     the ``max(0, ...)`` clamps. This invariant catches the misconfig at
     boot instead. (We assert strict ordering, not a uniform >200ms gap:
-    the bankroll->ramp_2 leg is ~120ms by design.)
+    the tightest leg (anchor_poll->critical_path) is ~330ms by design.)
 
     Also asserts the anchor poll can complete before the critical-path
     wake: it fires at ``lock - ANCHOR_POLL_OFFSET`` and is awaited up to
@@ -297,11 +295,9 @@ def _assert_critical_path_timing_sane(cfg: RuntimeConfig) -> None:
     dead (every round silently falls back to static).
     """
     ladder = [
-        ("ramp_poll_1", cfg.ramp_poll_1_wakeup_offset_before_lock_ms),
         ("okx_warmup", cfg.okx_warmup_wakeup_offset_before_lock_ms),
         ("preflight", cfg.preflight_wakeup_offset_before_lock_ms),
-        ("ramp_poll_2", cfg.ramp_poll_2_wakeup_offset_before_lock_ms),
-        ("final_rpc_poll", cfg.final_rpc_poll_wakeup_offset_before_lock_ms),
+        ("single_poll", cfg.single_poll_wakeup_offset_before_lock_ms),
         ("anchor_poll", _tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS),
         ("critical_path", cfg.critical_path_wakeup_offset_before_lock_ms),
         ("bet_submit_deadline", cfg.bet_submit_deadline_offset_before_lock_ms),
@@ -425,7 +421,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # Sync round-phase state into rpc_poller immediately after handshake.
         # Bundle 2 (2026-05-13): on the first call this synchronously initializes
         # the cursor from chain head (~1 RPC, sub-second) but does NOT block on
-        # backfill — the periodic daemon's first tick + the ramp/final polls
+        # backfill — the periodic daemon's first tick + the single poll
         # drive the in-round catch-up. is_pool_ready below gates against acting
         # on a half-built pool aggregate via the cold_start_in_progress reason.
         if cfg.rpc_poller is not None:
@@ -537,38 +533,11 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # ``(local - ntp)`` offset measurement. The W32Time prerequisite
         # (MaxPollInterval=5, see README) keeps the OS clock within a
         # few ms of NTP truth directly, so there is no application-level
-        # NTP layer to refresh. The first pre-lock wake is now
-        # ``wait_for_ramp_poll_1`` (= lock - 7550ms).
-
-        # -- Ramp poll #1 (Era 11) --
-        # All three polls (ramp_1, ramp_2, final) take a deadline_ms
-        # and skip-on-miss. The label "ramp" is 4 chars, fits the
-        # log SUB_W=6.
-        # First of three RPC polls that ramp the local pool aggregate
-        # toward the critical_path snapshot. Fires at lock_at -
-        # ramp_poll_1_wakeup_offset_before_lock_ms (= ~7.500s before lock at canonical
-        # pool_cutoff=6 per the per-leg refactor 2026-05-12). Catches
-        # blocks since the last periodic poll. deadline_ms = gap to
-        # ramp_2 - safety; on RTT-exceeds-deadline the poll marks
-        # _last_poll_too_slow=True for diagnostics, but is_pool_ready()
-        # only returns False when the round-aware feasibility check
-        # has flagged the round.
-        if cfg.rpc_poller is not None:
-            ramp_poll_1_wake_ts = (
-                lock_ts_t - cfg.ramp_poll_1_wakeup_offset_before_lock_ms / 1000.0
-            )
-            _sleep_until_ts(
-                ramp_poll_1_wake_ts,
-                reason="wait_for_ramp_poll_1",
-                epoch=current_epoch,
-            )
-            ramp_1_deadline_ms = max(
-                0,
-                cfg.ramp_poll_1_wakeup_offset_before_lock_ms
-                - cfg.ramp_poll_2_wakeup_offset_before_lock_ms
-                - 200,  # safety
-            )
-            cfg.rpc_poller.poll_ramp(deadline_ms=ramp_1_deadline_ms)
+        # NTP layer to refresh. Candidate C (2026-06-06): the first pre-lock
+        # wake is now the OKX warmup (= lock - 7000ms); the RPC catch-up is a
+        # single batched poll just before the critical path (was a 3-leg ramp
+        # ladder — ramp_1/ramp_2 removed, the final poll became the single
+        # poll below).
 
         # -- Bankroll wake --
         # Refreshes wallet balance so risk gates + decide_open_round
@@ -677,52 +646,33 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             cfg.contract.prefetch_nonce()
         info("READY", f"send-cache refreshed: {cfg.contract.send_cache_summary()}")
 
-        # -- Ramp poll #2 (Era 11) --
-        # Second RPC poll. Fires at lock_at -
-        # ramp_poll_2_wakeup_offset_before_lock_ms (= ~5.800s at canonical
-        # pool_cutoff=6 per the per-leg refactor 2026-05-12; naturally
-        # falls after bankroll completes). Bridges
-        # ramp_1 -> final. deadline_ms = gap to final_poll - safety.
+        # -- Single RPC poll (Candidate C, 2026-06-06) --
+        # ONE batched catch-up before the critical-path snapshot, replacing
+        # the 3-leg ramp ladder. Fires at lock_at -
+        # single_poll_wakeup_offset_before_lock_ms (= ~4.75s at canonical
+        # pool_cutoff=6 — the latest offset that still captures the cutoff
+        # block with the availability + safety cushion). The retained 8s
+        # periodic poll keeps the cursor within ~1 interval, so this catches
+        # only the ~5-20 blocks since the last periodic. deadline_ms = gap to
+        # critical_path - safety; on RTT-exceeds-deadline the round-aware
+        # feasibility check (INFEAS) drives the skip, not this poll. Label
+        # "single" is 6 chars, fits the log SUB_W=6.
         if cfg.rpc_poller is not None:
-            ramp_poll_2_wake_ts = (
-                lock_ts_t - cfg.ramp_poll_2_wakeup_offset_before_lock_ms / 1000.0
+            single_poll_wake_ts = (
+                lock_ts_t - cfg.single_poll_wakeup_offset_before_lock_ms / 1000.0
             )
             _sleep_until_ts(
-                ramp_poll_2_wake_ts,
-                reason="wait_for_ramp_poll_2",
+                single_poll_wake_ts,
+                reason="wait_for_single_poll",
                 epoch=current_epoch,
             )
-            ramp_2_deadline_ms = max(
+            single_poll_deadline_ms = max(
                 0,
-                cfg.ramp_poll_2_wakeup_offset_before_lock_ms
-                - cfg.final_rpc_poll_wakeup_offset_before_lock_ms
-                - 200,  # safety
-            )
-            cfg.rpc_poller.poll_ramp(deadline_ms=ramp_2_deadline_ms)
-
-        # -- Final RPC poll (Era 11) --
-        # Last RPC poll before critical_path reads the pool snapshot.
-        # Fires at lock_at - final_rpc_poll_wakeup_offset_before_lock_ms (= ~4.7s
-        # at canonical pool_cutoff=6 post 2026-05-12 refactor; was ~3.79s
-        # before lock). Catches blocks since ramp_2. deadline_ms = gap
-        # to critical_path - safety. Same skip-on-too-slow contract as
-        # ramp polls.
-        if cfg.rpc_poller is not None:
-            final_rpc_poll_wake_ts = (
-                lock_ts_t - cfg.final_rpc_poll_wakeup_offset_before_lock_ms / 1000.0
-            )
-            _sleep_until_ts(
-                final_rpc_poll_wake_ts,
-                reason="wait_for_final_rpc_poll",
-                epoch=current_epoch,
-            )
-            final_deadline_ms = max(
-                0,
-                cfg.final_rpc_poll_wakeup_offset_before_lock_ms
+                cfg.single_poll_wakeup_offset_before_lock_ms
                 - cfg.critical_path_wakeup_offset_before_lock_ms
                 - 200,  # safety
             )
-            cfg.rpc_poller.poll_final(deadline_ms=final_deadline_ms)
+            cfg.rpc_poller.poll(deadline_ms=single_poll_deadline_ms)
 
         # -- Anchor poll + critical-path wake (Bundle 5 v2, 2026-05-14) --
         #

@@ -27,8 +27,9 @@ The poller has three trigger paths:
    ``is_pool_ready`` returns ``cold_start_in_progress``. Off the
    critical path; failures are non-fatal (next periodic poll retries).
 
-3. **Ramp + final polls** — engine-driven, called from the wake
-   schedule. Synchronous; deadline-aware. RTT-exceeds-deadline marks
+3. **Single poll** — engine-driven catch-up before the critical path
+   (Candidate C, 2026-06-06), called from the wake schedule.
+   Synchronous; deadline-aware. RTT-exceeds-deadline marks
    ``_last_poll_too_slow=True`` for diagnostics, but skips are driven
    by the round-aware feasibility check
    (``catchup_infeasible_for_round``), not by individual slow polls.
@@ -322,7 +323,7 @@ class RpcPoller:
         contract_address: str = PREDICTION_V2_CONTRACT_ADDRESS,
         periodic_poll_interval_s: int = _tc.RPC_PERIODIC_POLL_INTERVAL_SECONDS,
         batch_size: int = _tc.RPC_BATCH_MAX_BLOCKS,
-        ramp_poll_1_wakeup_offset_before_lock_ms: int = 7500,
+        single_poll_wakeup_offset_before_lock_ms: int = 4750,
     ) -> None:
         if interval_seconds <= 0:
             raise InvariantError("interval_seconds_nonpositive")
@@ -333,8 +334,8 @@ class RpcPoller:
                 f"batch_size_out_of_range: {batch_size} "
                 f"(max {_tc.RPC_BATCH_MAX_BLOCKS})"
             )
-        if ramp_poll_1_wakeup_offset_before_lock_ms <= 0:
-            raise InvariantError("ramp_poll_1_wakeup_offset_ms_nonpositive")
+        if single_poll_wakeup_offset_before_lock_ms <= 0:
+            raise InvariantError("single_poll_wakeup_offset_ms_nonpositive")
 
         pool = list(endpoint_pool)
         if not pool:
@@ -378,14 +379,14 @@ class RpcPoller:
         self._contract_addr = contract_address.lower()
         self._periodic_poll_interval_s = int(periodic_poll_interval_s)
         self._batch_size = int(batch_size)
-        # Engine-side ramp_poll_1 lock-relative offset (config-derived in
+        # Engine-side single-poll lock-relative offset (config-derived in
         # production via pancakebot/config.py from pool_cutoff_seconds;
-        # canonical value at pool_cutoff=6 is 7500ms). Used by the
+        # canonical value at pool_cutoff=6 is 4750ms). Used by the
         # lock-anchored _periodic_loop to suspend periodic ticks that
-        # would otherwise land inside the (lock - ramp_1_offset, lock]
-        # ramp/final window and race the engine-driven polls for the
-        # non-blocking _poll_lock.
-        self._ramp_poll_1_wakeup_offset_ms = int(ramp_poll_1_wakeup_offset_before_lock_ms)
+        # would otherwise land inside the (lock - single_poll_offset, lock]
+        # window and race the engine-driven single poll for the
+        # non-blocking _poll_lock (Candidate C, 2026-06-06).
+        self._single_poll_wakeup_offset_ms = int(single_poll_wakeup_offset_before_lock_ms)
 
         self._lock = threading.Lock()
 
@@ -401,13 +402,13 @@ class RpcPoller:
         # Cursor: the highest block number we've polled receipts for.
         # Cursor-init sets this to round_start_block - 1 on the first
         # set_round_phase; subsequent polls advance it. Periodic and
-        # ramp/final polls all read+write under self._lock to keep
+        # single polls all read+write under self._lock to keep
         # log-id dedup honest.
         self._last_polled_block_number: int = 0
 
         # Connection / readiness state.
         # Bundle 2 (2026-05-13): True after the first successful
-        # periodic/ramp/final poll latches via
+        # periodic/single poll latches via
         # _latch_first_successful_poll_locked. Until then, is_pool_ready
         # returns (False, "cold_start_in_progress") and the engine skips.
         self._connected: bool = False
@@ -1022,16 +1023,18 @@ class RpcPoller:
             return self._last_catchup_detail
 
     # ------------------------------------------------------------------
-    # Engine integration: deadline-driven polls (ramp + final)
+    # Engine integration: deadline-driven single poll
     # ------------------------------------------------------------------
 
-    def poll_ramp(self, deadline_ms: int = 0) -> None:
-        """Engine-driven ramp poll. Synchronous; blocks until complete
-        or until RTT exceeds deadline_ms (0 = no deadline).
+    def poll(self, deadline_ms: int = 0) -> None:
+        """Engine-driven single batched catch-up poll before the critical
+        path (Candidate C, 2026-06-06 — replaced the 3-leg ramp ladder).
+        Synchronous; blocks until complete or until RTT exceeds deadline_ms
+        (0 = no deadline).
 
-        Side-effects (diagnostics only — none of these directly cause
-        round skips; the round-aware feasibility check is the canonical
-        skip signal):
+        Side-effects (diagnostics only — none of these directly cause round
+        skips; the round-aware feasibility check is the canonical skip
+        signal):
           - On success: _last_poll_succeeded=True, _last_poll_too_slow=False.
           - On RTT-exceeds-deadline: _last_poll_too_slow=True.
           - On RPC error: _last_poll_succeeded=False.
@@ -1039,12 +1042,7 @@ class RpcPoller:
         feasibility check (in _on_epoch_advance and _poll_now) sets when
         math says we cannot catch up before lock_at.
         """
-        self._poll_now(deadline_ms=deadline_ms, label="ramp")
-
-    def poll_final(self, deadline_ms: int = 0) -> None:
-        """Engine-driven final poll. Same behaviour as poll_ramp;
-        named distinctly for log readability."""
-        self._poll_now(deadline_ms=deadline_ms, label="final")
+        self._poll_now(deadline_ms=deadline_ms, label="single")
 
     # ------------------------------------------------------------------
     # Internal: cold-start + periodic + poll mechanics
@@ -1240,13 +1238,13 @@ class RpcPoller:
             Three sub-cases inside State B (see
             ``_compute_periodic_timeout``):
             - the anchored tick has comfortable margin before
-              ramp_window_start — fire at next_at.
-            - the anchored tick is outside the ramp window but its
-              worst-case HTTP RTT could extend past ramp_window_start
+              single_poll_window_start — fire at next_at.
+            - the anchored tick is outside the single-poll window but its
+              worst-case HTTP RTT could extend past single_poll_window_start
               — reschedule to fire at the latest safe time
-              (``ramp_window_start − max_rtt − safety``). If that
+              (``single_poll_window_start − max_rtt − safety``). If that
               time has already passed (previous poll overran), suspend.
-            - the anchored tick lands INSIDE the ramp window — suspend.
+            - the anchored tick lands INSIDE the single-poll window — suspend.
 
             Suspended ticks sleep to ``_lock_at + 0.1s`` so the next
             loop iteration picks up State C (and shortly afterwards,
@@ -1310,21 +1308,21 @@ class RpcPoller:
         while the engine is in ``_sleep_and_claim`` and
         ``set_round_phase`` hasn't yet advanced ``_lock_at``.
 
-        Before lock, the periodic poll must not race ``ramp_poll_1``
-        for ``_poll_lock``. The ramp wake fires at
-        ``lock_at − ramp_poll_1_offset`` and uses non-blocking acquire;
-        if a periodic poll is still in flight at that moment, ramp_1 is
+        Before lock, the periodic poll must not race the engine-driven
+        ``single`` poll for ``_poll_lock``. The single poll's wake fires at
+        ``lock_at − single_poll_offset`` and uses non-blocking acquire; if a
+        periodic poll is still in flight at that moment, the single poll is
         silently dropped. Two distinct dangers:
 
-          * The anchored tick lands INSIDE the ramp window. Suspend
+          * The anchored tick lands INSIDE the single-poll window. Suspend
             (sleep past lock and let the post-lock branch resume).
-            (Example: ramp_window_start=lock_at−7.5s, next_at=lock_at−4s.)
+            (Example: single_poll_window_start=lock_at−4.75s, next_at=lock_at−2s.)
 
           * The anchored tick is just BEFORE the window, but its HTTP
             timeout (5s) plus jitter could extend it past
-            ramp_window_start. Try to fire earlier, at
-            ``ramp_window_start − max_rtt − safety``, so a full-timeout
-            poll completes before the ramp wake. If the latest safe
+            single_poll_window_start. Try to fire earlier, at
+            ``single_poll_window_start − max_rtt − safety``, so a full-timeout
+            poll completes before the single poll's wake. If the latest safe
             fire time has already PASSED (the prior poll overran),
             suspend rather than fire a doomed poll.
 
@@ -1342,47 +1340,47 @@ class RpcPoller:
         if now >= lock_at:
             return float(period)
         round_open = lock_at - self._interval_seconds
-        ramp_window_start = (
-            lock_at - self._ramp_poll_1_wakeup_offset_ms / 1000.0
+        single_poll_window_start = (
+            lock_at - self._single_poll_wakeup_offset_ms / 1000.0
         )
         # Latest moment a worst-case-RTT periodic poll can BEGIN and
-        # still finish before the ramp window opens. A poll that hits
+        # still finish before the single-poll window opens. A poll that hits
         # the full HTTP timeout (RPC_HTTP_BATCH_TIMEOUT_SECONDS) holds
         # ``_poll_lock`` for that long; firing later than this would
-        # leave the lock held when ramp_1 wakes.
+        # leave the lock held when the single poll wakes.
         safe_fire_latest = (
-            ramp_window_start
+            single_poll_window_start
             - _tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS
-            - _tc.RPC_PERIODIC_TO_RAMP_SAFETY_BUFFER_SECONDS
+            - _tc.RPC_PERIODIC_TO_SINGLE_POLL_SAFETY_BUFFER_SECONDS
         )
         k = max(1, int((now - round_open) // period) + 1)
         next_at = round_open + k * period
 
-        # The anchored tick lands inside the ramp window itself —
-        # firing here would either race ramp_1 directly or block it.
+        # The anchored tick lands inside the single-poll window itself —
+        # firing here would either race the single poll directly or block it.
         # Sleep past lock and let the post-lock branch resume.
-        if next_at >= ramp_window_start:
+        if next_at >= single_poll_window_start:
             return max(0.1, lock_at + 0.1 - now)
 
-        # The anchored tick is outside the ramp window but close
-        # enough that its worst-case RTT could extend into ramp_1.
-        # Try to fire earlier at the latest safe time; if that time
-        # has already passed (the previous poll overran), suspend
-        # instead of firing a doomed poll that would still overlap.
-        # Example (reschedule): canonical config (period=8, ramp=7.5,
-        #   max_rtt=5, safety=0.05). At now=lock_at−13, anchored
-        #   next_at=lock_at−12 falls in (safe_fire_latest=lock_at−12.55,
-        #   ramp_window_start=lock_at−7.5). Reschedule to lock_at−12.55.
-        # Example (overrun → suspend): previous poll completed at
-        #   lock_at−12.5 (overran past safe_fire_latest=lock_at−12.55
-        #   by 50 ms). No safe time remains; suspend and let
-        #   ramp_1+ramp_2 absorb the extra backlog.
+        # The anchored tick is outside the single-poll window but close
+        # enough that its worst-case RTT could extend into it. Try to fire
+        # earlier at the latest safe time; if that time has already passed
+        # (the previous poll overran), suspend instead of firing a doomed
+        # poll that would still overlap.
+        # Example (reschedule): canonical config (period=8, single_poll=4.75,
+        #   max_rtt=5, safety=0.05) → safe_fire_latest=lock_at−9.8. At
+        #   now=lock_at−10, anchored next_at=lock_at−9 falls in
+        #   (safe_fire_latest=lock_at−9.8, single_poll_window_start=lock_at−4.75).
+        #   Reschedule to lock_at−9.8.
+        # Example (overrun → suspend): previous poll completed at lock_at−9.7
+        #   (overran past safe_fire_latest=lock_at−9.8 by 100 ms). No safe
+        #   time remains; suspend and let the single poll absorb the backlog.
         if next_at > safe_fire_latest:
             if safe_fire_latest > now:
                 return safe_fire_latest - now
             return max(0.1, lock_at + 0.1 - now)
 
-        # Anchored tick has comfortable margin before the ramp window.
+        # Anchored tick has comfortable margin before the single-poll window.
         return max(0.0, next_at - now)
 
     def _latch_first_successful_poll_locked(self) -> None:
@@ -1418,8 +1416,8 @@ class RpcPoller:
         """
         if not self._poll_lock.acquire(blocking=False):
             # Another poll is in flight; skip this one. Periodic polls
-            # are advisory; if a ramp/final poll is concurrent, they
-            # share the same data anyway. A dropped ramp/final poll IS a
+            # are advisory; if the single poll is concurrent, they
+            # share the same data anyway. A dropped single poll IS a
             # critical-path event (cursor advance skipped on the wake the
             # engine scheduled), so surface it (guard audit 1.2); periodic
             # drops stay silent by design.
@@ -1497,20 +1495,20 @@ class RpcPoller:
             # Retry previously-skipped blocks (2.1 fix): periodic only, off the
             # critical path. The retry is one extra batched call; only run it
             # when an extra batch's worst-case lock-hold still finishes before
-            # ramp_poll_1 (the periodic cadence budgets ONE batch before the
-            # ramp window — this adds at most one more). Pre-init / post-lock
+            # the single poll (the periodic cadence budgets ONE batch before
+            # the single-poll window — this adds at most one more). Pre-init / post-lock
             # (_lock_at<=0) runs wall-clock with ample margin.
             if label == "period" and self._pending_retry_blocks:
                 if lock_at_local <= 0:
                     self._retry_pending_receipt_blocks()
                 else:
-                    ramp_window_start = (
-                        lock_at_local - self._ramp_poll_1_wakeup_offset_ms / 1000.0
+                    single_poll_window_start = (
+                        lock_at_local - self._single_poll_wakeup_offset_ms / 1000.0
                     )
                     extra_batch_safe_latest = (
-                        ramp_window_start
+                        single_poll_window_start
                         - 2 * _tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS
-                        - _tc.RPC_PERIODIC_TO_RAMP_SAFETY_BUFFER_SECONDS
+                        - _tc.RPC_PERIODIC_TO_SINGLE_POLL_SAFETY_BUFFER_SECONDS
                     )
                     if time.time() < extra_batch_safe_latest:
                         self._retry_pending_receipt_blocks()
@@ -1561,7 +1559,7 @@ class RpcPoller:
                 self._last_poll_too_slow = too_slow
 
             # Phase B v2 (2026-05-18): per-poll OK lines DROPPED — they fired
-            # every 8s (periodic) + ramp/final polls = ~30-50/round, mostly
+            # every 8s (periodic) + the single poll = ~30-50/round, mostly
             # operator-noise. PARTIAL / EMPTY remain at WARN level since
             # each indicates an anomaly worth reading.
             if blocks_polled == 0 and error_seen is None and n_blocks > 0:

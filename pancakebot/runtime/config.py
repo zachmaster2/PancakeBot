@@ -33,41 +33,30 @@ class RuntimeConfig:
     # at config load; not user-tunable). All in milliseconds before lock_at.
     #
     # Chronological order (lock - X ms; bigger X = earlier in the round):
-    #   ramp_poll_1    (lock -  7.550s)   <-- Era 11 RPC poll (per-leg refactor 2026-05-12)
-    #   bankroll       (lock -  6.045s)
-    #   ramp_poll_2    (lock -  5.850s)   <-- Era 11 RPC poll (per-leg refactor 2026-05-12)
-    #   final_rpc_poll (lock -  4.750s)   <-- Era 11 RPC poll (per-leg refactor 2026-05-12)
+    #   okx_warmup     (lock -  7.000s)   <-- OKX TLS warmup (off critical path)
+    #   preflight      (lock -  5.970s)   <-- wallet balance + nonce/gas prefetch
+    #   single_poll    (lock -  4.750s)   <-- Candidate C RPC catch-up (2026-06-06)
     #   anchor_poll    (lock -  1.300s)   <-- Bundle 5 v2 single anchor poll (200ms timeout)
-    #   critical_path  (lock -  1.045s)
-    #   bet_submit     (lock -  0.700s)   <-- timing-guard deadline (static fallback)
+    #   critical_path  (lock -  0.970s)
+    #   bet_submit     (lock -  0.625s)   <-- timing-guard deadline (static fallback)
     #
-    # The per-leg ramp intervals (RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS=1700,
-    # RPC_RAMP_2_TO_FINAL_INTERVAL_MS=1100) are sized for each ramp's
-    # actual expected workload: ramp_1 catches up an 8s-periodic-interval
-    # of blocks (worst case ~18), ramp_2 is a small incremental top-up
-    # (~4 blocks). Replaces the uniform RPC_RAMP_POLL_INTERVAL_MS=1500
-    # that was sized for an outdated 30s-periodic-era batch=15 assumption.
-    #
-    # At canonical pool_cutoff=6 specifically: chronology is monotonic —
-    # ramp_2 (5.850s) naturally falls AFTER bankroll (6.045s). At larger
-    # pool_cutoff values (≥7), final shifts earlier and ramp_2 may push
-    # above bankroll's offset again; engine.py fires wakes in fixed code
-    # order (ramp_1 → bankroll → ramp_2 → final) and _sleep_until_ts
-    # returns immediately for past-due wakes, so runtime stays correct
-    # but the wake order in wall-clock differs from the offset order.
+    # Candidate C (2026-06-06): the 3-leg ramp ladder (ramp_1/ramp_2/final)
+    # collapsed to ONE batched poll at the old final-poll slot. The retained
+    # 8s periodic poll keeps the cursor within ~1 interval, so the single poll
+    # only catches up the ~5-20 blocks since the last periodic. All offsets are
+    # strictly decreasing; engine.py validates the ordering at startup.
     #
     # Bundle 5 v2 (2026-05-14): the ``ntp_sync_wake`` (formerly at
     # lock - 11.095s) is retired. The bot trusts the OS clock directly
     # (W32Time tightening per README); no application-level NTP layer.
     #
     # preflight_wake refreshes wallet balance (live: BSC RPC; dry: in-memory).
-    # ramp + final RPC polls catch up bet events from BSC via batched
-    #   eth_getBlockReceipts so the critical_path snapshot is fresh.
+    # single_poll (Candidate C, 2026-06-06) is ONE batched eth_getBlockReceipts
+    #   catch-up before the critical path (replaced the 3-leg ramp ladder); the
+    #   retained 8s periodic poll keeps the snapshot fresh between rounds.
     # critical_path_wake reads the local pool aggregate, runs the gate,
     #   and submits the bet.
-    ramp_poll_1_wakeup_offset_before_lock_ms: int
-    ramp_poll_2_wakeup_offset_before_lock_ms: int
-    final_rpc_poll_wakeup_offset_before_lock_ms: int
+    single_poll_wakeup_offset_before_lock_ms: int
     preflight_wakeup_offset_before_lock_ms: int
     okx_warmup_wakeup_offset_before_lock_ms: int
     critical_path_wakeup_offset_before_lock_ms: int

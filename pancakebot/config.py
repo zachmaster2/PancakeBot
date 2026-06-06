@@ -344,9 +344,7 @@ class AppConfig:
     # Derived (from timing_constants.py at load time)
     bet_submit_deadline_offset_before_lock_ms: int
     critical_path_wakeup_offset_before_lock_ms: int
-    final_rpc_poll_wakeup_offset_before_lock_ms: int
-    ramp_poll_1_wakeup_offset_before_lock_ms: int
-    ramp_poll_2_wakeup_offset_before_lock_ms: int
+    single_poll_wakeup_offset_before_lock_ms: int
     preflight_wakeup_offset_before_lock_ms: int
     okx_warmup_wakeup_offset_before_lock_ms: int
 
@@ -832,113 +830,57 @@ def load_app_config(path: str) -> AppConfig:
     # The bot trusts the OS clock directly (W32Time tightening per
     # README); no application-level NTP wake is scheduled.
 
-    # --- RPC poll wake schedule (Era 11: 2026-05-07 pivot; refactored 2026-05-12) ---
-    # final_rpc_poll fires before the critical_path read; ramp_2 fires
-    # before final; ramp_1 fires before ramp_2. See
-    # var/design/rpc_polling_architecture_2026_05_07.md.
+    # --- RPC poll wake schedule (Era 11: 2026-05-07 pivot; Candidate C
+    # single-poll: 2026-06-06) ---
+    # See var/design/rpc_polling_architecture_2026_05_07.md. The single-poll
+    # offset doesn't depend on the rtt_p99 lookup; the startup invariant below
+    # checks the chosen offset still accommodates the actual p99 + safety,
+    # failing-fast with a clear InvariantError if rtt_p99 drifts past what the
+    # schedule can absorb.
     #
-    # Refactor rationale (2026-05-12): the prior derivation subtracted
-    # ``rpc_rtt_p99_for_batch(EXPECTED_FINAL_POLL_BATCH_SIZE)`` from
-    # ``final_rpc_poll_wakeup_offset_before_lock_ms``. As measured RTT grew, the
-    # final-poll wake fired LATER (smaller offset = closer to lock),
-    # leaving LESS time to complete the poll — opposite of the desired
-    # direction. The ramp_1/ramp_2 derivations had the same RTT
-    # coupling (direction-correct but still runtime-fragile).
-    #
-    # Shape:
-    #   final = pool_cutoff*1000 − BSC_BLOCK_TIME − RPC_BLOCK_AVAILABILITY_DELAY_P99
-    #           − RPC_POLL_FINAL_SAFETY_BUFFER
-    #   ramp_2 = final + RPC_RAMP_2_TO_FINAL_INTERVAL_MS
-    #   ramp_1 = ramp_2 + RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS
-    #
-    # The runtime offsets no longer depend on the rtt_p99 lookup. The
-    # startup invariants below check that each chosen offset still
-    # accommodates the actual rtt_p99 + safety; if rtt_p99 drifts past
-    # what the schedule can absorb, startup fails-fast with a clear
-    # InvariantError.
-    #
-    # Per-leg ramp intervals (2026-05-12 refactor): ramp_1's worst-case
-    # workload (catching up an 8s periodic interval = ~18 blocks) is
-    # much larger than ramp_2's incremental top-up (~4 blocks). The
-    # uniform RPC_RAMP_POLL_INTERVAL_MS=1500 it replaced was sized for a
-    # outdated batch=15 assumption and under-provisioned ramp_1 while
-    # over-provisioning ramp_2/final.
-    final_rpc_poll_wakeup_offset_before_lock_ms = (
+    # Candidate C (2026-06-06): ONE batched poll before the critical path,
+    # replacing the 3-leg ramp ladder. Fires at the latest offset that still
+    # captures the cutoff block (block_ts < lock - pool_cutoff) with the
+    # availability + safety cushion — i.e. the old final-poll derivation. The
+    # retained 8s periodic poll keeps the catch-up batch bounded (~1 interval).
+    single_poll_wakeup_offset_before_lock_ms = (
         pool_cutoff_seconds * 1000
         - _tc.BSC_BLOCK_TIME_MS
         - _tc.RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
         - _tc.RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS
     )
-    ramp_poll_2_wakeup_offset_before_lock_ms = (
-        final_rpc_poll_wakeup_offset_before_lock_ms
-        + _tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS
-    )
-    ramp_poll_1_wakeup_offset_before_lock_ms = (
-        ramp_poll_2_wakeup_offset_before_lock_ms
-        + _tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS
-    )
 
-    # --- Startup invariants: validate the refactored schedule still
-    # leaves room for the actual rtt_p99 + safety ---
-    # Final poll: at empirical p99 RTT, the poll must complete before
-    # critical_path fires, with the deadline safety cushion. If this
-    # ever fails, either pool_cutoff_seconds is too small or the
-    # rtt_p99 table value has grown past what the budget can absorb.
-    _final_poll_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_FINAL_POLL_BATCH_SIZE)
-    _final_poll_completion_offset = (
-        final_rpc_poll_wakeup_offset_before_lock_ms
-        - _final_poll_rtt
+    # --- Startup invariant: the single batched poll must complete before
+    # critical_path reads the pool snapshot (Candidate C, 2026-06-06) ---
+    # At the worst-case batch (one 8s periodic interval ≈ 20 blocks) and
+    # empirical p99 RTT, the single poll must fire AND complete before
+    # critical_path, with the deadline safety cushion. If this fails, either
+    # pool_cutoff_seconds is too small or the rtt_p99 table value has grown
+    # past what the budget absorbs. (The prior 3-leg ladder's per-leg interval
+    # invariants are retired with the ladder.)
+    _single_poll_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_SINGLE_POLL_BATCH_SIZE)
+    _single_poll_completion_offset = (
+        single_poll_wakeup_offset_before_lock_ms
+        - _single_poll_rtt
         - _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
     )
-    if _final_poll_completion_offset < critical_path_wakeup_offset_before_lock_ms:
+    if _single_poll_completion_offset < critical_path_wakeup_offset_before_lock_ms:
         raise InvariantError(
-            f"final_rpc_poll_rtt_budget_insufficient: "
-            f"final_rpc_poll_wakeup={final_rpc_poll_wakeup_offset_before_lock_ms}ms "
-            f"- rtt_p99({_tc.EXPECTED_FINAL_POLL_BATCH_SIZE})={_final_poll_rtt}ms "
+            f"single_poll_rtt_budget_insufficient: "
+            f"single_poll_wakeup={single_poll_wakeup_offset_before_lock_ms}ms "
+            f"- rtt_p99({_tc.EXPECTED_SINGLE_POLL_BATCH_SIZE})={_single_poll_rtt}ms "
             f"- safety={_tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS}ms "
-            f"= {_final_poll_completion_offset}ms "
+            f"= {_single_poll_completion_offset}ms "
             f"< critical_path={critical_path_wakeup_offset_before_lock_ms}ms. "
             f"pool_cutoff_seconds={pool_cutoff_seconds}. Either raise "
             f"pool_cutoff_seconds or investigate RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE."
         )
 
-    # Per-leg ramp interval invariants. Each interval must cover its
-    # corresponding ramp poll's actual rtt_p99 + safety; future drift
-    # in RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE that violates either
-    # fails-fast at startup rather than silently producing a too-tight
-    # schedule.
-    _ramp_1_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_1_BATCH_SIZE)
-    _ramp_1_required = _ramp_1_rtt + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-    if _tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS < _ramp_1_required:
-        raise InvariantError(
-            f"ramp_poll_1_to_ramp_2_interval_insufficient: "
-            f"RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS={_tc.RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS}ms "
-            f"< rtt_p99({_tc.EXPECTED_RAMP_POLL_1_BATCH_SIZE})={_ramp_1_rtt}ms + "
-            f"safety={_tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS}ms "
-            f"= {_ramp_1_required}ms. "
-            f"Raise RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS or investigate "
-            f"RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE drift."
-        )
-
-    _ramp_2_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_RAMP_POLL_2_BATCH_SIZE)
-    _ramp_2_required = _ramp_2_rtt + _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-    if _tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS < _ramp_2_required:
-        raise InvariantError(
-            f"ramp_poll_2_to_final_interval_insufficient: "
-            f"RPC_RAMP_2_TO_FINAL_INTERVAL_MS={_tc.RPC_RAMP_2_TO_FINAL_INTERVAL_MS}ms "
-            f"< rtt_p99({_tc.EXPECTED_RAMP_POLL_2_BATCH_SIZE})={_ramp_2_rtt}ms + "
-            f"safety={_tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS}ms "
-            f"= {_ramp_2_required}ms. "
-            f"Raise RPC_RAMP_2_TO_FINAL_INTERVAL_MS or investigate "
-            f"RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE drift."
-        )
-
-    # Bundle 5 v2 (2026-05-14): the ``ramp_poll_1 < ntp_sync_wake``
-    # invariant is retired alongside the ntp_sync wake itself. ramp_1
-    # is now the first scheduled wake in the round; the next wake
-    # immediately after it is preflight (lower offset = later). The
-    # preflight wake's 5s budget vs ~50-200ms wallet RPC means the
-    # ramp_1 -> preflight ordering is robust without an explicit check.
+    # Candidate C (2026-06-06): the 3-leg ramp ladder + its per-leg interval
+    # invariants are retired. The first scheduled wake in the round is now
+    # okx_warmup, then preflight, then the single poll — all strictly
+    # decreasing offsets, validated by the engine's wake-ladder ordering
+    # check (_assert_critical_path_timing_sane) at startup.
 
     # Bundle 5 v2 (2026-05-14): the NTP wake budget cross-validation
     # is retired alongside the application-level NTP layer itself.
@@ -987,9 +929,7 @@ def load_app_config(path: str) -> AppConfig:
         max_consecutive_kline_fetch_failures=max_consecutive_kline_fetch_failures,
         bet_submit_deadline_offset_before_lock_ms=bet_submit_deadline_offset_before_lock_ms,
         critical_path_wakeup_offset_before_lock_ms=critical_path_wakeup_offset_before_lock_ms,
-        final_rpc_poll_wakeup_offset_before_lock_ms=final_rpc_poll_wakeup_offset_before_lock_ms,
-        ramp_poll_1_wakeup_offset_before_lock_ms=ramp_poll_1_wakeup_offset_before_lock_ms,
-        ramp_poll_2_wakeup_offset_before_lock_ms=ramp_poll_2_wakeup_offset_before_lock_ms,
+        single_poll_wakeup_offset_before_lock_ms=single_poll_wakeup_offset_before_lock_ms,
         preflight_wakeup_offset_before_lock_ms=preflight_wakeup_offset_before_lock_ms,
         okx_warmup_wakeup_offset_before_lock_ms=okx_warmup_wakeup_offset_before_lock_ms,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
