@@ -675,7 +675,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         cfg.contract.refresh_gas_price()
         if not cfg.dry:
             cfg.contract.prefetch_nonce()
-        info("PREFLIGHT", f"send-cache refreshed: {cfg.contract.send_cache_summary()}")
+        info("READY", f"send-cache refreshed: {cfg.contract.send_cache_summary()}")
 
         # -- Ramp poll #2 (Era 11) --
         # Second RPC poll. Fires at lock_at -
