@@ -1,9 +1,8 @@
 """Tests for the Tier 1+2+4 observability sweep (guard audit).
 
-Covers the startup timing-ladder invariant, the gas-cap-bypass streak
-counter, the anchor static-fallback / block-time monitors, and the named
-wallet-balance exhaustion. The pure rolling-window monitors are covered
-separately in ``test_regime_telemetry.py``.
+Covers the startup timing-ladder invariant, the anchor static-fallback /
+block-time monitors, and the named wallet-balance exhaustion. The pure
+rolling-window monitors are covered separately in ``test_regime_telemetry.py``.
 """
 from __future__ import annotations
 
@@ -20,10 +19,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 from pancakebot import timing_constants as _tc  # noqa: E402
 from pancakebot.runtime import engine  # noqa: E402
-from pancakebot.chain.prediction_contract import (  # noqa: E402
-    Web3PredictionContract,
-    _GAS_CAP_BYPASS_WARN_STREAK,
-)
 from pancakebot.chain.rpc_poller import RpcPoller  # noqa: E402
 from pancakebot.runtime.regime_telemetry import (  # noqa: E402
     RollingMedianDriftMonitor,
@@ -85,40 +80,6 @@ def test_real_constants_pass_the_invariant():
     (otherwise the bot can't boot)."""
     # Mirror the production offsets the runtime config derives.
     engine._assert_critical_path_timing_sane(_valid_timing_cfg())
-
-
-# --------------------------------------------------------------------------
-# 4.3 — gas-cap-bypass streak counter
-# --------------------------------------------------------------------------
-
-
-def _bare_contract() -> Web3PredictionContract:
-    c = object.__new__(Web3PredictionContract)
-    c._gas_cap_bypass_streak = 0
-    return c
-
-
-def test_gas_cap_bypass_warns_only_at_threshold():
-    c = _bare_contract()
-    with mock.patch("pancakebot.chain.prediction_contract.warn") as m_warn:
-        for _ in range(_GAS_CAP_BYPASS_WARN_STREAK - 1):
-            c._note_gas_cap_bypass("rpc_error")
-        assert m_warn.call_count == 0  # below threshold: silent
-        c._note_gas_cap_bypass("rpc_error")  # crosses threshold
-        assert m_warn.call_count == 1
-        args = m_warn.call_args[0]
-        assert args[0] == "ALERT"
-        assert "GAS_CAP_BYPASS" in args[1]
-        assert f"streak={_GAS_CAP_BYPASS_WARN_STREAK}" in args[1]
-
-
-def test_gas_cap_streak_resets_field():
-    c = _bare_contract()
-    for _ in range(5):
-        c._note_gas_cap_bypass("node_returned_zero")
-    assert c._gas_cap_bypass_streak == 5
-    c._gas_cap_bypass_streak = 0  # simulates a clean validation
-    assert c._gas_cap_bypass_streak == 0
 
 
 # --------------------------------------------------------------------------

@@ -20,11 +20,13 @@ from pancakebot.chain.contract_config import Web3ContractConfig
 from pancakebot.log import warn
 from pancakebot.util import GasPriceCapBreachedError, InvariantError, TransientRpcError
 
-# Gas-cap-bypass observability (guard audit 4.3): WARN after this many
-# CONSECUTIVE rounds where the gas-cap check could not validate and the
-# bet proceeded at MAX. A single bypass is a transient hiccup; a sustained
-# streak means the cap is silently un-enforced every round.
-_GAS_CAP_BYPASS_WARN_STREAK = 3
+# Pre-cache (2026-06-06): the bet/claim send path reads a CACHED nonce + gas
+# price, both refreshed OFF the critical path (preflight wake / startup), so the
+# send makes zero RPCs but send_raw. The gas cache is valid for the cap check
+# only if refreshed within this bound; older => the off-path refresh is broken,
+# so fail-loud (skip + surface) rather than bet on an ancient gas price. ~2
+# rounds (a round is ~5 min); normal age at bet time is ~5 s (preflight wake).
+_GAS_CACHE_MAX_AGE_MS = 600_000
 
 _T = TypeVar("_T")
 
@@ -238,9 +240,13 @@ class Web3PredictionContract:
         self._contract = self._providers[0][1]
         # Account is optional -- only needed for live mode (signing transactions).
         self._account: Any = w3_primary.eth.account.from_key(pk) if len(pk) == 64 else None
-        # Consecutive gas-cap-bypass counter (guard audit 4.3). Reset to 0
-        # on any clean validation; WARN once the streak crosses the threshold.
-        self._gas_cap_bypass_streak: int = 0
+        # Pre-cache (2026-06-06): send-path nonce + gas price, refreshed OFF the
+        # critical path (preflight wake + startup). None => unpopulated; the send
+        # path gates on send_caches_ready() and SKIPs fail-loud rather than
+        # live-fetch. See prefetch_nonce / refresh_gas_price / warm_write_endpoints.
+        self._cached_nonce: int | None = None
+        self._cached_gas_price_wei: int | None = None
+        self._cached_gas_price_mono_ms: float | None = None
 
     def _rotate_rpc(self) -> None:
         """Round-robin to next RPC URL, switching to its warm session."""
@@ -260,6 +266,105 @@ class Web3PredictionContract:
         if account is None:
             return ""
         return str(account.address)
+
+    # ---- Pre-cache: off-critical-path nonce + gas-price (2026-06-06) ----
+    #
+    # The bet send path reads a CACHED nonce + gas price so it makes zero RPCs
+    # but send_raw — the critical path drops from two cold rotated RPCs (~220ms)
+    # to build-encode + ECDSA sign + send_raw (~50ms). Both caches are refreshed
+    # OFF the critical path (preflight wake + startup). See
+    # research/probe_critpath_rpc_breakdown_2026_06_06.py for the breakdown.
+
+    def prefetch_nonce(self) -> None:
+        """Refresh the cached send-nonce from chain ("pending") OFF the critical
+        path. Self-healing: if the chain nonce disagrees with the locally
+        incremented cache (a missed increment or external wallet activity),
+        adopt chain truth and surface the reconcile. Live-only (no-op without a
+        signing account)."""
+        if self._account is None:
+            return
+        addr = self._require_account().address
+        chain_nonce = int(self._rpc_call(
+            op="prefetch_nonce",
+            fn=lambda: Web3.to_int(self._w3.eth.get_transaction_count(addr, "pending")),
+        ))
+        if self._cached_nonce is not None and chain_nonce != self._cached_nonce:
+            warn(
+                "ALERT",
+                f"NONCE_RECONCILE cached={self._cached_nonce} chain_pending={chain_nonce}; "
+                f"adopting chain truth (missed increment or external wallet activity)",
+            )
+        self._cached_nonce = chain_nonce
+
+    def refresh_gas_price(self) -> None:
+        """Refresh the cached node gas price OFF the critical path. On RPC
+        failure keep the prior cached value (one blip shouldn't blank the
+        cache); a SUSTAINED outage ages the value past _GAS_CACHE_MAX_AGE_MS,
+        which the cap check then rejects fail-loud."""
+        try:
+            wei = int(self._rpc_call(
+                op="refresh_gas_price",
+                fn=lambda: Web3.to_int(self._w3.eth.gas_price),
+            ))
+        except TransientRpcError:
+            return
+        self._cached_gas_price_wei = wei
+        self._cached_gas_price_mono_ms = float(time.perf_counter() * 1000.0)
+
+    def warm_write_endpoints(self) -> None:
+        """Warm the TLS connection on EVERY write endpoint OFF the critical path
+        (preflight wake). Keep-alive holds >=30s (probe 2026-06-06), so a touch
+        ~5s before the bet keeps whichever rotated endpoint send_raw lands on hot
+        (~27ms vs ~110ms cold reconnect). Best-effort latency optimization, NOT a
+        correctness condition: a failed warm just means that endpoint pays a cold
+        handshake if the bet rotates to it."""
+        for w3, _c in self._providers:
+            try:
+                w3.eth.gas_price
+            except Exception:
+                pass
+
+    def gas_cache_age_ms(self) -> float | None:
+        """Age of the cached gas price in ms, or None if never populated."""
+        if self._cached_gas_price_mono_ms is None:
+            return None
+        return float(time.perf_counter() * 1000.0) - self._cached_gas_price_mono_ms
+
+    def send_caches_ready(self) -> bool:
+        """True iff BOTH caches are populated and the gas cache is fresh enough
+        for the cap check. The send path gates on this and SKIPs (fail-loud,
+        surfaced) when False — a False means the off-path preflight refresh did
+        not run; we never silently live-fetch a fallback on the hot path."""
+        if self._cached_nonce is None or self._cached_gas_price_wei is None:
+            return False
+        age_ms = self.gas_cache_age_ms()
+        return age_ms is not None and age_ms <= _GAS_CACHE_MAX_AGE_MS
+
+    def send_cache_summary(self) -> str:
+        """One-line cache state for preflight-wake / startup observability."""
+        age = self.gas_cache_age_ms()
+        age_s = "n/a" if age is None else f"{age:.0f}ms"
+        return (f"nonce={self._cached_nonce} gas_price_wei={self._cached_gas_price_wei} "
+                f"gas_age={age_s}")
+
+    def _next_nonce(self) -> int:
+        """Cached send-nonce. Raises if unpopulated — defense-in-depth; callers
+        gate on send_caches_ready() first and skip. NEVER live-fetches here (that
+        would re-mask the ~110ms RPC the cache exists to remove)."""
+        if self._cached_nonce is None:
+            raise InvariantError("nonce_cache_unpopulated")
+        return int(self._cached_nonce)
+
+    def _on_send_success(self) -> None:
+        """Advance the cached nonce after a confirmed send_raw acceptance."""
+        if self._cached_nonce is None:
+            raise InvariantError("nonce_cache_unpopulated_on_increment")
+        self._cached_nonce += 1
+
+    def _invalidate_nonce(self) -> None:
+        """Drop the cached nonce after a send error so the next preflight wake
+        re-prefetches from chain truth."""
+        self._cached_nonce = None
 
     def _rpc_call(self, *, op: str, fn: Callable[[], _T]) -> _T:
         self._rotate_rpc()
@@ -520,57 +625,47 @@ class Web3PredictionContract:
         return int(self._rpc_call(op="suggest_gas_price_wei", fn=lambda: Web3.to_int(self._w3.eth.gas_price)))
 
     def assert_gas_cap_not_breached(self) -> None:
-        """Validates that eth.gas_price <= MAX_GAS_PRICE_WEI.
+        """Validate the CACHED node gas price <= MAX_GAS_PRICE_WEI.
 
-        Live bet/claim TXs are posted at MAX_GAS_PRICE_WEI (the worst-case
-        ceiling). If the node-suggested gas price exceeds the cap, the
-        ceiling is below current network reality and live TXs paid at MAX
-        would land at the back of the priority queue (likely to miss the
-        lock-block inclusion window).
+        The value is refreshed OFF the critical path (refresh_gas_price at the
+        preflight wake / claim flush), so the bet path makes no gas RPC. Fail
+        LOUD — raise GasPriceCapBreachedError so the caller SKIPs + alerts — on:
+          - unpopulated cache (refresh never ran: a wiring bug),
+          - cache staler than _GAS_CACHE_MAX_AGE_MS (sustained refresh outage;
+            betting on an ancient gas price is unsafe),
+          - cached price 0 (misbehaving node), or
+          - cached price > MAX_GAS_PRICE_WEI (the real breach: the cap is below
+            network reality, so bets at MAX would miss the lock window).
+        We never silently live-fetch a fallback here — that would re-mask the
+        latency the cache removes AND paper over a broken refresh. (The engine
+        gates on send_caches_ready() first, so on the bet path only the
+        real-breach branch fires; the others are defense-in-depth + the claim
+        path, which has no separate readiness gate.)
 
         Raises:
-            GasPriceCapBreachedError: when ``eth.gas_price > MAX_GAS_PRICE_WEI``.
-                The caller should skip the bet/claim, alert the operator,
-                and continue running. The operator must lift the cap and
-                review before resuming.
-
-        Logs warning and returns (does NOT raise) on:
-            - RPC failure fetching ``eth.gas_price``. Proceed with MAX
-              (single-round transient hiccups shouldn't block the bet).
-            - ``eth.gas_price`` == 0. Misbehaving node; proceed with MAX.
+            GasPriceCapBreachedError: on any of the above. The caller skips the
+                bet/claim, alerts the operator, and keeps running.
         """
-        try:
-            suggested = self.suggest_gas_price_wei()
-        except TransientRpcError:
-            # Don't crash the round on a transient RPC hiccup; proceed with MAX.
-            # The check repeats next round; sustained outages surface elsewhere
-            # (preflight wake fetch, etc.).
-            self._note_gas_cap_bypass("rpc_error")
-            return
-        if suggested == 0:
-            # Misbehaving node returned 0 — can't validate. Proceed with MAX;
-            # the bet still goes out at the ceiling.
-            self._note_gas_cap_bypass("node_returned_zero")
-            return
-        if suggested > MAX_GAS_PRICE_WEI:
+        wei = self._cached_gas_price_wei
+        if wei is None:
             raise GasPriceCapBreachedError(
-                f"eth.gas_price={suggested} > MAX_GAS_PRICE_WEI={MAX_GAS_PRICE_WEI}; "
-                f"raise the cap and review before resuming"
+                "gas_price_cache_unpopulated: refresh_gas_price did not run before "
+                "send; skipping (fix the preflight/claim refresh wiring)"
             )
-        # Clean validation (valid, under cap): reset the bypass streak.
-        self._gas_cap_bypass_streak = 0
-
-    def _note_gas_cap_bypass(self, reason: str) -> None:
-        """Increment the consecutive gas-cap-bypass streak and WARN once it
-        crosses the threshold (guard audit 4.3). Telemetry only — the bet
-        still proceeds at MAX in the calling branch."""
-        self._gas_cap_bypass_streak += 1
-        if self._gas_cap_bypass_streak >= _GAS_CAP_BYPASS_WARN_STREAK:
-            warn(
-                "ALERT",
-                f"GAS_CAP_BYPASS streak={self._gas_cap_bypass_streak} reason={reason}; "
-                f"gas-cap check un-enforced — bets proceeding at MAX_GAS_PRICE_WEI "
-                f"without validation",
+        age_ms = self.gas_cache_age_ms()
+        if age_ms is not None and age_ms > _GAS_CACHE_MAX_AGE_MS:
+            raise GasPriceCapBreachedError(
+                f"gas_price_cache_stale age_ms={age_ms:.0f} > {_GAS_CACHE_MAX_AGE_MS}: "
+                f"refresh_gas_price not running; skipping rather than bet on a stale price"
+            )
+        if wei == 0:
+            raise GasPriceCapBreachedError(
+                "gas_price_cache_zero: node returned 0; cannot validate cap, skipping"
+            )
+        if wei > MAX_GAS_PRICE_WEI:
+            raise GasPriceCapBreachedError(
+                f"cached eth.gas_price={wei} > MAX_GAS_PRICE_WEI={MAX_GAS_PRICE_WEI}; "
+                f"raise the cap and review before resuming"
             )
 
     def get_user_rounds_length(self, wallet_address: str) -> int:
@@ -748,8 +843,13 @@ class Web3PredictionContract:
         try:
             txh = self._w3.eth.send_raw_transaction(signed.raw_transaction)
         except Exception as e:
+            # Send failed: the cached nonce may or may not have been consumed —
+            # drop it so the next preflight wake re-prefetches chain truth.
+            self._invalidate_nonce()
             raise TransientRpcError(f"tx_send_failed: {e}") from e
         t_tx_hash = float(time.perf_counter() * 1000.0)
+        # Accepted into the mempool: advance the cached nonce for the next send.
+        self._on_send_success()
 
         tx_hash = str(txh.hex())
         t_receipt = None
@@ -830,15 +930,20 @@ class Web3PredictionContract:
         else:
             raise InvariantError("bet_side_invalid")
 
+        # Cached nonce + explicit chainId => build_transaction makes ZERO RPCs
+        # (was an inline get_transaction_count, ~110ms cold). _rpc_call still
+        # rotates the endpoint so send_raw lands on one warmed at the preflight
+        # wake (keep-alive >=30s).
         return self._rpc_call(
             op="build_bet_tx",
             fn=lambda: fn.build_transaction(
                 {
                     "from": self._require_account().address,
                     "value": int(amount_wei),
-                    "nonce": Web3.to_int(self._w3.eth.get_transaction_count(self._require_account().address)),
+                    "nonce": self._next_nonce(),
                     "gas": int(gas_limit),
                     "gasPrice": int(gas_price_wei),
+                    "chainId": int(EXPECTED_CHAIN_ID),
                 }
             ),
         )
@@ -932,17 +1037,20 @@ class Web3PredictionContract:
         tx = fn.build_transaction(
             {
                 "from": self._require_account().address,
-                "nonce": Web3.to_int(self._w3.eth.get_transaction_count(self._require_account().address)),
+                "nonce": self._next_nonce(),
                 "gas": int(gas_limit),
                 "gasPrice": int(gas_price_wei),
+                "chainId": int(EXPECTED_CHAIN_ID),
             }
         )
         signed = self._require_account().sign_transaction(tx)
         try:
             txh = self._w3.eth.send_raw_transaction(signed.raw_transaction)
         except Exception as e:
+            self._invalidate_nonce()
             raise TransientRpcError(f"claim_tx_send_failed: {e}") from e
         tx_hash = str(txh.hex())
+        self._on_send_success()
 
         if not bool(wait_receipt):
             return ClaimSubmitResult(

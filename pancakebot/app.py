@@ -208,6 +208,16 @@ def run_from_config(
     interval_seconds = _cc.interval_seconds
     buffer_seconds = _cc.buffer_seconds
 
+    # Pre-cache (2026-06-06): prime the send caches at startup so the FIRST
+    # bet/claim already reads from cache (the per-round preflight wake keeps them
+    # fresh thereafter). nonce prefetch is live-only (needs the signing account);
+    # gas refresh + endpoint warm run in both modes.
+    contract.warm_write_endpoints()
+    contract.refresh_gas_price()
+    if not dry:
+        contract.prefetch_nonce()
+    info("START", f"send-cache primed: {contract.send_cache_summary()}")
+
     _okx_timeout_seconds = 10.0
     okx_client = OkxClient(timeout_seconds=_okx_timeout_seconds)
     # Observability (guard audit 4.1): the OKX REST timeout is the one
