@@ -38,8 +38,8 @@ Derivation chain (computed at config-load time in ``pancakebot/config.py``):
                                       + RPC_RAMP_2_TO_FINAL_INTERVAL_MS)
     ramp_poll_1_wakeup_offset_before_lock_ms   = (ramp_poll_2_wakeup_offset_before_lock_ms
                                       + RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS)
-    bankroll_wakeup_offset_before_lock_ms      = (critical_path_wakeup_offset_before_lock_ms
-                                      + BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS)
+    preflight_wakeup_offset_before_lock_ms     = (critical_path_wakeup_offset_before_lock_ms
+                                      + PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS)
 
 Inside the critical-path wake the engine sequences pool snapshot ->
 kline fetch -> signal compute -> bet submit. The 5ms POOL_READ_TIME_MS
@@ -50,12 +50,12 @@ its own wake (the prior architecture used a separate pool_read_wake
 A single ``critical_path_wakeup_offset_before_lock_ms`` keeps the wake schedule
 honest about what's a scheduled event vs what's intra-wake sequencing.
 
-The bankroll wake offset above the critical path is deliberately a
+The preflight wake offset above the critical path is deliberately a
 LITERAL 5-second gap rather than derived from tightly measured query
 budgets. Non-critical-path wakes are sized for robustness against
 environmental drift (network spikes, Windows update kicks, OKX RPC
 pauses) — a 5s gap dwarfs every observed worst case (~50-200ms wallet
-RPC). See ``BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS`` for the rationale.
+RPC). See ``PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS`` for the rationale.
 
 Bundle 5 v2 (2026-05-14): the prior ``ntp_sync_wakeup_offset_ms`` is
 retired. The bot trusts the OS clock directly (Windows Time Service
@@ -515,7 +515,7 @@ def rpc_rtt_p99_for_batch(batch_size: int) -> int:
 
 # --- Non-critical-path wake gaps ------------------------------------------
 
-# Gap between bankroll_wake and the critical_path entry. The bankroll
+# Gap between preflight_wake and the critical_path entry. The preflight
 # wake fires at critical_path_wakeup_offset_before_lock_ms + this offset
 # (= ~lock-6.045s); the engine uses the budget to read live wallet
 # balance via BSC RPC (~50-200ms p99) or, in dry mode, the in-memory
@@ -528,10 +528,10 @@ def rpc_rtt_p99_for_batch(batch_size: int) -> int:
 # bets on time. If it drifts to 6s the cross-validation gate in
 # config.py fires and the operator notices before production breaks.
 # Last measured: 2026-05-06
-BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS: int = 5000
+PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS: int = 5000
 
 # OKX warmup wake (2026-05-21): pre-bet TLS-handshake warmup for the
-# OkxClient's HTTPS connection pool. Fires BEFORE bankroll_wake so any
+# OkxClient's HTTPS connection pool. Fires BEFORE preflight_wake so any
 # OKX-side keep-alive expiry (typical nginx default ~75s) from a long
 # idle window (e.g. a catchup_infeasible streak) is paid OUT of the
 # critical path. Without this, the first kline fetch after a long idle
@@ -541,7 +541,7 @@ BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS: int = 5000
 # ~25 minutes; on the recovery round, fetch_ms ran 734-850ms vs typical
 # 270ms, contributing to a missed lock-block inclusion.
 #
-# Slot rationale: between ramp_poll_1 (lock - 7550ms) and bankroll
+# Slot rationale: between ramp_poll_1 (lock - 7550ms) and preflight
 # (lock - 5970ms), leaving ~550ms headroom on each side for a slow
 # warmup (~270ms typical, ~800ms worst-case cold). Doesn't touch the
 # critical path; even a fully-failed warmup (rare; OkxClient.warmup

@@ -333,7 +333,7 @@ class AppConfig:
     ``pancakebot/timing_constants.py``; not user-tunable):
     - ``bet_submit_deadline_offset_before_lock_ms``
     - ``critical_path_wakeup_offset_before_lock_ms``
-    - ``bankroll_wakeup_offset_before_lock_ms``
+    - ``preflight_wakeup_offset_before_lock_ms``
     """
 
     # User-tunable
@@ -347,7 +347,7 @@ class AppConfig:
     final_rpc_poll_wakeup_offset_before_lock_ms: int
     ramp_poll_1_wakeup_offset_before_lock_ms: int
     ramp_poll_2_wakeup_offset_before_lock_ms: int
-    bankroll_wakeup_offset_before_lock_ms: int
+    preflight_wakeup_offset_before_lock_ms: int
     okx_warmup_wakeup_offset_before_lock_ms: int
 
     # Other
@@ -818,11 +818,11 @@ def load_app_config(path: str) -> AppConfig:
         + _tc.SIGNAL_COMPUTE_TIME_MS
         + _tc.POOL_READ_TIME_MS
     )
-    bankroll_wakeup_offset_before_lock_ms = (
+    preflight_wakeup_offset_before_lock_ms = (
         critical_path_wakeup_offset_before_lock_ms
-        + _tc.BANKROLL_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS
+        + _tc.PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS
     )
-    # OKX session warmup wake (2026-05-21): fires before bankroll_wake so
+    # OKX session warmup wake (2026-05-21): fires before preflight_wake so
     # any TLS handshake cost on an expired OkxClient connection is paid OUT
     # of the bet-decision critical path.
     okx_warmup_wakeup_offset_before_lock_ms = (
@@ -936,9 +936,9 @@ def load_app_config(path: str) -> AppConfig:
     # Bundle 5 v2 (2026-05-14): the ``ramp_poll_1 < ntp_sync_wake``
     # invariant is retired alongside the ntp_sync wake itself. ramp_1
     # is now the first scheduled wake in the round; the next wake
-    # immediately after it is bankroll (lower offset = later). The
-    # bankroll wake's 5s budget vs ~50-200ms wallet RPC means the
-    # ramp_1 -> bankroll ordering is robust without an explicit check.
+    # immediately after it is preflight (lower offset = later). The
+    # preflight wake's 5s budget vs ~50-200ms wallet RPC means the
+    # ramp_1 -> preflight ordering is robust without an explicit check.
 
     # Bundle 5 v2 (2026-05-14): the NTP wake budget cross-validation
     # is retired alongside the application-level NTP layer itself.
@@ -990,7 +990,7 @@ def load_app_config(path: str) -> AppConfig:
         final_rpc_poll_wakeup_offset_before_lock_ms=final_rpc_poll_wakeup_offset_before_lock_ms,
         ramp_poll_1_wakeup_offset_before_lock_ms=ramp_poll_1_wakeup_offset_before_lock_ms,
         ramp_poll_2_wakeup_offset_before_lock_ms=ramp_poll_2_wakeup_offset_before_lock_ms,
-        bankroll_wakeup_offset_before_lock_ms=bankroll_wakeup_offset_before_lock_ms,
+        preflight_wakeup_offset_before_lock_ms=preflight_wakeup_offset_before_lock_ms,
         okx_warmup_wakeup_offset_before_lock_ms=okx_warmup_wakeup_offset_before_lock_ms,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_min_bet_only=live_min_bet_only,

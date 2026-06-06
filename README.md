@@ -122,7 +122,7 @@ See [docs/architecture.html](docs/architecture.html) for the visual diagram.
 
 Three pre-lock wakes anchored at the chain-supplied `lock_at` timestamp,
 plus a post-close claim wake anchored at `close_at(prev_locked_epoch)`.
-The bankroll wake uses a deliberately generous (5 s) gap above the
+The preflight wake uses a deliberately generous (5 s) gap above the
 critical path — robustness over micro-optimization for non-critical-path
 operations. The critical path wake is a single scheduled event whose
 budget covers a sequential pool snapshot → kline fetch → signal compute
@@ -134,7 +134,7 @@ predicted predecessor block (Bundle 5 v2, 2026-05-14).
 | Wake | Anchor + offset (static fallback) | Activities |
 |---|---|---|
 | `wait_for_okx_warmup` | `lock_at - 7000ms` | Pre-establish OKX TLS connections by calling `MomentumGate.warmup_okx_session()` (proxies to `OkxClient.warmup`). Idempotent when sockets are already warm. Added 2026-05-21 (commit `5c496b1`) after a BSC RPC outage left the OKX session cold and the recovery round paid 500-800ms TLS handshakes on the critical-path kline fetch |
-| `wait_for_bankroll` | `lock_at - 5970ms` | Refresh wallet balance: live mode = BSC RPC; dry mode = in-memory simulated bankroll. Feeds the risk gates and `decide_open_round` with fresh-truth |
+| `wait_for_preflight` | `lock_at - 5970ms` | Refresh wallet balance: live mode = BSC RPC; dry mode = in-memory simulated bankroll. Feeds the risk gates and `decide_open_round` with fresh-truth |
 | Anchor poll | `lock_at - 1300ms` | Single sub-second poll of chain head's BEP-520-encoded ms timestamp; drives dynamic critical-path scheduling |
 | `wait_for_critical_path` | `lock_at - 970ms` | Single critical-path entry. Sequentially: pool snapshot from RPC poller (Era 11; `pool_cutoff_seconds = 6` data horizon) → 3 parallel OKX `/history-candles` GETs (BTC/ETH/SOL) → signal compute → bet submit |
 | Pre-bet timing guard | `lock_at - 625ms` | Abort if decision-ready past the safety margin (TX would mine after lock). Before submission, `assert_gas_cap_not_breached()` reads `eth.gas_price` and raises `GasPriceCapBreachedError` if it exceeds `MAX_GAS_PRICE_WEI` (1 Gwei). Bets are posted at `MAX_GAS_PRICE_WEI` deterministically; on breach the bot SKIPs the round + fires a CRITICAL Discord alert |

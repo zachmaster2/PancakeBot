@@ -606,9 +606,9 @@
         <div class="ls-time">lock_at &minus; okx_warmup_wakeup_offset_before_lock_ms &rarr; ~7.00s before lock</div>
       </div>
       <div class="loop-step">
-        <div class="ls-title">Bankroll Wake</div>
+        <div class="ls-title">Preflight Wake</div>
         <div class="ls-desc">Refresh wallet balance: live mode = BSC RPC call (~50-200ms p99); dry mode = in-memory simulated bankroll. Feeds the risk gates and decide_open_round with fresh-truth right before the bet decision. 5s wake budget covers any plausible RPC stall.</div>
-        <div class="ls-time">lock_at &minus; bankroll_wakeup_offset_before_lock_ms &rarr; ~5.97s before lock</div>
+        <div class="ls-time">lock_at &minus; preflight_wakeup_offset_before_lock_ms &rarr; ~5.97s before lock</div>
       </div>
       <div class="loop-step">
         <div class="ls-title">Ramp Poll 2 + Final RPC Poll</div>

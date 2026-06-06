@@ -37,7 +37,7 @@ def _valid_timing_cfg() -> SimpleNamespace:
     return SimpleNamespace(
         ramp_poll_1_wakeup_offset_before_lock_ms=7550,
         okx_warmup_wakeup_offset_before_lock_ms=7000,
-        bankroll_wakeup_offset_before_lock_ms=5970,
+        preflight_wakeup_offset_before_lock_ms=5970,
         ramp_poll_2_wakeup_offset_before_lock_ms=5850,
         final_rpc_poll_wakeup_offset_before_lock_ms=4750,
         critical_path_wakeup_offset_before_lock_ms=970,
