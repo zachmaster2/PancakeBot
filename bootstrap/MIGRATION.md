@@ -98,3 +98,15 @@ reconciled (R3) when the VM placed any bets.
   installed as a warm rollback target for a while).
 - Long-term, consider a **dedicated VM wallet** to remove the shared-wallet
   hazard entirely (eliminates the zero-overlap constraint for future work).
+
+## Phase 5: Windows decommission — DONE 2026-06-06 (Option B: disabled, not uninstalled)
+
+Verified state (2026-06-06, post-Candidate-C): `PancakeBotLive` and `PancakeBotDry`
+are **Stopped + Disabled** (SCM `StartType=Disabled`) with **0 bot processes** — they
+cannot auto-start, even on reboot, so there is no shared-wallet collision path. The
+services are **left installed-but-disabled, NOT uninstalled**, and the production wallet
+key is **retained in the Windows `.env`** — both deliberate, to keep Windows as a warm
+rollback target and avoid irrecoverable deletions (lesson from the test-wallet incident).
+Windows stays a **dev/backtest box** (repo + venv intact). The VM (`167.172.100.184`) is
+the sole live host. To re-arm Windows as a fallback: `scripts\enable_live.ps1` AFTER
+confirming VM-live is stopped (the zero-overlap rule still applies in both directions).
