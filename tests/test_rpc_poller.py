@@ -626,12 +626,12 @@ def test_catchup_feasibility_at_typical_30_block_lag():
 # ---------------------------------------------------------------------------
 
 def _make_anchored_poller() -> RpcPoller:
-    """Poller with default canonical ramp_poll_1 offset (7500ms) and
-    interval=300s for periodic-loop math tests."""
+    """Poller with a single_poll offset (7500ms here, chosen to make the
+    periodic-loop math legible) and interval=300s for periodic-loop tests."""
     return RpcPoller(
         interval_seconds=300,
         endpoint_pool=["https://test.example.com"],
-        ramp_poll_1_wakeup_offset_before_lock_ms=7500,
+        single_poll_wakeup_offset_before_lock_ms=7500,
     )
 
 
@@ -800,7 +800,7 @@ def test_periodic_timeout_state_b_exact_boundary_suspends():
     tick exists, but a future change to either constant could produce
     one. Construct a config where it does and pin the >= behavior.
 
-    Construction: ``ramp_poll_1_wakeup_offset_before_lock_ms=200_000`` (200s) →
+    Construction: ``single_poll_wakeup_offset_before_lock_ms=200_000`` (200s) →
     ``ramp_window_start = lock_at − 200``. With ``round_open = 0``,
     ``period = 8``, ticks land at 8, 16, ..., 800. The 800 tick
     falls EXACTLY on the ramp_window_start boundary at lock_at=1000.
@@ -810,7 +810,7 @@ def test_periodic_timeout_state_b_exact_boundary_suspends():
     p = RpcPoller(
         interval_seconds=1000,
         endpoint_pool=["https://test.example.com"],
-        ramp_poll_1_wakeup_offset_before_lock_ms=200_000,
+        single_poll_wakeup_offset_before_lock_ms=200_000,
     )
     lock_at = 1000
     # next-tick math at now=795: k = max(1, 795//8 + 1) = 100;

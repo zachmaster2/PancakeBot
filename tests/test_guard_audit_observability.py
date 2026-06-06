@@ -30,11 +30,9 @@ from pancakebot.util import InvariantError, TransientRpcError  # noqa: E402
 def _valid_timing_cfg() -> SimpleNamespace:
     """A strictly-decreasing offset ladder with positive anchor slack."""
     return SimpleNamespace(
-        ramp_poll_1_wakeup_offset_before_lock_ms=7550,
         okx_warmup_wakeup_offset_before_lock_ms=7000,
         preflight_wakeup_offset_before_lock_ms=5970,
-        ramp_poll_2_wakeup_offset_before_lock_ms=5850,
-        final_rpc_poll_wakeup_offset_before_lock_ms=4750,
+        single_poll_wakeup_offset_before_lock_ms=4750,
         critical_path_wakeup_offset_before_lock_ms=970,
         bet_submit_deadline_offset_before_lock_ms=625,
     )
@@ -51,8 +49,9 @@ def test_timing_ladder_valid_config_passes():
 
 def test_timing_ladder_misordered_raises():
     cfg = _valid_timing_cfg()
-    # ramp_2 fires earlier than bankroll -> not strictly decreasing.
-    cfg.ramp_poll_2_wakeup_offset_before_lock_ms = 6000
+    # single_poll fires earlier than preflight (6000 > 5970) -> not strictly
+    # decreasing.
+    cfg.single_poll_wakeup_offset_before_lock_ms = 6000
     with pytest.raises(InvariantError, match="timing_ladder_not_strictly_decreasing"):
         engine._assert_critical_path_timing_sane(cfg)
 

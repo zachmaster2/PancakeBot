@@ -133,20 +133,14 @@ def test_wake_chain_strictly_increasing(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_pool_cutoff_too_small_for_rpc_completion_rejected(tmp_path):
-    """final_rpc_poll completion budget invariant must reject too-small pool_cutoff.
+    """single-poll completion budget invariant must reject too-small pool_cutoff.
 
-    Era 11 (2026-05-07) introduced the RPC-completion gate; the
-    2026-05-12 refactor strengthened it: instead of just checking
-    ``final_offset > critical_path + safety``, the invariant now
-    validates ``final_offset - rtt_p99 - safety >= critical_path``,
-    i.e., the final poll's actual completion time at empirical p99 RTT
-    must arrive before critical_path with the safety cushion.
-
-    Bundle 4 (2026-05-14): BSC_BLOCK_TIME_MS=450 (was 500), so the math
-    shifts slightly but the invariant still fires for pool_cutoff=2.
-    At pool_cutoff=2 (=2000ms): final_offset = 2000 - 450 - 600 - 200
-    = 750ms. final_offset - rtt_p99(10)=910 - safety=200 = -360ms, well
-    below critical_path = 1045ms -> InvariantError fires.
+    Candidate C (2026-06-06): the single poll's completion at empirical p99
+    RTT (worst-case batch) must arrive before critical_path with the safety
+    cushion: ``single_poll_offset - rtt_p99(20) - safety >= critical_path``.
+    At pool_cutoff=2 (=2000ms): single_poll_offset = 2000 - 450 - 600 - 200
+    = 750ms. 750 - rtt_p99(20)=1319 - safety=200 = -769ms, well below
+    critical_path = 970ms -> InvariantError fires.
     """
     extra = "pool_cutoff_seconds = 2"
     raised: Exception | None = None
@@ -155,47 +149,7 @@ def test_pool_cutoff_too_small_for_rpc_completion_rejected(tmp_path):
     except InvariantError as e:
         raised = e
     assert isinstance(raised, InvariantError)
-    assert "final_rpc_poll_rtt_budget_insufficient" in str(raised)
-
-
-def test_ramp_1_to_ramp_2_interval_insufficient_rejected(tmp_path, monkeypatch):
-    """If RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS is set below
-    rtt_p99(EXPECTED_RAMP_POLL_1_BATCH_SIZE) + safety, config-load must
-    raise ``ramp_poll_1_to_ramp_2_interval_insufficient``. Y6 coverage
-    for the 2026-05-12 per-leg ramp interval refactor.
-    """
-    # Required at current constants: rtt_p99(20)=1319 + safety=200 = 1519.
-    # Set interval just below required to trip the invariant.
-    monkeypatch.setattr(tc, "RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS", 1500)
-    raised: Exception | None = None
-    try:
-        load_app_config(str(_write_cfg(tmp_path)))
-    except InvariantError as e:
-        raised = e
-    assert isinstance(raised, InvariantError), (
-        f"Expected InvariantError; got {type(raised).__name__}: {raised}"
-    )
-    assert "ramp_poll_1_to_ramp_2_interval_insufficient" in str(raised)
-
-
-def test_ramp_2_to_final_interval_insufficient_rejected(tmp_path, monkeypatch):
-    """If RPC_RAMP_2_TO_FINAL_INTERVAL_MS is set below
-    rtt_p99(EXPECTED_RAMP_POLL_2_BATCH_SIZE) + safety, config-load must
-    raise ``ramp_poll_2_to_final_interval_insufficient``. Y6 coverage
-    for the 2026-05-12 per-leg ramp interval refactor.
-    """
-    # Required at current constants: rtt_p99(5)=771 + safety=200 = 971.
-    # Set interval just below required to trip the invariant.
-    monkeypatch.setattr(tc, "RPC_RAMP_2_TO_FINAL_INTERVAL_MS", 900)
-    raised: Exception | None = None
-    try:
-        load_app_config(str(_write_cfg(tmp_path)))
-    except InvariantError as e:
-        raised = e
-    assert isinstance(raised, InvariantError), (
-        f"Expected InvariantError; got {type(raised).__name__}: {raised}"
-    )
-    assert "ramp_poll_2_to_final_interval_insufficient" in str(raised)
+    assert "single_poll_rtt_budget_insufficient" in str(raised)
 
 
 def test_pool_cutoff_default_is_6(tmp_path):

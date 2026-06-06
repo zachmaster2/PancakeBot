@@ -81,9 +81,7 @@ def run_from_config(
             contract=None,
             wallet_address="",
             kline_cutoff_seconds=cfg.kline_cutoff_seconds,
-            ramp_poll_1_wakeup_offset_before_lock_ms=cfg.ramp_poll_1_wakeup_offset_before_lock_ms,
-            ramp_poll_2_wakeup_offset_before_lock_ms=cfg.ramp_poll_2_wakeup_offset_before_lock_ms,
-            final_rpc_poll_wakeup_offset_before_lock_ms=cfg.final_rpc_poll_wakeup_offset_before_lock_ms,
+            single_poll_wakeup_offset_before_lock_ms=cfg.single_poll_wakeup_offset_before_lock_ms,
             preflight_wakeup_offset_before_lock_ms=cfg.preflight_wakeup_offset_before_lock_ms,
             okx_warmup_wakeup_offset_before_lock_ms=cfg.okx_warmup_wakeup_offset_before_lock_ms,
             critical_path_wakeup_offset_before_lock_ms=cfg.critical_path_wakeup_offset_before_lock_ms,
@@ -257,7 +255,7 @@ def run_from_config(
     rpc_poller = RpcPoller(
         interval_seconds=interval_seconds,
         endpoint_pool=READ_PATH_HEDGED_ENDPOINTS,
-        ramp_poll_1_wakeup_offset_before_lock_ms=cfg.ramp_poll_1_wakeup_offset_before_lock_ms,
+        single_poll_wakeup_offset_before_lock_ms=cfg.single_poll_wakeup_offset_before_lock_ms,
     )
     rpc_poller.start()
 
@@ -273,9 +271,7 @@ def run_from_config(
         contract=contract,
         wallet_address=contract.wallet_address,
         kline_cutoff_seconds=cfg.kline_cutoff_seconds,
-        ramp_poll_1_wakeup_offset_before_lock_ms=cfg.ramp_poll_1_wakeup_offset_before_lock_ms,
-        ramp_poll_2_wakeup_offset_before_lock_ms=cfg.ramp_poll_2_wakeup_offset_before_lock_ms,
-        final_rpc_poll_wakeup_offset_before_lock_ms=cfg.final_rpc_poll_wakeup_offset_before_lock_ms,
+        single_poll_wakeup_offset_before_lock_ms=cfg.single_poll_wakeup_offset_before_lock_ms,
         preflight_wakeup_offset_before_lock_ms=cfg.preflight_wakeup_offset_before_lock_ms,
         okx_warmup_wakeup_offset_before_lock_ms=cfg.okx_warmup_wakeup_offset_before_lock_ms,
         critical_path_wakeup_offset_before_lock_ms=cfg.critical_path_wakeup_offset_before_lock_ms,

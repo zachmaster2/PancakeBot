@@ -29,15 +29,10 @@ Derivation chain (computed at config-load time in ``pancakebot/config.py``):
                                       + OKX_KLINE_FETCH_RTT_P95_MS
                                       + SIGNAL_COMPUTE_TIME_MS
                                       + POOL_READ_TIME_MS)
-    final_rpc_poll_wakeup_offset_before_lock_ms = (
-        pool_cutoff_seconds * 1000
-        - BSC_BLOCK_TIME_MS
-        - RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
-        - RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS)
-    ramp_poll_2_wakeup_offset_before_lock_ms   = (final_rpc_poll_wakeup_offset_before_lock_ms
-                                      + RPC_RAMP_2_TO_FINAL_INTERVAL_MS)
-    ramp_poll_1_wakeup_offset_before_lock_ms   = (ramp_poll_2_wakeup_offset_before_lock_ms
-                                      + RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS)
+    single_poll_wakeup_offset_before_lock_ms   = (pool_cutoff_seconds * 1000
+                                      - BSC_BLOCK_TIME_MS
+                                      - RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
+                                      - RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS)
     preflight_wakeup_offset_before_lock_ms     = (critical_path_wakeup_offset_before_lock_ms
                                       + PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS)
 
@@ -67,27 +62,18 @@ Cross-validations enforced at config load. The CUTOFFS are fixed
 inputs (set by strategy / data-horizon requirements); the OFFSETS
 must fit within the cutoff windows.
 
-    (final_rpc_poll_wakeup_offset_before_lock_ms
-        - rpc_rtt_p99_for_batch(EXPECTED_FINAL_POLL_BATCH_SIZE)
+    (single_poll_wakeup_offset_before_lock_ms
+        - rpc_rtt_p99_for_batch(EXPECTED_SINGLE_POLL_BATCH_SIZE)
         - RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
         >= critical_path_wakeup_offset_before_lock_ms)
-        (the final RPC poll must fire AND complete (at empirical p99
-        RTT) before the critical-path wake reads the pool snapshot;
+        (Candidate C, 2026-06-06: the single RPC poll must fire AND
+        complete (at empirical p99 RTT for the worst-case full-interval
+        batch) before the critical-path wake reads the pool snapshot;
         pool_cutoff_seconds too small OR an upward drift in
-        rpc_rtt_p99_for_batch raises ``final_rpc_poll_rtt_budget_insufficient``
-        at config load — refactored 2026-05-12 to be strictly stronger
-        than the prior ``final > critical_path + safety`` check.)
-
-    RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS >= (
-        rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_1_BATCH_SIZE)
-        + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS)
-    RPC_RAMP_2_TO_FINAL_INTERVAL_MS >= (
-        rpc_rtt_p99_for_batch(EXPECTED_RAMP_POLL_2_BATCH_SIZE)
-        + RPC_POLL_DEADLINE_SAFETY_BUFFER_MS)
-        (each per-leg interval must accommodate its corresponding ramp
-        poll's actual rtt_p99 + safety; upward drift in
-        rpc_rtt_p99_for_batch raises ``ramp_poll_1_to_ramp_2_interval_insufficient``
-        or ``ramp_poll_2_to_final_interval_insufficient`` at config load.)
+        rpc_rtt_p99_for_batch raises ``single_poll_rtt_budget_insufficient``
+        at config load. The prior 3-leg ramp ladder + its per-leg interval
+        invariants are retired — the retained 8s periodic poll bounds the
+        single poll's catch-up batch.)
 """
 from __future__ import annotations
 
@@ -261,8 +247,8 @@ BSC_BET_SUBMIT_ONE_WAY_MS: int = 75
 #
 # Replaces the WSS-subscription pool watcher with deterministic
 # batched-RPC polling. WSS arrival timing is no longer relevant on the
-# decision path; the pool aggregate is built from periodic + ramp +
-# final polls of `eth_getBlockReceipts(blockHash)` over HTTP. See
+# decision path; the pool aggregate is built from periodic + single
+# polls of `eth_getBlockReceipts(blockHash)` over HTTP. See
 # var/design/rpc_polling_architecture_2026_05_07.md for the full
 # architecture and var/incident_reports/2026_05_07_rpc_polling_spike_results.md
 # for the empirical provenance.
@@ -271,11 +257,11 @@ BSC_BET_SUBMIT_ONE_WAY_MS: int = 75
 # offsets look up this table by EXPECTED_*_BATCH_SIZE constants below.
 #
 # Sizes 2-15: research/probe_rpc_polling.py n=50 per size, 2026-05-07,
-# publicnode single-endpoint. Wake-offset derivation uses sizes 10
-# (EXPECTED_FINAL_POLL_BATCH_SIZE) and 15 (EXPECTED_RAMP_POLL_{1,2}_BATCH_SIZE);
-# these are preserved at the original publicnode baseline to keep the
-# canonical wake-offset schedule (pinned by
-# test_canonical_pool_cutoff_6_produces_expected_offsets) stable across
+# publicnode single-endpoint. The single-poll startup invariant looks up
+# size 20 (EXPECTED_SINGLE_POLL_BATCH_SIZE); the table is preserved at the
+# original publicnode baseline to keep the canonical wake-offset schedule
+# (pinned by test_canonical_pool_cutoff_6_produces_expected_offsets) stable
+# across
 # the 2026-05-11 transport switch. Re-measuring sizes 10/15 under the
 # new fire-to-all transport would force a wake-schedule shift the
 # wider system isn't asking for. drpc.org rejected batched JSON-RPC
@@ -375,15 +361,15 @@ RPC_PERIODIC_POLL_INTERVAL_SECONDS: int = 8
 
 # Defense-in-depth pad on top of RPC_HTTP_BATCH_TIMEOUT_SECONDS when
 # deciding the latest safe time a periodic poll may fire before the
-# ramp window opens.
+# single-poll window opens.
 #
 # What it protects: the race where a periodic poll's ``_poll_lock``
-# release barely overlaps with ramp_1's wake and non-blocking acquire.
-# If a periodic poll anchored just before ramp_window_start hits its
-# full HTTP timeout (5s), it completes IN-FLIGHT against ramp_1's wake
-# at lock_at − ramp_poll_1_offset. Even a few ms of overlap causes
-# ramp_1's ``_poll_lock.acquire(blocking=False)`` to fail and silently
-# drop ramp_1.
+# release barely overlaps with the engine-driven single poll's wake and
+# non-blocking acquire. If a periodic poll anchored just before
+# single_poll_window_start hits its full HTTP timeout (5s), it completes
+# IN-FLIGHT against the single poll's wake at lock_at − single_poll_offset.
+# Even a few ms of overlap causes the single poll's
+# ``_poll_lock.acquire(blocking=False)`` to fail and silently drop it.
 #
 # What it accounts for:
 #   - OS scheduler jitter on thread wake (~1 ms typical, up to a few
@@ -404,9 +390,9 @@ RPC_PERIODIC_POLL_INTERVAL_SECONDS: int = 8
 # ``_compute_periodic_timeout`` is the actual correctness fix for this
 # race. This buffer is purely defense-in-depth for the rare
 # exact-timeout-with-bad-jitter case where a periodic completed within
-# the buffer of ramp_1's wake; a larger buffer would needlessly skip
+# the buffer of the single poll's wake; a larger buffer would needlessly skip
 # more periodic ticks per round without proportionate safety gain.
-RPC_PERIODIC_TO_RAMP_SAFETY_BUFFER_SECONDS: float = 0.05
+RPC_PERIODIC_TO_SINGLE_POLL_SAFETY_BUFFER_SECONDS: float = 0.05
 
 # Final-poll wake derivation safety cushion (cross-RPC variance the
 # spike didn't capture, etc.). Engineering judgment.
@@ -420,48 +406,14 @@ RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS: int = 200
 # integrating signal. Engineering judgment.
 RPC_POLL_DEADLINE_SAFETY_BUFFER_MS: int = 200
 
-# Per-leg fixed intervals between successive RPC polls. Replaces the
-# prior uniform ``RPC_RAMP_POLL_INTERVAL_MS=1500`` (2026-05-12) which
-# coupled both ramp gaps to the same constant and was sized for a
-# outdated 30s-periodic-cadence assumption (batch=15 for both ramps).
-# With 8s periodic cadence (post 740328f), the actual expected ramp
-# workloads diverge sharply:
-#
-#   ramp_1: catches up since the last periodic poll. Worst case = one
-#           periodic interval (8s) at BSC 0.45s blocks ≈ 17.8 blocks
-#           → batch=20 (clamped at RPC_BATCH_MAX_BLOCKS).
-#           Needs rtt_p99(20)=1319ms + safety + margin → 1700ms.
-#   ramp_2: catches up since ramp_1 cursor advance. Wall gap is
-#           bounded by RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS plus bankroll
-#           work; ≈ 1700-2000ms / 450ms/block ≈ 4 blocks → batch=5.
-#           Needs rtt_p99(5)=771ms + safety + margin → 1100ms.
-#
-# Startup invariants in pancakebot/config.py validate each interval
-# covers its corresponding rtt_p99 + safety; future drift in
-# RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE that violates either invariant
-# fails-fast at config-load time rather than silently producing a
-# too-tight schedule.
-RPC_RAMP_1_TO_RAMP_2_INTERVAL_MS: int = 1700
-RPC_RAMP_2_TO_FINAL_INTERVAL_MS: int = 1100
-
-# Expected batch sizes used to derive the deadline-driven wake offsets'
-# rtt_p99 lookups (in the startup invariants). Runtime batches are
-# dynamic (= blocks since last poll); these are sized for the worst-case
-# blocks-behind each poll could plausibly see at the canonical 8s
-# periodic cadence (BSC 0.45s blocks):
-#
-#   ramp_1: catches up since last periodic poll. Worst case = full
-#           periodic interval (8s) → ~17.8 blocks → batch=20 (clamped at
-#           RPC_BATCH_MAX_BLOCKS).
-#   ramp_2: catches up since ramp_1 cursor advance (1.7-2s wall gap) →
-#           ~4 blocks → batch=5.
-#   final:  catches up since ramp_2 cursor advance (1.1s wall gap) →
-#           ~3 blocks → batch=5.
-#
-# Refactored 2026-05-12 from the prior 30s-periodic-era values (10/15/15).
-EXPECTED_FINAL_POLL_BATCH_SIZE: int = 5
-EXPECTED_RAMP_POLL_2_BATCH_SIZE: int = 5
-EXPECTED_RAMP_POLL_1_BATCH_SIZE: int = 20
+# Expected batch size used to derive the single-poll wake offset's rtt_p99
+# lookup (in the startup invariant). Candidate C (2026-06-06) replaced the
+# 3-leg ramp ladder with ONE batched poll before the critical path; the
+# retained 8s periodic poll keeps the cursor within one interval of head, so
+# the single poll's worst case = one periodic interval (8s) at BSC 0.45s
+# blocks ≈ 17.8 blocks → batch=20 (clamped at RPC_BATCH_MAX_BLOCKS). Runtime
+# batches are dynamic (= blocks since last periodic poll).
+EXPECTED_SINGLE_POLL_BATCH_SIZE: int = 20
 
 
 def rpc_rtt_p99_for_batch(batch_size: int) -> int:
@@ -541,9 +493,9 @@ PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS: int = 5000
 # ~25 minutes; on the recovery round, fetch_ms ran 734-850ms vs typical
 # 270ms, contributing to a missed lock-block inclusion.
 #
-# Slot rationale: between ramp_poll_1 (lock - 7550ms) and preflight
-# (lock - 5970ms), leaving ~550ms headroom on each side for a slow
-# warmup (~270ms typical, ~800ms worst-case cold). Doesn't touch the
+# Slot rationale: the first pre-lock wake (lock - 7000ms), ~1030ms before
+# preflight (lock - 5970ms), leaving headroom for a slow warmup (~270ms
+# typical, ~800ms worst-case cold). Doesn't touch the
 # critical path; even a fully-failed warmup (rare; OkxClient.warmup
 # swallows transient errors) just means the bet round pays the cold
 # fetch like before.
