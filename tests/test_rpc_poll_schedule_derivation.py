@@ -26,11 +26,12 @@ from pancakebot import timing_constants as _tc  # noqa: E402
 
 
 def _derive_schedule(pool_cutoff_seconds: int) -> dict[str, int]:
-    """Derive the lock-relative offsets (ms) from pool_cutoff using the exact
-    same formula as pancakebot/config.py. The single-poll offset does NOT
-    depend on rpc_rtt_p99_for_batch; the RTT lives in the startup invariant
-    (validates the chosen offset can absorb the actual p99 + safety), not in
-    the wake-time derivation itself.
+    """Derive the lock-relative offsets (ms) using the exact same formula as
+    pancakebot/config.py. The single-poll offset is a FIXED rail
+    (SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS), pool_cutoff-independent;
+    pool_cutoff only sets the CAPTURE upper bound (single_poll_max_capture)
+    the rail must stay under. The completion invariant (rtt_p99 + safety) is
+    validated separately at config load.
     """
     bet_submit_deadline_offset_before_lock_ms = (
         _tc.BSC_QUANTUM_MS
@@ -40,11 +41,14 @@ def _derive_schedule(pool_cutoff_seconds: int) -> dict[str, int]:
     )
     critical_path_wakeup_offset_before_lock_ms = (
         bet_submit_deadline_offset_before_lock_ms
-        + _tc.OKX_KLINE_FETCH_RTT_P95_MS
+        + _tc.OKX_KLINE_FETCH_RTT_P99_MS
         + _tc.SIGNAL_COMPUTE_TIME_MS
         + _tc.POOL_READ_TIME_MS
     )
     single_poll_wakeup_offset_before_lock_ms = (
+        _tc.SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS
+    )
+    single_poll_max_capture_offset = (
         pool_cutoff_seconds * 1000
         - _tc.BSC_BLOCK_TIME_MS
         - _tc.RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
@@ -54,6 +58,7 @@ def _derive_schedule(pool_cutoff_seconds: int) -> dict[str, int]:
         "bet_submit": bet_submit_deadline_offset_before_lock_ms,
         "critical_path": critical_path_wakeup_offset_before_lock_ms,
         "single_poll": single_poll_wakeup_offset_before_lock_ms,
+        "single_poll_max_capture": single_poll_max_capture_offset,
     }
 
 
@@ -112,13 +117,13 @@ def test_rpc_rtt_p99_for_batch_interp_passthrough_at_keys():
 
 def test_rpc_rtt_p99_for_batch_interp_interior_points():
     """Linear-interpolation between bracketing adjacent keys, rounded to the
-    nearest integer. Spec values against {2:421, 5:771, 10:910, 15:1213, 20:1319}.
+    nearest integer. Spec values against {2:79, 5:122, 10:222, 15:229, 20:240}.
     """
-    assert _tc.rpc_rtt_p99_for_batch(3) == 538
-    assert _tc.rpc_rtt_p99_for_batch(4) == 654
-    assert _tc.rpc_rtt_p99_for_batch(7) == 827
-    assert _tc.rpc_rtt_p99_for_batch(12) == 1031
-    assert _tc.rpc_rtt_p99_for_batch(18) == 1277
+    assert _tc.rpc_rtt_p99_for_batch(3) == 93
+    assert _tc.rpc_rtt_p99_for_batch(4) == 108
+    assert _tc.rpc_rtt_p99_for_batch(7) == 162
+    assert _tc.rpc_rtt_p99_for_batch(12) == 225
+    assert _tc.rpc_rtt_p99_for_batch(18) == 236
 
 
 def test_rpc_rtt_p99_for_batch_interp_edges():
@@ -140,13 +145,18 @@ def test_rpc_rtt_p99_for_batch_interp_edges():
 
 @pytest.mark.parametrize("pool_cutoff", [6, 7, 8, 10, 12])
 def test_single_poll_offset_within_pool_cutoff_window(pool_cutoff):
-    """single_poll offset must be > 0 and < pool_cutoff * 1000 (it fires
-    inside the round, after the cutoff block is available)."""
+    """The fixed single_poll rail must fire inside the round (0 < offset <
+    pool_cutoff window) and no earlier than the capture bound (so the cutoff
+    block's receipts are available when it polls)."""
     s = _derive_schedule(pool_cutoff)
     assert s["single_poll"] > 0, f"single_poll <= 0 at pool_cutoff={pool_cutoff}"
     assert s["single_poll"] < pool_cutoff * 1000, (
         f"single_poll {s['single_poll']}ms >= pool_cutoff_window "
         f"{pool_cutoff * 1000}ms at pool_cutoff={pool_cutoff}"
+    )
+    assert s["single_poll"] <= s["single_poll_max_capture"], (
+        f"single_poll {s['single_poll']}ms > capture bound "
+        f"{s['single_poll_max_capture']}ms at pool_cutoff={pool_cutoff}"
     )
 
 
@@ -171,32 +181,31 @@ def test_single_poll_leaves_room_for_critical_path_completion(pool_cutoff):
 def test_canonical_pool_cutoff_6_produces_expected_offsets():
     """Pin the canonical-baseline schedule.
 
-    Candidate C (2026-06-06): the single poll inherits the old final-poll
-    derivation (the latest offset that still captures the cutoff block):
-        single_poll = 6000 - 450 - 600 - 200 = 4750ms
-        critical_path = bet_submit + 290 + 50 + 5 = 970ms
+    2026-06-06 VM re-baseline: the single poll is a fixed rail (no longer
+    pool_cutoff-derived); critical_path uses OKX P99 (the P95 tier is retired):
+        single_poll   = SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS = 2500ms
+        critical_path = bet_submit + 351 + 50 + 5 = 1031ms
         bet_submit    = 50 + 450 + 50 + 75        = 625ms
+        capture bound = 6000 - 450 - 625 - 200    = 4725ms (>= 2500)
     """
     s = _derive_schedule(6)
-    assert s["critical_path"] == 970
+    assert s["critical_path"] == 1031
     assert s["bet_submit"] == 625
-    assert s["single_poll"] == 4750
+    assert s["single_poll"] == 2500
+    assert s["single_poll_max_capture"] == 4725
 
 
-def test_pool_cutoff_too_small_would_violate_single_poll_floor():
-    """pool_cutoff=2 (or any value where single_poll - rtt_p99 - safety <=
-    critical_path) trips the startup invariant. At pool_cutoff=2:
-        single_poll = 2000 - 450 - 600 - 200 = 750ms
-    rtt_p99(20)=1319; safety=200. 750 - 1319 - 200 = -769ms << critical_path
-    970ms — the startup invariant raises InvariantError; here we just assert
-    the math.
+def test_pool_cutoff_too_small_would_violate_single_poll_capture():
+    """With a FIXED single_poll rail, too-small pool_cutoff trips the CAPTURE
+    bound (not the completion floor). At pool_cutoff=2 the cutoff block sits at
+    lock-2000, but the fixed 2500ms rail would fire at lock-2500 — before that
+    block even exists. capture bound = 2000 - 450 - 625 - 200 = 725ms;
+    single_poll=2500 > 725 → the startup CAPTURE invariant raises
+    (single_poll_fires_before_cutoff_available). Here we just assert the math.
     """
     s = _derive_schedule(2)
-    rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_SINGLE_POLL_BATCH_SIZE)
-    safety = _tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-    completion_offset = s["single_poll"] - rtt - safety
-    assert completion_offset < s["critical_path"], (
-        f"pool_cutoff=2 should violate the startup invariant "
-        f"(completion_offset={completion_offset}ms >= "
-        f"critical_path={s['critical_path']}ms)"
+    assert s["single_poll"] > s["single_poll_max_capture"], (
+        f"pool_cutoff=2 should violate the capture bound "
+        f"(single_poll={s['single_poll']}ms <= max_capture="
+        f"{s['single_poll_max_capture']}ms)"
     )

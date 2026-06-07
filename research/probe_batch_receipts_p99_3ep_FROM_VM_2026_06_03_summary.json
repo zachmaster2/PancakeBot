@@ -1,0 +1,111 @@
+{
+  "endpoints": [
+    "https://bsc-dataseed1.binance.org",
+    "https://bsc-dataseed1.defibit.io",
+    "https://bsc-rpc.publicnode.com"
+  ],
+  "spacing_s": 5.0,
+  "timeout_s": 5,
+  "current_table": {
+    "2": 421,
+    "5": 771,
+    "10": 910,
+    "15": 1213,
+    "20": 1319
+  },
+  "per_size": {
+    "2": {
+      "n": 100,
+      "n_fail": 0,
+      "p50_ms": 29.50884999881964,
+      "p90_ms": 46.72604599909391,
+      "p95_ms": 48.84881900215987,
+      "p99_ms": 79.37893200141843,
+      "max_ms": 93.48143299575895,
+      "current_table_ms": 421,
+      "recommended_ms": 79,
+      "delta_ms": -342,
+      "material_drift_gt_15pct": false,
+      "winner_internal_p99_ms": 76.6145579982549
+    },
+    "5": {
+      "n": 100,
+      "n_fail": 0,
+      "p50_ms": 47.612041991669685,
+      "p90_ms": 70.30743701034226,
+      "p95_ms": 88.75635599542875,
+      "p99_ms": 121.97546300012618,
+      "max_ms": 127.20232500578277,
+      "current_table_ms": 771,
+      "recommended_ms": 122,
+      "delta_ms": -649,
+      "material_drift_gt_15pct": false,
+      "winner_internal_p99_ms": 120.12194299313705
+    },
+    "10": {
+      "n": 100,
+      "n_fail": 0,
+      "p50_ms": 80.73749199684244,
+      "p90_ms": 123.69533200399019,
+      "p95_ms": 155.32146600889973,
+      "p99_ms": 222.2965050023049,
+      "max_ms": 347.5382949982304,
+      "current_table_ms": 910,
+      "recommended_ms": 222,
+      "delta_ms": -688,
+      "material_drift_gt_15pct": false,
+      "winner_internal_p99_ms": 221.18029800185468
+    },
+    "15": {
+      "n": 100,
+      "n_fail": 0,
+      "p50_ms": 117.8062620019773,
+      "p90_ms": 182.25273700954858,
+      "p95_ms": 187.61745899973903,
+      "p99_ms": 229.272509997827,
+      "max_ms": 333.1433410057798,
+      "current_table_ms": 1213,
+      "recommended_ms": 229,
+      "delta_ms": -984,
+      "material_drift_gt_15pct": false,
+      "winner_internal_p99_ms": 228.95843800506555
+    },
+    "20": {
+      "n": 100,
+      "n_fail": 0,
+      "p50_ms": 153.4853560006013,
+      "p90_ms": 202.61484500952065,
+      "p95_ms": 220.16478300793096,
+      "p99_ms": 240.0241389987059,
+      "max_ms": 256.5110120049212,
+      "current_table_ms": 1319,
+      "recommended_ms": 240,
+      "delta_ms": -1079,
+      "material_drift_gt_15pct": false,
+      "winner_internal_p99_ms": 239.50505901302677
+    }
+  },
+  "per_endpoint": {
+    "https://bsc-dataseed1.binance.org": {
+      "n_success": 500,
+      "p50_ms": 158.56375099974684,
+      "p95_ms": 485.24848200031556,
+      "p99_ms": 972.0441899989964,
+      "max_ms": 1960.5651580059202
+    },
+    "https://bsc-dataseed1.defibit.io": {
+      "n_success": 500,
+      "p50_ms": 149.28739999595564,
+      "p95_ms": 380.9722490113927,
+      "p99_ms": 900.1610370032722,
+      "max_ms": 1761.4394219999667
+    },
+    "https://bsc-rpc.publicnode.com": {
+      "n_success": 500,
+      "p50_ms": 85.24747399496846,
+      "p95_ms": 230.2479279896943,
+      "p99_ms": 439.40104301145766,
+      "max_ms": 615.7550159987295
+    }
+  }
+}

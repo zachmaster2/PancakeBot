@@ -26,13 +26,13 @@ Derivation chain (computed at config-load time in ``pancakebot/config.py``):
     # under Lorentz uses ``RpcPoller.compute_dynamic_submit_deadline_ms()`` for
     # per-round prediction that's typically 250-300ms tighter than this fallback.
     critical_path_wakeup_offset_before_lock_ms = (bet_submit_deadline_offset_before_lock_ms
-                                      + OKX_KLINE_FETCH_RTT_P95_MS
+                                      + OKX_KLINE_FETCH_RTT_P99_MS
                                       + SIGNAL_COMPUTE_TIME_MS
                                       + POOL_READ_TIME_MS)
-    single_poll_wakeup_offset_before_lock_ms   = (pool_cutoff_seconds * 1000
-                                      - BSC_BLOCK_TIME_MS
-                                      - RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
-                                      - RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS)
+    single_poll_wakeup_offset_before_lock_ms   = SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS
+                                      # fixed 2500ms rail (2026-06-06); bounded below
+                                      # (completion) and above (capture) by the two
+                                      # startup invariants documented below.
     preflight_wakeup_offset_before_lock_ms     = (critical_path_wakeup_offset_before_lock_ms
                                       + PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS)
 
@@ -59,21 +59,29 @@ kept tight via MaxPollInterval=5; see README "W32Time prerequisite").
 constants are deleted along with this retirement.
 
 Cross-validations enforced at config load. The CUTOFFS are fixed
-inputs (set by strategy / data-horizon requirements); the OFFSETS
-must fit within the cutoff windows.
+inputs (set by strategy / data-horizon requirements); the single-poll
+OFFSET is a fixed rail (SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS) bounded
+on BOTH sides:
 
-    (single_poll_wakeup_offset_before_lock_ms
+    completion (fire early enough to finish before critical_path):
+        single_poll_wakeup_offset_before_lock_ms
         - rpc_rtt_p99_for_batch(EXPECTED_SINGLE_POLL_BATCH_SIZE)
         - RPC_POLL_DEADLINE_SAFETY_BUFFER_MS
-        >= critical_path_wakeup_offset_before_lock_ms)
-        (Candidate C, 2026-06-06: the single RPC poll must fire AND
-        complete (at empirical p99 RTT for the worst-case full-interval
-        batch) before the critical-path wake reads the pool snapshot;
-        pool_cutoff_seconds too small OR an upward drift in
-        rpc_rtt_p99_for_batch raises ``single_poll_rtt_budget_insufficient``
-        at config load. The prior 3-leg ramp ladder + its per-leg interval
-        invariants are retired — the retained 8s periodic poll bounds the
-        single poll's catch-up batch.)
+        >= critical_path_wakeup_offset_before_lock_ms
+        (else ``single_poll_rtt_budget_insufficient``)
+
+    capture (don't fire so early the cutoff block isn't yet available):
+        single_poll_wakeup_offset_before_lock_ms
+        <= pool_cutoff_seconds * 1000 - BSC_BLOCK_TIME_MS
+           - RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
+           - RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS
+        (else ``single_poll_fires_before_cutoff_available``)
+
+    Candidate C (2026-06-06): ONE batched poll before the critical-path
+    wake. The 2026-06-06 VM re-baseline moved the rail 4750 -> 2500ms (the
+    VM RPC-RTT table makes the completion budget comfortable). The prior
+    3-leg ramp ladder + its per-leg interval invariants are retired — the
+    retained 8s periodic poll bounds the single poll's catch-up batch.
 """
 from __future__ import annotations
 
@@ -106,34 +114,32 @@ from __future__ import annotations
 # whatever offset the anchor dictates anyway, making the static-wake
 # tier label misleading.
 
-# OKX REST round-trip time for /history-candles fetches. Pooled p95 over
-# the 4 symbols (BTC, ETH, SOL, BNB).
+# OKX REST round-trip time for /history-candles fetches: p99 of the
+# "max-of-3" parallel symbol fetch (BTC, ETH, SOL — the decision-critical
+# trio; BNB is fetched but off the strategy path). The decision waits on
+# the SLOWEST of the three parallel fetches, so max-of-3 p99 is the correct
+# deadline statistic; a pooled-per-symbol p99 understates it (one symbol can
+# sit in its tail while the max is still on the body).
 #
-# Source: research/p4c_canonical_loop_probe.py n=1000, 2026-05-03.
-# Pooled (n=4000 fetches): p50=258, p90=277, p95=289, p99=363, max=981.
-# Last measured: 2026-05-03
-OKX_KLINE_FETCH_RTT_P95_MS: int = 290
-
-# Same fetch, p99 measurement. Used by the Bundle 5 (2026-05-14) dynamic
-# critical_path_wakeup_offset_before_lock_ms: ``RpcPoller.compute_dynamic_critical_path_wake_ts()``
-# walks back from the predicted predecessor block by
-#   (OKX_KLINE_FETCH_RTT_P99_MS + SIGNAL_COMPUTE_TIME_MS
-#    + POOL_READ_TIME_MS + BSC_BET_SUBMIT_ONE_WAY_MS)
-# = 352 + 50 + 5 + 75 = 482ms.
+# This is a NETWORK RTT (bot host -> OKX), so it is host/network-specific BY
+# DEFINITION — the route from the running host to OKX. It is re-baselined on
+# the host the bot actually runs on, never reused from another host on the
+# assumption the value "should" match. (See feedback: network-rtt-host-dependent.)
 #
-# Why 352 (not the 363 from the pooled canonical probe): the production
-# decision-path effective p99 is "max-of-3" across the 3 OKX symbols
-# fetched in parallel (BTC, ETH, SOL — BNB is fetched but not on the
-# strategy-critical path). The Bundle 4 timing harness measured the
-# round-trip of the slowest of three parallel fetches at 352ms p99 over
-# n=1000 rounds, 2026-05-14. The pooled-per-symbol p99 (363ms) is a
-# strictly weaker statistic for the deadline math (a single symbol could
-# be in its tail while the max-of-3 is still on the central body).
+# Drives BOTH wake paths off this single statistic (the prior separate p95
+# tier is retired):
+#   - dynamic: RpcPoller dynamic critical_path wake walks back by
+#     (OKX_KLINE_FETCH_RTT_P99_MS + SIGNAL_COMPUTE_TIME_MS + POOL_READ_TIME_MS)
+#   - static fallback: critical_path_wakeup_offset_before_lock_ms (config.py),
+#     used only when the per-round anchor poll times out.
 #
-# Source: research/bundle4_timing_harness.py n=1000, 2026-05-14
-#         (max-of-3 parallel symbol fetch RTT).
-# Last measured: 2026-05-14
-OKX_KLINE_FETCH_RTT_P99_MS: int = 352
+# Source: VM live var/live/cycle_audit.csv, max-of-3 of {btc,eth,sol}_fetch_ms
+# over n=202 post-cutover rounds, 2026-06-06: p50=208, p90=240, p95=262,
+# p99=351, max=362. (The prior home value was 352 from
+# research/bundle4_timing_harness.py n=1000, 2026-05-14 — within 1ms, but
+# re-sourced from the VM on principle, not because they happened to match.)
+# Last measured: 2026-06-06 (VM live cycle_audit)
+OKX_KLINE_FETCH_RTT_P99_MS: int = 351
 
 
 # --- Strategy compute ------------------------------------------------------
@@ -253,73 +259,54 @@ BSC_BET_SUBMIT_ONE_WAY_MS: int = 75
 # architecture and var/incident_reports/2026_05_07_rpc_polling_spike_results.md
 # for the empirical provenance.
 
-# Per-batch p99 round-trip time, indexed by batch size. The wake
-# offsets look up this table by EXPECTED_*_BATCH_SIZE constants below.
+# Per-batch p99 round-trip time, indexed by batch size. The single-poll
+# startup invariant looks up size 20 (EXPECTED_SINGLE_POLL_BATCH_SIZE);
+# ``_estimated_catchup_ms`` interpolates for partial-batch remainders.
 #
-# Sizes 2-15: research/probe_rpc_polling.py n=50 per size, 2026-05-07,
-# publicnode single-endpoint. The single-poll startup invariant looks up
-# size 20 (EXPECTED_SINGLE_POLL_BATCH_SIZE); the table is preserved at the
-# original publicnode baseline to keep the canonical wake-offset schedule
-# (pinned by test_canonical_pool_cutoff_6_produces_expected_offsets) stable
-# across
-# the 2026-05-11 transport switch. Re-measuring sizes 10/15 under the
-# new fire-to-all transport would force a wake-schedule shift the
-# wider system isn't asking for. drpc.org rejected batched JSON-RPC
-# arrays with HTTP 500 at every tested size. size=15's raw measurement
-# was 2285ms but came from 50-sample p99-as-max noise; the monotonic
-# interpolation 1213ms (between size=10 at 910 and the OLD size=20
-# publicnode baseline of 1533ms) is the correct provisioning value.
+# This is a NETWORK RTT (bot host -> hedged RPC endpoints), so it is
+# host/network-specific BY DEFINITION and is measured on the host the bot
+# actually runs on. Re-baselined home -> Frankfurt VM 2026-06-06: the home
+# values were ~5x larger purely because of the home host's route to the
+# endpoints (size=20: 1319ms home -> 240ms VM), NOT a transport change.
+# (See feedback: network-rtt-host-dependent.) The retired home-era table
+# {2:421, 5:771, 10:910, 15:1213, 20:1319} is recorded in the decision-log
+# memory.
 #
-# Size=20: research/probe_fire_to_all_p99_batch20_clean_2026_05_11.py
-# n=30, fire-to-all-pool (6 endpoints), urllib3 PoolManager, 30s
-# inter-call spacing, BOT STOPPED. 30/30 successes. The bot-stopped
-# measurement matters because the 2026-05-11 transport switch
-# (urllib3 PoolManager + fire-to-all) means production now hedges
-# across the configured endpoints; running the probe alongside the
-# bot inflated RTTs ~3.5x due to same-IP / Windows-TCP / urllib3-pool
-# contention between the two processes. The 1319ms is the bot's
-# actual operating value (no concurrent caller in production).
+# Source: research/probe_batch_receipts_p99_3ep_2026_06_03.py run ON THE VM
+# (output probe_batch_receipts_p99_3ep_FROM_VM_2026_06_03_summary.json), n=100
+# per size, 0 failures, fire-to-all across READ_PATH_HEDGED_ENDPOINTS (the
+# 3-endpoint min-wins hedge), bot stopped (no same-host contention).
+# Per-size p99: {2:79, 5:122, 10:222, 15:229, 20:240}.
 #
-# Bundle 6 caveat (2026-05-15): the 1319ms value was measured under
-# the prior 6-endpoint hedged pool (min-of-6 fastest-response wins).
-# Bundle 6 trimmed the pool to 3 endpoints (one per fault-domain
-# family — see READ_PATH_HEDGED_ENDPOINTS in chain/rpc_poller.py).
-# Under min-of-3, the operating p99 could rise modestly vs min-of-6,
-# but the per-endpoint probe (research/probe_per_endpoint_isolated_2026_05_15.py)
-# showed bsc-dataseed1.binance.org dominates: its single-endpoint
-# batch p95 is 2717ms, well below the 5s timeout, and it wins
-# production hedged races by a wide margin (23/40 in I3). The
-# downstream consumer (``_estimated_catchup_ms`` feasibility check)
-# absorbs modest under-measurement via the per-batch deadline check
-# and per-batch try/except in ``RpcPoller._poll_now``. If post-trim
-# cold-start observations show the estimate is too tight, re-measure
-# under the 3-endpoint pool.
-#
-# CAVEAT: n=30 is statistically thin for a P99 estimate (~2nd-highest
-# sample out of 30). The true population P99 could realistically sit
-# anywhere from p93 to p100 of this sample; rule of thumb for a stable
-# P99 is n>=100. The value is used by ``_estimated_catchup_ms`` for
-# the catch-up feasibility check; runtime graceful degradation absorbs
-# undermeasurement via the per-batch deadline check + per-batch
-# try/except in ``RpcPoller._poll_now`` (which downgrades partial
-# failures to ``pool_not_ready`` rather than crashing). If a tighter
-# estimate is needed (e.g. INFEAS rate diagnostics still suggest the
-# value is wrong), re-measure with n>=100.
+# Consumer: ``_estimated_catchup_ms`` (catch-up feasibility / INFEAS gate).
+# Runtime graceful degradation absorbs any under-measurement via the
+# per-batch deadline check + per-batch try/except in ``RpcPoller._poll_now``
+# (partial failures downgrade to ``pool_not_ready`` rather than crashing).
 RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE: dict[int, int] = {
-    2: 421,
-    5: 771,
-    10: 910,
-    15: 1213,   # interpolated against OLD size=20 publicnode baseline 1533
-    20: 1319,   # fire-to-all p99 n=30, 2026-05-11 (was 1533 single-publicnode)
+    2: 79,
+    5: 122,
+    10: 222,
+    15: 229,
+    20: 240,   # VM fire-to-all p99 n=100, 2026-06-03 (was 1319 home)
 }
 
-# Block availability delay — newhead arrival to first successful
-# eth_getBlockReceipts(block_hash). drpc.org p99 596ms, publicnode
-# p99 436ms (n=133 each, 2026-05-07). Lock 600ms = drpc.org worst-case
-# + small buffer to absorb either endpoint.
+# Block availability delay — block production (BEP-520 ms) to first
+# successful eth_getBlockReceipts. NODE-SIDE receipt-indexing latency plus
+# the host's RTT tail; like every network-touching constant it is measured
+# on the host the bot runs on (see feedback: network-rtt-host-dependent).
 #
-# Source: research/probe_rpc_polling.py n=133 per endpoint, 2026-05-07.
-RPC_BLOCK_AVAILABILITY_DELAY_P99_MS: int = 600
+# Feeds the single-poll CAPTURE invariant (config.py): the fixed 2500ms rail
+# must fire after the cutoff block's receipts are available. At 2500 the
+# margin is ~2200ms, so this value is not load-bearing at the current rail —
+# but it is held at a VM-measured, conservative ceiling so a future tighter
+# rail stays honest.
+#
+# Source: research/probe_block_availability_vm_2026_06_06.py, VM, 25 samples
+# on the production read endpoints (binance/defibit; publicnode 403s raw
+# urllib): per-endpoint p99 518-624ms, pooled p99 624ms. 625 covers the
+# observed max (the poll granularity adds up to +100ms, so the true value is
+# likely ~525). Prior home value 600 (drpc 596 / publicnode 436, 2026-05-07).
+RPC_BLOCK_AVAILABILITY_DELAY_P99_MS: int = 625
 
 # Hard cap on batch size. publicnode tested up to 100 (p50 3092ms;
 # unusable for deadline path) and 200 (response-too-large rejection).
@@ -332,7 +319,7 @@ RPC_BATCH_MAX_BLOCKS: int = 20
 # eth_getBlockByNumber bundles, batch_size <= RPC_BATCH_MAX_BLOCKS).
 # 5s detects unreachable-endpoint scenarios fast while staying well above
 # the empirical p99 single-batch RTT (RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE:
-# batch=20 -> 1319ms fire-to-all, 2026-05-11). Was 30s; reduced 2026-05-08
+# batch=20 -> 240ms VM fire-to-all, 2026-06-03). Was 30s; reduced 2026-05-08
 # after a publicnode outage where 30s hangs grew the catch-up backlog by
 # ~60 blocks per failed poll.
 RPC_HTTP_BATCH_TIMEOUT_SECONDS: int = 5
@@ -414,6 +401,18 @@ RPC_POLL_DEADLINE_SAFETY_BUFFER_MS: int = 200
 # blocks ≈ 17.8 blocks → batch=20 (clamped at RPC_BATCH_MAX_BLOCKS). Runtime
 # batches are dynamic (= blocks since last periodic poll).
 EXPECTED_SINGLE_POLL_BATCH_SIZE: int = 20
+
+# Fixed single-poll wake offset (ms before lock). Candidate C originally
+# DERIVED this from pool_cutoff (the latest offset that still captures the
+# cutoff block); the 2026-06-06 VM re-baseline pins it to a fixed 2500ms rail
+# instead — fired later (closer to lock) for a fresher pool snapshot, which the
+# VM RPC-RTT table now affords. config.py enforces two startup invariants
+# around it: completion (fires early enough to finish before the critical-path
+# wake at rtt_p99(20)+safety) and capture (fires late enough that the cutoff
+# block's receipts are already available). Both drive off the re-baselined VM
+# constants, so a future pool_cutoff / RTT / availability drift fails LOUD at
+# config load rather than silently mis-timing the poll.
+SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS: int = 2500
 
 
 def rpc_rtt_p99_for_batch(batch_size: int) -> int:
@@ -520,11 +519,3 @@ OKX_WARMUP_WAKEUP_OFFSET_BEFORE_LOCK_MS: int = 7000
 # Source: code inspection of pool_watcher.PoolEventWatcher.get_pool.
 # Last measured: 2026-05-03 (engineering judgment)
 POOL_READ_TIME_MS: int = 5
-
-# --- Module-load sanity checks --------------------------------------------
-
-assert OKX_KLINE_FETCH_RTT_P95_MS <= OKX_KLINE_FETCH_RTT_P99_MS, (
-    f"OKX_KLINE_FETCH_RTT_P95_MS ({OKX_KLINE_FETCH_RTT_P95_MS}) "
-    f"must be <= OKX_KLINE_FETCH_RTT_P99_MS "
-    f"({OKX_KLINE_FETCH_RTT_P99_MS}); probe ordering violated"
-)

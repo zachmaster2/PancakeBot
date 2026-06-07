@@ -810,9 +810,13 @@ def load_app_config(path: str) -> AppConfig:
         + _tc.VALIDATOR_ASSEMBLY_WINDOW_MS
         + _tc.BSC_BET_SUBMIT_ONE_WAY_MS
     )
+    # Static critical-path fallback offset, used only when the per-round anchor
+    # poll times out. Uses OKX P99 — the SAME statistic the dynamic wake walks
+    # back by (engine.py) — so static and dynamic agree; the prior separate P95
+    # tier is retired (2026-06-06 VM re-baseline).
     critical_path_wakeup_offset_before_lock_ms = (
         bet_submit_deadline_offset_before_lock_ms
-        + _tc.OKX_KLINE_FETCH_RTT_P95_MS
+        + _tc.OKX_KLINE_FETCH_RTT_P99_MS
         + _tc.SIGNAL_COMPUTE_TIME_MS
         + _tc.POOL_READ_TIME_MS
     )
@@ -839,25 +843,53 @@ def load_app_config(path: str) -> AppConfig:
     # schedule can absorb.
     #
     # Candidate C (2026-06-06): ONE batched poll before the critical path,
-    # replacing the 3-leg ramp ladder. Fires at the latest offset that still
-    # captures the cutoff block (block_ts < lock - pool_cutoff) with the
-    # availability + safety cushion — i.e. the old final-poll derivation. The
-    # retained 8s periodic poll keeps the catch-up batch bounded (~1 interval).
+    # replacing the 3-leg ramp ladder. The 2026-06-06 VM re-baseline pins it to
+    # a fixed rail (SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS = 2500ms) fired
+    # closer to lock for a fresher pool snapshot; the VM RPC-RTT table makes the
+    # completion budget comfortable. The retained 8s periodic poll keeps the
+    # catch-up batch bounded (~1 interval). Two startup invariants below bracket
+    # the rail: CAPTURE (don't fire before the cutoff block is available) then
+    # COMPLETION (fire early enough to finish before critical_path).
     single_poll_wakeup_offset_before_lock_ms = (
+        _tc.SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS
+    )
+
+    # --- Startup invariant (CAPTURE): the single poll must NOT fire before the
+    # cutoff block (block_ts < lock - pool_cutoff) has its receipts available
+    # (2026-06-06). The latest safe offset = the old final-poll derivation: the
+    # pool_cutoff window minus one block, the receipt-availability delay, and
+    # the final-to-critical-path cushion. If the rail is set EARLIER than this
+    # (a LARGER offset), it polls before the cutoff block is fetchable and
+    # misses late bets — normally a sign pool_cutoff_seconds is too small for
+    # the chosen rail. ---
+    _single_poll_max_capture_offset = (
         pool_cutoff_seconds * 1000
         - _tc.BSC_BLOCK_TIME_MS
         - _tc.RPC_BLOCK_AVAILABILITY_DELAY_P99_MS
         - _tc.RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS
     )
+    if single_poll_wakeup_offset_before_lock_ms > _single_poll_max_capture_offset:
+        raise InvariantError(
+            f"single_poll_fires_before_cutoff_available: "
+            f"single_poll_wakeup={single_poll_wakeup_offset_before_lock_ms}ms "
+            f"> max_capture={_single_poll_max_capture_offset}ms "
+            f"(pool_cutoff*1000={pool_cutoff_seconds * 1000} "
+            f"- block_time={_tc.BSC_BLOCK_TIME_MS} "
+            f"- availability={_tc.RPC_BLOCK_AVAILABILITY_DELAY_P99_MS} "
+            f"- safety={_tc.RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS}). "
+            f"pool_cutoff_seconds={pool_cutoff_seconds}. Either raise "
+            f"pool_cutoff_seconds or lower "
+            f"SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS."
+        )
 
-    # --- Startup invariant: the single batched poll must complete before
-    # critical_path reads the pool snapshot (Candidate C, 2026-06-06) ---
+    # --- Startup invariant (COMPLETION): the single batched poll must complete
+    # before critical_path reads the pool snapshot (Candidate C, 2026-06-06) ---
     # At the worst-case batch (one 8s periodic interval ≈ 20 blocks) and
     # empirical p99 RTT, the single poll must fire AND complete before
-    # critical_path, with the deadline safety cushion. If this fails, either
-    # pool_cutoff_seconds is too small or the rtt_p99 table value has grown
-    # past what the budget absorbs. (The prior 3-leg ladder's per-leg interval
-    # invariants are retired with the ladder.)
+    # critical_path, with the deadline safety cushion. If this fails, the rail
+    # (SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS) is too small, critical_path has
+    # grown, or the rtt_p99 table value has grown past what the budget absorbs.
+    # (The prior 3-leg ladder's per-leg interval invariants are retired.)
     _single_poll_rtt = _tc.rpc_rtt_p99_for_batch(_tc.EXPECTED_SINGLE_POLL_BATCH_SIZE)
     _single_poll_completion_offset = (
         single_poll_wakeup_offset_before_lock_ms
@@ -872,8 +904,8 @@ def load_app_config(path: str) -> AppConfig:
             f"- safety={_tc.RPC_POLL_DEADLINE_SAFETY_BUFFER_MS}ms "
             f"= {_single_poll_completion_offset}ms "
             f"< critical_path={critical_path_wakeup_offset_before_lock_ms}ms. "
-            f"pool_cutoff_seconds={pool_cutoff_seconds}. Either raise "
-            f"pool_cutoff_seconds or investigate RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE."
+            f"Either raise SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS or investigate "
+            f"RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE."
         )
 
     # Candidate C (2026-06-06): the 3-leg ramp ladder + its per-leg interval
