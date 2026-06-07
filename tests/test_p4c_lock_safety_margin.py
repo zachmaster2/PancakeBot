@@ -94,18 +94,20 @@ def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
     snapshot -> kline fetch -> signal compute -> bet submit; all the
     operation-time constants roll up into the one wake offset.
 
-    2026-05-20: 1045 -> 970ms (75ms tighter), driven by the
-    BSC_BET_SUBMIT_ONE_WAY_MS reduction from 150 -> 75ms after re-measurement.
+    2026-05-20: 1045 -> 970ms (BSC_BET_SUBMIT_ONE_WAY_MS 150 -> 75ms).
+    2026-06-06 VM re-baseline: 970 -> 1031ms — the static fallback now uses
+    OKX P99 (351), the same statistic the dynamic wake uses; the P95 tier is
+    retired.
     """
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     expected = (
         cfg.bet_submit_deadline_offset_before_lock_ms
-        + tc.OKX_KLINE_FETCH_RTT_P95_MS
+        + tc.OKX_KLINE_FETCH_RTT_P99_MS
         + tc.SIGNAL_COMPUTE_TIME_MS
         + tc.POOL_READ_TIME_MS
     )
     assert cfg.critical_path_wakeup_offset_before_lock_ms == expected
-    assert cfg.critical_path_wakeup_offset_before_lock_ms == 970  # 2026-05-20 re-measurement
+    assert cfg.critical_path_wakeup_offset_before_lock_ms == 1031  # 2026-06-06 VM re-baseline
 
 
 def test_preflight_wakeup_offset_derived_correctly(tmp_path):
@@ -115,7 +117,7 @@ def test_preflight_wakeup_offset_derived_correctly(tmp_path):
         + tc.PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS
     )
     assert cfg.preflight_wakeup_offset_before_lock_ms == expected
-    assert cfg.preflight_wakeup_offset_before_lock_ms == 5970  # 2026-05-20 re-measurement
+    assert cfg.preflight_wakeup_offset_before_lock_ms == 6031  # 2026-06-06 VM re-baseline
 
 
 def test_wake_chain_strictly_increasing(tmp_path):
@@ -132,15 +134,14 @@ def test_wake_chain_strictly_increasing(tmp_path):
 # 2. Cross-validations fire when cutoffs are too small
 # ---------------------------------------------------------------------------
 
-def test_pool_cutoff_too_small_for_rpc_completion_rejected(tmp_path):
-    """single-poll completion budget invariant must reject too-small pool_cutoff.
+def test_pool_cutoff_too_small_for_single_poll_capture_rejected(tmp_path):
+    """The single-poll CAPTURE invariant must reject too-small pool_cutoff.
 
-    Candidate C (2026-06-06): the single poll's completion at empirical p99
-    RTT (worst-case batch) must arrive before critical_path with the safety
-    cushion: ``single_poll_offset - rtt_p99(20) - safety >= critical_path``.
-    At pool_cutoff=2 (=2000ms): single_poll_offset = 2000 - 450 - 600 - 200
-    = 750ms. 750 - rtt_p99(20)=1319 - safety=200 = -769ms, well below
-    critical_path = 970ms -> InvariantError fires.
+    2026-06-06 VM re-baseline: the single poll is a FIXED 2500ms rail. At
+    pool_cutoff=2 the cutoff block sits at lock-2000, available ~lock-1375,
+    but the rail fires at lock-2500 — before the cutoff block even exists.
+    capture bound = 2000 - 450 - 625 - 200 = 725ms; single_poll=2500 > 725
+    -> single_poll_fires_before_cutoff_available fires at config load.
     """
     extra = "pool_cutoff_seconds = 2"
     raised: Exception | None = None
@@ -149,7 +150,7 @@ def test_pool_cutoff_too_small_for_rpc_completion_rejected(tmp_path):
     except InvariantError as e:
         raised = e
     assert isinstance(raised, InvariantError)
-    assert "single_poll_rtt_budget_insufficient" in str(raised)
+    assert "single_poll_fires_before_cutoff_available" in str(raised)
 
 
 def test_pool_cutoff_default_is_6(tmp_path):
@@ -207,7 +208,7 @@ def test_inclusion_math_at_locked_constants_median_fetch(tmp_path):
     kline_fetch_offset = cfg.critical_path_wakeup_offset_before_lock_ms - tc.POOL_READ_TIME_MS
     delta_ms = _wake_to_block_landing_ms(
         kline_fetch_wakeup_offset_ms=kline_fetch_offset,
-        fetch_rtt_ms=tc.OKX_KLINE_FETCH_RTT_P95_MS - 50,  # ~median (slightly tighter than p95)
+        fetch_rtt_ms=208,  # VM cycle_audit p50 max-of-3, 2026-06-06 (well below the p99 tail)
     )
     assert delta_ms < 0, (
         f"At median fetch RTT and locked constants, worst-case block landing "
@@ -215,24 +216,25 @@ def test_inclusion_math_at_locked_constants_median_fetch(tmp_path):
     )
 
 
-def test_inclusion_math_at_locked_constants_p95_fetch_aborts_safely(tmp_path):
-    """At p95 fetch RTT, decision-ready hits the timing guard cleanly --
-    no submission, no gas burn.
+def test_inclusion_math_at_design_p99_fetch_aborts_safely(tmp_path):
+    """At the design (p99) fetch RTT — the same statistic critical_path is
+    sized from — decision-ready lands exactly at the bet-submit deadline, so
+    the timing guard fires cleanly: no submission, no gas burn.
     """
     cfg = load_app_config(str(_write_cfg(tmp_path)))
-    # decision_ready_ms_after_wake at p95 fetch
-    p95_decision_ms_after_wake = (
-        tc.OKX_KLINE_FETCH_RTT_P95_MS + tc.SIGNAL_COMPUTE_TIME_MS
+    # decision_ready_ms_after_wake at the design p99 fetch
+    p99_decision_ms_after_wake = (
+        tc.OKX_KLINE_FETCH_RTT_P99_MS + tc.SIGNAL_COMPUTE_TIME_MS
     )
     kline_fetch_offset = cfg.critical_path_wakeup_offset_before_lock_ms - tc.POOL_READ_TIME_MS
-    decision_ready_offset_ms = kline_fetch_offset - p95_decision_ms_after_wake
+    decision_ready_offset_ms = kline_fetch_offset - p99_decision_ms_after_wake
     # Guard fires when remaining_to_lock <= safety_margin
     guard_fires = decision_ready_offset_ms <= cfg.bet_submit_deadline_offset_before_lock_ms
-    # Note: at the locked constants kline_fetch_offset=1090, p95_decision=340,
-    # so decision_ready_offset = 750 = exactly the bet-submit-deadline. The
-    # guard condition is `>=`, so equality fires the guard.
+    # By construction kline_fetch_offset = bet_submit + p99 + signal, so at a
+    # p99 fetch decision_ready_offset = bet_submit_deadline exactly (1026 - 401
+    # = 625). The guard condition is `<=`, so equality fires the guard.
     assert guard_fires, (
-        f"At p95 fetch RTT, decision-ready offset = {decision_ready_offset_ms}ms "
+        f"At the design p99 fetch RTT, decision-ready offset = {decision_ready_offset_ms}ms "
         f"vs bet_submit_deadline_offset_before_lock_ms = {cfg.bet_submit_deadline_offset_before_lock_ms}ms. "
         f"Guard must fire to abort the round before risk of late inclusion."
     )

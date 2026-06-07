@@ -1323,7 +1323,7 @@ def test_init_cursor_marks_infeasible_and_jumps_to_head_when_no_time():
 
 # ---------------------------------------------------------------------------
 # T3-B: RpcPoller.last_catchup_detail exposes (need_ms, have_ms) for the
-# engine's SKIP narrative ("RPC catchup infeasible (need 39.5s, have 30.1s)")
+# engine's SKIP narrative ("RPC catchup infeasible (need 36.0s, have 29.8s)")
 # ---------------------------------------------------------------------------
 
 
@@ -1334,13 +1334,13 @@ def test_last_catchup_detail_captured_when_infeasibility_check_fires():
     """
     import time as _t
     p = _make_poller()
-    # Force a known-infeasible scenario: 597 blocks behind, 30s until lock.
-    # estimated_ms = 29 batches × 1319ms + 1 partial → ~39.5s
+    # Force a known-infeasible scenario: 3000 blocks behind, 30s until lock.
+    # estimated_ms = 150 batches × 240ms (0 remainder) → ~36s
     # available_ms = 30000 - 200 safety = 29800ms
     # → infeasible.
     now = _t.time()
     lock_at = int(now + 30)
-    blocks_behind = 597
+    blocks_behind = 3000
 
     assert p._is_catchup_infeasible(
         blocks_behind=blocks_behind, lock_at=lock_at,
@@ -1350,8 +1350,8 @@ def test_last_catchup_detail_captured_when_infeasibility_check_fires():
     need_ms, have_ms = detail
     # Need substantially exceeds have for this construction.
     assert need_ms > have_ms
-    # Empirical: ~39.5s vs ~29.8s.
-    assert 35_000 <= need_ms <= 45_000, f"need_ms={need_ms} outside expected band"
+    # Empirical: ~36s vs ~29.8s.
+    assert 34_000 <= need_ms <= 38_000, f"need_ms={need_ms} outside expected band"
     assert 28_000 <= have_ms <= 30_500, f"have_ms={have_ms} outside expected band"
 
 
@@ -1370,7 +1370,7 @@ def test_last_catchup_detail_reset_on_epoch_advance():
     # Populate detail via an infeasible check (as if a prior round
     # observed catchup_infeasible_for_round).
     now = _t.time()
-    p._is_catchup_infeasible(blocks_behind=597, lock_at=int(now + 30))
+    p._is_catchup_infeasible(blocks_behind=3000, lock_at=int(now + 30))
     assert p.last_catchup_detail is not None
 
     # Mock the RPC head fetch + round_start derivation so

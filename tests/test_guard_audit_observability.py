@@ -31,9 +31,9 @@ def _valid_timing_cfg() -> SimpleNamespace:
     """A strictly-decreasing offset ladder with positive anchor slack."""
     return SimpleNamespace(
         okx_warmup_wakeup_offset_before_lock_ms=7000,
-        preflight_wakeup_offset_before_lock_ms=5970,
-        single_poll_wakeup_offset_before_lock_ms=4750,
-        critical_path_wakeup_offset_before_lock_ms=970,
+        preflight_wakeup_offset_before_lock_ms=6031,
+        single_poll_wakeup_offset_before_lock_ms=2500,
+        critical_path_wakeup_offset_before_lock_ms=1031,
         bet_submit_deadline_offset_before_lock_ms=625,
     )
 
@@ -49,9 +49,9 @@ def test_timing_ladder_valid_config_passes():
 
 def test_timing_ladder_misordered_raises():
     cfg = _valid_timing_cfg()
-    # single_poll fires earlier than preflight (6000 > 5970) -> not strictly
+    # single_poll fires earlier than preflight (6100 > 6031) -> not strictly
     # decreasing.
-    cfg.single_poll_wakeup_offset_before_lock_ms = 6000
+    cfg.single_poll_wakeup_offset_before_lock_ms = 6100
     with pytest.raises(InvariantError, match="timing_ladder_not_strictly_decreasing"):
         engine._assert_critical_path_timing_sane(cfg)
 
