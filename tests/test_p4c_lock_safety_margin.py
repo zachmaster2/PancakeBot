@@ -71,7 +71,7 @@ def _write_cfg(tmp_path: Path, *, cutoff: int = 2, extra: str = "") -> Path:
 
 def test_bet_submit_deadline_offset_derived_correctly(tmp_path):
     """Bundle 4 (2026-05-14): derivation is
-    (BSC_QUANTUM_MS + BSC_BLOCK_TIME_MS + VALIDATOR_ASSEMBLY_WINDOW_MS + BSC_BET_SUBMIT_ONE_WAY_MS) = 625.
+    (BSC_QUANTUM_MS + BSC_BLOCK_TIME_MS + VALIDATOR_ASSEMBLY_WINDOW_MS + BSC_BET_SUBMIT_ONE_WAY_MS) = 789.
     These constants reflect BEP-520 ms-encoding awareness and the
     correct one-way RPC framing (vs the prior round-trip overestimate). Used
     only as static fallback; the live decision path uses
@@ -85,7 +85,7 @@ def test_bet_submit_deadline_offset_derived_correctly(tmp_path):
         + tc.BSC_BET_SUBMIT_ONE_WAY_MS
     )
     assert cfg.bet_submit_deadline_offset_before_lock_ms == expected
-    assert cfg.bet_submit_deadline_offset_before_lock_ms == 625  # 2026-05-20 re-measurement
+    assert cfg.bet_submit_deadline_offset_before_lock_ms == 789  # 2026-06-08 assembly-window re-probe (off350)
 
 
 def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
@@ -94,10 +94,9 @@ def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
     snapshot -> kline fetch -> signal compute -> bet submit; all the
     operation-time constants roll up into the one wake offset.
 
-    2026-05-20: 1045 -> 970ms (BSC_BET_SUBMIT_ONE_WAY_MS 150 -> 75ms).
-    2026-06-06 VM re-baseline: 970 -> 1031ms — the static fallback now uses
-    OKX P99 (351), the same statistic the dynamic wake uses; the P95 tier is
-    retired.
+    = bet_submit_deadline_offset + OKX_P99 (351) + SIGNAL (50) + POOL (5)
+    = 1195ms. The static fallback uses OKX P99, the same statistic the
+    dynamic wake uses.
     """
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     expected = (
@@ -107,7 +106,7 @@ def test_critical_path_wakeup_offset_derived_correctly(tmp_path):
         + tc.POOL_READ_TIME_MS
     )
     assert cfg.critical_path_wakeup_offset_before_lock_ms == expected
-    assert cfg.critical_path_wakeup_offset_before_lock_ms == 1031  # 2026-06-06 VM re-baseline
+    assert cfg.critical_path_wakeup_offset_before_lock_ms == 1195  # 2026-06-08 assembly-window re-probe (off350)
 
 
 def test_preflight_wakeup_offset_derived_correctly(tmp_path):
@@ -117,7 +116,7 @@ def test_preflight_wakeup_offset_derived_correctly(tmp_path):
         + tc.PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS
     )
     assert cfg.preflight_wakeup_offset_before_lock_ms == expected
-    assert cfg.preflight_wakeup_offset_before_lock_ms == 6031  # 2026-06-06 VM re-baseline
+    assert cfg.preflight_wakeup_offset_before_lock_ms == 6195  # 2026-06-08 assembly-window re-probe (off350)
 
 
 def test_wake_chain_strictly_increasing(tmp_path):

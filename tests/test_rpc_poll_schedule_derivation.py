@@ -184,13 +184,13 @@ def test_canonical_pool_cutoff_6_produces_expected_offsets():
     2026-06-06 VM re-baseline: the single poll is a fixed rail (no longer
     pool_cutoff-derived); critical_path uses OKX P99 (the P95 tier is retired):
         single_poll   = SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS = 2500ms
-        critical_path = bet_submit + 351 + 50 + 5 = 1031ms
-        bet_submit    = 50 + 450 + 50 + 75        = 625ms
+        critical_path = bet_submit + 351 + 50 + 5 = 1195ms
+        bet_submit    = 50 + 450 + 214 + 75       = 789ms
         capture bound = 6000 - 450 - 625 - 200    = 4725ms (>= 2500)
     """
     s = _derive_schedule(6)
-    assert s["critical_path"] == 1031
-    assert s["bet_submit"] == 625
+    assert s["critical_path"] == 1195
+    assert s["bet_submit"] == 789
     assert s["single_poll"] == 2500
     assert s["single_poll_max_capture"] == 4725
 
