@@ -1780,55 +1780,55 @@ def _deadline_at_gap(gap_ms: int) -> int:
 
 def test_submit_deadline_gap_50_triggers_boundary_backoff():
     """gap == quantum: bet_inclusion_deadline + 50 = lock → backoff fires.
-    bet_inclusion_deadline = predecessor - 450 (backoff) - 50 (assembly) = pred - 500.
-    Final deadline = pred - 500 - 75 (one-way) = pred - 575 = lock - 625.
+    bet_inclusion_deadline = predecessor - 450 (backoff) - 214 (assembly) = pred - 664.
+    Final deadline = pred - 664 - 75 (one-way) = pred - 739 = lock - 789.
     """
-    # Boundary case: total = lock - 625ms (= static fallback offset post 2026-05-20).
-    assert _deadline_at_gap(50) == 1_000_000 - 625
+    # Boundary case: total = lock - 789ms (= static fallback offset post 2026-06-08).
+    assert _deadline_at_gap(50) == 1_000_000 - 789
 
 
 def test_submit_deadline_gap_100_no_backoff():
     """gap == 100ms: not within quantum of lock → no backoff.
-    Final = predecessor - 50 (assembly) - 75 (one-way) = pred - 125.
-    Total = lock - 100 - 125 = lock - 225.
+    Final = predecessor - 214 (assembly) - 75 (one-way) = pred - 289.
+    Total = lock - 100 - 289 = lock - 389.
     """
-    assert _deadline_at_gap(100) == 1_000_000 - 225
+    assert _deadline_at_gap(100) == 1_000_000 - 389
 
 
 def test_submit_deadline_gap_150():
-    assert _deadline_at_gap(150) == 1_000_000 - 275
+    assert _deadline_at_gap(150) == 1_000_000 - 439
 
 
 def test_submit_deadline_gap_200():
-    assert _deadline_at_gap(200) == 1_000_000 - 325
+    assert _deadline_at_gap(200) == 1_000_000 - 489
 
 
 def test_submit_deadline_gap_250():
-    assert _deadline_at_gap(250) == 1_000_000 - 375
+    assert _deadline_at_gap(250) == 1_000_000 - 539
 
 
 def test_submit_deadline_gap_300():
-    assert _deadline_at_gap(300) == 1_000_000 - 425
+    assert _deadline_at_gap(300) == 1_000_000 - 589
 
 
 def test_submit_deadline_gap_350():
-    assert _deadline_at_gap(350) == 1_000_000 - 475
+    assert _deadline_at_gap(350) == 1_000_000 - 639
 
 
 def test_submit_deadline_gap_400():
-    assert _deadline_at_gap(400) == 1_000_000 - 525
+    assert _deadline_at_gap(400) == 1_000_000 - 689
 
 
 def test_submit_deadline_gap_450_max_no_backoff():
-    """gap == 450ms (full block): no backoff. Deadline = lock - 575."""
-    assert _deadline_at_gap(450) == 1_000_000 - 575
+    """gap == 450ms (full block): no backoff. Deadline = lock - 739."""
+    assert _deadline_at_gap(450) == 1_000_000 - 739
 
 
 def test_submit_deadline_boundary_at_exactly_quantum_msbacks_off():
     """When predecessor + quantum >= lock_ms exactly, the backoff fires
     (>= semantics, not >). Boundary case must be conservative."""
     # gap = BSC_QUANTUM_MS = 50; pred + 50 = lock - 50 + 50 = lock, fires backoff.
-    assert _deadline_at_gap(_tc.BSC_QUANTUM_MS) == 1_000_000 - 625
+    assert _deadline_at_gap(_tc.BSC_QUANTUM_MS) == 1_000_000 - 789
 
 
 # ---------------------------------------------------------------------------

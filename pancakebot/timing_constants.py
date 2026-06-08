@@ -19,9 +19,9 @@ Derivation chain (computed at config-load time in ``pancakebot/config.py``):
 
     bet_submit_deadline_offset_before_lock_ms  = (BSC_QUANTUM_MS              # 50ms — quantum-shift buffer
                                       + BSC_BLOCK_TIME_MS         # 450ms — one full slot back-off
-                                      + VALIDATOR_ASSEMBLY_WINDOW_MS  # 50ms — validator TX-list freeze
+                                      + VALIDATOR_ASSEMBLY_WINDOW_MS  # 214ms — empirical bet-submit lead (2026-06-08)
                                       + BSC_BET_SUBMIT_ONE_WAY_MS)  # 75ms — one-way RPC submit
-    # = 625ms STATIC FALLBACK (Bundle 4 2026-05-14). Used when Lorentz ms-encoding
+    # = 789ms STATIC FALLBACK. Used when Lorentz ms-encoding
     # is unavailable (pre-Lorentz chain or detection failed). Live decision path
     # under Lorentz uses ``RpcPoller.compute_dynamic_submit_deadline_ms()`` for
     # per-round prediction that's typically 250-300ms tighter than this fallback.
@@ -169,13 +169,16 @@ SIGNAL_COMPUTE_TIME_MS: int = 50
 # - Single poll, not continuous (Bundle 4 ran a 200ms-interval fine-phase
 #   poller across the last ~3.5s before critical_path; Bundle 5 v2 drops
 #   that for one well-timed poll, saving ~15 RPC calls per round).
-# - Fire at lock-1300ms = static_wake_offset (1045) + ANCHOR_POLL_TIMEOUT_MS
-#   (200) + small slack (55ms). Worst-case completion at lock-1100ms,
-#   leaving 5ms slack before static_wake would otherwise fire at lock-1045.
+# - Fire at lock-1500ms = critical_path (1195) + ANCHOR_POLL_TIMEOUT_MS
+#   (200) + slack (105ms): worst-case anchor completion at lock-1300ms
+#   clears the static critical-path wake at lock-1195 by 105ms. This offset
+#   is co-locked with VALIDATOR_ASSEMBLY_WINDOW_MS (which sets critical_path):
+#   the anchor_slack invariant (engine.py) enforces offset - timeout >=
+#   critical_path, so raising the assembly window requires raising this.
 # - Anchor lifetime is one round: no persistent state on RpcPoller. The
 #   engine stores the AnchorState in a local variable and passes it to
 #   the wake + deadline math.
-ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS: int = 1300
+ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS: int = 1500
 ANCHOR_POLL_TIMEOUT_MS: int = 200
 
 
@@ -213,18 +216,23 @@ BSC_BLOCK_TIME_MS: int = 450
 # Last measured: 2026-05-13
 BSC_QUANTUM_MS: int = 50
 
-# Validator TX-list freeze window: time before block publication when
-# the in-turn validator stops accepting new TXs into the candidate
-# block. A bet TX that arrives at the validator's mempool LESS than
-# this window before the validator publishes will miss inclusion in
-# that block (and slip to the next slot, which is the lock block —
-# definite revert).
+# Effective bet-submit lead before the predecessor block seals: how far
+# ahead of predecessor_block.milli_ts the bet's eth_sendRawTransaction must
+# be issued (together with BSC_BET_SUBMIT_ONE_WAY_MS) for the TX to land in
+# the predecessor block rather than the lock block (the lock block reverts).
+# Folds the validator TX-list freeze AND the live wake/fetch/sign chain's
+# empirical behaviour into one calibrated lead.
 #
-# Source: BSC Parlia consensus literature + community probes. Conservative
-#         50ms estimate; precise value is implementation-defined per
-#         validator and not directly measurable from RPC.
-# Last measured: 2026-05-13 (engineering judgment; not empirically probed)
-VALIDATOR_ASSEMBLY_WINDOW_MS: int = 50
+# Empirically probed by the 2026-06-08 inclusion-offset experiment
+# (research/inclusion_experiment_2026_06_08): a 10-round live paired A/B
+# (5 test wallets at fixed offsets from the dynamic deadline) found
+# broadcasting at predecessor-475ms gives 0/30 LATE, vs 20% LATE at the
+# live broadcast's prior predecessor-311ms. 214ms lands the live broadcast
+# at predecessor-475 given the rest of the chain: the bot already broadcasts
+# ~186ms ahead of the deadline (OKX-P99 wake head-start), so the deadline
+# shifts 164ms (-> 214), not the full 350.
+# Last measured: 2026-06-08 (research/inclusion_experiment_2026_06_08)
+VALIDATOR_ASSEMBLY_WINDOW_MS: int = 214
 
 # One-way TCP submit time from this host to a BSC validator/RPC mempool.
 # Used in the dynamic deadline math: the bet TX must REACH the validator
