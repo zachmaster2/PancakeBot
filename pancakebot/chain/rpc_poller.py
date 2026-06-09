@@ -1,8 +1,12 @@
 """HTTP RPC poller for PancakeSwap PredictionV2 bet pools.
 
 Era 11 (2026-05-07): replaces the WSS-subscription pool watcher.
-Architecture: deterministic poll schedule using batched
-``eth_getBlockReceipts``. See:
+Era 12 (2026-06-09): bet events fetched via ``eth_getLogs`` range queries
+(replaced the per-block ``eth_getBlockReceipts`` firehose — byte-identical
+extraction, day-rate ~60 GB -> ~7 MB; the dataseed pool rejects getLogs, so
+the scan runs against ``BET_EVENTS_GETLOGS_ENDPOINT``). Head/anchor/block-ts
+calls stay ``eth_blockNumber``/``eth_getBlockByNumber`` on the hedged pool.
+Architecture: deterministic poll schedule. See:
 - ``var/design/rpc_polling_architecture_2026_05_07.md`` (architecture)
 - ``var/incident_reports/2026_05_07_rpc_polling_spike_results.md`` (provenance)
 - ``var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md``
@@ -79,44 +83,61 @@ _BET_BULL_TOPIC = "0x438122d8cff518d18388099a5181f0d17a12b4f1b55faedf6e4a6acee00
 _BET_BEAR_TOPIC = "0x0d8c1fe3e67ab767116a81f122b83c2557a8c2564019cb7c4f83de1aeb1f1f0d"
 
 
-# Fire-to-all-pool endpoint set. Every JSON-RPC call fans out in
-# parallel to every URL in this list; the first successful response
-# wins. There is no selection logic — if an endpoint misbehaves
-# chronically (sustained timeouts, wrong-chain responses, etc.),
-# remove it from this list manually.
+# Hedged endpoint pool for the poller's SINGLE-call RPCs: eth_blockNumber
+# (head) + eth_getBlockByNumber (anchor poll + lazy bet-block timestamps).
+# Every such call fans out in parallel to every URL here; the first 200 wins.
+# No selection logic — if an endpoint misbehaves chronically (sustained
+# timeouts, wrong-chain responses), remove it from this list manually.
 #
-# 3-endpoint pool (Bundle 6 trim, 2026-05-15): one endpoint per
-# fault domain. Per-endpoint probe (n=15 isolated calls, 6s spacing)
-# from research/probe_per_endpoint_isolated_2026_05_15.py:
+# NOTE (Era 12, 2026-06-09): the bet-event scan no longer runs on this pool.
+# It moved from per-block eth_getBlockReceipts to a single eth_getLogs range
+# query against BET_EVENTS_GETLOGS_ENDPOINT (below) — these 3 dataseed
+# endpoints REJECT eth_getLogs (-32005 "limit exceeded" / 403). So this pool
+# now carries only the small header / blockNumber calls.
 #
-#                                anchor p50 / p95     batch p50 / p95
-#   bsc-dataseed1.binance.org    30ms / 837ms         1914ms / 2717ms   (AS14618 AWS EC2)
-#   bsc-dataseed1.defibit.io     128ms / 1194ms       1496ms / 14760ms  (AS16509 AWS GA)
-#   bsc-rpc.publicnode.com       103ms / 822ms        2357ms / 10816ms  (AS13335 Cloudflare)
+# 3-endpoint pool (Bundle 6 trim, 2026-05-15): one endpoint per fault domain.
+# Per-endpoint probe (n=15 isolated calls, 6s spacing) from
+# research/probe_per_endpoint_isolated_2026_05_15.py — anchor p50/p95 is the
+# metric that still applies (the batch columns measured the retired receipts
+# path):
+#   bsc-dataseed1.binance.org    anchor  30ms /  837ms   (AS14618 AWS EC2)
+#   bsc-dataseed1.defibit.io     anchor 128ms / 1194ms   (AS16509 AWS GA)
+#   bsc-rpc.publicnode.com       anchor 103ms /  822ms   (AS13335 Cloudflare)
 #
-# Dropped (Bundle 6 trim):
-#   - bsc-dataseed3.binance.org  identical IP pool to dataseed1 (same
-#                                AWS EC2 backend; pure redundancy)
-#   - bsc-dataseed1.ninicoin.io  same AS16509 family as defibit; worst
-#                                anchor p50 (525ms) in that family
-#   - bsc.rpc.blxrbdn.com        same AS16509 family as defibit;
-#                                middling on both metrics
-#
-# Rationale: 5 of the prior 6 endpoints were AWS-hosted (3 in AS16509,
-# 2 in AS14618). Cold-start burst (~20 batches × 6 endpoints = 120
-# concurrent in-flight connections) was triggering all-pool
-# HedgedAllFailed timeouts at the ~400-block-backlog scale (verified
-# at PID 2096 / PID 10656 spawns: 7 and 2 BATCH_FAILs respectively).
-# Trimming to one endpoint per ASN-family reduces concurrent in-flight
-# to ~60 and gives each AWS family 1× pool load instead of 2-3×.
-#
-# Fault diversity is preserved (or improved): AWS EC2 + AWS GA +
-# Cloudflare. If AWS us-east goes down entirely, publicnode remains.
+# One endpoint per ASN-family (AWS EC2 + AWS GA + Cloudflare) bounds the
+# cold-start concurrent-connection burst that previously tripped all-pool
+# HedgedAllFailed timeouts. If AWS us-east drops entirely, publicnode remains.
+# (bsc.rpc.blxrbdn.com — same AS16509 family — was dropped from THIS pool in
+# the trim, but is re-added below as the dedicated eth_getLogs endpoint, the
+# only validated no-key option for that role.)
 READ_PATH_HEDGED_ENDPOINTS: list[str] = [
     "https://bsc-dataseed1.binance.org",
     "https://bsc-dataseed1.defibit.io",
     "https://bsc-rpc.publicnode.com",
 ]
+
+# Dedicated bet-event fetch endpoint (eth_getLogs). SEPARATE from the hedged
+# pool above by necessity: the 3 dataseed endpoints reject eth_getLogs
+# (-32005 "limit exceeded" / 403 — verified 2026-06-09 across the whole free-
+# dataseed set, research/survey_getlogs_endpoints_2026_06_09.py). bloXroute
+# serves it with no practical range cap (~90ms for 1000 blocks) and byte-
+# identical extraction to the old getBlockReceipts path
+# (research/parity_getlogs_v2_blxr_2026_06_09.py: 114==114, IDENTICAL).
+# SINGLE endpoint by design: a getLogs failure degrades to a skipped poll
+# (the same failure mode as the prior all-pool receipts failure), so no hedge
+# is needed; add a 2nd validated endpoint here as a list only if redundancy is
+# later wanted. block-ts / anchor / head calls stay on the hedged pool.
+BET_EVENTS_GETLOGS_ENDPOINT: str = "https://bsc.rpc.blxrbdn.com"
+
+# Max blocks per eth_getLogs range. Sized to cover every fetch path in ONE
+# call: steady ~8s poll (~18 blocks), engine single poll (~18), and cold-start
+# catch-up (<= 667 = one 5-min round). Backlogs above this loop in chunks.
+_GETLOGS_CHUNK_BLOCKS: int = 750
+
+# Conservative p99 wallclock for one getLogs chunk fetch — the per-chunk cost
+# in the catch-up feasibility estimate. Soak p99 ~137ms (18-block ranges) /
+# survey ~90ms (1000-block); 250ms leaves headroom for tail latency.
+_GETLOGS_FETCH_RTT_P99_MS: int = 250
 
 _USER_AGENT = "pancakebot-rpc-poller/1.0"
 
@@ -139,8 +160,8 @@ class _EpochPool:
 class AnchorState:
     """BEP-520 ms-precise chain anchor for Bundle 4 dynamic deadline math.
 
-    Captured from any observed block header (coarse-phase: existing batched
-    eth_getBlockByNumber/eth_getBlockReceipts calls; fine-phase: dedicated
+    Captured from any observed block header (coarse-phase: the poller's
+    eth_getBlockByNumber head/anchor calls; fine-phase: dedicated
     latest-block polls during the last ~2s before critical_path wake).
 
     Monotonic on ``block_number``: updates only when the incoming block_number
@@ -307,8 +328,8 @@ class HedgedAllFailed(Exception):
 
 
 class RpcPoller:
-    """Polls PredictionV2 bet events from BSC via batched
-    ``eth_getBlockReceipts`` over HTTP.
+    """Polls PredictionV2 bet events from BSC via ``eth_getLogs`` range
+    queries over HTTP.
 
     Replaces ``PoolEventWatcher``. Public interface intentionally
     mirrors ``PoolEventWatcher`` so the engine integration is a
@@ -365,11 +386,15 @@ class RpcPoller:
         # rate under bare urllib. Validated 2026-05-11 (max wallclock
         # 4.745s → 2.502s); see
         # var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md.
-        # ``num_pools`` and ``maxsize`` both sized to len(pool) so every
-        # endpoint can hold one persistent connection.
+        # ``num_pools`` and ``maxsize`` sized to len(pool) + 1 so every hedged
+        # endpoint AND the separate eth_getLogs host (BET_EVENTS_GETLOGS_ENDPOINT,
+        # POSTed via _rpc_post through this same PoolManager) each keep one
+        # persistent connection — without the +1 the 4th distinct host
+        # (bloXroute) would churn the LRU pool cache against the 3 hedged hosts
+        # every poll, paying a TLS handshake per getLogs call.
         self._pool: urllib3.PoolManager = urllib3.PoolManager(
-            num_pools=max(1, len(self._endpoint_pool)),
-            maxsize=max(1, len(self._endpoint_pool)),
+            num_pools=max(1, len(self._endpoint_pool) + 1),
+            maxsize=max(1, len(self._endpoint_pool) + 1),
             headers={
                 "User-Agent": _USER_AGENT,
                 "Content-Type": "application/json",
@@ -478,24 +503,14 @@ class RpcPoller:
         )
         self._prev_anchor_block: int = 0
         self._prev_anchor_milli_ts: int = 0
-        # Pool-understatement counters (2.1 / 3.2): blocks dropped from the
-        # pool aggregate because a receipt fetch errored, or a bet's block
-        # timestamp could not be resolved. Both silently understate a side's
-        # pool — surface them.
-        self._block_receipt_skips_total: int = 0
+        # Pool-understatement counter (3.2): bets dropped from the pool
+        # aggregate because their block timestamp could not be resolved
+        # (eth_getBlockByNumber failed) — silently understates a side's pool,
+        # so surface it. (Era 12 removed the per-block receipt-skip retry
+        # queue: a getLogs range either returns ALL the range's Bet logs or
+        # raises; on raise the cursor doesn't advance and the next poll
+        # re-fetches the same range — no per-block skip/retry bookkeeping.)
         self._pool_block_ts_zero_drops_total: int = 0
-        # Failed-block retry queue (2.1 fix): a block whose receipts errored is
-        # re-fetched on later periodic polls (off the critical path) instead of
-        # being permanently dropped from the pool aggregate. ``{block: attempts}``.
-        # Idempotent — ``_process_receipts_for_block`` dedups by log-id, so a
-        # recovered block can never double-count, and a retry can only ADD the
-        # block's real (previously-missed) bets (conservative-direction safe).
-        # Bounded by ``_retry_max_attempts`` and a block-age window so the queue
-        # cannot grow without bound; exhausted/aged blocks are dropped with a WARN.
-        self._pending_retry_blocks: dict[int, int] = {}
-        self._block_receipts_recovered_total: int = 0
-        self._retry_max_attempts: int = 4
-        self._retry_window_blocks: int = 900
 
     # ------------------------------------------------------------------
     # Public properties (mirror PoolEventWatcher)
@@ -684,8 +699,9 @@ class RpcPoller:
         self._periodic_thread.start()
         info("START",
              f"RPC poller started endpoint={self._current_endpoint} "
+             f"getlogs_endpoint={BET_EVENTS_GETLOGS_ENDPOINT} "
              f"periodic={self._periodic_poll_interval_s}s "
-             f"batch={self._batch_size}")
+             f"getlogs_chunk={_GETLOGS_CHUNK_BLOCKS}")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -754,7 +770,7 @@ class RpcPoller:
                 # _processed_bet_log_ids. The "+1" next-epoch entries
                 # are kept. The two dicts share the same epoch keyset
                 # by construction (see population site in
-                # _process_receipts_for_block), so a single key list
+                # _process_bet_logs), so a single key list
                 # suffices for both deletes.
                 epochs_to_drop = [e for e in self._pools if e < current_epoch]
                 for e in epochs_to_drop:
@@ -964,27 +980,22 @@ class RpcPoller:
         return max(0, head_num - delta_blocks)
 
     def _estimated_catchup_ms(self, blocks_behind: int) -> int:
-        """Estimated wallclock to fetch ``blocks_behind`` blocks at the
-        per-batch p99 RTT. Conservative — doesn't account for current
-        degradation, and uses the static p99 table not a live observed
-        p99.
+        """Estimated wallclock to catch up ``blocks_behind`` blocks via
+        eth_getLogs range queries chunked at ``_GETLOGS_CHUNK_BLOCKS``.
 
-        Batch-size-aware (2026-05-12): full batches use the table's
-        ``batch_size`` p99; the final partial batch uses the (smaller)
-        p99 for ``remainder`` blocks. For a 7-block lag at batch_size=20,
-        the prior unconditional ``rtt_p99(20)=1319ms`` estimate drops to
-        ``rtt_p99(7) = 827ms`` (interpolated between table[5]=771 and
-        table[10]=910), eliminating false-INFEAS at small backlogs.
-        For a 47-block lag: 2 full batches * rtt_p99(20) + rtt_p99(7).
+        A getLogs range returns only the (sparse, server-filtered) Bet logs
+        regardless of how many blocks it spans, so cost is per-CHUNK, not
+        per-block: ``ceil(blocks_behind / _GETLOGS_CHUNK_BLOCKS)`` chunks,
+        each at ``_GETLOGS_FETCH_RTT_P99_MS``. Conservative (static p99, no
+        live-degradation term). With a 750-block chunk every realistic backlog
+        — steady ~18, one round <= 667 — is a single ~250ms chunk, so the
+        INFEAS gate now only trips for pathological multi-thousand-block
+        backlogs very near lock.
         """
         if blocks_behind <= 0:
             return 0
-        full_batches, remainder = divmod(blocks_behind, self._batch_size)
-        full_rtt = _tc.rpc_rtt_p99_for_batch(self._batch_size)
-        total_ms = full_batches * full_rtt
-        if remainder > 0:
-            total_ms += _tc.rpc_rtt_p99_for_batch(remainder)
-        return total_ms
+        chunks = -(-blocks_behind // _GETLOGS_CHUNK_BLOCKS)  # ceil division
+        return chunks * _GETLOGS_FETCH_RTT_P99_MS
 
     def _available_catchup_ms(self, time_until_lock_ms: int) -> int:
         """Time available for catch-up, with the same safety buffer
@@ -1406,7 +1417,7 @@ class RpcPoller:
 
     def _poll_now(self, *, deadline_ms: int, label: str) -> None:
         """Core poll: fetch new blocks since _last_polled_block_number,
-        in chunks of self._batch_size, until caught up to head.
+        in eth_getLogs ranges of _GETLOGS_CHUNK_BLOCKS, until caught up to head.
 
         Updates _last_poll_succeeded / _last_poll_too_slow / etc on
         completion. ``deadline_ms`` is the soft RTT budget; if any
@@ -1492,56 +1503,33 @@ class RpcPoller:
             blocks_polled = 0
             error_seen: str | None = None
 
-            # Retry previously-skipped blocks (2.1 fix): periodic only, off the
-            # critical path. The retry is one extra batched call; only run it
-            # when an extra batch's worst-case lock-hold still finishes before
-            # the single poll (the periodic cadence budgets ONE batch before
-            # the single-poll window — this adds at most one more). Pre-init / post-lock
-            # (_lock_at<=0) runs wall-clock with ample margin.
-            if label == "period" and self._pending_retry_blocks:
-                if lock_at_local <= 0:
-                    self._retry_pending_receipt_blocks()
-                else:
-                    single_poll_window_start = (
-                        lock_at_local - self._single_poll_wakeup_offset_ms / 1000.0
-                    )
-                    extra_batch_safe_latest = (
-                        single_poll_window_start
-                        - 2 * _tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS
-                        - _tc.RPC_PERIODIC_TO_SINGLE_POLL_SAFETY_BUFFER_SECONDS
-                    )
-                    if time.time() < extra_batch_safe_latest:
-                        self._retry_pending_receipt_blocks()
-
-            # Batch in chunks. Deadline check is total-RTT-based: if
-            # the cumulative time since poll start exceeds deadline_ms
-            # at any point, abort remaining batches (we'll process
-            # what we got and mark too_slow). The engine passes
-            # deadline_ms = (next_wake_time - now) - safety.
-            for batch_start in range(from_block, head + 1, self._batch_size):
+            # Fetch in eth_getLogs ranges. Deadline check is total-RTT-based:
+            # if cumulative time since poll start exceeds deadline_ms at any
+            # point, abort remaining chunks (process what we got, mark
+            # too_slow). The engine passes deadline_ms = (next_wake - now) - safety.
+            for chunk_start in range(from_block, head + 1, _GETLOGS_CHUNK_BLOCKS):
                 if deadline_ms > 0:
                     elapsed_ms = int((time.time() - t_start) * 1000)
                     if elapsed_ms > deadline_ms:
                         warn("ALERT",
-                             f"{label} poll deadline exceeded after batch_start={batch_start}: "
+                             f"{label} poll deadline exceeded after chunk_start={chunk_start}: "
                              f"elapsed={elapsed_ms}ms > deadline={deadline_ms}ms; "
-                             f"aborting remaining batches")
+                             f"aborting remaining chunks")
                         break
-                batch_end = min(batch_start + self._batch_size - 1, head)
-                batch_nums = list(range(batch_start, batch_end + 1))
+                chunk_end = min(chunk_start + _GETLOGS_CHUNK_BLOCKS - 1, head)
                 try:
-                    self._fetch_and_process_blocks(batch_nums)
+                    self._fetch_and_process_logs(chunk_start, chunk_end)
                 except Exception as e:  # noqa: BLE001
-                    error_seen = f"batch[{batch_start}..{batch_end}]: {type(e).__name__}: {e}"
-                    # Transient publicnode failures are expected; the
-                    # cursor advance + feasibility check together prevent
-                    # the catch-up backlog from compounding. INFO severity
-                    # avoids alert noise on routine outages.
-                    warn("ALERT", f"{label} poll batch failed: {error_seen}")
+                    error_seen = f"getlogs[{chunk_start}..{chunk_end}]: {type(e).__name__}: {e}"
+                    # Transient getLogs-endpoint failures: the cursor is NOT
+                    # advanced past a failed chunk, so the next poll re-fetches
+                    # the same range; the feasibility check prevents the
+                    # catch-up backlog from compounding.
+                    warn("ALERT", f"{label} poll getlogs failed: {error_seen}")
                     break
-                blocks_polled += len(batch_nums)
+                blocks_polled += (chunk_end - chunk_start + 1)
                 with self._lock:
-                    self._last_polled_block_number = batch_end
+                    self._last_polled_block_number = chunk_end
 
             rtt_ms = int((time.time() - t_start) * 1000)
             too_slow = (deadline_ms > 0 and rtt_ms > deadline_ms)
@@ -1576,158 +1564,79 @@ class RpcPoller:
                 self._poll_in_progress = False
             self._poll_lock.release()
 
-    def _fetch_and_process_blocks(self, block_numbers: list[int]) -> None:
-        """Fetch ``eth_getBlockReceipts`` for each block in a SINGLE
-        batched HTTP request, then process bet events.
+    def _fetch_and_process_logs(self, from_block: int, to_block: int) -> None:
+        """Fetch Bet logs in [from_block, to_block] via a SINGLE eth_getLogs
+        range query against ``BET_EVENTS_GETLOGS_ENDPOINT`` (server-side
+        filtered by contract address + Bet topic0), then process them.
 
-        Bundle 5 v2 (2026-05-14): receipts-only backfill. Previously
-        (commit f02d736, 2026-05-08) we bundled ``eth_getBlockByNumber``
-        alongside each receipts call to populate ``_block_ts`` for the
-        pool_cutoff filter — but the I3 probe (2026-05-14, 20 samples
-        per shape) showed that doubling sub-calls per batch added ~1%
-        to per-batch RTT, vs the 2× speedup hoped for. The savings from
-        receipts-only batching come from halving JSON-RPC payload size,
-        not from halving sub-call count. Sub-call count is dominated by
-        per-batch fixed costs (TLS, urllib3 PoolManager contention,
-        rate-limit decisions).
+        Era 12 (2026-06-09) replacement for the per-block eth_getBlockReceipts
+        firehose: receipts returned every full receipt in the range (~315
+        KB/block, ~60 GB/day) just to find the sparse Bet logs, and the
+        dataseed pool errored on ~5% of those heavy responses. getLogs returns
+        only the Bet logs (~KB), byte-identical extraction
+        (research/parity_getlogs_v2_blxr_2026_06_09.py: 114==114), at ~7 MB/day.
 
-        Block timestamps for bet-containing blocks are resolved lazily
-        in ``_process_receipts_for_block`` via a single
-        ``eth_getBlockByNumber`` per bet-containing block. Bet rate is
-        sparse (~5-20 bets per 5-min round, ~1-3% of backfilled blocks),
-        so the lazy path fires ~1-3 single-RPCs per round at most,
-        off the critical path.
+        Raises on transport/RPC error so the caller aborts the chunk loop with
+        the cursor un-advanced — the next poll re-fetches the same range. A
+        range fetch is all-or-nothing, so there are no partial-block skips to
+        track (this replaces the old per-block receipt-skip retry queue).
         """
-        if not block_numbers:
-            return
-        # Each block contributes ONE sub-call (receipts only).
-        calls: list[tuple[str, list]] = [
-            ("eth_getBlockReceipts", [hex(bn)]) for bn in block_numbers
-        ]
-        results = self._rpc_batch(calls)
-        if len(results) != len(calls):
+        flt = {
+            "fromBlock": hex(from_block),
+            "toBlock": hex(to_block),
+            "address": self._contract_addr,
+            "topics": [[_BET_BULL_TOPIC, _BET_BEAR_TOPIC]],
+        }
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs", "params": [flt],
+        }).encode()
+        resp_bytes = self._rpc_post(
+            BET_EVENTS_GETLOGS_ENDPOINT, body,
+            timeout_seconds=_tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS,
+        )
+        payload = json.loads(resp_bytes)
+        if "error" in payload:
+            raise InvariantError(f"getlogs_rpc_error:{payload['error']}")
+        logs = payload.get("result")
+        if not isinstance(logs, list):
             raise InvariantError(
-                f"rpc_batch_length_mismatch: expected={len(calls)} got={len(results)}"
+                f"getlogs_result_not_list: {type(logs).__name__}"
             )
-        _block_skips = 0
-        _skipped_bns: list[int] = []
-        for i, bn in enumerate(block_numbers):
-            receipts, recv_err = results[i]
-            if recv_err is not None:
-                # Single-block error: queue for retry on a later periodic
-                # poll (2.1 fix). Don't raise here because the rest of the
-                # batch might be valid.
-                _block_skips += 1
-                _skipped_bns.append(bn)
-                continue
-            if not isinstance(receipts, list):
-                _block_skips += 1
-                _skipped_bns.append(bn)
-                continue
-            self._process_receipts_for_block(bn, receipts)
-            # Recovered (or never-failed) block: clear any pending retry. If
-            # it WAS pending, this read recovered its previously-missed bets.
-            with self._lock:
-                if self._pending_retry_blocks.pop(bn, None) is not None:
-                    self._block_receipts_recovered_total += 1
-        if _skipped_bns:
-            # Queue skipped blocks for retry (forward-only cursor is untouched;
-            # these blocks are re-fetched explicitly, not via the cursor).
-            with self._lock:
-                for bn in _skipped_bns:
-                    self._pending_retry_blocks[bn] = self._pending_retry_blocks.get(bn, 0) + 1
-        if _block_skips > 0:
-            # Pool-understatement signal (guard audit 2.1): bets in the
-            # skipped blocks are absent from the pool aggregate UNTIL the
-            # retry queue recovers them on a later periodic poll — surface so
-            # a corrupted bull/bear ratio doesn't go unnoticed in the interim.
-            self._block_receipt_skips_total += _block_skips
-            with self._lock:
-                _pending_n = len(self._pending_retry_blocks)
-            warn(
-                "ALERT",
-                f"block receipt fetch skipped {_block_skips}/{len(block_numbers)} "
-                f"blocks (receipt error); queued for retry "
-                f"(pending={_pending_n}, cumulative_skips={self._block_receipt_skips_total}, "
-                f"recovered={self._block_receipts_recovered_total})",
-            )
+        self._process_bet_logs(logs)
 
-    def _retry_pending_receipt_blocks(self) -> None:
-        """Re-fetch blocks whose receipts errored on an earlier poll (2.1 fix).
+    def _process_bet_logs(self, logs: list[dict]) -> None:
+        """Extract BetBull/BetBear events from a batch of eth_getLogs log
+        objects (which may span multiple blocks) and update the local pool
+        state. Same log-id dedup + epoch-gate + lazy block_ts resolution as
+        the prior receipts path — a getLogs log object has the identical shape
+        to a receipt's log entry (address / topics / data / blockNumber /
+        transactionHash / logIndex), so the per-log extraction is verbatim
+        (parity-verified 2026-06-09).
 
-        Called only from periodic polls, off the critical path. Recovers bets
-        that would otherwise be permanently missing from the pool aggregate
-        (the cursor already advanced past these blocks, so nothing else
-        re-fetches them). ``_fetch_and_process_blocks`` itself maintains the
-        queue: a recovered block is popped (and counted), a still-failing one
-        is re-incremented. Idempotent — log-id dedup means a partially-counted
-        block can't double-count, and the retry only ever ADDS real missed bets.
-
-        Bounded two ways so the queue can't grow without limit:
-          * attempts >= ``_retry_max_attempts`` -> give up, drop with a WARN.
-          * block older than ``_retry_window_blocks`` behind the cursor -> drop
-            (its bets are epoch-gated out of the current round anyway).
-        Both drops are surfaced (no silent truncation of the understatement)."""
-        with self._lock:
-            floor = self._last_polled_block_number - self._retry_window_blocks
-            retry: list[int] = []
-            dropped: list[int] = []
-            for bn, attempts in list(self._pending_retry_blocks.items()):
-                if attempts >= self._retry_max_attempts or bn < floor:
-                    dropped.append(bn)
-                    del self._pending_retry_blocks[bn]
-                else:
-                    retry.append(bn)
-        if dropped:
-            warn(
-                "ALERT",
-                f"pool understatement: dropped {len(dropped)} block(s) after "
-                f"exhausting receipt retries (blocks={sorted(dropped)[:10]}); "
-                f"their bets remain missing from the pool aggregate",
-            )
-        if retry:
-            # Single extra batched call; success/failure bookkeeping happens
-            # inside _fetch_and_process_blocks (pop-on-recover, increment-on-fail).
-            self._fetch_and_process_blocks(sorted(retry))
-
-    def _process_receipts_for_block(self, block_number: int, receipts: list[dict]) -> None:
-        """Extract BetBull/BetBear events from a block's receipts and
-        update the local pool state. Same log-id dedup + epoch-gate
-        behaviour as the prior PoolEventWatcher._process_bet_event.
-
-        Bundle 5 v2 (2026-05-14): when a bet log is detected, resolve
-        the block timestamp lazily via a single ``eth_getBlockByNumber``
-        call (cached in ``_block_ts``). The receipts-only backfill no
-        longer pre-populates ``_block_ts`` from a bundled header call,
-        so this lazy path is the canonical source of block_ts for the
-        pool_cutoff filter. Bet rate is sparse (~5-20 per round across
-        ~600 backfilled blocks); the single-RPC cost per bet-containing
-        block is off the critical path.
+        Logs arrive server-side-filtered (address + Bet topic0); the address /
+        topic guards below are a defensive re-check. block_ts is resolved once
+        per bet-containing block via a single eth_getBlockByNumber (cached in
+        ``_block_ts`` + this call's local cache), off the critical path.
         """
         bet_logs: list[dict] = []
-        for r in receipts:
-            if not isinstance(r, dict):
+        for log in logs:
+            if not isinstance(log, dict):
                 continue
-            for log in r.get("logs", []) or []:
-                if (log.get("address") or "").lower() != self._contract_addr:
-                    continue
-                topics = log.get("topics") or []
-                if len(topics) < 3:
-                    continue
-                topic0 = topics[0]
-                if topic0 == _BET_BULL_TOPIC or topic0 == _BET_BEAR_TOPIC:
-                    bet_logs.append(log)
+            if (log.get("address") or "").lower() != self._contract_addr:
+                continue
+            topics = log.get("topics") or []
+            if len(topics) < 3:
+                continue
+            topic0 = topics[0]
+            if topic0 == _BET_BULL_TOPIC or topic0 == _BET_BEAR_TOPIC:
+                bet_logs.append(log)
 
         if not bet_logs:
-            return  # no bets in this block — nothing to do
+            return  # no bets in this range — nothing to do
 
-        # Resolve block_ts ONCE for this block (cheaper than per-bet).
-        # Cache hit if a prior pass already resolved this block (e.g.,
-        # epoch_advance cache lookup); otherwise fire one RPC.
-        with self._lock:
-            cached_ts = self._block_ts.get(block_number, 0)
-        block_ts = cached_ts if cached_ts > 0 else self._resolve_block_ts(block_number)
-
+        # block_ts resolved once per block — cache hit if a prior pass (or an
+        # earlier log in this batch) already resolved it; otherwise one RPC.
+        block_ts_local: dict[int, int] = {}
         for log in bet_logs:
             topic0 = log.get("topics", [None])[0]
             side = "Bull" if topic0 == _BET_BULL_TOPIC else "Bear"
@@ -1744,6 +1653,12 @@ class RpcPoller:
                 self._current_epoch, self._current_epoch + 1
             ):
                 continue
+            block_ts = block_ts_local.get(bn)
+            if block_ts is None:
+                with self._lock:
+                    cached_ts = self._block_ts.get(bn, 0)
+                block_ts = cached_ts if cached_ts > 0 else self._resolve_block_ts(bn)
+                block_ts_local[bn] = block_ts
             tx_hash = log.get("transactionHash", "")
             log_idx = log.get("logIndex", "")
             bet_log_id = f"{tx_hash}:{log_idx}"
@@ -1767,7 +1682,7 @@ class RpcPoller:
         caches the result in ``_block_ts`` and returns the timestamp
         in chain seconds.
 
-        Called from ``_process_receipts_for_block`` when a bet log is
+        Called from ``_process_bet_logs`` when a bet log is
         detected. Sparse bet rate (~5-20 per round) means this fires
         at most ~5-20 times per round, off the critical path.
         """
@@ -1940,44 +1855,3 @@ class RpcPoller:
         if "error" in payload:
             raise InvariantError(f"rpc_error:{payload['error']}")
         return payload.get("result")
-
-    def _rpc_batch(self, calls: list[tuple[str, list]]) -> list[tuple[Any, str | None]]:
-        """Batched JSON-RPC call. Returns list of (result, error_str)
-        parallel to calls. On transport-level failures (HTTP error,
-        non-list response, id mismatch) raises -- the entire batch is
-        considered failed. Hedged across every endpoint in the pool;
-        first endpoint to return a well-formed list response wins.
-        """
-        if not calls:
-            return []
-        batch = [
-            {"jsonrpc": "2.0", "id": i, "method": method, "params": params}
-            for i, (method, params) in enumerate(calls)
-        ]
-        body = json.dumps(batch).encode()
-        _ep, resp_bytes = self._do_hedged_post(
-            body, timeout_seconds=_tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS,
-        )
-        payload = json.loads(resp_bytes)
-        if not isinstance(payload, list):
-            raise InvariantError(
-                f"rpc_batch_non_list_response: type={type(payload).__name__}"
-            )
-        # Build aligned result list (sort by id; verify all ids present)
-        ids_returned = sorted(r.get("id", -1) for r in payload)
-        ids_expected = list(range(len(calls)))
-        if ids_returned != ids_expected:
-            missing = set(ids_expected) - set(ids_returned)
-            extras = set(ids_returned) - set(ids_expected)
-            raise InvariantError(
-                f"rpc_batch_id_mismatch: missing={sorted(missing)} extras={sorted(extras)}"
-            )
-        by_id = {r["id"]: r for r in payload}
-        results: list[tuple[Any, str | None]] = []
-        for i in range(len(calls)):
-            r = by_id[i]
-            if "error" in r:
-                results.append((None, f"rpc_error:{r['error']}"))
-            else:
-                results.append((r.get("result"), None))
-        return results

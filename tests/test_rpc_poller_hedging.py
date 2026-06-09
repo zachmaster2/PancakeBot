@@ -281,7 +281,7 @@ def test_stats_exposes_pool_size_no_health_tracker():
 
 
 # ---------------------------------------------------------------------------
-# Integration: _rpc_call_single + _rpc_batch hit the hedged transport
+# Integration: _rpc_call_single hits the hedged transport
 # ---------------------------------------------------------------------------
 
 def test_rpc_call_single_uses_hedged_transport():
@@ -293,21 +293,3 @@ def test_rpc_call_single_uses_hedged_transport():
     ):
         out = p._rpc_call_single("eth_blockNumber", [])
     assert out == "0x10"
-
-
-def test_rpc_batch_uses_hedged_transport():
-    pool = ["https://a.example.com", "https://b.example.com"]
-    p = _make_poller(endpoint_pool=pool)
-    batch_resp = (
-        b'[{"jsonrpc":"2.0","id":0,"result":"0xa"},'
-        b'{"jsonrpc":"2.0","id":1,"result":"0xb"}]'
-    )
-    with mock.patch.object(
-        p, "_rpc_post",
-        side_effect=_make_responder(response=batch_resp),
-    ):
-        results = p._rpc_batch([
-            ("eth_blockNumber", []),
-            ("eth_blockNumber", []),
-        ])
-    assert results == [("0xa", None), ("0xb", None)]
