@@ -256,6 +256,7 @@ def run_from_config(
         interval_seconds=interval_seconds,
         endpoint_pool=READ_PATH_HEDGED_ENDPOINTS,
         single_poll_wakeup_offset_before_lock_ms=cfg.single_poll_wakeup_offset_before_lock_ms,
+        pool_cutoff_seconds=cfg.pool_cutoff_seconds,
     )
     rpc_poller.start()
 

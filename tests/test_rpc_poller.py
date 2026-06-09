@@ -38,10 +38,15 @@ from pancakebot.util import InvariantError  # noqa: E402
 
 def _make_poller() -> RpcPoller:
     """Construct a poller with default args + lightweight endpoint_pool."""
-    return RpcPoller(
+    p = RpcPoller(
         interval_seconds=300,
         endpoint_pool=["https://test.example.com"],
     )
+    # Hermetic default: the Era-12 clamp calls _bloxroute_block_number() inside
+    # _poll_now; stub it high so the clamp is a no-op (poll head unchanged) and
+    # no test hits the real bloXroute endpoint. Clamp-specific tests override it.
+    p._bloxroute_block_number = lambda: 10**12  # type: ignore[assignment]
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +173,82 @@ def test_is_pool_ready_priority_catchup_infeasible_beats_poll_in_progress():
     ready, reason = p.is_pool_ready()
     assert ready is False
     assert reason == "catchup_infeasible_for_round"
+
+
+# ---------------------------------------------------------------------------
+# Era 12: getLogs head-clamp + F0 pool-coverage gate
+# ---------------------------------------------------------------------------
+
+def test_poll_clamps_head_to_bloxroute_and_advances_cursor_to_clamp():
+    """Clamp: when bloXroute's head lags the reference head, the poll fetches
+    only up to bloXroute's head and the cursor advances to THAT (never past
+    bloXroute), so no getLogs range exceeds bloXroute's synced tip. The blocks
+    bloXroute hasn't synced are picked up next tick (contiguous cursor)."""
+    p = _make_poller()
+    p._last_polled_block_number = 99_990
+    p._lock_at = 0  # skip the feasibility branch
+    p._rpc_eth_block_number = lambda: 100_000       # reference head
+    p._bloxroute_block_number = lambda: 99_995      # bloXroute lags by 5
+    fetched: list = []
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda frm, to: fetched.append((frm, to))
+    )
+
+    p._poll_now(deadline_ms=0, label="period")
+
+    assert fetched == [(99_991, 99_995)]            # clamped to bloXroute head
+    assert p._last_polled_block_number == 99_995    # cursor at the clamped head
+
+
+def test_is_pool_ready_true_when_pool_covers_cutoff():
+    """F0: cursor has polled THROUGH the pool-cutoff block
+    (cursor_block_ts >= lock - pool_cutoff) -> ready."""
+    p = _make_poller()
+    p._connected = True
+    p._lock_at = 1000               # cutoff_ts = (1000-6)*1000 = 994_000ms
+    p._pool_cutoff_seconds = 6
+    p._prev_anchor_block = 2000
+    p._prev_anchor_milli_ts = 1_000_000
+    p._last_polled_block_number = 1999   # 1_000_000 - 450 = 999_550ms >= 994_000
+    ready, reason = p.is_pool_ready(500)
+    assert ready is True
+    assert reason == ""
+
+
+def test_is_pool_ready_false_and_alerts_when_pool_uncovered(monkeypatch):
+    """F0 hard guarantee: bloXroute lagged so far the cursor is SHORT of the
+    pool-cutoff block -> is_pool_ready False (pool_uncovered) + a distinct
+    POOL UNCOVERED ALERT. Never size the bet on an incomplete pool."""
+    import pancakebot.chain.rpc_poller as mod
+    p = _make_poller()
+    p._connected = True
+    p._lock_at = 1000               # cutoff_ts = 994_000ms
+    p._pool_cutoff_seconds = 6
+    p._prev_anchor_block = 2000
+    p._prev_anchor_milli_ts = 1_000_000
+    p._last_polled_block_number = 1980   # 1_000_000 - 9000 = 991_000ms < 994_000
+    warns: list = []
+    monkeypatch.setattr(mod, "warn", lambda action, msg: warns.append((action, msg)))
+    ready, reason = p.is_pool_ready(488_500)
+    assert ready is False
+    assert reason == "pool_uncovered"
+    assert any(
+        a == "ALERT" and "POOL UNCOVERED" in m and "488500" in m for a, m in warns
+    ), f"expected a POOL UNCOVERED ALERT for epoch 488500, got {warns}"
+
+
+def test_is_pool_ready_no_coverage_gate_without_anchor():
+    """F0 is not evaluable without an anchor (e.g. the anchor poll failed) ->
+    no coverage gate; existing readiness applies (anchor-absent rounds already
+    run on the static-deadline fallback)."""
+    p = _make_poller()
+    p._connected = True
+    p._lock_at = 1000
+    p._pool_cutoff_seconds = 6
+    p._prev_anchor_block = 0             # no anchor
+    p._last_polled_block_number = 1      # would be wildly uncovered IF evaluated
+    ready, reason = p.is_pool_ready(500)
+    assert ready is True
 
 
 # ---------------------------------------------------------------------------

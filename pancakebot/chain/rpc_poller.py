@@ -345,6 +345,7 @@ class RpcPoller:
         periodic_poll_interval_s: int = _tc.RPC_PERIODIC_POLL_INTERVAL_SECONDS,
         batch_size: int = _tc.RPC_BATCH_MAX_BLOCKS,
         single_poll_wakeup_offset_before_lock_ms: int = 4750,
+        pool_cutoff_seconds: int = 6,
     ) -> None:
         if interval_seconds <= 0:
             raise InvariantError("interval_seconds_nonpositive")
@@ -363,6 +364,13 @@ class RpcPoller:
             raise InvariantError("endpoint_pool_empty")
 
         self._interval_seconds = int(interval_seconds)
+        # F0 pool-coverage gate (Era 12): get_pool sizes the bet from bets with
+        # block_ts < lock - pool_cutoff_seconds; is_pool_ready refuses to bet
+        # unless the cursor has polled THROUGH that cutoff block — the hard
+        # guarantee that sizing uses COMPLETE data despite the getLogs endpoint
+        # (bloXroute) possibly lagging the reference pool. See
+        # _pool_coverage_shortfall_locked.
+        self._pool_cutoff_seconds = int(pool_cutoff_seconds)
         self._endpoint_pool: list[str] = pool
 
         # ThreadPoolExecutor for parallel fan-out across the full pool.
@@ -679,7 +687,65 @@ class RpcPoller:
                 return False, "catchup_infeasible_for_round"
             if self._poll_in_progress:
                 return False, "poll_in_progress"
+            shortfall = self._pool_coverage_shortfall_locked()
+        # F0 coverage gate (Era 12) — the HARD GUARANTEE that bet sizing uses
+        # COMPLETE pool data. If the cursor (clamped to bloXroute in _poll_now)
+        # has NOT polled through the pool-cutoff block, the get_pool sizing
+        # window has a hole -> skip + ALERT rather than size on partial data.
+        # ALERT outside the lock; expected ~once/round (the engine calls
+        # is_pool_ready once at the decision). See _pool_coverage_shortfall_locked.
+        if shortfall is None:
             return True, ""
+        cursor_ms, cutoff_ms, blocks_short = shortfall
+        warn(
+            "ALERT",
+            f"POOL UNCOVERED epoch={epoch}: getLogs endpoint lagged the "
+            f"pool-cutoff block — cursor_block_ts={cursor_ms}ms < "
+            f"cutoff_ts={cutoff_ms}ms (~{blocks_short} blocks short). Skipping "
+            f"to avoid sizing the bet on an incomplete pool (F0 guarantee).",
+        )
+        return False, "pool_uncovered"
+
+    def _pool_coverage_shortfall_locked(self) -> tuple[int, int, int] | None:
+        """F0 pool-coverage check (call holding ``self._lock``).
+
+        THE HARD GUARANTEE that bet sizing uses COMPLETE pool data. ``get_pool``
+        sizes the bet from bets with ``block_ts < lock - pool_cutoff_seconds``
+        (the "cutoff block" = the newest block that counts). Bet events come
+        from the getLogs endpoint (bloXroute), whose head can lag the reference
+        pool. If bloXroute lagged far enough that the cursor (clamped to
+        bloXroute in ``_poll_now``) is SHORT of the cutoff block, the sizing
+        window has a HOLE — the caller SKIPs rather than size on partial data.
+        Normal jitter (<= ~1 block) leaves the cursor ~3.5s past the cutoff (the
+        single poll fires lock-2500ms vs the lock-6000ms cutoff), so this fires
+        only under a multi-second getLogs lag (degradation).
+
+        Returns ``None`` if covered (or not evaluable), else
+        ``(cursor_block_milli_ts, cutoff_milli_ts, blocks_short)``.
+
+        The cursor block's BEP-520 ms-timestamp is extrapolated from the latest
+        anchor by exact 450ms increments — NO extra RPC. The extrapolation
+        error over the ~2-5 blocks between cursor and anchor is far below the
+        ~3.5s cutoff buffer, so it cannot mask a real multi-second lag. Returns
+        ``None`` (no gate) when no anchor or lock is set: cold-start is gated by
+        ``_connected``, and an anchor-absent round already runs on the
+        static-deadline fallback path.
+        """
+        if self._prev_anchor_block <= 0 or self._lock_at <= 0:
+            return None
+        cutoff_milli = (self._lock_at - self._pool_cutoff_seconds) * 1000
+        cursor = self._last_polled_block_number
+        cursor_milli = (
+            self._prev_anchor_milli_ts
+            + (cursor - self._prev_anchor_block) * _tc.BSC_BLOCK_TIME_MS
+        )
+        if cursor_milli >= cutoff_milli:
+            return None
+        blocks_short = (
+            (cutoff_milli - cursor_milli + _tc.BSC_BLOCK_TIME_MS - 1)
+            // _tc.BSC_BLOCK_TIME_MS
+        )
+        return (cursor_milli, cutoff_milli, blocks_short)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1452,6 +1518,28 @@ class RpcPoller:
                 warn("ALERT", f"{label} poll: eth_blockNumber failed: {self._last_poll_error}")
                 return
 
+            # Era 12 clamp: getLogs runs against bloXroute, whose head can lag
+            # the reference pool by a block during propagation. Clamp the poll
+            # head to bloXroute's own tip so a getLogs range never requests a
+            # toBlock beyond what bloXroute has synced (which returns -32000
+            # "invalid block range params"). The cursor then tracks bloXroute's
+            # polled position; any block the reference pool has but bloXroute
+            # hasn't is picked up next tick — the cursor is contiguous, so NO
+            # block is skipped. The F0 gate in is_pool_ready is the hard
+            # guarantee that we never BET while the cursor is short of the
+            # pool-cutoff block.
+            try:
+                bloxroute_head = self._bloxroute_block_number()
+            except Exception as e:  # noqa: BLE001
+                with self._lock:
+                    self._last_poll_succeeded = False
+                    self._last_poll_error = f"bloxroute_head_fetch:{type(e).__name__}:{e}"
+                warn("ALERT",
+                     f"{label} poll: bloXroute eth_blockNumber failed: {self._last_poll_error}")
+                return
+            if bloxroute_head < head:
+                head = bloxroute_head
+
             with self._lock:
                 from_block = self._last_polled_block_number + 1
                 lock_at_local = self._lock_at
@@ -1717,6 +1805,30 @@ class RpcPoller:
         result = self._rpc_call_single("eth_blockNumber", [])
         if not isinstance(result, str):
             raise InvariantError(f"eth_blockNumber_unexpected_result: {result!r}")
+        return int(result, 16)
+
+    def _bloxroute_block_number(self) -> int:
+        """Current head block number as seen by the getLogs endpoint
+        (``BET_EVENTS_GETLOGS_ENDPOINT`` / bloXroute). The poll head is clamped
+        to this so a getLogs range never requests a toBlock beyond bloXroute's
+        synced tip — which returns -32000 "invalid block range params" when
+        bloXroute momentarily lags the reference pool during propagation.
+        Single-endpoint POST (NOT the hedged pool). Raises on transport/RPC
+        error; the caller treats that as 'getLogs endpoint unavailable' and
+        fails the poll, exactly like a read-pool head-fetch failure."""
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": [],
+        }).encode()
+        resp_bytes = self._rpc_post(
+            BET_EVENTS_GETLOGS_ENDPOINT, body,
+            timeout_seconds=float(_tc.RPC_HTTP_SINGLE_TIMEOUT_SECONDS),
+        )
+        payload = json.loads(resp_bytes)
+        if "error" in payload:
+            raise InvariantError(f"bloxroute_blocknumber_rpc_error:{payload['error']}")
+        result = payload.get("result")
+        if not isinstance(result, str):
+            raise InvariantError(f"bloxroute_blocknumber_unexpected_result: {result!r}")
         return int(result, 16)
 
     def _rpc_eth_get_latest_block_header(self) -> tuple[int, int]:
