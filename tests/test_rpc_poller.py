@@ -31,6 +31,7 @@ from pancakebot.chain.rpc_poller import (  # noqa: E402
     _Bet,
     _EpochPool,
     _BET_BULL_TOPIC,
+    _BET_BEAR_TOPIC,
 )
 from pancakebot.util import InvariantError  # noqa: E402
 
@@ -417,23 +418,28 @@ def test_on_epoch_advance_resets_infeasibility_flag():
 
 
 def test_on_epoch_advance_marks_infeasible_when_catchup_exceeds_budget():
-    """Far behind + tight time -> flag set, log emitted at WARN."""
+    """One round behind with the lock imminent (~150ms) -> INFEAS flag set.
+
+    Under the Era-12 getLogs model a full-round backlog is a single ~250ms
+    chunk, so the gate trips only when less than a chunk of time remains. A
+    lock ~150ms out gives available_ms below the 250ms estimate while still
+    being pre-lock (time_until_lock_ms > 0), so the flag is set rather than
+    suppressed as moot. (Pre-Era-12 the receipts model estimated multiple
+    seconds and tripped INFEAS even with ~800ms to spare — the migration is
+    exactly this win; sub-second time-to-lock is normal in production since
+    lock_at is whole-second and ``now`` is sub-second.)
+    """
     import time as _t
     p = _make_poller()
     _prep_for_epoch_advance(p)
-    p._last_polled_block_number = 1_000  # very stale
+    p._last_polled_block_number = 1_000  # very stale; clamp jumps to round_start
 
-    # head_ts to make round_start_block = 90_000, head=100_000 -> 10_000 behind.
-    # 10_000 / 20 = 500 batches @ p99(20)ms estimated catch-up (way past deadline).
-    # Set lock_at to "now + 1s" to make available_ms tiny.
     p._rpc_eth_get_latest_block_header = lambda: (100_000, _t.time())  # type: ignore[assignment]
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
 
-    # round_start_ts = lock_at - 300, round_start_block ~= 100_000 -
-    #   (head_ts - round_start_ts)*2 = 100_000 - 600 = 99_400.
-    # So blocks_behind = 100_000 - 99_400 = 600. 30 batches * p99(20) ms.
-    # available = max(0, 1000 - 200) = 800 ms. infeasible.
-    near_lock_at = int(_t.time()) + 1
+    # ~150ms to lock: available < the 250ms one-chunk estimate, but still
+    # pre-lock so the flag is not suppressed.
+    near_lock_at = _t.time() + 0.15
 
     p._on_epoch_advance(lock_at=near_lock_at, current_epoch=101)
 
@@ -494,69 +500,38 @@ def test_first_call_set_round_phase_does_not_invoke_clamp(monkeypatch):
 # Feasibility math
 # ---------------------------------------------------------------------------
 
-def test_estimated_catchup_ms_calculation():
-    """Full-batch backlogs: ``full_batches * p99(batch_size)`` plus the
-    partial-batch tail. Refactored 2026-05-12: the helper is now
-    batch-size-aware (full batches at p99(batch_size), partial at
-    p99(remainder)).
-
-    1319ms is the 2026-05-11 fire-to-all-pool measurement for batch=20
-    (n=30, bot stopped). See RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE
-    docstring in timing_constants.py.
+def test_estimated_catchup_ms_getlogs_chunk_model():
+    """Era 12 getLogs model: ceil(blocks_behind / _GETLOGS_CHUNK_BLOCKS)
+    chunks, each costing _GETLOGS_FETCH_RTT_P99_MS. A getLogs range returns
+    only the sparse Bet logs regardless of block span, so cost is per-chunk,
+    not per-block — every realistic backlog (steady ~18, one round <= 667) is
+    a single chunk.
     """
-    p = _make_poller()
-    rtt_full = _tc.rpc_rtt_p99_for_batch(20)  # 1319 canonical
-    rtt_one = _tc.rpc_rtt_p99_for_batch(1)    # 421 canonical (ceiling at small end)
-    assert p._estimated_catchup_ms(0) == 0
-    assert p._estimated_catchup_ms(20) == rtt_full           # 1 full batch, 0 remainder
-    assert p._estimated_catchup_ms(21) == rtt_full + rtt_one  # 1 full + 1-block partial
-    assert p._estimated_catchup_ms(60) == 3 * rtt_full        # 3 full batches, 0 remainder
-
-
-def test_estimated_catchup_ms_partial_batch_uses_remainder_rtt():
-    """The partial trailing batch uses the (smaller) p99 for the
-    remainder size — not the full-batch p99 — eliminating the prior
-    ceiling-style overestimate. At blocks_behind=7 (= remainder only,
-    no full batches), the result is rtt_p99(7) ~ 827ms (interpolated),
-    NOT the prior unconditional rtt_p99(20)=1319ms.
-    """
-    p = _make_poller()
-    # 7 blocks: 0 full batches + 7-block partial.
-    assert p._estimated_catchup_ms(7) == _tc.rpc_rtt_p99_for_batch(7)
-    # 18 blocks: same — 0 full batches + 18-block partial.
-    assert p._estimated_catchup_ms(18) == _tc.rpc_rtt_p99_for_batch(18)
-    # 27 blocks: 1 full batch + 7-block partial.
-    assert p._estimated_catchup_ms(27) == (
-        _tc.rpc_rtt_p99_for_batch(20) + _tc.rpc_rtt_p99_for_batch(7)
+    from pancakebot.chain.rpc_poller import (
+        _GETLOGS_CHUNK_BLOCKS as CHUNK,
+        _GETLOGS_FETCH_RTT_P99_MS as RTT,
     )
-
-
-def test_estimated_catchup_ms_strictly_smaller_than_old_ceiling_math():
-    """Regression guard: the new estimate is at most equal to the prior
-    ``ceil(n/batch_size) * p99(batch_size)`` ceiling math, and strictly
-    smaller for any non-multiple of batch_size. At canonical batch=20:
-      - blocks=7  : old 1319, new ~827
-      - blocks=21 : old 2638, new 1319+421=1740
-      - blocks=27 : old 2638, new 1319+827=2146
-    This is the load-bearing property: small backlogs no longer
-    false-INFEAS due to ceiling overestimation.
-    """
     p = _make_poller()
-    rtt20 = _tc.rpc_rtt_p99_for_batch(20)
-    for blocks in (7, 21, 27, 33, 47):
-        full, remainder = divmod(blocks, 20)
-        old_ceiling = (full + (1 if remainder else 0)) * rtt20
-        new_estimate = p._estimated_catchup_ms(blocks)
-        # When remainder > 0, new estimate must be strictly smaller
-        # (since rtt_p99(remainder) < rtt_p99(20) for remainder < 20).
-        if remainder > 0:
-            assert new_estimate < old_ceiling, (
-                f"blocks={blocks}: new={new_estimate} should be < "
-                f"old_ceiling={old_ceiling} (smaller partial RTT)"
-            )
-        else:
-            # Multiples of batch_size: same result, both math models.
-            assert new_estimate == old_ceiling
+    assert p._estimated_catchup_ms(0) == 0
+    assert p._estimated_catchup_ms(1) == RTT              # 1 chunk
+    assert p._estimated_catchup_ms(18) == RTT             # steady poll: 1 chunk
+    assert p._estimated_catchup_ms(667) == RTT            # one 5-min round: 1 chunk
+    assert p._estimated_catchup_ms(CHUNK) == RTT          # exactly one chunk
+    assert p._estimated_catchup_ms(CHUNK + 1) == 2 * RTT  # spills to a 2nd chunk
+
+
+def test_estimated_catchup_ms_chunks_large_backlog():
+    """Backlogs above one chunk accrue one RTT per chunk (ceil division). The
+    INFEAS gate therefore only bites for pathological multi-thousand-block
+    backlogs — realistic ones are always a single fast chunk.
+    """
+    from pancakebot.chain.rpc_poller import (
+        _GETLOGS_CHUNK_BLOCKS as CHUNK,
+        _GETLOGS_FETCH_RTT_P99_MS as RTT,
+    )
+    p = _make_poller()
+    assert p._estimated_catchup_ms(CHUNK * 3) == 3 * RTT
+    assert p._estimated_catchup_ms(CHUNK * 3 + 1) == 4 * RTT
 
 
 def test_is_catchup_infeasible_returns_false_when_no_backlog():
@@ -571,17 +546,20 @@ def test_is_catchup_infeasible_returns_false_when_lock_at_zero():
 
 
 def test_is_catchup_infeasible_returns_true_when_estimate_exceeds_budget():
-    """600 blocks => 30 batches * p99(20) ms estimated.
-    Available = 1000 - 200 = 800ms. Infeasible regardless of exact p99 value."""
+    """getLogs model: a pathological backlog (9000 blocks = 12 chunks ×
+    _GETLOGS_FETCH_RTT_P99_MS = 3000ms) far exceeds the <1s available when
+    lock is imminent → infeasible. (Realistic backlogs are a single fast chunk
+    and never trip this; the gate only bites near-lock cold starts thousands
+    of blocks behind.)"""
     import time as _t
     p = _make_poller()
     near_lock = int(_t.time()) + 1
-    assert p._is_catchup_infeasible(blocks_behind=600, lock_at=near_lock) is True
+    assert p._is_catchup_infeasible(blocks_behind=9000, lock_at=near_lock) is True
 
 
 def test_is_catchup_infeasible_returns_false_when_estimate_fits_budget():
-    """20 blocks => 1 batch * p99(20)ms estimated. Available = 60_000 -
-    200 = 59_800ms. Feasible regardless of p99 value."""
+    """20 blocks => 1 getLogs chunk (~250ms estimated). Available ~59_800ms
+    (lock 60s out). Feasible by a wide margin."""
     import time as _t
     p = _make_poller()
     far_lock = int(_t.time()) + 60
@@ -589,35 +567,20 @@ def test_is_catchup_infeasible_returns_false_when_estimate_fits_budget():
 
 
 def test_catchup_feasibility_at_typical_30_block_lag():
-    """Regression: at canonical pool_cutoff=6 (final fires at lock-4.7s),
-    a 30-block lag should be FEASIBLE (not trip INFEAS). 30-block lag at
-    batch_size=20 = ceil(30/20)=2 batches * p99(20). With the 2026-05-11
-    fire-to-all p99=1319ms, 2 * 1319 = 2638ms, must fit comfortably
-    within available_catchup_ms.
+    """Regression: a typical 23-30 block lag must be FEASIBLE (not trip
+    INFEAS) at canonical final-poll timing. Under the getLogs model a 23- or
+    30-block lag is a single ~250ms chunk, trivially within the ~4800ms
+    available when lock is 5s out.
 
-    Also tests the 23-block-lag false-positive scenario the
-    2026-05-11_fire_to_all_p99_measurement.md memo flagged: at 23 blocks
-    (= 2 batches), the math must NOT trip INFEAS just because of stale
-    constants. Anchors the constant value as load-bearing.
-
-    Pin lock_at = now + 5s (well above canonical final-poll timing of
-    4.7s) so the test has comfortable margin against int() truncation
-    of the current wallclock and any small wallclock drift between the
-    pin and the assertion. The point is to test the math contract, not
-    race CI timers.
+    Pin lock_at = now + 5s (well above the canonical final-poll timing of
+    4.7s) so the test has comfortable margin against int() truncation of the
+    current wallclock and any small drift between the pin and the assertion.
+    The point is the math contract, not racing CI timers.
     """
     import time as _t
     p = _make_poller()
     lock_at = int(_t.time()) + 5  # 5s out: ~4800ms available after safety
-    # 23-block lag (post-2026-05-12 batch-aware math):
-    #   1 full batch (20) * p99(20)=1319ms + 3-block partial at
-    #   p99(3)=538ms (interpolated) = 1857ms < 4800ms. Feasible.
-    assert p._is_catchup_infeasible(blocks_behind=23, lock_at=lock_at) is False, (
-        "23-block lag must be feasible at canonical final-poll timing. "
-        "If this fails, RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE[20] may be "
-        "stale relative to current transport — re-measure."
-    )
-    # 30-block lag: 1 full + 10-block partial @ p99(10)=910ms = 2229ms. Same result.
+    assert p._is_catchup_infeasible(blocks_behind=23, lock_at=lock_at) is False
     assert p._is_catchup_infeasible(blocks_behind=30, lock_at=lock_at) is False
 
 
@@ -853,16 +816,16 @@ def test_poll_lock_arbitration_periodic_yields_to_concurrent_ramp_poll():
     fetch_can_finish = threading.Event()
     fetched_calls: list[int] = []
 
-    def slow_fetch(block_numbers):
+    def slow_fetch(from_block, to_block):
         fetch_started.set()
-        # Emulate a slow eth_getBlockReceipts batch by parking here.
+        # Emulate a slow eth_getLogs range fetch by parking here.
         # The test signals fetch_can_finish once the racing call has
         # had its chance to attempt _poll_lock acquisition.
         if not fetch_can_finish.wait(timeout=5.0):
             raise RuntimeError("test deadlock waiting on fetch_can_finish")
-        fetched_calls.append(len(block_numbers))
+        fetched_calls.append(to_block - from_block + 1)
 
-    p._fetch_and_process_blocks = slow_fetch  # type: ignore[assignment]
+    p._fetch_and_process_logs = slow_fetch  # type: ignore[assignment]
 
     # Thread A: simulates the engine-driven ramp_1 poll — acquires the
     # lock and parks inside the slow fetch.
@@ -961,8 +924,8 @@ def test_poll_now_aborts_early_when_catchup_infeasible_mid_round(caplog):
     # Mock: head jumped to 100_000 (99_000 blocks behind).
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
     # If the batch fetcher is invoked, blow up the test.
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda block_numbers: pytest.fail("should not have fetched")
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda *a: pytest.fail("should not have fetched")
     )
 
     # Pre-lock + tight time: ~1s until lock, available ~800ms. Math
@@ -993,8 +956,8 @@ def test_poll_now_post_lock_infeas_does_not_set_flag(capsys):
     p._last_polled_block_number = 1_000
 
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda block_numbers: pytest.fail("should not have fetched")
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda *a: pytest.fail("should not have fetched")
     )
 
     # Stale anchor: lock_at strictly in the past relative to _t.time().
@@ -1037,9 +1000,9 @@ def test_poll_now_post_lock_cursor_advances_after_set_round_phase():
 
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
 
-    fetched: list[list[int]] = []
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: fetched.append(list(nums))
+    fetched: list = []
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda frm, to: fetched.append((frm, to))
     )
 
     # First call: post-lock periodic (lock_at in the past). INFEAS path
@@ -1073,14 +1036,14 @@ def test_poll_now_skips_feasibility_check_when_lock_at_zero():
     p._last_polled_block_number = 99_999
     p._lock_at = 0
 
-    fetched: list[list[int]] = []
+    fetched: list = []
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: fetched.append(nums)
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda frm, to: fetched.append((frm, to))
     )
 
     p._poll_now(deadline_ms=0, label="period")
-    # batch_size=20 and only 1 block to fetch (100_000 - 99_999 = 1) so 1 batch.
+    # Only 1 block to fetch (100_000 - 99_999 = 1) -> 1 getLogs chunk.
     assert len(fetched) == 1
     assert p._catchup_infeasible_for_round is False
 
@@ -1091,22 +1054,25 @@ def test_poll_now_logs_partial_at_info_when_some_batches_succeeded(caplog):
     p = _make_poller()
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 99_900
-    p._rpc_eth_block_number = lambda: 99_960  # type: ignore[assignment]
+    # 1500 blocks behind -> two 750-block getLogs chunks, so a mid-fetch
+    # failure (chunk 2 raises) leaves a genuine PARTIAL: chunk 1 advanced the
+    # cursor, chunk 2 didn't.
+    p._rpc_eth_block_number = lambda: 101_400  # type: ignore[assignment]
 
-    fetched: list[list[int]] = []
+    fetched: list = []
     call_count = {"n": 0}
 
-    def flaky_fetch(nums):
+    def flaky_fetch(from_block, to_block):
         call_count["n"] += 1
         if call_count["n"] == 1:
-            fetched.append(nums)  # first batch ok
+            fetched.append((from_block, to_block))  # first chunk ok
             return
         raise RuntimeError("publicnode_glitch")
 
-    p._fetch_and_process_blocks = flaky_fetch  # type: ignore[assignment]
+    p._fetch_and_process_logs = flaky_fetch  # type: ignore[assignment]
 
-    # Tight enough to NOT trigger feasibility. 60 blocks / 20 = 3 batches *
-    # p99(20) ms estimated. 60s available is >> any plausible p99 * 3.
+    # Tight enough to NOT trigger feasibility: 1500 blocks = 2 getLogs chunks
+    # ~= 500ms estimated; 60s available is >> that.
     import time as _t
     p._lock_at = int(_t.time()) + 60  # 60s out -> 59800ms available
 
@@ -1114,8 +1080,8 @@ def test_poll_now_logs_partial_at_info_when_some_batches_succeeded(caplog):
     with caplog.at_level(logging.INFO):
         p._poll_now(deadline_ms=0, label="period")
 
-    # First batch succeeded; second raised; cursor advanced by 20.
-    assert p._last_polled_block_number == 99_920
+    # Chunk 1 (99_901..100_650) succeeded -> cursor at 100_650; chunk 2 raised.
+    assert p._last_polled_block_number == 100_650
     assert p._last_poll_succeeded is False  # diagnostic flag
 
 
@@ -1140,12 +1106,12 @@ def test_poll_now_sets_and_clears_poll_in_progress_on_success():
 
     seen_flag: list[bool] = []
 
-    def fake_fetch(nums):
+    def fake_fetch(from_block, to_block):
         # Snapshot the flag while inside the fetch.
         seen_flag.append(p._poll_in_progress)
 
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
-    p._fetch_and_process_blocks = fake_fetch  # type: ignore[assignment]
+    p._fetch_and_process_logs = fake_fetch  # type: ignore[assignment]
 
     # Plenty of time for feasibility.
     import time as _t
@@ -1165,10 +1131,10 @@ def test_poll_now_clears_poll_in_progress_on_failure():
 
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
 
-    def boom(nums):
+    def boom(from_block, to_block):
         raise RuntimeError("publicnode_error")
 
-    p._fetch_and_process_blocks = boom  # type: ignore[assignment]
+    p._fetch_and_process_logs = boom  # type: ignore[assignment]
 
     import time as _t
     p._lock_at = int(_t.time()) + 60
@@ -1206,8 +1172,8 @@ def test_poll_now_clears_poll_in_progress_when_infeasible_aborts_early():
     p._last_polled_block_number = 1_000  # very stale
 
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: pytest.fail("should not have fetched")
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda *a: pytest.fail("should not have fetched")
     )
 
     p._lock_at = int(_t.time()) + 1  # pre-lock, tight => infeasible
@@ -1249,8 +1215,8 @@ def test_init_cursor_positions_at_round_start_minus_1_when_feasible():
     p._lock_at = now + 290  # 10s into round
     p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
     # cursor-init must NOT call _fetch_and_process_blocks: blow up if it does.
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: pytest.fail("init_cursor must not fetch batches")
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda *a: pytest.fail("init_cursor must not fetch batches")
     )
 
     p._initialize_cursor_from_head()
@@ -1278,8 +1244,8 @@ def test_init_cursor_scopes_target_to_current_round_only():
     now = int(_t.time())
     p._lock_at = now + 240  # 60s into round
     p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: pytest.fail("init_cursor must not fetch batches")
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda *a: pytest.fail("init_cursor must not fetch batches")
     )
 
     p._initialize_cursor_from_head()
@@ -1297,16 +1263,23 @@ def test_init_cursor_scopes_target_to_current_round_only():
 
 
 def test_init_cursor_marks_infeasible_and_jumps_to_head_when_no_time():
-    """Bot starts 1s before lock — math says first periodic tick can't
-    catch up ~620 blocks in time. Cursor jumps to head, flag set,
-    _connected stays False (no successful poll has run yet)."""
+    """Bot starts with the lock already upon it (no time left): even a single
+    ~250ms getLogs catch-up chunk can't complete, so cursor-init marks the
+    round infeasible, jumps the cursor to head (no backlog carryover), and
+    leaves _connected False (no successful poll has run yet).
+
+    Under the Era-12 getLogs model a one-round backlog is otherwise feasible
+    (one fast chunk), so this gate now requires the lock essentially upon us:
+    available_ms = 0 against a >0 estimate. (Cold-start has no post-lock flag
+    suppression, unlike _poll_now/_on_epoch_advance.)
+    """
     import time as _t
     p = _make_poller()
     now = int(_t.time())
-    p._lock_at = now + 1  # only 1s left
+    p._lock_at = now  # lock is now -> available_ms = 0 -> any estimate infeasible
     p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: pytest.fail("init_cursor must not fetch batches")
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda *a: pytest.fail("init_cursor must not fetch batches")
     )
 
     p._initialize_cursor_from_head()
@@ -1333,14 +1306,15 @@ def test_last_catchup_detail_captured_when_infeasibility_check_fires():
     engine's catchup_infeasible SKIP narrative can render the numbers.
     """
     import time as _t
+    from pancakebot.chain.rpc_poller import _GETLOGS_FETCH_RTT_P99_MS as RTT
     p = _make_poller()
-    # Force a known-infeasible scenario: 3000 blocks behind, 30s until lock.
-    # estimated_ms = 150 batches × 240ms (0 remainder) → ~36s
-    # available_ms = 30000 - 200 safety = 29800ms
-    # → infeasible.
+    # Under the getLogs model catch-up is so cheap that tripping INFEAS at a
+    # comfortable 30s-out lock takes a deliberately extreme backlog:
+    #   100_000 blocks = ceil(100000/750)=134 chunks × 250ms = 33_500ms est
+    #   vs available ~29_800ms (30s - safety) → infeasible.
     now = _t.time()
     lock_at = int(now + 30)
-    blocks_behind = 3000
+    blocks_behind = 100_000
 
     assert p._is_catchup_infeasible(
         blocks_behind=blocks_behind, lock_at=lock_at,
@@ -1348,10 +1322,8 @@ def test_last_catchup_detail_captured_when_infeasibility_check_fires():
     detail = p.last_catchup_detail
     assert detail is not None
     need_ms, have_ms = detail
-    # Need substantially exceeds have for this construction.
     assert need_ms > have_ms
-    # Empirical: ~36s vs ~29.8s.
-    assert 34_000 <= need_ms <= 38_000, f"need_ms={need_ms} outside expected band"
+    assert need_ms == 134 * RTT, f"need_ms={need_ms} != expected 134*{RTT}"
     assert 28_000 <= have_ms <= 30_500, f"have_ms={have_ms} outside expected band"
 
 
@@ -1370,7 +1342,7 @@ def test_last_catchup_detail_reset_on_epoch_advance():
     # Populate detail via an infeasible check (as if a prior round
     # observed catchup_infeasible_for_round).
     now = _t.time()
-    p._is_catchup_infeasible(blocks_behind=3000, lock_at=int(now + 30))
+    p._is_catchup_infeasible(blocks_behind=100_000, lock_at=int(now + 30))
     assert p.last_catchup_detail is not None
 
     # Mock the RPC head fetch + round_start derivation so
@@ -1407,8 +1379,8 @@ def test_init_cursor_handles_head_before_round_start():
     p._lock_at = now + 600  # round won't START for another 5 min
     # round_start_ts = lock_at - 300 = now+300; head_ts = now < round_start_ts.
     p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: pytest.fail("init_cursor must not fetch batches")
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda *a: pytest.fail("init_cursor must not fetch batches")
     )
 
     p._initialize_cursor_from_head()
@@ -1426,9 +1398,9 @@ def test_init_cursor_logs_infeas_at_warn_severity():
     import time as _t
     p = _make_poller()
     now = int(_t.time())
-    p._lock_at = now + 1
+    p._lock_at = now  # lock is now -> available_ms = 0 -> infeasible (cold-start)
     p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
-    p._fetch_and_process_blocks = lambda nums: None  # type: ignore[assignment]
+    p._fetch_and_process_logs = lambda *a: None  # type: ignore[assignment]
 
     # We can't easily assert log level via pytest.caplog without the
     # log module routing through the logging stdlib. Instead, monkey-
@@ -1490,9 +1462,9 @@ def test_first_successful_poll_latches_connected_and_cold_start_done():
 
     # Mock a successful poll: head advanced 50 blocks since cursor.
     p._rpc_eth_block_number = lambda: 99_950  # type: ignore[assignment]
-    fetched: list[list[int]] = []
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: fetched.append(list(nums))
+    fetched: list = []
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda frm, to: fetched.append((frm, to))
     )
 
     p._poll_now(deadline_ms=0, label="period")
@@ -1522,8 +1494,8 @@ def test_first_successful_poll_latch_fires_in_no_new_blocks_branch():
     p._last_polled_block_number = 100_000
 
     p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]  # head == cursor
-    p._fetch_and_process_blocks = (  # type: ignore[assignment]
-        lambda nums: pytest.fail("no-new-blocks branch must not fetch")
+    p._fetch_and_process_logs = (  # type: ignore[assignment]
+        lambda *a: pytest.fail("no-new-blocks branch must not fetch")
     )
 
     assert p._connected is False
@@ -1925,160 +1897,143 @@ def test_fire_anchor_poll_passes_timeout_through(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Bundle 5 v2 (2026-05-14): receipts-only batch shape
+# Era 12 (2026-06-09): bet-event fetch via eth_getLogs
 # ---------------------------------------------------------------------------
 
-def test_fetch_and_process_blocks_sends_receipts_only_batch(monkeypatch):
-    """_fetch_and_process_blocks must build a JSON-RPC batch of ONLY
-    eth_getBlockReceipts calls (no eth_getBlockByNumber per block).
-    Catches accidental re-introduction of the bundled header fetch."""
-    p = _make_poller()
-    captured_calls: list = []
-
-    def _capture(calls):
-        captured_calls.extend(calls)
-        return [([], None) for _ in calls]
-
-    monkeypatch.setattr(p, "_rpc_batch", _capture)
-    p._fetch_and_process_blocks([100, 101, 102])
-    assert len(captured_calls) == 3
-    for method, params in captured_calls:
-        assert method == "eth_getBlockReceipts"
-        assert len(params) == 1
-    assert not any(m == "eth_getBlockByNumber" for m, _ in captured_calls)
-
-
-def test_fetch_and_process_blocks_empty_input_no_rpc(monkeypatch):
-    """Empty block list → no RPC call fired."""
-    p = _make_poller()
-    rpc_calls = 0
-
-    def _track(calls):
-        nonlocal rpc_calls
-        rpc_calls += 1
-        return []
-
-    monkeypatch.setattr(p, "_rpc_batch", _track)
-    p._fetch_and_process_blocks([])
-    assert rpc_calls == 0
-
-
-# ---------------------------------------------------------------------------
-# Pool-understatement fix (2.1): failed-block receipt retry queue
-# ---------------------------------------------------------------------------
-
-def _ok(receipts=None):
-    return (receipts if receipts is not None else [], None)
-
-
-def _err(msg="receipt error"):
-    return (None, msg)
-
-
-def test_skipped_block_is_queued_for_retry(monkeypatch):
-    """A per-block receipt error queues that block for retry instead of
-    dropping it permanently. Other blocks in the batch still process."""
-    p = _make_poller()
-    monkeypatch.setattr(p, "_rpc_batch", lambda calls: [_ok(), _err(), _ok()])
-    p._fetch_and_process_blocks([100, 101, 102])
-    assert p._pending_retry_blocks == {101: 1}      # only the errored block
-    assert p._block_receipt_skips_total == 1
-    assert p._block_receipts_recovered_total == 0
-
-
-def test_non_list_receipts_also_queued(monkeypatch):
-    p = _make_poller()
-    monkeypatch.setattr(p, "_rpc_batch", lambda calls: [("not_a_list", None)])
-    p._fetch_and_process_blocks([100])
-    assert p._pending_retry_blocks == {100: 1}
-
-
-def test_retry_recovers_block_and_pops_queue(monkeypatch):
-    """A queued block that succeeds on retry is re-fetched, processed, popped,
-    and counted as recovered."""
-    p = _make_poller()
-    p._last_polled_block_number = 200               # floor = 200-900 < 101: not aged
-    p._pending_retry_blocks = {101: 1}
-    seen: list[int] = []
-    monkeypatch.setattr(p, "_process_receipts_for_block", lambda bn, r: seen.append(bn))
-    monkeypatch.setattr(p, "_rpc_batch", lambda calls: [_ok([])])
-    p._retry_pending_receipt_blocks()
-    assert seen == [101]                            # re-fetched + processed
-    assert 101 not in p._pending_retry_blocks       # popped on recovery
-    assert p._block_receipts_recovered_total == 1
-
-
-def test_retry_failure_reincrements_attempts(monkeypatch):
-    p = _make_poller()
-    p._last_polled_block_number = 200
-    p._pending_retry_blocks = {101: 1}
-    monkeypatch.setattr(p, "_rpc_batch", lambda calls: [_err()])
-    p._retry_pending_receipt_blocks()
-    assert p._pending_retry_blocks == {101: 2}      # still failing -> attempt++
-
-
-def test_retry_drops_block_after_max_attempts(monkeypatch):
-    """An exhausted block is dropped with a WARN and NOT re-fetched
-    (no silent truncation of the understatement)."""
+def test_fetch_and_process_logs_queries_getlogs_endpoint(monkeypatch):
+    """_fetch_and_process_logs POSTs a single eth_getLogs range query to
+    BET_EVENTS_GETLOGS_ENDPOINT (NOT the hedged receipts pool), filtered by
+    contract address + Bet topic0, and feeds the result to _process_bet_logs."""
+    import json as _json
     import pancakebot.chain.rpc_poller as mod
     p = _make_poller()
-    p._last_polled_block_number = 200
-    p._pending_retry_blocks = {101: p._retry_max_attempts}
-    called: list = []
-    monkeypatch.setattr(p, "_rpc_batch", lambda calls: called.append(calls) or [_ok()])
-    warns: list[str] = []
-    monkeypatch.setattr(mod, "warn", lambda action, msg: warns.append(msg))
-    p._retry_pending_receipt_blocks()
-    assert 101 not in p._pending_retry_blocks       # dropped
-    assert called == []                             # NOT re-fetched
-    assert any("pool understatement: dropped" in m for m in warns)
+    captured: dict = {}
+
+    def _capture_post(url, body, *, timeout_seconds):
+        captured["url"] = url
+        captured["req"] = _json.loads(body)
+        return b'{"jsonrpc":"2.0","id":1,"result":[]}'
+
+    monkeypatch.setattr(p, "_rpc_post", _capture_post)
+    seen: list = []
+    monkeypatch.setattr(p, "_process_bet_logs", lambda logs: seen.append(logs))
+    p._fetch_and_process_logs(100, 117)
+
+    assert captured["url"] == mod.BET_EVENTS_GETLOGS_ENDPOINT
+    req = captured["req"]
+    assert req["method"] == "eth_getLogs"
+    flt = req["params"][0]
+    assert flt["fromBlock"] == hex(100)
+    assert flt["toBlock"] == hex(117)
+    assert flt["address"] == p._contract_addr
+    assert flt["topics"] == [[mod._BET_BULL_TOPIC, mod._BET_BEAR_TOPIC]]
+    assert seen == [[]]
 
 
-def test_retry_drops_aged_out_block(monkeypatch):
-    """A block older than the retry window is dropped — its bets are
-    epoch-gated out of the current round anyway."""
+def test_fetch_and_process_logs_raises_on_rpc_error(monkeypatch):
+    """An RPC-level error in the getLogs response raises, so the poll loop
+    aborts the chunk and leaves the cursor un-advanced for re-fetch."""
     p = _make_poller()
-    p._last_polled_block_number = 10_000            # floor = 9100
-    p._pending_retry_blocks = {100: 1}              # 100 < 9100 -> aged
-    called: list = []
-    monkeypatch.setattr(p, "_rpc_batch", lambda calls: called.append(calls) or [_ok()])
-    p._retry_pending_receipt_blocks()
-    assert 100 not in p._pending_retry_blocks
-    assert called == []
+    monkeypatch.setattr(
+        p, "_rpc_post",
+        lambda url, body, *, timeout_seconds:
+            b'{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"limit exceeded"}}',
+    )
+    with pytest.raises(InvariantError, match="getlogs_rpc_error"):
+        p._fetch_and_process_logs(100, 117)
 
 
-def test_retry_does_not_advance_cursor(monkeypatch):
-    """The retry re-fetches specific blocks; it must NOT move the forward-only
-    cursor (_last_polled_block_number) or reorder it."""
+def test_fetch_and_process_logs_raises_on_non_list_result(monkeypatch):
+    """A non-list ``result`` is a malformed getLogs response → raise."""
     p = _make_poller()
-    p._last_polled_block_number = 200
-    p._pending_retry_blocks = {101: 1}
-    monkeypatch.setattr(p, "_process_receipts_for_block", lambda bn, r: None)
-    monkeypatch.setattr(p, "_rpc_batch", lambda calls: [_ok([])])
-    p._retry_pending_receipt_blocks()
-    assert p._last_polled_block_number == 200       # unchanged
+    monkeypatch.setattr(
+        p, "_rpc_post",
+        lambda url, body, *, timeout_seconds: b'{"jsonrpc":"2.0","id":1,"result":"0xdead"}',
+    )
+    with pytest.raises(InvariantError, match="getlogs_result_not_list"):
+        p._fetch_and_process_logs(100, 117)
 
 
-def test_retry_is_idempotent_no_double_count(monkeypatch):
-    """Re-processing a recovered block does NOT double-count its bets
-    (log-id dedup). Conservative-direction invariant: a retry only ADDS
-    previously-missed real bets, never duplicates and never invents."""
+# ---------------------------------------------------------------------------
+# Era 12: _process_bet_logs extraction (verbatim from the receipts path)
+# ---------------------------------------------------------------------------
+
+def _bet_log(*, side_topic=_BET_BULL_TOPIC, epoch=500, amount=5 * 10**16,
+             block=101, tx="0xabc", log_idx="0x0"):
+    """A getLogs-shaped Bet log object (caller adds 'address')."""
+    return {
+        "topics": [side_topic, "0x" + "0" * 64, hex(epoch)],
+        "data": hex(amount),
+        "blockNumber": hex(block),
+        "transactionHash": tx,
+        "logIndex": log_idx,
+    }
+
+
+def test_process_bet_logs_extracts_and_dedups(monkeypatch):
+    """_process_bet_logs extracts BetBull/BetBear logs into the pool and dedups
+    by (tx_hash:logIndex) — re-processing the same log (e.g. an overlapping
+    re-fetched range) never double-counts (the parity-verified extraction;
+    conservative-direction invariant)."""
     p = _make_poller()
     p._current_epoch = 500                          # epoch gate: 500 / 501 allowed
     monkeypatch.setattr(p, "_resolve_block_ts", lambda bn: 1)
-    receipt = {
-        "logs": [{
-            "address": p._contract_addr,
-            "topics": [_BET_BULL_TOPIC, "0x" + "0" * 64, hex(500)],
-            "data": hex(5 * 10**16),
-            "transactionHash": "0xabc",
-            "logIndex": "0x0",
-        }]
-    }
-    # First read counted it; the retry recover re-processes the same block.
-    p._process_receipts_for_block(101, [receipt])
-    p._process_receipts_for_block(101, [receipt])
+    log = {**_bet_log(), "address": p._contract_addr}
+    p._process_bet_logs([log])
+    p._process_bet_logs([log])                      # same log again
     assert len(p._pools[500].bets) == 1             # deduped, not 2
+    bet = p._pools[500].bets[0]
+    assert bet.side == "Bull"
+    assert bet.amount_wei == 5 * 10**16
+    assert bet.block_number == 101
+
+
+def test_process_bet_logs_multi_block_range(monkeypatch):
+    """A getLogs result can span multiple blocks; block_ts is resolved once per
+    distinct block (cached), and bets from every block land in the pool."""
+    p = _make_poller()
+    p._current_epoch = 500
+    resolved: list = []
+    monkeypatch.setattr(
+        p, "_resolve_block_ts",
+        lambda bn: (resolved.append(bn), 1000 + bn)[1],
+    )
+    logs = [
+        {**_bet_log(block=101, tx="0xa", log_idx="0x0"), "address": p._contract_addr},
+        {**_bet_log(side_topic=_BET_BEAR_TOPIC, block=101, tx="0xb", log_idx="0x1"),
+         "address": p._contract_addr},
+        {**_bet_log(block=205, tx="0xc", log_idx="0x0"), "address": p._contract_addr},
+    ]
+    p._process_bet_logs(logs)
+    assert len(p._pools[500].bets) == 3
+    # block_ts resolved once per DISTINCT block (101, 205), not once per log.
+    assert sorted(resolved) == [101, 205]
+
+
+def test_process_bet_logs_epoch_gate(monkeypatch):
+    """Logs outside (current_epoch, current_epoch+1) are dropped by the gate."""
+    p = _make_poller()
+    p._current_epoch = 500
+    monkeypatch.setattr(p, "_resolve_block_ts", lambda bn: 1)
+    old = {**_bet_log(epoch=498, tx="0xold"), "address": p._contract_addr}   # too old
+    fut = {**_bet_log(epoch=502, tx="0xfut"), "address": p._contract_addr}   # too far ahead
+    p._process_bet_logs([old, fut])
+    assert 498 not in p._pools
+    assert 502 not in p._pools
+
+
+def test_process_bet_logs_ignores_non_bet_and_foreign(monkeypatch):
+    """Foreign-contract logs and non-Bet topic0s are filtered out (defensive
+    re-check — the server filters, but a mismatched response must not poison
+    the pool)."""
+    p = _make_poller()
+    p._current_epoch = 500
+    monkeypatch.setattr(p, "_resolve_block_ts", lambda bn: 1)
+    foreign = {**_bet_log(tx="0xf"), "address": "0xdeadbeef"}                # wrong contract
+    non_bet = {**_bet_log(tx="0xn"), "address": p._contract_addr,
+               "topics": ["0x" + "9" * 64, "0x" + "0" * 64, hex(500)]}       # wrong topic0
+    p._process_bet_logs([foreign, non_bet])
+    assert 500 not in p._pools
 
 
 # ---------------------------------------------------------------------------
