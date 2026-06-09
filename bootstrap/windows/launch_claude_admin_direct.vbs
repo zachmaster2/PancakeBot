@@ -26,6 +26,15 @@
 '   /check     - dry-run the happy path (query + Status gate + would-launch).
 '   /checkfail - dry-run the FAILURE cascade (recovery + reboot DECISION,
 '                including the per-day cap) without launching/restarting/rebooting.
+'
+' Periodic keepalive (2026-06-09 -- companion ClaudeKeepalive task, ~5 min):
+'   /keepalive      - launch-if-down only; Status-gates but DELIBERATELY does NOT
+'                     run the AppXSvc-restart / auto-reboot cascade (that would be
+'                     hit every 5 min on a persistent lock). Recovery stays in the
+'                     AtLogon task; keepalive just re-spawns a cleanly-died Claude.
+'                     Closes the gap where Claude dies mid-session and the AtLogon
+'                     trigger never re-fires (long-lived logged-in session).
+'   /keepalivecheck - dry-run the keepalive decision (no launch).
 
 Option Explicit
 
@@ -41,16 +50,18 @@ Const MAX_REBOOTS_PER_DAY = 3          ' cap to prevent reboot loops
 Const REBOOT_DIALOG_TIMEOUT_S = 60     ' cancellable countdown before reboot
 Const REBOOT_STATE_PATH = "C:\Tools\claude_reboot_state.txt"  ' "YYYY-MM-DD|count"
 
-Dim wsh, fs, dryRun, simulateFail
+Dim wsh, fs, dryRun, simulateFail, keepAlive
 Set wsh = CreateObject("WScript.Shell")
 Set fs = CreateObject("Scripting.FileSystemObject")
 
 ' Mode parse (And is NOT short-circuit in VBScript; guard the arg access).
-dryRun = False : simulateFail = False
+dryRun = False : simulateFail = False : keepAlive = False
 If WScript.Arguments.Count > 0 Then
     Select Case UCase(WScript.Arguments(0))
-        Case "/CHECK"     : dryRun = True
-        Case "/CHECKFAIL" : dryRun = True : simulateFail = True
+        Case "/CHECK"          : dryRun = True
+        Case "/CHECKFAIL"      : dryRun = True : simulateFail = True
+        Case "/KEEPALIVE"      : keepAlive = True
+        Case "/KEEPALIVECHECK" : keepAlive = True : dryRun = True
     End Select
 End If
 
@@ -68,6 +79,28 @@ candidateExe = installLocation & "\app\Claude.exe"
 If Not fs.FileExists(candidateExe) Then
     LogBoth "registered package has no app\Claude.exe at " & candidateExe
     WScript.Quit 3
+End If
+
+' --- KEEPALIVE MODE (periodic, ~5 min). Launch-if-down only; NO recovery
+' --- cascade (that stays at-logon -- a persistent lock must not be hit every
+' --- 5 min). Returns fast. ---
+If keepAlive Then
+    If pkgStatus <> "Ok" Then
+        LogBoth "keepalive: package Status='" & pkgStatus & "' (not Ok) -- skipping; recovery cascade is at-logon only"
+        WScript.Quit 6
+    End If
+    If IsClaudeRunning() Then
+        LogFile "keepalive: Claude already running -- no-op"
+        WScript.Quit 0
+    End If
+    LogBoth "keepalive: Claude not running -- relaunching (keepalive does NOT run the recovery cascade)"
+    If LaunchWithShortRetry(candidateExe) Then
+        StampAumid
+        If Not dryRun Then LogBoth "keepalive: relaunch succeeded"
+        WScript.Quit 0
+    End If
+    LogBoth "keepalive: relaunch FAILED after short retries -- recovery deferred to the at-logon task"
+    WScript.Quit 7
 End If
 
 ' --- Step 1: pre-flight Status gate. ---
@@ -289,3 +322,32 @@ Sub LogBoth(msg)
     f.Close
     On Error GoTo 0
 End Sub
+
+' File-only log (keepalive heartbeat). Keeps the 5-min no-op cadence out of the
+' Windows Application event log; LogBoth is reserved for noteworthy events
+' (relaunch, not-Ok skip, recovery cascade).
+Sub LogFile(msg)
+    On Error Resume Next
+    Dim f
+    Set f = fs.OpenTextFile(LOG_PATH, 8, True)  ' 8=ForAppending, create if absent
+    f.WriteLine Now & "  " & msg
+    f.Close
+    On Error GoTo 0
+End Sub
+
+' True if at least one Claude.exe is running (WMI). Best-effort: a query failure
+' returns False, so keepalive would attempt a launch -- harmless, since the launch
+' auto-attaches to a running Claude rather than spawning a duplicate.
+Function IsClaudeRunning()
+    IsClaudeRunning = False
+    On Error Resume Next
+    Dim wmi, procs
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    If Err.Number = 0 And Not (wmi Is Nothing) Then
+        Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name = 'Claude.exe'")
+        If Err.Number = 0 And Not (procs Is Nothing) Then
+            If procs.Count > 0 Then IsClaudeRunning = True
+        End If
+    End If
+    On Error GoTo 0
+End Function

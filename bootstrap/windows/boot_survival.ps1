@@ -18,6 +18,12 @@
        and launches Claude.exe directly (bypasses UWP activation to preserve
        elevation), then stamps the window AUMID via
        C:\Tools\stamp_claude_aumid.exe.
+    3. ClaudeKeepalive scheduled task (every ~5 min, RunLevel=Highest) ->
+       runs the SAME launcher in /keepalive mode: relaunches Claude if it has
+       died mid-session. The AtLogon trigger fires only at logon, so on a long-
+       lived session a mid-session death would otherwise leave Claude down until
+       the next logon. Launch-if-down only; the AppXSvc/reboot recovery cascade
+       stays in the AtLogon task (a persistent lock must not be hit every 5 min).
 
   The launcher VBS (launch_claude_admin_direct.vbs) is repo-tracked under
   bootstrap\windows\ and is DEPLOYED to ToolsDir by this script, so a fresh
@@ -71,4 +77,28 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings | Out-Null
 Log "registered '$TaskName' (AtLogon, RunLevel=Highest -> $vbs)"
+
+# 4. ClaudeKeepalive scheduled task -- periodic launch-if-down (~5 min,
+#    indefinite) so a mid-session Claude death is recovered without waiting for
+#    the next logon. Runs the SAME launcher in /keepalive mode (Status-gate +
+#    relaunch-if-down, but NO AppXSvc/reboot cascade -- that stays in the AtLogon
+#    task). Time-anchored (-Once + repetition), NOT AtLogon, so it starts mid-
+#    session rather than waiting for the next logon (the exact gap this closes).
+$KeepName = "ClaudeKeepalive"
+$existingKeep = Get-ScheduledTask -TaskName $KeepName -ErrorAction SilentlyContinue
+if ($existingKeep) {
+    Log "scheduled task '$KeepName' already exists; re-registering to match this definition"
+    Unregister-ScheduledTask -TaskName $KeepName -Confirm:$false
+}
+$kaAction = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbs`" /keepalive"
+$kaTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 5)
+$kaPrincipal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+    -RunLevel Highest
+$kaSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+try { $kaSettings.MultipleInstancesPolicy = 'IgnoreNew' } catch { }
+Register-ScheduledTask -TaskName $KeepName -Action $kaAction -Trigger $kaTrigger `
+    -Principal $kaPrincipal -Settings $kaSettings | Out-Null
+Log "registered '$KeepName' (every 5 min, indefinite, RunLevel=Highest -> $vbs /keepalive)"
+
 Log "DONE (operator-UI only; the bot's reboot survival is the SCM services, independent of this)"
