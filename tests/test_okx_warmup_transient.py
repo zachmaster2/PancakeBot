@@ -1,4 +1,4 @@
-"""Regression test for the OKX warmup ConnectionError fix.
+﻿"""Regression test for the OKX warmup ConnectionError fix.
 
 Before this fix, ``OkxClient.warmup()`` re-raised ``requests.exceptions.
 ConnectionError`` (wrapping a ``ConnectionResetError`` from a socket reset),
@@ -36,8 +36,8 @@ def _make_client_with_session_that_raises(exc: BaseException) -> OkxClient:
     """Build a client whose underlying session.get always raises *exc*.
 
     Sets ``_session`` directly. Note: ``warmup()`` replaces ``_session``
-    on each call (per-round connection-affinity break, design doc
-    research/okx_kline_freshness_fix_design.md), so callers exercising
+    on each call (per-round connection-affinity break; the original
+    design memo was not retained in-repo), so callers exercising
     warmup() should use ``_patch_session_factory`` instead -- this
     helper is only useful for tests that exercise ``kline_fetch_window``
     (which does NOT replace the session).
@@ -149,7 +149,7 @@ def test_warmup_partial_failure_succeeds():
 
 def test_kline_fetch_window_wraps_connection_error_into_transient():
     """``kline_fetch_window`` (the canonical primitive) classifies
-    ConnectionError as RETRYABLE and exhausts the policy → TransientOkxError.
+    ConnectionError as RETRYABLE and exhausts the policy â†’ TransientOkxError.
     The error type matters: callers on the live decision path catch
     TransientOkxError to skip the round; InvariantError would crash the
     bot (reserved for shape-violation conditions)."""
@@ -233,14 +233,14 @@ def test_kline_fetch_window_rejects_gap_in_middle():
     rows 1 and 2 (1000_000 -> 1002_000 with 1001_000 missing). The
     boundary check passes; only the contiguity check catches it."""
     # Synthetic shape: 1000_000, 1002_000, 1003_000. First=1000, last=1003,
-    # length=3 — boundary check happy. But idx=1 has delta=2000.
+    # length=3 â€” boundary check happy. But idx=1 has delta=2000.
     # Need to pass expected_count for the request. We tell OKX we want
     # [1000..1003] (4 candles), but OKX returns 3 rows. We need len match.
     # Use [1000..1002] as request (3 candles), have rows[1] = 1002 (skip 1001).
-    # First check: oldest=1000 ✓, newest=1002 ✓. Then contiguity fires.
+    # First check: oldest=1000 âœ“, newest=1002 âœ“. Then contiguity fires.
     rows_newest_first = [
         _okx_row(1002_000),  # newest
-        _okx_row(1002_000),  # NOT — these aren't gappy enough
+        _okx_row(1002_000),  # NOT â€” these aren't gappy enough
         _okx_row(1000_000),  # oldest
     ]
     # Actually, to exercise the gap check, we need rows where adjacent
@@ -263,7 +263,7 @@ def test_kline_fetch_window_rejects_gap_in_middle():
     # internal rows whose timestamps don't fit the 1000ms grid.
     # Example: request [1000, 1003] (count=4). OKX returns
     # newest-first [1003, 1002, 1002, 1000] -> oldest-first
-    # [1000, 1002, 1002, 1003]. Length=4 ✓, first=1000 ✓, last=1003 ✓.
+    # [1000, 1002, 1002, 1003]. Length=4 âœ“, first=1000 âœ“, last=1003 âœ“.
     # Contiguity: idx=1 delta=1002-1000=2 (in seconds; 2000ms != 1000) -> fails.
     rows_newest_first = [
         _okx_row(1003_000),
@@ -289,7 +289,7 @@ def test_kline_fetch_window_rejects_gap_in_middle():
 
 
 def test_kline_fetch_window_rejects_duplicate_timestamp():
-    """Two adjacent rows at the same timestamp (duplicate) → contiguity
+    """Two adjacent rows at the same timestamp (duplicate) â†’ contiguity
     delta == 0, fails."""
     # request [1000, 1003] count=4. Returned oldest-first: [1000, 1001, 1001, 1003]
     rows_newest_first = [
@@ -316,7 +316,7 @@ def test_kline_fetch_window_rejects_duplicate_timestamp():
 
 
 def test_kline_fetch_window_rejects_out_of_order_rows():
-    """Internal rows out of strictly-increasing order → contiguity delta
+    """Internal rows out of strictly-increasing order â†’ contiguity delta
     is negative, fails."""
     # request [1000, 1003] count=4. Returned oldest-first: [1000, 1002, 1001, 1003]
     rows_newest_first = [

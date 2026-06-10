@@ -10,8 +10,8 @@ kline_cutoff_seconds = 2
 
 # Pool aggregate horizon: only on-chain bets with block_ts < lock_at -
 # pool_cutoff_seconds are counted into the cutoff-pool used by the
-# strategy. The RPC poll schedule (ramp_1, ramp_2, final) is derived
-# from this. Canonical value: 6.
+# strategy. The single-poll rail is cross-validated against this at
+# config load (CAPTURE invariant). Canonical value: 6.
 pool_cutoff_seconds = 6
 
 # Streak counter on the live decision path. After this many consecutive

@@ -142,9 +142,9 @@ from __future__ import annotations
 #
 # Source: VM live var/live/cycle_audit.csv, max-of-3 of {btc,eth,sol}_fetch_ms
 # over n=202 post-cutover rounds, 2026-06-06: p50=208, p90=240, p95=262,
-# p99=351, max=362. (The prior home value was 352 from
-# research/bundle4_timing_harness.py n=1000, 2026-05-14 — within 1ms, but
-# re-sourced from the VM on principle, not because they happened to match.)
+# p99=351, max=362. (The prior home value was 352 from the Bundle 4 timing
+# harness, n=1000, 2026-05-14 — harness not retained in-repo; within 1ms,
+# but re-sourced from the VM on principle, not because they matched.)
 # Last measured: 2026-06-06 (VM live cycle_audit)
 OKX_KLINE_FETCH_RTT_P99_MS: int = 351
 
@@ -259,8 +259,8 @@ VALIDATOR_ASSEMBLY_WINDOW_MS: int = 214
 # tail-outlier buffer.
 #
 # Source: research/probe_send_raw_tx_rtt_2026_05_20*.py (n=400 across
-#         4 runs). Full distributions in
-#         var/strategy_review/2026_05_20_send_raw_tx_probe_100_at_{1s,10s}{,_hour2}.{jsonl,md}.
+#         4 runs). Full distributions + memos tracked at
+#         research/2026_05_20_bsc_rtt_probe_data/.
 # Last measured: 2026-05-20
 BSC_BET_SUBMIT_ONE_WAY_MS: int = 75
 

@@ -1,11 +1,12 @@
-"""Pure bot-health classification + restart-history helpers (no Win32 deps).
+"""Pure bot-health classification + restart-history helpers (OS-agnostic).
 
 Two classifier entry points:
 
   classify_running_bot(proc, proc_started_at, art, ...)
-      The authoritative in-loop classifier used by the Windows Service.
-      Liveness is determined by ``Popen.poll()`` — zero filesystem race.
-      This is what the service's supervision loop calls every tick.
+      The authoritative in-loop classifier used by the supervisor
+      (SupervisorCore under the systemd units). Liveness is determined by
+      ``Popen.poll()`` — zero filesystem race. This is what the
+      supervision loop calls every tick.
 
   classify_state(mode, ...)
       Legacy artifact-only classifier (bot.pid + crash.json). Kept for

@@ -1,6 +1,6 @@
-"""Permutation null on extension_v2_2026_05_09 PnL.
+﻿"""Permutation null on extension_v2_2026_05_09 PnL.
 
-Adapted from research/regime_phase0_permutation.py. Parameterized for the
+Adapted from the regime_phase0 permutation harness (not retained in-repo). Parameterized for the
 NEW out-of-sample slice (epochs 478541..479822) synced 2026-05-09. Reads
 canonical bet sequence from the in_process_runner output and round outcomes
 from var/closed_rounds.jsonl (the canonical store, since this slice is

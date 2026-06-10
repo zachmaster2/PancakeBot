@@ -1,7 +1,7 @@
 """Supervisor artifacts: PID file + crash dump.
 
-Written by the runtime (dry/live) and consumed by the Windows Service
-supervisor.
+Written by the runtime (dry/live) and consumed by the supervisor
+(SupervisorCore under the systemd units).
 
 Two artifacts per mode:
   - ``var/<mode>/bot.pid``: contains the OS pid as plain text. Written at
