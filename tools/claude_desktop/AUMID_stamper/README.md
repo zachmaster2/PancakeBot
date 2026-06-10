@@ -17,7 +17,7 @@ C:\Tools\launch_claude_admin_direct.vbs
 C:\Tools\Autologon\Autologon64.exe  # Sysinternals
 ```
 
-`bootstrap\windows\boot_survival.ps1` verifies these exist and wires the
+`tools\claude_desktop\boot_survival.ps1` verifies these exist and wires the
 `ClaudeLaunchElevated` scheduled task to them. It does NOT rebuild the binary.
 
 ## Rebuilding the stamper (if `C:\Tools\stamp_claude_aumid.exe` is missing)

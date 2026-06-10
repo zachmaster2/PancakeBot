@@ -1,15 +1,16 @@
-"""Cross-platform supervisor entry point (primarily Linux / systemd).
+"""Supervisor entry point (Linux / systemd).
 
     python -m pancakebot.service.supervise --mode live|dry
 
-Constructs the OS ``ServicePlatform`` adapter + ``SupervisorCore`` and runs the
-supervision loop, spawning + monitoring the bot child (``run.py``) and emitting
-the full Discord alert taxonomy — identical to the Windows service host.
+Constructs the ``LinuxServicePlatform`` adapter + ``SupervisorCore`` and runs
+the supervision loop, spawning + monitoring the bot child (``run.py``) and
+emitting the full Discord alert taxonomy.
 
-On Linux the systemd unit's ExecStart points here: systemd is the OUTER
-supervisor that restarts THIS process (``Restart=on-failure``); SupervisorCore
-handles the INNER bot restarts, crashloop limiting, and alerts. SIGTERM/SIGINT
-request a graceful stop.
+The systemd unit's ExecStart points here: systemd is the OUTER supervisor
+that restarts THIS process (``Restart=on-failure``); SupervisorCore handles
+the INNER bot restarts, crashloop limiting, and alerts. SIGTERM/SIGINT
+request a graceful stop. (Phase 3c-2 plans to collapse this double-wrap to
+systemd->run.py direct.)
 """
 from __future__ import annotations
 
@@ -25,11 +26,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _service_names(mode: str) -> tuple[str, str]:
-    """(this_service, other_service) per OS convention."""
-    if sys.platform == "win32":
-        live, dry = "PancakeBotLive", "PancakeBotDry"
-    else:
-        live, dry = "pancakebot-live", "pancakebot-dry"
+    """(this_service, other_service) — systemd unit names (Linux-only
+    since the Phase 3 Windows-host retirement)."""
+    live, dry = "pancakebot-live", "pancakebot-dry"
     return (live, dry) if mode == "live" else (dry, live)
 
 

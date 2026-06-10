@@ -1,4 +1,4 @@
-"""Ping-fallback: send a Discord follow-up for a pending coordinator message.
+﻿"""Ping-fallback: send a Discord follow-up for a pending coordinator message.
 
 Designed to be invoked by Windows Task Scheduler (via ``pythonw.exe`` so no
 console window flashes) against a specific notification ``id``. If the user
@@ -20,7 +20,7 @@ is gitignored):
         }
 
 Usage:
-    python scripts/notify_user_followup.py --id <uuid>
+    python tools/claude_desktop/notify_user_followup.py --id <uuid>
 
 Exit codes:
     0 - done (alert sent, OR already answered/fired -> silent no-op)

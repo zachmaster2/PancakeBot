@@ -1,11 +1,11 @@
-"""Ping-fallback: mark notification entries as answered.
+﻿"""Ping-fallback: mark notification entries as answered.
 
 Called when the user responds so subsequent scheduled ``notify_user_followup``
 invocations become silent no-ops.
 
 Usage:
-    python scripts/notify_user_mark_answered.py --id <uuid>
-    python scripts/notify_user_mark_answered.py --all-unanswered
+    python tools/claude_desktop/notify_user_mark_answered.py --id <uuid>
+    python tools/claude_desktop/notify_user_mark_answered.py --all-unanswered
 
 ``--all-unanswered`` is the common case when the user replies to the running
 Claude session: we don't know which specific pending id the reply is

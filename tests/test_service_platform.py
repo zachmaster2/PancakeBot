@@ -122,17 +122,6 @@ def test_linux_clear_restart_counter_calls_reset_failed():
     assert ["systemctl", "reset-failed", "pancakebot-live.service"] in r.calls
 
 
-@pytest.mark.skipif(not _IS_WIN, reason="Windows adapter needs pywin32")
-def test_windows_clear_restart_counter_is_noop():
-    # E: Windows inherits the base no-op — SCM `failureflag 1` already counts
-    # only non-clean exits, so an intentional stop never increments the counter.
-    from pancakebot.service.windows_platform import WindowsServicePlatform
-    r = _FakeRunner()
-    p = WindowsServicePlatform(runner=r)
-    p.clear_restart_counter("PancakeBotLive")
-    assert r.calls == []          # nothing to reset -> no sc.exe call
-
-
 def test_linux_signal_health_payload_mapping():
     p = LinuxServicePlatform(runner=_FakeRunner())
     seen = []
@@ -182,108 +171,28 @@ def test_linux_exclusive_lock_mutex(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# Windows adapter
+# Factory + adapter contract
+# (The WindowsServicePlatform adapter + its 8 tests were archived in Phase
+# 3c-1, 2026-06-10 — Downloads/OLD/pancakebot_old/.)
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _IS_WIN, reason="Windows adapter needs pywin32")
-def test_windows_signal_health_maps_to_scm():
-    import win32service
-    from pancakebot.service.windows_platform import WindowsServicePlatform
-    reporter = mock.Mock()
-    p = WindowsServicePlatform(status_reporter=reporter)
-    p.signal_health(HealthState.READY)
-    p.signal_health(HealthState.STOPPING)
-    assert reporter.call_args_list[0].args[0] == win32service.SERVICE_RUNNING
-    assert reporter.call_args_list[1].args[0] == win32service.SERVICE_STOP_PENDING
-
-
-@pytest.mark.skipif(not _IS_WIN, reason="Windows adapter needs pywin32")
-def test_windows_signal_health_noop_without_reporter():
-    from pancakebot.service.windows_platform import WindowsServicePlatform
-    WindowsServicePlatform().signal_health(HealthState.READY)  # must not raise
-
-
-@pytest.mark.skipif(not _IS_WIN, reason="Windows adapter needs pywin32")
-def test_windows_spawn_kwargs_has_creationflags():
-    from pancakebot.service.windows_platform import WindowsServicePlatform
-    kw = WindowsServicePlatform().spawn_kwargs()
-    assert "creationflags" in kw
-    assert kw["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
-
-
-@pytest.mark.skipif(not _IS_WIN, reason="Windows adapter needs pywin32")
-def test_windows_killtree_adopt_failure_is_nonfatal():
-    from pancakebot.service.windows_platform import WindowsServicePlatform
-    logs = []
-    p = WindowsServicePlatform(log=logs.append)
-    kt = p.create_kill_tree()       # real Job Object
-    kt.adopt(mock.Mock(pid=999, _handle=0))   # bogus handle -> logged, no raise
-    assert any("AssignProcessToJobObject failed" in m for m in logs)
-
-
-@pytest.mark.skipif(not _IS_WIN, reason="Windows adapter needs pywin32")
-def test_windows_management_uses_sc_exe():
-    from pancakebot.service.windows_platform import WindowsServicePlatform
-    r = _FakeRunner()
-    p = WindowsServicePlatform(runner=r)
-    p.enable_auto_start("PancakeBotLive")
-    p.set_restart_on_failure("PancakeBotLive", max_attempts=3, reset_window_s=86400, delay_s=60)
-    p.set_service_dependencies("PancakeBotLive", requires_network=True)
-    flat = [" ".join(c) for c in r.calls]
-    assert any("sc.exe config PancakeBotLive start= auto" in c for c in flat)
-    assert any("sc.exe failure PancakeBotLive" in c for c in flat)
-    assert any("depend= Dnscache/NlaSvc" in c for c in flat)
-
-
-@pytest.mark.skipif(not _IS_WIN, reason="Windows adapter needs pywin32")
-def test_windows_service_status_mapping(monkeypatch):
-    import win32service
-    from pancakebot.service import windows_platform as wp
-    p = wp.WindowsServicePlatform(runner=_FakeRunner())
-    monkeypatch.setattr(wp, "query_service_state", lambda n: win32service.SERVICE_RUNNING)
-    assert p.service_status("X") == ServiceState.RUNNING
-    monkeypatch.setattr(wp, "query_service_state", lambda n: None)
-    assert p.service_status("X") == ServiceState.UNKNOWN
-
-
-@pytest.mark.skipif(not _IS_WIN, reason="msvcrt lock is Windows-only")
-def test_windows_exclusive_lock_mutex(tmp_path):
-    from pancakebot.service.windows_platform import WindowsServicePlatform
-    p = WindowsServicePlatform()
-    lock = str(tmp_path / "mode.lock")
-    with p.acquire_exclusive_lock(lock) as got_outer:
-        assert got_outer is True
-        with p.acquire_exclusive_lock(lock) as got_inner:
-            assert got_inner is False
-
-
-# --------------------------------------------------------------------------
-# Factory + cross-adapter parity
-# --------------------------------------------------------------------------
-
-
-def test_factory_selects_by_os():
+def test_factory_returns_linux_adapter():
+    """get_platform() is Linux-only since Phase 3c-1; constructing the
+    adapter is OS-neutral (only systemctl-backed METHODS need Linux), so
+    this runs on the operator desktop too."""
     from pancakebot.service import get_platform, reset_platform_cache
     reset_platform_cache()
     p = get_platform()
-    assert p.name == ("windows" if _IS_WIN else "linux")
+    assert p.name == "linux"
     assert get_platform() is p          # cached
     reset_platform_cache()
 
 
-def test_cross_adapter_status_parity_normalized():
-    """Both adapters normalize a 'running' service to ServiceState.RUNNING and
-    an absent one to UNKNOWN — identical contract regardless of OS mechanism."""
+def test_adapter_status_contract_normalized():
+    """The adapter normalizes a 'running' service to ServiceState.RUNNING and
+    an absent one to UNKNOWN."""
     lin = LinuxServicePlatform(runner=_FakeRunner(responses={"show": ("active\n", 0)}))
     assert lin.service_status("svc") == ServiceState.RUNNING
     lin_absent = LinuxServicePlatform(runner=_FakeRunner(responses={"show": ("\n", 0)}))
     assert lin_absent.service_status("svc") == ServiceState.UNKNOWN
-    if _IS_WIN:
-        import win32service
-        from pancakebot.service import windows_platform as wp
-        p = wp.WindowsServicePlatform(runner=_FakeRunner())
-        with mock.patch.object(wp, "query_service_state", lambda n: win32service.SERVICE_RUNNING):
-            assert p.service_status("svc") == ServiceState.RUNNING
-        with mock.patch.object(wp, "query_service_state", lambda n: None):
-            assert p.service_status("svc") == ServiceState.UNKNOWN

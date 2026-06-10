@@ -1,4 +1,5 @@
-"""Tests for the Windows-Service-based supervisor architecture.
+"""Tests for the supervisor architecture (Linux/systemd production;
+OS-agnostic logic exercised here on any host).
 
 Exercises the pure-logic surface of ``pancakebot/service/``:
   - ``supervision.classify_state`` for each state (UP / STARTING /
@@ -9,11 +10,9 @@ Exercises the pure-logic surface of ``pancakebot/service/``:
   - ``notifications.rate_limit_ok`` cooldown enforcement
   - ``notifications.build_message`` basic structure
 
-SCM-interaction code (win32service.OpenSCManager / ControlService etc.)
-is intentionally NOT covered here — it's effectively e2e-only and
-requires admin + an installed service. The service base class loads
-``win32serviceutil`` at module import so we skip those imports in this
-test file.
+The Windows-Service (pywin32/SCM) variant was archived in Phase 3c-1
+(2026-06-10, Downloads/OLD/pancakebot_old/); its import-smoke and
+Job-Object tests went with it.
 
 Run:
     python -m pytest tests/test_service_lifecycle.py -v
@@ -324,35 +323,18 @@ def test_notify_disabled_when_env_var_unset(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Module-import smoke test for the Win32-dependent code path
+# Module-import smoke test for the supervision core
 # ---------------------------------------------------------------------------
 
-def test_common_module_imports():
-    """``pancakebot.service.common`` imports pywin32; verify it loads cleanly.
-
-    We don't exercise the ServiceFramework class here — that requires
-    SCM context — but a successful import catches typos / wrong symbol
-    references before install.
-    """
+def test_supervisor_core_importable():
+    """The supervision core must import cleanly on any host (the systemd
+    entry point depends on it; the pywin32 modules it once sat beside are
+    archived)."""
     import importlib
-    mod = importlib.import_module("pancakebot.service.common")
-    assert hasattr(mod, "_PancakeBotServiceBase")
-    # The SCM helpers moved to windows_platform (the adapter is the SSOT); the
-    # supervision logic moved to supervisor_core. common.py is now a thin shell.
-    wp = importlib.import_module("pancakebot.service.windows_platform")
-    assert hasattr(wp, "query_service_state")
-    assert hasattr(wp, "stop_service_and_wait")
     sc = importlib.import_module("pancakebot.service.supervisor_core")
     assert hasattr(sc, "SupervisorCore")
-
-
-def test_live_and_dry_service_classes_importable():
-    from pancakebot.service.live_service import PancakeBotLiveService
-    from pancakebot.service.dry_service import PancakeBotDryService
-    assert PancakeBotLiveService._MODE == "live"
-    assert PancakeBotLiveService._OTHER_SERVICE == "PancakeBotDry"
-    assert PancakeBotDryService._MODE == "dry"
-    assert PancakeBotDryService._OTHER_SERVICE == "PancakeBotLive"
+    sv = importlib.import_module("pancakebot.service.supervise")
+    assert hasattr(sv, "build_core")
 
 
 # ---------------------------------------------------------------------------
@@ -484,60 +466,10 @@ def test_write_restart_history_does_not_raise_with_stderr_none(monkeypatch, tmp_
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Job Object with KILL_ON_JOB_CLOSE
+# (The Windows Job-Object KILL_ON_JOB_CLOSE test was archived with the
+# pywin32 cluster in Phase 3c-1; the Linux equivalent — cgroup tree-kill via
+# KillMode=control-group — is unit-level untestable and validated on the VM.)
 # ---------------------------------------------------------------------------
-
-def test_job_object_kills_child_on_supervisor_death(tmp_path):
-    """Spawn an outer 'supervisor' process that creates a kill-on-close job
-    + spawns a long-sleeping child + assigns it to the job, then exits.
-    The child MUST be killed when the supervisor exits (the job handle
-    closes → KILL_ON_JOB_CLOSE → all members terminated)."""
-    import subprocess as sp
-
-    supervisor_script = r"""
-import subprocess, sys, time
-import win32job
-job = win32job.CreateJobObject(None, "")
-info = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
-info["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, info)
-proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
-win32job.AssignProcessToJobObject(job, int(proc._handle))
-sys.stdout.write(f"{proc.pid}\n")
-sys.stdout.flush()
-# Brief sleep to make sure the child is fully running before we exit.
-time.sleep(0.5)
-# Outer process exits here — job handle is closed by the OS as part of
-# process teardown — KILL_ON_JOB_CLOSE fires — child should die.
-"""
-    result = sp.run(
-        [sys.executable, "-c", supervisor_script],
-        capture_output=True, text=True, timeout=15,
-    )
-    assert result.returncode == 0, f"supervisor script failed: {result.stderr}"
-    child_pid_line = result.stdout.strip().splitlines()[-1]
-    child_pid = int(child_pid_line)
-
-    # Wait up to 2s for the child to be killed by job close.
-    import psutil
-    deadline = time.time() + 2.0
-    killed = False
-    while time.time() < deadline:
-        if not psutil.pid_exists(child_pid):
-            killed = True
-            break
-        time.sleep(0.05)
-
-    if not killed:
-        # Cleanup before failing
-        try:
-            psutil.Process(child_pid).kill()
-        except Exception:
-            pass
-        raise AssertionError(
-            f"child pid={child_pid} survived 2s after supervisor exit — "
-            f"KILL_ON_JOB_CLOSE did not work"
-        )
 
 
 # ---------------------------------------------------------------------------
