@@ -8,8 +8,8 @@
 #   1. Python 3.13 (pyenv, additive)          bootstrap/linux/install_python313.sh
 #   2. venv + dependencies                    bootstrap/common/python_setup.py
 #   3. config + secrets present?              bootstrap/common/config_check.py
-#   4. EnvironmentFile for Discord webhooks   /etc/pancakebot/pancakebot.env (if absent)
-#   5. systemd units (live + dry, DISABLED)   bootstrap/linux/setup_service.py
+#   4. EnvironmentFiles (secrets + alerts)    /etc/pancakebot/{pancakebot,alerts}.env
+#   5. systemd units (tracked; DISABLED)      bootstrap/linux/systemd/*.service
 #   6. chrony drop-in (clock-step detection)  /etc/chrony.d/pancakebot.conf
 #
 # Does NOT enable/start anything (no auto-start of a live bot on a fresh box).
@@ -40,23 +40,47 @@ VENV_PY="$REPO_ROOT/.venv/bin/python"
 log "STEP 3/6: config + secrets check"
 "$VENV_PY" "$HERE/common/config_check.py"
 
-log "STEP 4/6: Discord webhook EnvironmentFile"
-if [ -f "$ENV_FILE" ]; then
-    log "$ENV_FILE already present; leaving as-is"
-else
-    mkdir -p "$ENV_DIR"
-    cat > "$ENV_FILE" <<'WEBHOOKS'
-# PancakeBot Discord webhooks — fill in, then `systemctl daemon-reload`.
-PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL=
-PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL=
-PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL=
-WEBHOOKS
+log "STEP 4/6: EnvironmentFiles (secrets + alerts split)"
+ALERTS_FILE="$ENV_DIR/alerts.env"
+mkdir -p "$ENV_DIR"
+if [ ! -f "$ENV_FILE" ]; then
+    cat > "$ENV_FILE" <<'SECRETS'
+# PancakeBot secrets (bot units ONLY — never loaded by the notify unit).
+BSC_WALLET_PRIVATE_KEY=
+THE_GRAPH_API_KEY=
+SECRETS
     chmod 600 "$ENV_FILE"
-    log "wrote $ENV_FILE (chmod 600) — FILL IN the webhook URLs"
+    log "wrote $ENV_FILE (chmod 600) — FILL IN the secrets"
+else
+    log "$ENV_FILE already present; leaving as-is"
+fi
+if [ ! -f "$ALERTS_FILE" ]; then
+    # Least-privilege split (Phase 3c-2): webhooks live separately so the
+    # pancakebot-notify@ unit can load them WITHOUT the wallet key.
+    # Migrate any webhook lines already present in pancakebot.env.
+    {
+        echo "# PancakeBot Discord webhooks (loaded by bot + notify units)."
+        grep -E "^PANCAKEBOT_(LIVE_ALERTS|DRY_ALERTS|GENERAL)_DISCORD_WEBHOOK_URL=" "$ENV_FILE" 2>/dev/null \
+            || printf 'PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL=\nPANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL=\nPANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL=\n'
+    } > "$ALERTS_FILE"
+    chmod 600 "$ALERTS_FILE"
+    log "wrote $ALERTS_FILE (chmod 600; webhooks migrated from pancakebot.env where present)"
+    log "NOTE: webhook lines may be removed from $ENV_FILE manually (alerts.env is authoritative for the notify unit)"
+else
+    log "$ALERTS_FILE already present; leaving as-is"
 fi
 
-log "STEP 5/6: systemd units (live + dry, left DISABLED)"
-"$VENV_PY" "$HERE/linux/setup_service.py" --venv-python "$VENV_PY"
+log "STEP 5/6: systemd units (tracked files; left DISABLED)"
+# Phase 3c-2 (systemd-direct): the units are TRACKED at
+# bootstrap/linux/systemd/ and installed verbatim — systemd itself is the
+# supervisor (no Python supervisor layer). Re-copying on every run keeps
+# /etc in sync with the repo (push-to-deploy updates the repo copies; rerun
+# this script — or cp + daemon-reload manually — to roll units forward).
+for unit in pancakebot-live.service pancakebot-dry.service pancakebot-notify@.service; do
+    cp "$HERE/linux/systemd/$unit" "/etc/systemd/system/$unit"
+done
+systemctl daemon-reload
+log "installed pancakebot-{live,dry}.service + pancakebot-notify@.service (disabled)"
 
 log "STEP 6/6: chrony drop-in (clock-step detection bound)"
 # Steady-state drift is a non-issue under chronyd (~30-60us RMS measured

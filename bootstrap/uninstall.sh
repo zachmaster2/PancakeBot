@@ -25,8 +25,9 @@ for svc in pancakebot-live pancakebot-dry; do
         log "$svc not installed; skipping"
     fi
 done
+rm -f /etc/systemd/system/pancakebot-notify@.service
 systemctl daemon-reload
-log "systemd units removed"
+log "systemd units removed (incl. notify template)"
 
 # chrony drop-in (install.sh STEP 6): remove the drop-in + the confdir
 # include line it appended, then restart chronyd back onto distro defaults.
@@ -41,11 +42,11 @@ else
 fi
 
 if [ "$PURGE" = "1" ]; then
-    log "--purge: removing venv + EnvironmentFile (NOT var/ state or config.toml)"
+    log "--purge: removing venv + EnvironmentFiles (NOT var/ state or config.toml)"
     rm -rf "$REPO_ROOT/.venv"
-    rm -f /etc/pancakebot/pancakebot.env
-    log "purged venv + /etc/pancakebot/pancakebot.env"
+    rm -f /etc/pancakebot/pancakebot.env /etc/pancakebot/alerts.env
+    log "purged venv + /etc/pancakebot/{pancakebot,alerts}.env"
 else
-    log "kept venv, .env, config.toml, var/ state (use --purge to remove venv + EnvironmentFile)"
+    log "kept venv, env files, config.toml, var/ state (use --purge to remove venv + EnvironmentFiles)"
 fi
 log "DONE"
