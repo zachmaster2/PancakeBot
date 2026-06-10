@@ -162,12 +162,18 @@ _RPC_ATTEMPTS_PERIODIC: int = 3
 # -- Wall-clock caps: hard bound on one whole poll operation (head fetch +
 # getLogs chunks + block-ts resolution, including all retries). Enforced
 # BEFORE each RPC attempt ("would this attempt's timeout overrun the cap?"),
-# so a poll can never run past its cap — by construction, not estimation.
+# and each attempt's wall time is itself bounded by the socket-level
+# total= budget in _rpc_post — so a poll cannot run materially past its
+# cap (residual: the post-attempt JSON-parse/append/log tail, covered by
+# the explicit tail margins below).
 #   single:   fires at lock - single_poll_offset (2500ms canonical); must
-#             leave the anchor poll (lock-1500ms) + critical path intact.
-#             1000ms < the engine's deadline_ms budget (~1105ms canonical);
-#             _poll_now takes min(deadline_ms, cap) so a tighter engine
-#             budget always wins.
+#             leave the anchor poll (lock - ANCHOR_POLL_OFFSET = 1500ms)
+#             + critical path intact. 950 = 2500 - 1500 - 50ms tail margin
+#             (the cap bounds RPC attempts via the socket total= budget;
+#             the residual JSON-parse/append/log tail after the last
+#             attempt is what the 50ms covers). Also < the engine's
+#             deadline_ms budget (~1105ms canonical); _poll_now takes
+#             min(deadline_ms, cap) so a tighter engine budget always wins.
 #   periodic: must release _poll_lock well inside the 8s cadence so ticks
 #             never pile up and the single poll's wake finds the lock free
 #             (see _compute_periodic_timeout's safe_fire_latest, which
@@ -175,7 +181,7 @@ _RPC_ATTEMPTS_PERIODIC: int = 3
 # On cap-abort mid-chunk the cursor is NOT advanced past that chunk; the next
 # poll re-fetches the same range, and if coverage is short at decision time
 # F0 skips the round.
-_POLL_WALL_CAP_SINGLE_MS: int = 1000
+_POLL_WALL_CAP_SINGLE_MS: int = 950
 _POLL_WALL_CAP_PERIODIC_MS: int = 4000
 
 # Parallel block-ts resolution fan-out width. The single poll's chunk can
@@ -620,6 +626,15 @@ class RpcPoller:
         # out on the conservative static schedule) + a loud distinct
         # ALERT. If this fires repeatedly, suspect the LOCAL clock as
         # much as the endpoint — the comparison can't tell them apart.
+        #
+        # The stale anchor still ARMS the F0 coverage reference
+        # (block_number/milli_ts passed through below): it is a real
+        # chain block, and F0's grid extrapolation from it is
+        # conservative (delay-only jitter -> cursor time UNDERestimated
+        # -> skip, never a blind bet). Without this, a bot restarted
+        # while the endpoint lags would never arm _prev_anchor_* and F0
+        # would silently sit out (gate-off = covered) in exactly the
+        # lag regime it exists for.
         staleness_ms = int(time.time() * 1000) - milli_ts
         if staleness_ms > _ANCHOR_STALENESS_MS:
             warn(
@@ -630,7 +645,10 @@ class RpcPoller:
                 f"desync or local-clock fault. Using the static deadline "
                 f"fallback for this round.",
             )
-            self._record_anchor_outcome(fell_back=True, reason="stale_anchor")
+            self._record_anchor_outcome(
+                fell_back=True, reason="stale_anchor",
+                block_number=bn, milli_ts=milli_ts,
+            )
             return None
         self._record_anchor_outcome(
             fell_back=False, reason="ok", block_number=bn, milli_ts=milli_ts,
@@ -645,14 +663,25 @@ class RpcPoller:
         self, *, fell_back: bool, reason: str,
         block_number: int | None = None, milli_ts: int | None = None,
     ) -> None:
-        """Update anchor observability monitors (guard audit 3.1 / 5.2).
+        """Update anchor observability monitors (guard audit 3.1 / 5.2)
+        and the F0 coverage reference (``_prev_anchor_*``).
 
         ``fell_back`` True means the anchor poll returned None and the round
         will use the static wake; the rolling-rate monitor alerts when that
         rate is sustained. On success, the average block time since the
         previous anchor (delta_milli_ts / delta_block_number) feeds the
         block-time drift monitor confirming BSC_BLOCK_TIME_MS still holds.
-        Telemetry only; wrapped so it can never affect the poll result.
+
+        The F0 reference updates whenever a decoded block is provided —
+        including the stale-anchor rejection path (fell_back=True with
+        block_number/milli_ts): a stale anchor is unusable for the dynamic
+        deadline math but is still a real chain block, and F0's grid
+        extrapolation from it errs conservative (skip, never a blind bet).
+        Gating the reference on success would leave F0 disarmed (gate-off
+        = "covered") on a bot restarted while the endpoint lags — exactly
+        the regime the gate exists for. The drift monitor stays
+        success-only (a stale anchor's age would distort the block-time
+        average). Telemetry wrapped so it can never affect the poll result.
         """
         try:
             alert = self._anchor_fallback_monitor.observe(
@@ -660,8 +689,12 @@ class RpcPoller:
             )
             if alert is not None:
                 warn("ALERT", alert)
-            if not fell_back and block_number is not None and milli_ts is not None:
-                if self._prev_anchor_block and block_number > self._prev_anchor_block:
+            if block_number is not None and milli_ts is not None:
+                if (
+                    not fell_back
+                    and self._prev_anchor_block
+                    and block_number > self._prev_anchor_block
+                ):
                     span_blocks = block_number - self._prev_anchor_block
                     avg_block_ms = (milli_ts - self._prev_anchor_milli_ts) / span_blocks
                     bt_alert = self._block_time_monitor.observe(avg_block_ms)
@@ -741,12 +774,17 @@ class RpcPoller:
         ``(cursor_block_milli_ts, cutoff_milli_ts, blocks_short)``.
 
         The cursor block's BEP-520 ms-timestamp is extrapolated from the latest
-        anchor by exact 450ms increments — NO extra RPC. The extrapolation
-        error over the ~2-5 blocks between cursor and anchor is far below the
-        ~3.5s cutoff buffer, so it cannot mask a real multi-second lag. Returns
-        ``None`` (no gate) when no anchor or lock is set: cold-start is gated by
-        ``_connected``, and an anchor-absent round already runs on the
-        static-deadline fallback path.
+        anchor by exact 450ms increments — NO extra RPC. In a normal round the
+        anchor is THIS round's (~2-5 blocks from the cursor) and the
+        extrapolation error is far below the ~3.5s cutoff buffer, so it cannot
+        mask a real multi-second lag. After an anchor-fallback round (timeout /
+        malformed) the reference can be up to ~a round old (stale-REJECTED
+        anchors still update it — see _record_anchor_outcome) and the longer
+        span amplifies the delay-only jitter error in the CONSERVATIVE
+        direction (cursor time understated -> POOL UNCOVERED skip, never a
+        blind bet). Returns ``None`` (no gate) when no anchor or lock is set:
+        cold-start is gated by ``_connected``, and an anchor-absent round
+        already runs on the static-deadline fallback path.
         """
         if self._prev_anchor_block <= 0 or self._lock_at <= 0:
             return None
@@ -791,7 +829,7 @@ class RpcPoller:
         if self._periodic_thread is not None:
             self._periodic_thread.join(timeout=10)
             self._periodic_thread = None
-        # wait=False — abandoned hedged requests should not block
+        # wait=False — abandoned block-ts resolves should not block
         # shutdown. The PoolManager has no real cancellation; the
         # in-flight sockets will time out on their own.
         self._executor.shutdown(wait=False)
@@ -1114,11 +1152,18 @@ class RpcPoller:
         A getLogs range returns only the (sparse, server-filtered) Bet logs
         regardless of how many blocks it spans, so cost is per-CHUNK, not
         per-block: ``ceil(blocks_behind / _GETLOGS_CHUNK_BLOCKS)`` chunks,
-        each at ``_GETLOGS_FETCH_RTT_P99_MS``. Conservative (static p99, no
-        live-degradation term). With a 750-block chunk every realistic backlog
-        — steady ~18, one round <= 667 — is a single ~250ms chunk, so the
-        INFEAS gate now only trips for pathological multi-thousand-block
-        backlogs very near lock.
+        each at ``_GETLOGS_FETCH_RTT_P99_MS``. With a 750-block chunk every
+        realistic backlog — steady ~18, one round <= 667 — is a single
+        ~250ms chunk, so the INFEAS gate now only trips for pathological
+        multi-thousand-block backlogs very near lock.
+
+        Deliberately OPTIMISTIC: the healthy-path p99, not the worst case
+        (retries + a heavy block-ts wave can take a chunk well past 250ms).
+        INFEAS is the cheap early-exit for hopeless backlogs; the BINDING
+        guards are the poll wall cap (aborts an overrunning poll with the
+        cursor un-advanced) and F0 (skips the round if coverage is short at
+        decision time) — an under-estimate here converts to the same skip,
+        just diagnosed at is_pool_ready instead of round-open.
         """
         if blocks_behind <= 0:
             return 0
@@ -1512,7 +1557,7 @@ class RpcPoller:
         # earlier at the latest safe time; if that time has already passed
         # (the previous poll overran), suspend instead of firing a doomed
         # poll that would still overlap.
-        # Example (reschedule): canonical config (period=8, single_poll=4.75,
+        # Example (reschedule): illustrative config (period=8, single_poll=4.75,
         #   wall_cap=4, safety=0.05) → safe_fire_latest=lock_at−8.8. At
         #   now=lock_at−9, anchored next_at=lock_at−8.5 falls in
         #   (safe_fire_latest=lock_at−8.8, single_poll_window_start=lock_at−4.75).
@@ -1557,11 +1602,13 @@ class RpcPoller:
         Wall-clock capped (``_POLL_WALL_CAP_SINGLE_MS`` /
         ``_POLL_WALL_CAP_PERIODIC_MS``, further tightened by ``deadline_ms``
         when the engine passes one): no RPC attempt is started unless its
-        timeout fits inside the cap, so the poll's total duration is bounded
-        by construction. A cap-abort mid-chunk raises out of the chunk's
-        processing, the cursor is NOT advanced past that chunk, and the next
-        poll re-fetches the same range (F0 skips the round if coverage is
-        short at decision time).
+        timeout fits inside the cap, and each attempt's wall time is bounded
+        by the socket total= budget — the poll's duration is capped up to a
+        small parse/processing tail (see the cap constants' margin notes).
+        A cap-abort mid-chunk raises out of the chunk's processing, the
+        cursor is NOT advanced past that chunk, and the next poll re-fetches
+        the same range (F0 skips the round if coverage is short at decision
+        time).
 
         Updates _last_poll_succeeded / _last_poll_too_slow / etc on
         completion.
@@ -1881,6 +1928,14 @@ class RpcPoller:
         for epoch, side, amount_wei, bn, tx_hash, log_idx in parsed:
             bet_log_id = f"{tx_hash}:{log_idx}"
             with self._lock:
+                # Defense-in-depth re-check of the Phase-1 epoch gate: if an
+                # epoch advance committed between the phases, appending a
+                # now-past epoch would resurrect a just-pruned _pools entry.
+                # (Unreachable under the current cadence — post-lock polls
+                # abort on the stale-lock_at fence before fetching — but the
+                # invariant shouldn't depend on that.)
+                if self._current_epoch >= 0 and epoch < self._current_epoch:
+                    continue
                 processed_log_ids = self._processed_bet_log_ids.setdefault(epoch, set())
                 if bet_log_id in processed_log_ids:
                     continue
@@ -2042,9 +2097,15 @@ class RpcPoller:
         call (per pooled connection) pays the TLS handshake; subsequent
         calls reuse the open socket.
         """
+        # total= bounds the WHOLE attempt (connect + all reads). Without it,
+        # connect and read are separate budgets and the read timeout re-arms
+        # per socket read, so a cold connection or a trickled response could
+        # run one attempt to ~2x its budget — silently eating the poll wall
+        # cap's tail margin (review finding 2026-06-10).
         resp = self._pool.request(
             "POST", url, body=body,
             timeout=urllib3.Timeout(
+                total=float(timeout_seconds),
                 connect=float(timeout_seconds),
                 read=float(timeout_seconds),
             ),

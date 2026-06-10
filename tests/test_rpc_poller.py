@@ -2249,6 +2249,65 @@ def test_fire_anchor_poll_stale_records_fallback_outcome(monkeypatch):
     assert outcomes[-1]["reason"] == "stale_anchor"
 
 
+def test_fire_anchor_poll_stale_still_arms_f0_reference(monkeypatch):
+    """REGRESSION GUARD (review blocker 2026-06-10): a stale-REJECTED anchor
+    must still arm the F0 coverage reference (_prev_anchor_*). Otherwise a
+    bot restarted while the endpoint lags never arms F0 (gate-off =
+    'covered') and could BET on an incomplete pool — the exact regime the
+    gate exists for. The stale anchor stays out of the deadline math (None
+    return) but is a real chain block, and F0's extrapolation from it errs
+    conservative (skip, never a blind bet)."""
+    p = _make_poller()
+    assert p._prev_anchor_block == 0  # fresh process: F0 not yet evaluable
+    block = _fresh_anchor_block(age_ms=5_000, number=98_000_000)
+    monkeypatch.setattr(
+        p, "_bloxroute_call", lambda method, params, **kw: block,
+    )
+
+    assert p.fire_anchor_poll(timeout_s=0.200) is None  # rejected for timing
+
+    assert p._prev_anchor_block == 98_000_000, (
+        "stale anchor must arm the F0 reference"
+    )
+    expected_milli = int(block["timestamp"], 16) * 1000 + int(
+        block["mixHash"][-4:], 16
+    )
+    assert p._prev_anchor_milli_ts == expected_milli
+
+
+def test_f0_gate_evaluable_after_stale_anchor_restart_during_lag(monkeypatch):
+    """End-to-end blocker scenario: restart during a bloXroute lag — every
+    anchor is stale-rejected, yet F0 must still evaluate coverage and SKIP
+    when the cursor is short of the pool cutoff (pre-fix it returned
+    'covered' with no anchor reference)."""
+    import time as _t
+    import pancakebot.chain.rpc_poller as mod
+    p = _make_poller()
+    p._connected = True
+    p._pool_cutoff_seconds = 6
+
+    # The lagging endpoint serves a "latest" ~10s old; fire the anchor.
+    block = _fresh_anchor_block(age_ms=10_000, number=2_000)
+    monkeypatch.setattr(
+        p, "_bloxroute_call", lambda method, params, **kw: block,
+    )
+    assert p.fire_anchor_poll(timeout_s=0.200) is None  # stale-rejected
+
+    # Round locks 8s from now; cursor sits AT the lagged anchor block, i.e.
+    # ~10s behind real time — well short of the lock-6s cutoff.
+    p._lock_at = int(_t.time()) + 8
+    p._last_polled_block_number = 2_000
+
+    warns: list = []
+    monkeypatch.setattr(mod, "warn", lambda action, msg: warns.append((action, msg)))
+    ready, reason = p.is_pool_ready(488_999)
+    assert ready is False and reason == "pool_uncovered", (
+        "F0 must evaluate (and skip) off the stale-anchor reference; "
+        "gate-off here would allow a bet on an incomplete pool"
+    )
+    assert any("POOL UNCOVERED" in m for _, m in warns)
+
+
 # ---------------------------------------------------------------------------
 # Era 12 (2026-06-09): bet-event fetch via eth_getLogs
 # ---------------------------------------------------------------------------
