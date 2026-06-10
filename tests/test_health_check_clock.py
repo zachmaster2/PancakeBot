@@ -125,6 +125,58 @@ def test_run_refuses_to_start_when_conflicting_unit_is_running(monkeypatch):
     )
 
 
+def test_run_already_active_passes_on_fresh_log(monkeypatch, tmp_path):
+    """An ALREADY-active unit has no boot READY to wait for — health is the
+    runtime log being actively written. Must pass WITHOUT systemctl start
+    (false UNHEALTHY on a healthy live bot invites a needless restart)."""
+    import bootstrap.common.health_check as hc
+
+    monkeypatch.setattr(hc, "_clock_sync_ok", lambda: (True, "test"))
+    log_path = tmp_path / "runtime.log"
+    log_path.write_text("fresh\n", encoding="utf-8")  # mtime = now
+    monkeypatch.setattr(hc, "_runtime_log", lambda mode: log_path)
+    started: list[list[str]] = []
+
+    def fake_systemctl(argv):
+        if argv[0] == "show":
+            return "LoadState=loaded\nActiveState=active\n"
+        started.append(argv)
+        return ""
+
+    monkeypatch.setattr(hc, "_run_systemctl", fake_systemctl)
+    ok = hc.run(
+        mode="live", service_name="pancakebot-live",
+        start_timeout_s=1.0, ready_timeout_s=1.0,
+    )
+    assert ok is True
+    assert started == [], "already-active path must not touch systemctl start"
+
+
+def test_run_already_active_fails_on_stale_log(monkeypatch, tmp_path):
+    """Active unit whose runtime log went silent (> freshness bound) is NOT
+    healthy — the bot logs many times per round."""
+    import os
+    import time as _time
+
+    import bootstrap.common.health_check as hc
+
+    monkeypatch.setattr(hc, "_clock_sync_ok", lambda: (True, "test"))
+    log_path = tmp_path / "runtime.log"
+    log_path.write_text("old\n", encoding="utf-8")
+    stale = _time.time() - hc._ACTIVE_LOG_FRESH_S - 60
+    os.utime(log_path, (stale, stale))
+    monkeypatch.setattr(hc, "_runtime_log", lambda mode: log_path)
+    monkeypatch.setattr(
+        hc, "_run_systemctl",
+        lambda argv: "LoadState=loaded\nActiveState=active\n",
+    )
+    ok = hc.run(
+        mode="live", service_name="pancakebot-live",
+        start_timeout_s=1.0, ready_timeout_s=1.0,
+    )
+    assert ok is False
+
+
 def test_run_fails_on_unregistered_unit(monkeypatch):
     """A unit systemd doesn't know (LoadState=not-found) fails step 1."""
     import bootstrap.common.health_check as hc
