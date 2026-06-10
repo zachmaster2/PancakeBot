@@ -37,15 +37,14 @@ from pancakebot.util import InvariantError  # noqa: E402
 
 
 def _make_poller() -> RpcPoller:
-    """Construct a poller with default args + lightweight endpoint_pool."""
-    p = RpcPoller(
-        interval_seconds=300,
-        endpoint_pool=["https://test.example.com"],
-    )
-    # Hermetic default: the Era-12 clamp calls _bloxroute_block_number() inside
-    # _poll_now; stub it high so the clamp is a no-op (poll head unchanged) and
-    # no test hits the real bloXroute endpoint. Clamp-specific tests override it.
-    p._bloxroute_block_number = lambda: 10**12  # type: ignore[assignment]
+    """Construct a poller with default args, hermetically stubbed.
+
+    The poll head comes from ``_bloxroute_block_number`` (the single read
+    endpoint); stub it high by default so tests that don't poll never hit
+    the real endpoint. Head-sensitive tests override it.
+    """
+    p = RpcPoller(interval_seconds=300)
+    p._bloxroute_block_number = lambda **kw: 10**12  # type: ignore[assignment]
     return p
 
 
@@ -54,40 +53,25 @@ def _make_poller() -> RpcPoller:
 # ---------------------------------------------------------------------------
 
 def test_construct_default_params():
+    from pancakebot.chain.rpc_poller import RPC_BLOXROUTE_ENDPOINT
     p = _make_poller()
     assert p.connected is False
-    assert p.current_endpoint == "https://test.example.com"
+    assert p.current_endpoint == RPC_BLOXROUTE_ENDPOINT
 
 
 def test_construct_invalid_interval_raises():
     with pytest.raises(InvariantError, match="interval_seconds"):
-        RpcPoller(interval_seconds=0, endpoint_pool=["https://x"])
+        RpcPoller(interval_seconds=0)
     with pytest.raises(InvariantError, match="interval_seconds"):
-        RpcPoller(interval_seconds=-1, endpoint_pool=["https://x"])
+        RpcPoller(interval_seconds=-1)
 
 
 def test_construct_invalid_periodic_interval_raises():
     with pytest.raises(InvariantError, match="periodic_poll_interval"):
         RpcPoller(
             interval_seconds=300,
-            endpoint_pool=["https://x"],
             periodic_poll_interval_s=0,
         )
-
-
-def test_construct_batch_size_too_large_raises():
-    from pancakebot import timing_constants as _tc
-    with pytest.raises(InvariantError, match="batch_size_out_of_range"):
-        RpcPoller(
-            interval_seconds=300,
-            endpoint_pool=["https://x"],
-            batch_size=_tc.RPC_BATCH_MAX_BLOCKS + 1,
-        )
-
-
-def test_construct_empty_rpc_urls_raises():
-    with pytest.raises(InvariantError, match="endpoint_pool_empty"):
-        RpcPoller(interval_seconds=300, endpoint_pool=[])
 
 
 # ---------------------------------------------------------------------------
@@ -179,25 +163,24 @@ def test_is_pool_ready_priority_catchup_infeasible_beats_poll_in_progress():
 # Era 12: getLogs head-clamp + F0 pool-coverage gate
 # ---------------------------------------------------------------------------
 
-def test_poll_clamps_head_to_bloxroute_and_advances_cursor_to_clamp():
-    """Clamp: when bloXroute's head lags the reference head, the poll fetches
-    only up to bloXroute's head and the cursor advances to THAT (never past
-    bloXroute), so no getLogs range exceeds bloXroute's synced tip. The blocks
-    bloXroute hasn't synced are picked up next tick (contiguous cursor)."""
+def test_poll_head_is_bloxroute_and_cursor_advances_to_it():
+    """The poll head IS bloXroute's own reported head — a getLogs range can
+    never exceed bloXroute's synced tip by construction (no -32000), and the
+    cursor advances exactly to it. Blocks bloXroute hasn't synced yet are
+    picked up next tick (contiguous cursor)."""
     p = _make_poller()
     p._last_polled_block_number = 99_990
     p._lock_at = 0  # skip the feasibility branch
-    p._rpc_eth_block_number = lambda: 100_000       # reference head
-    p._bloxroute_block_number = lambda: 99_995      # bloXroute lags by 5
+    p._bloxroute_block_number = lambda **kw: 99_995  # type: ignore[assignment]
     fetched: list = []
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda frm, to: fetched.append((frm, to))
+        lambda frm, to, **kw: fetched.append((frm, to))
     )
 
     p._poll_now(deadline_ms=0, label="period")
 
-    assert fetched == [(99_991, 99_995)]            # clamped to bloXroute head
-    assert p._last_polled_block_number == 99_995    # cursor at the clamped head
+    assert fetched == [(99_991, 99_995)]            # range capped at bloXroute head
+    assert p._last_polled_block_number == 99_995    # cursor at bloXroute head
 
 
 def test_is_pool_ready_true_when_pool_covers_cutoff():
@@ -375,11 +358,11 @@ def test_compute_round_start_block_rejects_stale_anchor():
     # We mock the helper to confirm it's invoked.
     invoked = {"n": 0}
 
-    def fake_header():
+    def fake_header(**kw):
         invoked["n"] += 1
-        return (10000, target_ts + 10)
+        return (10000, target_ts + 10, None)
 
-    p._rpc_eth_get_latest_block_header = fake_header  # type: ignore[assignment]
+    p._bloxroute_latest_header = fake_header  # type: ignore[assignment]
     rs = p._compute_round_start_block(target_ts)
     # Bundle 4: head_ts = target+10 -> 10s back -> round(10000/450)=22
     # blocks back from 10000 = 9978 (was 9980 with 500ms divisor).
@@ -391,10 +374,10 @@ def test_compute_round_start_block_falls_back_to_rpc_when_cache_empty():
     """Empty cache forces the RPC path."""
     p = _make_poller()
 
-    def fake_header():
-        return (1_000_000, 50_000)
+    def fake_header(**kw):
+        return (1_000_000, 50_000, None)
 
-    p._rpc_eth_get_latest_block_header = fake_header  # type: ignore[assignment]
+    p._bloxroute_latest_header = fake_header  # type: ignore[assignment]
     rs = p._compute_round_start_block(round_start_ts=49_000)
     # Bundle 4: delta_seconds = 50000 - 49000 = 1000s -> round(1_000_000/450) = 2222
     # blocks at 450ms/block. round_start_block = 1_000_000 - 2222 = 997_778
@@ -407,10 +390,10 @@ def test_compute_round_start_block_returns_none_on_rpc_failure():
     leaves cursor untouched."""
     p = _make_poller()
 
-    def boom():
-        raise RuntimeError("publicnode_unreachable")
+    def boom(**kw):
+        raise RuntimeError("endpoint_unreachable")
 
-    p._rpc_eth_get_latest_block_header = boom  # type: ignore[assignment]
+    p._bloxroute_latest_header = boom  # type: ignore[assignment]
     rs = p._compute_round_start_block(round_start_ts=10_000)
     assert rs is None
 
@@ -420,10 +403,10 @@ def test_compute_round_start_block_handles_future_round_start():
     return head_num as the cursor target."""
     p = _make_poller()
 
-    def fake_header():
-        return (5000, 9_000)  # head_ts BEFORE round_start_ts
+    def fake_header(**kw):
+        return (5000, 9_000, None)  # head_ts BEFORE round_start_ts
 
-    p._rpc_eth_get_latest_block_header = fake_header  # type: ignore[assignment]
+    p._bloxroute_latest_header = fake_header  # type: ignore[assignment]
     rs = p._compute_round_start_block(round_start_ts=10_000)
     assert rs == 5000
 
@@ -446,13 +429,13 @@ def test_on_epoch_advance_clamps_cursor_after_long_silence():
     p._last_polled_block_number = 1_000  # very stale
 
     # Mock: round_start_block = 99_900; head_num = 100_000.
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, 1_000_050)  # type: ignore[assignment]
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, 1_000_050, None)  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
     # head_ts = 1_000_300, lock_at = 1_000_350, round_start_ts = 1_000_050.
     # Bundle 4: delta = 250s -> round(250_000/450) = 556 blocks ->
     # rs = 100_000 - 556 = 99_444 (was 99_500 with 500ms divisor).
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, 1_000_300)  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, 1_000_300, None)  # type: ignore[assignment]
 
     p._on_epoch_advance(lock_at=1_000_350, current_epoch=101)
 
@@ -467,8 +450,8 @@ def test_on_epoch_advance_does_not_rewind_cursor_when_in_round():
     p._last_polled_block_number = 99_900  # past round_start = 99_500
 
     # Same mocks as the clamp test but cursor is in-round.
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, 1_000_300)  # type: ignore[assignment]
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, 1_000_300, None)  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
     p._on_epoch_advance(lock_at=1_000_350, current_epoch=101)
 
@@ -486,8 +469,8 @@ def test_on_epoch_advance_resets_infeasibility_flag():
     p._last_polled_block_number = 99_999
 
     # Mock: very small backlog, plenty of time -> still feasible.
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, 1_000_300)  # type: ignore[assignment]
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, 1_000_300, None)  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
     # lock_at far in the future to ensure feasibility.
     import time as _t
@@ -515,8 +498,8 @@ def test_on_epoch_advance_marks_infeasible_when_catchup_exceeds_budget():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 1_000  # very stale; clamp jumps to round_start
 
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, _t.time())  # type: ignore[assignment]
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, _t.time(), None)  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
     # ~150ms to lock: available < the 250ms one-chunk estimate, but still
     # pre-lock so the flag is not suppressed.
@@ -533,8 +516,8 @@ def test_on_epoch_advance_handles_block_number_failure_gracefully():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 99_900
 
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, 1_000_300)  # type: ignore[assignment]
-    p._rpc_eth_block_number = lambda: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, 1_000_300, None)  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:(_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
 
     # Should not raise.
     p._on_epoch_advance(lock_at=1_000_350, current_epoch=101)
@@ -549,8 +532,8 @@ def test_on_epoch_advance_handles_compute_round_start_failure_gracefully():
     p._last_polled_block_number = 1_000
 
     # _block_ts empty AND header RPC raises.
-    p._rpc_eth_get_latest_block_header = (  # type: ignore[assignment]
-        lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    p._bloxroute_latest_header = (  # type: ignore[assignment]
+        lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
     )
     # Should not raise; cursor stays put.
     p._on_epoch_advance(lock_at=1_000_350, current_epoch=101)
@@ -674,7 +657,6 @@ def _make_anchored_poller() -> RpcPoller:
     periodic-loop math legible) and interval=300s for periodic-loop tests."""
     return RpcPoller(
         interval_seconds=300,
-        endpoint_pool=["https://test.example.com"],
         single_poll_wakeup_offset_before_lock_ms=7500,
     )
 
@@ -720,22 +702,27 @@ def test_periodic_timeout_state_b_suspend_in_ramp_window():
     assert timeout == pytest.approx(6.1, abs=1e-6)
 
 
-def test_periodic_timeout_reschedule_when_anchored_tick_in_rtt_safety_band():
-    """The anchored tick is outside the ramp window itself but close
-    enough that its worst-case HTTP RTT (5s + 0.05s safety = 5.05s)
-    could extend into ramp_1's wake. Fire earlier at the latest safe
-    time so a full-timeout poll still completes before ramp_window_start.
+def test_periodic_timeout_reschedule_when_anchored_tick_in_wall_cap_band():
+    """The anchored tick is outside the single-poll window itself but close
+    enough that its worst-case duration (the 4s periodic wall cap + 0.05s
+    safety = 4.05s) could extend into the single poll's wake. Fire earlier
+    at the latest safe time so a cap-bound poll still completes before
+    single_poll_window_start.
 
-    Canonical config: ramp_window_start = lock_at - 7.5,
-    safe_fire_latest = ramp_window_start - 5 - 0.05 = lock_at - 12.55.
-    At now = lock_at - 13, the anchored next_at = round_open + 288 =
-    lock_at - 12, which falls in the (safe_fire_latest, ramp_window_start)
-    band. safe_fire_latest (lock_at - 12.55) is 0.45s in the future →
+    Config (offset=9500ms so a tick lands in the band):
+      single_poll_window_start = lock_at - 9.5
+      safe_fire_latest = lock_at - 9.5 - 4 - 0.05 = lock_at - 13.55.
+    At now = lock_at - 14, the anchored next_at = round_open + 288 =
+    lock_at - 12, which falls in the (safe_fire_latest, window_start)
+    band. safe_fire_latest (lock_at - 13.55) is 0.45s in the future →
     reschedule, timeout = 0.45s.
     """
-    p = _make_anchored_poller()
+    p = RpcPoller(
+        interval_seconds=300,
+        single_poll_wakeup_offset_before_lock_ms=9500,
+    )
     lock_at = 1_000_300
-    now = lock_at - 13
+    now = lock_at - 14
     timeout = p._compute_periodic_timeout(
         now=float(now), lock_at=lock_at, period=8,
     )
@@ -744,55 +731,59 @@ def test_periodic_timeout_reschedule_when_anchored_tick_in_rtt_safety_band():
 
 def test_periodic_timeout_suspend_when_safe_fire_latest_has_passed():
     """The novel safety branch added 2026-05-18: the anchored tick is
-    outside the ramp window itself, but ``safe_fire_latest`` has
-    already passed (the previous poll overran). Firing now would
-    risk a periodic in-flight at ramp_1's wake. Suspend the tick;
-    ramp_1+ramp_2 absorb the extra backlog.
+    outside the single-poll window itself, but ``safe_fire_latest`` has
+    already passed (the previous poll overran). Firing now would risk a
+    periodic in-flight at the single poll's wake. Suspend the tick; the
+    single poll absorbs the extra backlog.
 
-    Canonical config (period=8, ramp_offset=7.5s, max_rtt=5s,
-    safety=0.05s):
-      ramp_window_start = lock_at - 7.5
-      safe_fire_latest = lock_at - 12.55
-      Band (safe_fire_latest, ramp_window_start) is 5.05s wide.
+    Config (period=8, offset=9.5s, wall_cap=4s, safety=0.05s):
+      single_poll_window_start = lock_at - 9.5
+      safe_fire_latest = lock_at - 13.55
+      Band (safe_fire_latest, window_start) is 4.05s wide.
 
-    At canonical anchoring, k=36 yields next_at = round_open + 288 =
-    lock_at - 12 — inside the band (not the ramp window itself). The
-    overrun branch fires for now in (lock_at - 12.55, lock_at - 12):
-    next_at is still ≤ ramp_window_start so the in-window suspend
-    doesn't trigger, but safe_fire_latest is already in the past so
-    no safe-fire moment remains.
+    At this anchoring, k=36 yields next_at = round_open + 288 =
+    lock_at - 12 — inside the band (not the single-poll window itself).
+    The overrun branch fires for now in (lock_at - 13.55, lock_at - 12):
+    next_at is still ≤ window_start so the in-window suspend doesn't
+    trigger, but safe_fire_latest is already in the past so no safe-fire
+    moment remains.
 
-    At now = lock_at - 12.5:
-      - next_at = lock_at - 12 (NOT in ramp window: -12 < -7.5)
-      - next_at > safe_fire_latest (-12 > -12.55): in the band
-      - safe_fire_latest <= now (-12.55 <= -12.5): overrun
-      → suspend, timeout = lock_at + 0.1 - now = 12.6s
+    At now = lock_at - 13.5:
+      - next_at = lock_at - 12 (NOT in the window: -12 < -9.5)
+      - next_at > safe_fire_latest (-12 > -13.55): in the band
+      - safe_fire_latest <= now (-13.55 <= -13.5): overrun
+      → suspend, timeout = lock_at + 0.1 - now = 13.6s
 
-    Critical: if the in-window suspend branch (next_at >=
-    ramp_window_start) fired here instead, the assertion would still
-    pass — both branches return "suspend" with the same timeout.
-    Hence the explicit assertions below on next_at, safe_fire_latest,
-    and ramp_window_start positions: they pin the test to the
-    overrun branch, not in-window suspend.
+    Critical: if the in-window suspend branch (next_at >= window_start)
+    fired here instead, the assertion would still pass — both branches
+    return "suspend" with the same timeout. Hence the explicit assertions
+    below on next_at, safe_fire_latest, and window_start positions: they
+    pin the test to the overrun branch, not in-window suspend.
     """
-    p = _make_anchored_poller()
+    from pancakebot.chain.rpc_poller import _POLL_WALL_CAP_PERIODIC_MS
+    p = RpcPoller(
+        interval_seconds=300,
+        single_poll_wakeup_offset_before_lock_ms=9500,
+    )
     lock_at = 1_000_300
-    now = lock_at - 12.5
+    now = lock_at - 13.5
 
     # Pin the branch: assert the geometric conditions that route to
-    # the overrun branch specifically (next_at outside ramp window,
+    # the overrun branch specifically (next_at outside the window,
     # safe_fire_latest in the past).
     round_open = lock_at - 300
-    ramp_window_start = lock_at - 7.5
-    safe_fire_latest = ramp_window_start - 5 - 0.05  # = lock_at - 12.55
+    window_start = lock_at - 9.5
+    safe_fire_latest = (
+        window_start - _POLL_WALL_CAP_PERIODIC_MS / 1000.0 - 0.05
+    )  # = lock_at - 13.55
     k = max(1, int((now - round_open) // 8) + 1)
     next_at = round_open + k * 8
     assert next_at == lock_at - 12, (
         f"test setup invariant: expected next_at=lock_at-12, got {next_at - lock_at}"
     )
-    assert next_at < ramp_window_start, (
-        "next_at must NOT be in the ramp window itself — otherwise the test "
-        "would hit the in-window suspend branch, not the overrun branch"
+    assert next_at < window_start, (
+        "next_at must NOT be in the single-poll window itself — otherwise the "
+        "test would hit the in-window suspend branch, not the overrun branch"
     )
     assert safe_fire_latest <= now, (
         "safe_fire_latest must already be in the past — otherwise the test "
@@ -802,8 +793,8 @@ def test_periodic_timeout_suspend_when_safe_fire_latest_has_passed():
     timeout = p._compute_periodic_timeout(
         now=float(now), lock_at=lock_at, period=8,
     )
-    # Suspend sleeps to lock_at + 0.1: timeout = 12.6.
-    assert timeout == pytest.approx(12.6, abs=1e-6)
+    # Suspend sleeps to lock_at + 0.1: timeout = 13.6.
+    assert timeout == pytest.approx(13.6, abs=1e-6)
 
 
 def test_periodic_timeout_state_c_post_lock_wall_clock_fallback():
@@ -853,7 +844,6 @@ def test_periodic_timeout_state_b_exact_boundary_suspends():
     """
     p = RpcPoller(
         interval_seconds=1000,
-        endpoint_pool=["https://test.example.com"],
         single_poll_wakeup_offset_before_lock_ms=200_000,
     )
     lock_at = 1000
@@ -889,7 +879,7 @@ def test_poll_lock_arbitration_periodic_yields_to_concurrent_ramp_poll():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 99_990  # 10 blocks behind; feasible budget
 
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
     # Plenty of time to lock so feasibility doesn't trip.
     p._lock_at = int(_t.time()) + 60
 
@@ -897,7 +887,7 @@ def test_poll_lock_arbitration_periodic_yields_to_concurrent_ramp_poll():
     fetch_can_finish = threading.Event()
     fetched_calls: list[int] = []
 
-    def slow_fetch(from_block, to_block):
+    def slow_fetch(from_block, to_block, **kw):
         fetch_started.set()
         # Emulate a slow eth_getLogs range fetch by parking here.
         # The test signals fetch_can_finish once the racing call has
@@ -953,33 +943,49 @@ def test_poll_lock_arbitration_periodic_yields_to_concurrent_ramp_poll():
 
 
 # ---------------------------------------------------------------------------
-# _rpc_eth_get_latest_block_header (RPC parsing)
+# _bloxroute_latest_header (RPC parsing incl. BEP-520 ms decode)
 # ---------------------------------------------------------------------------
 
-def test_rpc_eth_get_latest_block_header_parses_response():
+def test_bloxroute_latest_header_parses_response_with_milli_ts():
     p = _make_poller()
-    # Mock the RPC layer; verify the parser unpacks the dict.
-    p._rpc_call_single = lambda method, params: {  # type: ignore[assignment]
-        "number": "0x186a0",     # 100000
-        "timestamp": "0x5f5e100", # 100000000
+    # Mock the transport; verify the parser unpacks the dict + decodes ms.
+    p._bloxroute_call = lambda method, params, **kw: {  # type: ignore[assignment]
+        "number": "0x186a0",      # 100000
+        "timestamp": "0x5f5e100",  # 100000000
+        "mixHash": "0x" + "00" * 30 + "01c2",  # ms = 0x01c2 = 450
     }
-    num, ts = p._rpc_eth_get_latest_block_header()
+    num, ts, milli = p._bloxroute_latest_header(attempts=1)
     assert num == 100_000
     assert ts == 100_000_000
+    assert milli == 100_000_000 * 1000 + 450
 
 
-def test_rpc_eth_get_latest_block_header_raises_on_unexpected_shape():
+def test_bloxroute_latest_header_milli_none_when_mixhash_undecodable():
     p = _make_poller()
-    p._rpc_call_single = lambda method, params: "not_a_dict"  # type: ignore[assignment]
+    p._bloxroute_call = lambda method, params, **kw: {  # type: ignore[assignment]
+        "number": "0x186a0",
+        "timestamp": "0x5f5e100",
+        # ms field 0x3e8 = 1000 > 999 -> decode rejects (pre-Lorentz guard)
+        "mixHash": "0x" + "00" * 30 + "03e8",
+    }
+    num, ts, milli = p._bloxroute_latest_header(attempts=1)
+    assert num == 100_000
+    assert ts == 100_000_000
+    assert milli is None
+
+
+def test_bloxroute_latest_header_raises_on_unexpected_shape():
+    p = _make_poller()
+    p._bloxroute_call = lambda method, params, **kw: "not_a_dict"  # type: ignore[assignment]
     with pytest.raises(InvariantError, match="unexpected_result"):
-        p._rpc_eth_get_latest_block_header()
+        p._bloxroute_latest_header(attempts=1)
 
 
-def test_rpc_eth_get_latest_block_header_raises_on_missing_fields():
+def test_bloxroute_latest_header_raises_on_missing_fields():
     p = _make_poller()
-    p._rpc_call_single = lambda method, params: {"number": "0x1"}  # type: ignore[assignment]
+    p._bloxroute_call = lambda method, params, **kw: {"number": "0x1"}  # type: ignore[assignment]
     with pytest.raises(InvariantError, match="missing_fields"):
-        p._rpc_eth_get_latest_block_header()
+        p._bloxroute_latest_header(attempts=1)
 
 
 # ---------------------------------------------------------------------------
@@ -1003,10 +1009,10 @@ def test_poll_now_aborts_early_when_catchup_infeasible_mid_round(caplog):
     p._last_polled_block_number = 1_000
 
     # Mock: head jumped to 100_000 (99_000 blocks behind).
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
     # If the batch fetcher is invoked, blow up the test.
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda *a: pytest.fail("should not have fetched")
+        lambda *a, **kw: pytest.fail("should not have fetched")
     )
 
     # Pre-lock + tight time: ~1s until lock, available ~800ms. Math
@@ -1036,9 +1042,9 @@ def test_poll_now_post_lock_infeas_does_not_set_flag(capsys):
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 1_000
 
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda *a: pytest.fail("should not have fetched")
+        lambda *a, **kw: pytest.fail("should not have fetched")
     )
 
     # Stale anchor: lock_at strictly in the past relative to _t.time().
@@ -1079,11 +1085,11 @@ def test_poll_now_post_lock_cursor_advances_after_set_round_phase():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 99_900  # 100 blocks behind head=100_000
 
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
     fetched: list = []
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda frm, to: fetched.append((frm, to))
+        lambda frm, to, **kw: fetched.append((frm, to))
     )
 
     # First call: post-lock periodic (lock_at in the past). INFEAS path
@@ -1118,9 +1124,9 @@ def test_poll_now_skips_feasibility_check_when_lock_at_zero():
     p._lock_at = 0
 
     fetched: list = []
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda frm, to: fetched.append((frm, to))
+        lambda frm, to, **kw: fetched.append((frm, to))
     )
 
     p._poll_now(deadline_ms=0, label="period")
@@ -1138,12 +1144,12 @@ def test_poll_now_logs_partial_at_info_when_some_batches_succeeded(caplog):
     # 1500 blocks behind -> two 750-block getLogs chunks, so a mid-fetch
     # failure (chunk 2 raises) leaves a genuine PARTIAL: chunk 1 advanced the
     # cursor, chunk 2 didn't.
-    p._rpc_eth_block_number = lambda: 101_400  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:101_400  # type: ignore[assignment]
 
     fetched: list = []
     call_count = {"n": 0}
 
-    def flaky_fetch(from_block, to_block):
+    def flaky_fetch(from_block, to_block, **kw):
         call_count["n"] += 1
         if call_count["n"] == 1:
             fetched.append((from_block, to_block))  # first chunk ok
@@ -1187,11 +1193,11 @@ def test_poll_now_sets_and_clears_poll_in_progress_on_success():
 
     seen_flag: list[bool] = []
 
-    def fake_fetch(from_block, to_block):
+    def fake_fetch(from_block, to_block, **kw):
         # Snapshot the flag while inside the fetch.
         seen_flag.append(p._poll_in_progress)
 
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
     p._fetch_and_process_logs = fake_fetch  # type: ignore[assignment]
 
     # Plenty of time for feasibility.
@@ -1210,9 +1216,9 @@ def test_poll_now_clears_poll_in_progress_on_failure():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 99_999
 
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
-    def boom(from_block, to_block):
+    def boom(from_block, to_block, **kw):
         raise RuntimeError("publicnode_error")
 
     p._fetch_and_process_logs = boom  # type: ignore[assignment]
@@ -1229,10 +1235,10 @@ def test_poll_now_clears_poll_in_progress_when_head_fetch_fails():
     p = _make_poller()
     _prep_for_epoch_advance(p)
 
-    def head_boom():
+    def head_boom(**kw):
         raise RuntimeError("head_unreachable")
 
-    p._rpc_eth_block_number = head_boom  # type: ignore[assignment]
+    p._bloxroute_block_number = head_boom  # type: ignore[assignment]
     p._poll_now(deadline_ms=0, label="period")
     assert p._poll_in_progress is False
 
@@ -1252,9 +1258,9 @@ def test_poll_now_clears_poll_in_progress_when_infeasible_aborts_early():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 1_000  # very stale
 
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda *a: pytest.fail("should not have fetched")
+        lambda *a, **kw: pytest.fail("should not have fetched")
     )
 
     p._lock_at = int(_t.time()) + 1  # pre-lock, tight => infeasible
@@ -1294,10 +1300,10 @@ def test_init_cursor_positions_at_round_start_minus_1_when_feasible():
     p = _make_poller()
     now = int(_t.time())
     p._lock_at = now + 290  # 10s into round
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, now, None)  # type: ignore[assignment]
     # cursor-init must NOT call _fetch_and_process_blocks: blow up if it does.
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda *a: pytest.fail("init_cursor must not fetch batches")
+        lambda *a, **kw: pytest.fail("init_cursor must not fetch batches")
     )
 
     p._initialize_cursor_from_head()
@@ -1324,9 +1330,9 @@ def test_init_cursor_scopes_target_to_current_round_only():
     p = _make_poller()
     now = int(_t.time())
     p._lock_at = now + 240  # 60s into round
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, now, None)  # type: ignore[assignment]
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda *a: pytest.fail("init_cursor must not fetch batches")
+        lambda *a, **kw: pytest.fail("init_cursor must not fetch batches")
     )
 
     p._initialize_cursor_from_head()
@@ -1358,9 +1364,9 @@ def test_init_cursor_marks_infeasible_and_jumps_to_head_when_no_time():
     p = _make_poller()
     now = int(_t.time())
     p._lock_at = now  # lock is now -> available_ms = 0 -> any estimate infeasible
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, now, None)  # type: ignore[assignment]
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda *a: pytest.fail("init_cursor must not fetch batches")
+        lambda *a, **kw: pytest.fail("init_cursor must not fetch batches")
     )
 
     p._initialize_cursor_from_head()
@@ -1429,7 +1435,7 @@ def test_last_catchup_detail_reset_on_epoch_advance():
     # Mock the RPC head fetch + round_start derivation so
     # _on_epoch_advance can run without real chain calls.
     p._compute_round_start_block = lambda _ts: 99_000  # type: ignore[assignment]
-    p._rpc_eth_block_number = lambda: 99_010  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:99_010  # type: ignore[assignment]
 
     # _on_epoch_advance is the canonical round-boundary hook; calling
     # it directly exercises the reset without the first-call cursor-init
@@ -1459,9 +1465,9 @@ def test_init_cursor_handles_head_before_round_start():
     now = int(_t.time())
     p._lock_at = now + 600  # round won't START for another 5 min
     # round_start_ts = lock_at - 300 = now+300; head_ts = now < round_start_ts.
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, now, None)  # type: ignore[assignment]
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda *a: pytest.fail("init_cursor must not fetch batches")
+        lambda *a, **kw: pytest.fail("init_cursor must not fetch batches")
     )
 
     p._initialize_cursor_from_head()
@@ -1480,8 +1486,8 @@ def test_init_cursor_logs_infeas_at_warn_severity():
     p = _make_poller()
     now = int(_t.time())
     p._lock_at = now  # lock is now -> available_ms = 0 -> infeasible (cold-start)
-    p._rpc_eth_get_latest_block_header = lambda: (100_000, now)  # type: ignore[assignment]
-    p._fetch_and_process_logs = lambda *a: None  # type: ignore[assignment]
+    p._bloxroute_latest_header = lambda **kw: (100_000, now, None)  # type: ignore[assignment]
+    p._fetch_and_process_logs = lambda *a, **kw: None  # type: ignore[assignment]
 
     # We can't easily assert log level via pytest.caplog without the
     # log module routing through the logging stdlib. Instead, monkey-
@@ -1542,10 +1548,10 @@ def test_first_successful_poll_latches_connected_and_cold_start_done():
     assert p._cold_start_done.is_set() is False
 
     # Mock a successful poll: head advanced 50 blocks since cursor.
-    p._rpc_eth_block_number = lambda: 99_950  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:99_950  # type: ignore[assignment]
     fetched: list = []
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda frm, to: fetched.append((frm, to))
+        lambda frm, to, **kw: fetched.append((frm, to))
     )
 
     p._poll_now(deadline_ms=0, label="period")
@@ -1574,9 +1580,9 @@ def test_first_successful_poll_latch_fires_in_no_new_blocks_branch():
     p._lock_at = int(_t.time()) + 290
     p._last_polled_block_number = 100_000
 
-    p._rpc_eth_block_number = lambda: 100_000  # type: ignore[assignment]  # head == cursor
+    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]  # head == cursor
     p._fetch_and_process_logs = (  # type: ignore[assignment]
-        lambda *a: pytest.fail("no-new-blocks branch must not fetch")
+        lambda *a, **kw: pytest.fail("no-new-blocks branch must not fetch")
     )
 
     assert p._connected is False
@@ -1595,9 +1601,9 @@ def test_first_poll_failure_does_not_set_latch():
     p._lock_at = int(_t.time()) + 290
     p._last_polled_block_number = 99_900
 
-    def boom():
-        raise RuntimeError("publicnode_unreachable")
-    p._rpc_eth_block_number = boom  # type: ignore[assignment]
+    def boom(**kw):
+        raise RuntimeError("endpoint_unreachable")
+    p._bloxroute_block_number = boom  # type: ignore[assignment]
     p._poll_now(deadline_ms=0, label="period")
 
     assert p._connected is False
@@ -1605,7 +1611,7 @@ def test_first_poll_failure_does_not_set_latch():
     assert p._last_poll_succeeded is False
 
     # Now a successful poll: head fetches OK, no new blocks.
-    p._rpc_eth_block_number = lambda: 99_900  # type: ignore[assignment]
+    p._bloxroute_block_number = lambda **kw:99_900  # type: ignore[assignment]
     p._poll_now(deadline_ms=0, label="period")
     assert p._connected is True
     assert p._cold_start_done.is_set() is True
@@ -1898,8 +1904,8 @@ def test_fire_anchor_poll_returns_anchor_state_on_success(monkeypatch):
         "mixHash": "0x" + "00" * 30 + "0352",  # 850ms quantum
     }
     monkeypatch.setattr(
-        p, "_rpc_call_single_with_timeout",
-        lambda method, params, *, timeout_s: block,
+        p, "_bloxroute_call",
+        lambda method, params, **kw: block,
     )
     anchor = p.fire_anchor_poll(timeout_s=0.200)
     assert anchor is not None
@@ -1908,13 +1914,13 @@ def test_fire_anchor_poll_returns_anchor_state_on_success(monkeypatch):
 
 
 def test_fire_anchor_poll_returns_none_on_rpc_error(monkeypatch):
-    """RPC raises (timeout, hedged-all-failed, transport error) → None."""
+    """RPC raises (timeout, transport error) → None."""
     p = _make_poller()
 
-    def _raise(method, params, *, timeout_s):
-        raise TimeoutError("hedged_timeout")
+    def _raise(method, params, **kw):
+        raise TimeoutError("anchor_timeout")
 
-    monkeypatch.setattr(p, "_rpc_call_single_with_timeout", _raise)
+    monkeypatch.setattr(p, "_bloxroute_call", _raise)
     assert p.fire_anchor_poll(timeout_s=0.200) is None
 
 
@@ -1922,8 +1928,8 @@ def test_fire_anchor_poll_returns_none_on_malformed_response(monkeypatch):
     """Response is not a dict → None (defensive against bad RPC)."""
     p = _make_poller()
     monkeypatch.setattr(
-        p, "_rpc_call_single_with_timeout",
-        lambda method, params, *, timeout_s: "not_a_dict",
+        p, "_bloxroute_call",
+        lambda method, params, **kw: "not_a_dict",
     )
     assert p.fire_anchor_poll(timeout_s=0.200) is None
 
@@ -1932,8 +1938,8 @@ def test_fire_anchor_poll_returns_none_on_missing_number(monkeypatch):
     """Response dict missing 'number' field → None."""
     p = _make_poller()
     monkeypatch.setattr(
-        p, "_rpc_call_single_with_timeout",
-        lambda method, params, *, timeout_s: {
+        p, "_bloxroute_call",
+        lambda method, params, **kw: {
             "timestamp": hex(1778712807),
             "mixHash": "0x" + "00" * 30 + "0352",
         },
@@ -1945,8 +1951,8 @@ def test_fire_anchor_poll_returns_none_on_unparseable_milli_ts(monkeypatch):
     """compute_milli_ts returns None (malformed mixHash or timestamp) → None."""
     p = _make_poller()
     monkeypatch.setattr(
-        p, "_rpc_call_single_with_timeout",
-        lambda method, params, *, timeout_s: {
+        p, "_bloxroute_call",
+        lambda method, params, **kw: {
             "number": hex(98_000_000),
             "timestamp": "0xZZ",  # bad hex → compute_milli_ts None
             "mixHash": "0x" + "00" * 32,
@@ -1955,24 +1961,28 @@ def test_fire_anchor_poll_returns_none_on_unparseable_milli_ts(monkeypatch):
     assert p.fire_anchor_poll(timeout_s=0.200) is None
 
 
-def test_fire_anchor_poll_passes_timeout_through(monkeypatch):
-    """The timeout_s argument must reach _rpc_call_single_with_timeout."""
+def test_fire_anchor_poll_passes_timeout_through_single_attempt(monkeypatch):
+    """The timeout_s argument must reach _bloxroute_call as timeout_ms, with
+    attempts=1 (the anchor's recovery path is the engine's static fallback,
+    never a retry inside the ~200ms ceiling)."""
     p = _make_poller()
     captured: dict = {}
 
-    def _capture(method, params, *, timeout_s):
+    def _capture(method, params, *, timeout_ms, attempts, abort_at=None):
         captured["method"] = method
         captured["params"] = params
-        captured["timeout_s"] = timeout_s
+        captured["timeout_ms"] = timeout_ms
+        captured["attempts"] = attempts
         return {
             "number": hex(1),
             "timestamp": hex(1778712807),
             "mixHash": "0x" + "00" * 30 + "0352",
         }
 
-    monkeypatch.setattr(p, "_rpc_call_single_with_timeout", _capture)
+    monkeypatch.setattr(p, "_bloxroute_call", _capture)
     p.fire_anchor_poll(timeout_s=0.200)
-    assert captured["timeout_s"] == 0.200
+    assert captured["timeout_ms"] == 200
+    assert captured["attempts"] == 1
     assert captured["method"] == "eth_getBlockByNumber"
     assert captured["params"] == ["latest", False]
 
@@ -1981,10 +1991,16 @@ def test_fire_anchor_poll_passes_timeout_through(monkeypatch):
 # Era 12 (2026-06-09): bet-event fetch via eth_getLogs
 # ---------------------------------------------------------------------------
 
+def _far_abort_at() -> float:
+    """A wall-cap deadline far enough out that no test trips it."""
+    import time as _t
+    return _t.monotonic() + 60.0
+
+
 def test_fetch_and_process_logs_queries_getlogs_endpoint(monkeypatch):
     """_fetch_and_process_logs POSTs a single eth_getLogs range query to
-    BET_EVENTS_GETLOGS_ENDPOINT (NOT the hedged receipts pool), filtered by
-    contract address + Bet topic0, and feeds the result to _process_bet_logs."""
+    RPC_BLOXROUTE_ENDPOINT, filtered by contract address + Bet topic0, and
+    feeds the result to _process_bet_logs."""
     import json as _json
     import pancakebot.chain.rpc_poller as mod
     p = _make_poller()
@@ -1997,10 +2013,12 @@ def test_fetch_and_process_logs_queries_getlogs_endpoint(monkeypatch):
 
     monkeypatch.setattr(p, "_rpc_post", _capture_post)
     seen: list = []
-    monkeypatch.setattr(p, "_process_bet_logs", lambda logs: seen.append(logs))
-    p._fetch_and_process_logs(100, 117)
+    monkeypatch.setattr(
+        p, "_process_bet_logs", lambda logs, **kw: seen.append(logs),
+    )
+    p._fetch_and_process_logs(100, 117, attempts=1, abort_at=_far_abort_at())
 
-    assert captured["url"] == mod.BET_EVENTS_GETLOGS_ENDPOINT
+    assert captured["url"] == mod.RPC_BLOXROUTE_ENDPOINT
     req = captured["req"]
     assert req["method"] == "eth_getLogs"
     flt = req["params"][0]
@@ -2011,17 +2029,38 @@ def test_fetch_and_process_logs_queries_getlogs_endpoint(monkeypatch):
     assert seen == [[]]
 
 
-def test_fetch_and_process_logs_raises_on_rpc_error(monkeypatch):
-    """An RPC-level error in the getLogs response raises, so the poll loop
-    aborts the chunk and leaves the cursor un-advanced for re-fetch."""
+def test_fetch_and_process_logs_raises_on_rpc_error_after_retries(monkeypatch):
+    """An RPC-level error in the getLogs response raises (after exhausting
+    the per-call attempts), so the poll loop aborts the chunk and leaves the
+    cursor un-advanced for re-fetch."""
     p = _make_poller()
-    monkeypatch.setattr(
-        p, "_rpc_post",
-        lambda url, body, *, timeout_seconds:
-            b'{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"limit exceeded"}}',
-    )
-    with pytest.raises(InvariantError, match="getlogs_rpc_error"):
-        p._fetch_and_process_logs(100, 117)
+    calls = {"n": 0}
+
+    def _err_post(url, body, *, timeout_seconds):
+        calls["n"] += 1
+        return b'{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"limit exceeded"}}'
+
+    monkeypatch.setattr(p, "_rpc_post", _err_post)
+    with pytest.raises(InvariantError, match="rpc_error:eth_getLogs"):
+        p._fetch_and_process_logs(100, 117, attempts=2, abort_at=_far_abort_at())
+    assert calls["n"] == 2, "the failing call must be retried (attempts=2)"
+
+
+def test_fetch_and_process_logs_retry_recovers_transient_failure(monkeypatch):
+    """First attempt fails at transport level, second succeeds — the chunk
+    completes without raising (momentary-blip recovery)."""
+    p = _make_poller()
+    calls = {"n": 0}
+
+    def _flaky_post(url, body, *, timeout_seconds):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("momentary blip")
+        return b'{"jsonrpc":"2.0","id":1,"result":[]}'
+
+    monkeypatch.setattr(p, "_rpc_post", _flaky_post)
+    p._fetch_and_process_logs(100, 117, attempts=2, abort_at=_far_abort_at())
+    assert calls["n"] == 2
 
 
 def test_fetch_and_process_logs_raises_on_non_list_result(monkeypatch):
@@ -2032,7 +2071,25 @@ def test_fetch_and_process_logs_raises_on_non_list_result(monkeypatch):
         lambda url, body, *, timeout_seconds: b'{"jsonrpc":"2.0","id":1,"result":"0xdead"}',
     )
     with pytest.raises(InvariantError, match="getlogs_result_not_list"):
-        p._fetch_and_process_logs(100, 117)
+        p._fetch_and_process_logs(100, 117, attempts=1, abort_at=_far_abort_at())
+
+
+def test_fetch_and_process_logs_wall_cap_blocks_attempt_start(monkeypatch):
+    """An attempt whose timeout cannot complete before the wall cap is NOT
+    started — the cap is a hard bound by construction, not an advisory
+    check after the fact."""
+    import time as _t
+    p = _make_poller()
+    monkeypatch.setattr(
+        p, "_rpc_post",
+        lambda url, body, *, timeout_seconds: pytest.fail(
+            "attempt must not start past the wall cap"
+        ),
+    )
+    with pytest.raises(InvariantError, match="poll_wall_cap_exceeded"):
+        p._fetch_and_process_logs(
+            100, 117, attempts=2, abort_at=_t.monotonic(),  # cap already NOW
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2058,7 +2115,7 @@ def test_process_bet_logs_extracts_and_dedups(monkeypatch):
     conservative-direction invariant)."""
     p = _make_poller()
     p._current_epoch = 500                          # epoch gate: 500 / 501 allowed
-    monkeypatch.setattr(p, "_resolve_block_ts", lambda bn: 1)
+    monkeypatch.setattr(p, "_resolve_block_ts", lambda bn, **kw: 1)
     log = {**_bet_log(), "address": p._contract_addr}
     p._process_bet_logs([log])
     p._process_bet_logs([log])                      # same log again
@@ -2077,7 +2134,7 @@ def test_process_bet_logs_multi_block_range(monkeypatch):
     resolved: list = []
     monkeypatch.setattr(
         p, "_resolve_block_ts",
-        lambda bn: (resolved.append(bn), 1000 + bn)[1],
+        lambda bn, **kw: (resolved.append(bn), 1000 + bn)[1],
     )
     logs = [
         {**_bet_log(block=101, tx="0xa", log_idx="0x0"), "address": p._contract_addr},
@@ -2095,7 +2152,7 @@ def test_process_bet_logs_epoch_gate(monkeypatch):
     """Logs outside (current_epoch, current_epoch+1) are dropped by the gate."""
     p = _make_poller()
     p._current_epoch = 500
-    monkeypatch.setattr(p, "_resolve_block_ts", lambda bn: 1)
+    monkeypatch.setattr(p, "_resolve_block_ts", lambda bn, **kw: 1)
     old = {**_bet_log(epoch=498, tx="0xold"), "address": p._contract_addr}   # too old
     fut = {**_bet_log(epoch=502, tx="0xfut"), "address": p._contract_addr}   # too far ahead
     p._process_bet_logs([old, fut])
@@ -2109,7 +2166,7 @@ def test_process_bet_logs_ignores_non_bet_and_foreign(monkeypatch):
     the pool)."""
     p = _make_poller()
     p._current_epoch = 500
-    monkeypatch.setattr(p, "_resolve_block_ts", lambda bn: 1)
+    monkeypatch.setattr(p, "_resolve_block_ts", lambda bn, **kw: 1)
     foreign = {**_bet_log(tx="0xf"), "address": "0xdeadbeef"}                # wrong contract
     non_bet = {**_bet_log(tx="0xn"), "address": p._contract_addr,
                "topics": ["0x" + "9" * 64, "0x" + "0" * 64, hex(500)]}       # wrong topic0
@@ -2118,40 +2175,127 @@ def test_process_bet_logs_ignores_non_bet_and_foreign(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Bundle 5 v2 (2026-05-14): lazy block_ts resolution for bet-containing blocks
+# Lazy block_ts resolution for bet-containing blocks (bloXroute, retried)
 # ---------------------------------------------------------------------------
 
 def test_resolve_block_ts_caches_result_on_success(monkeypatch):
     """A successful header fetch caches the timestamp in _block_ts."""
     p = _make_poller()
     monkeypatch.setattr(
-        p, "_rpc_call_single",
-        lambda method, params: {"timestamp": hex(1778712807)},
+        p, "_bloxroute_call",
+        lambda method, params, **kw: {"timestamp": hex(1778712807)},
     )
     assert p._resolve_block_ts(100) == 1778712807
     assert p._block_ts.get(100) == 1778712807
 
 
 def test_resolve_block_ts_returns_zero_on_rpc_error(monkeypatch):
-    """RPC raises → return 0, no cache write."""
+    """RPC raises on every attempt → return 0, no cache write, no raise."""
     p = _make_poller()
 
-    def _raise(method, params):
+    def _raise(method, params, **kw):
         raise RuntimeError("rpc failed")
 
-    monkeypatch.setattr(p, "_rpc_call_single", _raise)
-    assert p._resolve_block_ts(100) == 0
+    monkeypatch.setattr(p, "_bloxroute_call", _raise)
+    assert p._resolve_block_ts(100, attempts=2) == 0
     assert 100 not in p._block_ts
+
+
+def test_resolve_block_ts_retry_recovers_transient_failure(monkeypatch):
+    """First attempt fails, second succeeds — the ingestion-time retry turns
+    a momentary blip into a resolved timestamp (no sizing-time drop)."""
+    p = _make_poller()
+    calls = {"n": 0}
+
+    def _flaky(method, params, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("momentary blip")
+        return {"timestamp": hex(1778712807)}
+
+    monkeypatch.setattr(p, "_bloxroute_call", _flaky)
+    assert p._resolve_block_ts(100, attempts=2) == 1778712807
+    assert calls["n"] == 2
+    assert p._block_ts.get(100) == 1778712807
 
 
 def test_resolve_block_ts_returns_zero_on_malformed_response(monkeypatch):
     """Response is not a dict or has bad timestamp → 0, no cache write."""
     p = _make_poller()
-    monkeypatch.setattr(p, "_rpc_call_single", lambda method, params: "not_a_dict")
+    monkeypatch.setattr(
+        p, "_bloxroute_call", lambda method, params, **kw: "not_a_dict",
+    )
     assert p._resolve_block_ts(100) == 0
-    monkeypatch.setattr(p, "_rpc_call_single",
-                        lambda method, params: {"timestamp": "0xZZ"})
+    monkeypatch.setattr(
+        p, "_bloxroute_call",
+        lambda method, params, **kw: {"timestamp": "0xZZ"},
+    )
     assert p._resolve_block_ts(101) == 0
     assert 101 not in p._block_ts
+
+
+def test_process_bet_logs_parallel_resolution_one_call_per_block(monkeypatch):
+    """The parallel block-ts wave fires exactly one resolve per unique
+    missing block, and every bet gets its block's timestamp."""
+    p = _make_poller()
+    p._current_epoch = 500
+    resolved: list = []
+
+    def _fake_resolve(bn, **kw):
+        resolved.append(bn)
+        ts = 1000 + bn
+        with p._lock:
+            p._block_ts[bn] = ts
+        return ts
+
+    monkeypatch.setattr(p, "_resolve_block_ts", _fake_resolve)
+    p._block_ts[300] = 1300  # pre-cached: must NOT be re-resolved
+    logs = [
+        {**_bet_log(block=101, tx="0xa", log_idx="0x0"), "address": p._contract_addr},
+        {**_bet_log(block=101, tx="0xb", log_idx="0x1"), "address": p._contract_addr},
+        {**_bet_log(block=205, tx="0xc", log_idx="0x0"), "address": p._contract_addr},
+        {**_bet_log(block=300, tx="0xd", log_idx="0x0"), "address": p._contract_addr},
+    ]
+    p._process_bet_logs(logs)
+    assert sorted(resolved) == [101, 205], (
+        "one resolve per unique MISSING block (cached 300 untouched)"
+    )
+    by_block = {b.block_number: b.block_ts for b in p._pools[500].bets}
+    assert by_block == {101: 1101, 205: 1205, 300: 1300}
+
+
+def test_process_bet_logs_wall_cap_pending_raises_and_appends_nothing(monkeypatch):
+    """If the wall cap expires while block-ts resolutions are still pending,
+    _process_bet_logs raises (caller aborts the chunk, cursor un-advanced)
+    and appends NO bets — a cap-abort loses the whole chunk cleanly, never a
+    partial append."""
+    import time as _t
+    p = _make_poller()
+    p._current_epoch = 500
+
+    def _slow_resolve(bn, **kw):
+        _t.sleep(0.5)  # far slower than the cap below
+        return 1
+
+    monkeypatch.setattr(p, "_resolve_block_ts", _slow_resolve)
+    log = {**_bet_log(block=101), "address": p._contract_addr}
+    with pytest.raises(InvariantError, match="poll_wall_cap_exceeded:block_ts"):
+        p._process_bet_logs(
+            [log], attempts=1, abort_at=_t.monotonic() + 0.05,
+        )
+    assert 500 not in p._pools, "no partial append on cap-abort"
+
+
+def test_process_bet_logs_unresolved_ts_still_appends_with_zero(monkeypatch):
+    """A block whose resolution fails (returns 0 after retries) still gets
+    its bets appended with block_ts=0 — the sizing-time drop + ALERT in
+    get_pool is the backstop, not a silent ingestion drop."""
+    p = _make_poller()
+    p._current_epoch = 500
+    monkeypatch.setattr(p, "_resolve_block_ts", lambda bn, **kw: 0)
+    log = {**_bet_log(block=101), "address": p._contract_addr}
+    p._process_bet_logs([log])
+    assert len(p._pools[500].bets) == 1
+    assert p._pools[500].bets[0].block_ts == 0
 
 
