@@ -53,8 +53,8 @@ pauses) — a 5s gap dwarfs every observed worst case (~50-200ms wallet
 RPC). See ``PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS`` for the rationale.
 
 Bundle 5 v2 (2026-05-14): the prior ``ntp_sync_wakeup_offset_ms`` is
-retired. The bot trusts the OS clock directly (Windows Time Service
-kept tight via MaxPollInterval=5; see README "W32Time prerequisite").
+retired. The bot trusts the OS clock directly (chrony-disciplined on
+the VM; see README "clock-sync prerequisite").
 ``NTP_WAKE_OFFSET_PRE_BANKROLL_MS`` and ``NTP_QUERY_TIME_P99_MS``
 constants are deleted along with this retirement.
 
@@ -547,8 +547,8 @@ OKX_WARMUP_WAKEUP_OFFSET_BEFORE_LOCK_MS: int = 7000
 
 # Bundle 5 v2 (2026-05-14): ``NTP_QUERY_TIME_P99_MS`` and
 # ``NTP_WAKE_OFFSET_PRE_BANKROLL_MS`` are retired alongside the
-# application-level NTP layer. The bot trusts the OS clock (W32Time
-# tightening per README).
+# application-level NTP layer. The bot trusts the OS clock
+# (chrony-disciplined on the VM, per README).
 
 
 # --- Static buffers --------------------------------------------------------

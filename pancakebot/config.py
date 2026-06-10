@@ -831,8 +831,8 @@ def load_app_config(path: str) -> AppConfig:
         _tc.OKX_WARMUP_WAKEUP_OFFSET_BEFORE_LOCK_MS
     )
     # Bundle 5 v2 (2026-05-14): ``ntp_sync_wakeup_offset_ms`` retired.
-    # The bot trusts the OS clock directly (W32Time tightening per
-    # README); no application-level NTP wake is scheduled.
+    # The bot trusts the OS clock directly (chrony-disciplined on the
+    # VM, per README); no application-level NTP wake is scheduled.
 
     # --- RPC poll wake schedule (Era 11: 2026-05-07 pivot; Candidate C
     # single-poll: 2026-06-06) ---

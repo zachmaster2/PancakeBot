@@ -32,28 +32,32 @@ class RuntimeConfig:
     # Pre-lock wake schedule (all DERIVED from pancakebot/timing_constants.py
     # at config load; not user-tunable). All in milliseconds before lock_at.
     #
-    # Chronological order (lock - X ms; bigger X = earlier in the round):
+    # Chronological order at canonical constants (lock - X ms; bigger X =
+    # earlier in the round):
     #   okx_warmup     (lock -  7.000s)   <-- OKX TLS warmup (off critical path)
-    #   preflight      (lock -  5.970s)   <-- wallet balance + nonce/gas prefetch
-    #   single_poll    (lock -  4.750s)   <-- Candidate C RPC catch-up (2026-06-06)
-    #   anchor_poll    (lock -  1.300s)   <-- Bundle 5 v2 single anchor poll (200ms timeout)
-    #   critical_path  (lock -  0.970s)
-    #   bet_submit     (lock -  0.625s)   <-- timing-guard deadline (static fallback)
+    #   preflight      (lock -  6.195s)   <-- wallet balance + nonce/gas prefetch
+    #   single_poll    (lock -  2.500s)   <-- fixed rail; getLogs catch-up (Era 12)
+    #   anchor_poll    (lock -  1.500s)   <-- Bundle 5 v2 single anchor poll (200ms timeout)
+    #   critical_path  (lock -  1.195s)
+    #   bet_submit     (lock -  0.789s)   <-- timing-guard deadline (static fallback)
     #
     # Candidate C (2026-06-06): the 3-leg ramp ladder (ramp_1/ramp_2/final)
-    # collapsed to ONE batched poll at the old final-poll slot. The retained
-    # 8s periodic poll keeps the cursor within ~1 interval, so the single poll
-    # only catches up the ~5-20 blocks since the last periodic. All offsets are
-    # strictly decreasing; engine.py validates the ordering at startup.
+    # collapsed to ONE catch-up poll; the 2026-06-06 VM re-baseline pinned it
+    # to the fixed 2500ms rail. The retained 8s periodic poll keeps the cursor
+    # within ~1 interval, so the single poll only catches up the ~5-20 blocks
+    # since the last periodic. All offsets are strictly decreasing; engine.py
+    # validates the ordering at startup, and config.py brackets the rail with
+    # the CAPTURE + COMPLETION + ANCHOR-CLEARANCE invariants.
     #
     # Bundle 5 v2 (2026-05-14): the ``ntp_sync_wake`` (formerly at
     # lock - 11.095s) is retired. The bot trusts the OS clock directly
-    # (W32Time tightening per README); no application-level NTP layer.
+    # (chrony-disciplined on the VM, see README); no application-level NTP
+    # layer.
     #
     # preflight_wake refreshes wallet balance (live: BSC RPC; dry: in-memory).
-    # single_poll (Candidate C, 2026-06-06) is ONE batched eth_getBlockReceipts
-    #   catch-up before the critical path (replaced the 3-leg ramp ladder); the
-    #   retained 8s periodic poll keeps the snapshot fresh between rounds.
+    # single_poll is ONE eth_getLogs range catch-up against bloXroute (Era
+    #   12b: the single read endpoint) before the critical path; the retained
+    #   8s periodic poll keeps the cursor fresh between rounds.
     # critical_path_wake reads the local pool aggregate, runs the gate,
     #   and submits the bet.
     single_poll_wakeup_offset_before_lock_ms: int
@@ -107,8 +111,9 @@ class RuntimeConfig:
     # Strategy config (10 knobs; loaded from config.toml [strategy.*] sections)
     strategy: StrategyConfig
 
-    # RPC poller: periodic + ramp + final batched-RPC polls of
-    # PredictionV2 BetBull/BetBear events. Era 11 (2026-05-07) replaced
+    # RPC poller: periodic + engine-driven single getLogs polls of
+    # PredictionV2 BetBull/BetBear events against the single bloXroute
+    # read endpoint (Era 12b, 2026-06-10). Era 11 (2026-05-07) replaced
     # the WSS-subscription PoolEventWatcher with this deterministic
     # poll model. Same get_pool / set_round_phase / is_pool_ready
     # interface so the engine call sites are minimally affected.

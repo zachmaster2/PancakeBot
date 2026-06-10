@@ -28,6 +28,18 @@ done
 systemctl daemon-reload
 log "systemd units removed"
 
+# chrony drop-in (install.sh STEP 6): remove the drop-in + the confdir
+# include line it appended, then restart chronyd back onto distro defaults.
+if [ -f /etc/chrony.d/pancakebot.conf ]; then
+    rm -f /etc/chrony.d/pancakebot.conf
+    rmdir /etc/chrony.d 2>/dev/null || true
+    sed -i '\#^confdir /etc/chrony.d$#d' /etc/chrony.conf
+    systemctl restart chronyd 2>/dev/null || true
+    log "chrony drop-in removed; chronyd restarted on distro defaults"
+else
+    log "chrony drop-in not present; skipping"
+fi
+
 if [ "$PURGE" = "1" ]; then
     log "--purge: removing venv + EnvironmentFile (NOT var/ state or config.toml)"
     rm -rf "$REPO_ROOT/.venv"
