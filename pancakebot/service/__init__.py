@@ -9,5 +9,5 @@ executor, the one module here). See docs/SUPERVISOR.md.
 
 The retired Python supervisor stack (SupervisorCore, the ServicePlatform
 adapters, ``supervise.py``) lives in the offline archive,
-``Downloads/OLD/pancakebot_old/``.
+``Downloads/OLD/pancakebot/2026_06_10_phase3_repo_archive/``.
 """
