@@ -77,6 +77,13 @@ on BOTH sides:
            - RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS
         (else ``single_poll_fires_before_cutoff_available``)
 
+    anchor clearance (a wall-cap-bound poll must release the engine
+    thread before the anchor poll fires):
+        RPC_POLL_WALL_CAP_SINGLE_MS + RPC_POLL_TAIL_MARGIN_MS
+        <= single_poll_wakeup_offset_before_lock_ms
+           - ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS
+        (else ``single_poll_wall_cap_collides_with_anchor``)
+
     Candidate C (2026-06-06): ONE batched poll before the critical-path
     wake. The 2026-06-06 VM re-baseline moved the rail 4750 -> 2500ms (the
     VM RPC-RTT table makes the completion budget comfortable). The prior
@@ -387,6 +394,46 @@ RPC_POLL_FINAL_TO_CRITICAL_PATH_SAFETY_MS: int = 200
 # (pool_not_ready_catchup_infeasible_for_round) is the canonical
 # integrating signal. Engineering judgment.
 RPC_POLL_DEADLINE_SAFETY_BUFFER_MS: int = 200
+
+# -- Poll wall-clock caps (Era 12b, 2026-06-10): hard bound on one whole
+# poll operation (head fetch + getLogs chunks + block-ts resolution,
+# including all retries). RpcPoller._poll_now enforces them BEFORE each RPC
+# attempt ("would this attempt's timeout overrun the cap?"), and each
+# attempt's wall time is itself bounded by the socket-level total= budget
+# in _rpc_post — so a poll cannot run materially past its cap (residual:
+# the post-attempt JSON-parse/append/log tail, covered by
+# RPC_POLL_TAIL_MARGIN_MS below). On cap-abort mid-chunk the cursor is NOT
+# advanced past that chunk; the next poll re-fetches the same range, and if
+# coverage is short at decision time F0 skips the round.
+#
+# SINGLE: the single poll runs synchronously on the engine thread between
+# its wake (lock - SINGLE_POLL_WAKEUP_OFFSET) and the anchor poll fire
+# (lock - ANCHOR_POLL_OFFSET) — the anchor is the next downstream event,
+# so the available gap is
+#   SINGLE_POLL_WAKEUP_OFFSET - ANCHOR_POLL_OFFSET = 2500 - 1500 = 1000ms
+# and the cap is that gap minus the processing tail: 1000 - 50 = 950.
+# Every ms a capped poll runs past the gap delays the anchor 1:1 and eats
+# the critical path's slack. The ANCHOR-CLEARANCE startup invariant in
+# config.py pins cap + tail <= gap, and the engine derives its
+# single_poll deadline_ms from the SAME expression — change the rail, the
+# anchor offset, or this cap and the invariant fires (co-update
+# discipline; the pre-2026-06-10 engine derivation keyed to critical_path
+# instead, yielding a 1105ms budget against the real 1000ms gap — the
+# masked adjacency the Era 12b review caught).
+#
+# PERIODIC: must release _poll_lock well inside the 8s cadence so ticks
+# never pile up and the single poll's wake finds the lock free
+# (_compute_periodic_timeout's safe_fire_latest assumes this cap as the
+# worst-case hold).
+RPC_POLL_WALL_CAP_SINGLE_MS: int = 950
+RPC_POLL_WALL_CAP_PERIODIC_MS: int = 4000
+
+# Post-cap processing tail: the work after a poll's last RPC attempt
+# returns (final JSON parse outside the socket window, phase-3 bet
+# appends under the lock, stats + log I/O). Measured ~1-10ms in spec; 50
+# covers pathological GC/scheduler pauses. Participates in the
+# ANCHOR-CLEARANCE invariant and the engine's single-poll deadline.
+RPC_POLL_TAIL_MARGIN_MS: int = 50
 
 # Expected batch size used to derive the single-poll wake offset's rtt_p99
 # lookup (in the startup invariant). Candidate C (2026-06-06) replaced the

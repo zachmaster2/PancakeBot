@@ -37,11 +37,11 @@ The poller has three trigger paths:
    ``_latch_first_successful_poll_locked``; until then
    ``is_pool_ready`` returns ``cold_start_in_progress``. Off the
    critical path; failures are non-fatal (next periodic poll retries).
-   Wall-clock cap ``_POLL_WALL_CAP_PERIODIC_MS`` bounds each tick.
+   Wall-clock cap ``RPC_POLL_WALL_CAP_PERIODIC_MS`` bounds each tick.
 
 3. **Single poll** — engine-driven catch-up before the critical path
    (Candidate C, 2026-06-06), called from the wake schedule.
-   Synchronous; wall-clock capped at ``_POLL_WALL_CAP_SINGLE_MS`` (no
+   Synchronous; wall-clock capped at ``RPC_POLL_WALL_CAP_SINGLE_MS`` (no
    single RPC attempt is even STARTED unless it can finish inside the
    cap, so the engine's downstream anchor/submit budget is protected
    by construction). RTT-exceeds-cap marks ``_last_poll_too_slow=True``
@@ -151,38 +151,22 @@ _BLX_RETRY_BACKOFF_MS: int = 25
 _ANCHOR_STALENESS_MS: int = 1350
 
 # Per-call-site attempt counts, derived from each site's time budget:
-# the single poll runs inside the lock-2500ms -> critical-path window (wall
-# cap 1000ms below), so one retry per call is all the budget affords; the
-# periodic poll has the 8s interval (wall cap 4000ms), affording two.
+# the single poll runs inside the lock-2500ms -> anchor-poll window (wall
+# cap RPC_POLL_WALL_CAP_SINGLE_MS = 950ms), so one retry per call is all
+# the budget affords; the periodic poll has the 8s interval (wall cap
+# 4000ms), affording two.
 # Sustained failure is NOT the retries' job — that is the wall cap +
 # feasibility check + F0 gate, which skip the round cleanly.
 _RPC_ATTEMPTS_SINGLE: int = 2
 _RPC_ATTEMPTS_PERIODIC: int = 3
 
-# -- Wall-clock caps: hard bound on one whole poll operation (head fetch +
-# getLogs chunks + block-ts resolution, including all retries). Enforced
-# BEFORE each RPC attempt ("would this attempt's timeout overrun the cap?"),
-# and each attempt's wall time is itself bounded by the socket-level
-# total= budget in _rpc_post — so a poll cannot run materially past its
-# cap (residual: the post-attempt JSON-parse/append/log tail, covered by
-# the explicit tail margins below).
-#   single:   fires at lock - single_poll_offset (2500ms canonical); must
-#             leave the anchor poll (lock - ANCHOR_POLL_OFFSET = 1500ms)
-#             + critical path intact. 950 = 2500 - 1500 - 50ms tail margin
-#             (the cap bounds RPC attempts via the socket total= budget;
-#             the residual JSON-parse/append/log tail after the last
-#             attempt is what the 50ms covers). Also < the engine's
-#             deadline_ms budget (~1105ms canonical); _poll_now takes
-#             min(deadline_ms, cap) so a tighter engine budget always wins.
-#   periodic: must release _poll_lock well inside the 8s cadence so ticks
-#             never pile up and the single poll's wake finds the lock free
-#             (see _compute_periodic_timeout's safe_fire_latest, which
-#             assumes this cap as the worst-case hold).
-# On cap-abort mid-chunk the cursor is NOT advanced past that chunk; the next
-# poll re-fetches the same range, and if coverage is short at decision time
-# F0 skips the round.
-_POLL_WALL_CAP_SINGLE_MS: int = 950
-_POLL_WALL_CAP_PERIODIC_MS: int = 4000
+# (The poll wall caps live in timing_constants — RPC_POLL_WALL_CAP_SINGLE_MS
+# / RPC_POLL_WALL_CAP_PERIODIC_MS / RPC_POLL_TAIL_MARGIN_MS — because they
+# participate in the cross-module ANCHOR-CLEARANCE startup invariant in
+# config.py and the engine's single-poll deadline derivation. Full
+# derivation + cap-abort semantics documented there; _poll_now enforces
+# them pre-attempt and takes min(deadline_ms, cap) so a tighter engine
+# budget always wins.)
 
 # Parallel block-ts resolution fan-out width. The single poll's chunk can
 # carry up to ~20 unique bet blocks; resolving serially would put K
@@ -822,7 +806,8 @@ class RpcPoller:
              f"RPC poller started endpoint={RPC_BLOXROUTE_ENDPOINT} "
              f"periodic={self._periodic_poll_interval_s}s "
              f"getlogs_chunk={_GETLOGS_CHUNK_BLOCKS} "
-             f"wall_caps={_POLL_WALL_CAP_SINGLE_MS}/{_POLL_WALL_CAP_PERIODIC_MS}ms")
+             f"wall_caps={_tc.RPC_POLL_WALL_CAP_SINGLE_MS}/"
+             f"{_tc.RPC_POLL_WALL_CAP_PERIODIC_MS}ms")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -1535,12 +1520,12 @@ class RpcPoller:
         # Latest moment a worst-case periodic poll can BEGIN and still
         # finish before the single-poll window opens. The wall-clock cap
         # bounds a periodic poll's _poll_lock hold to
-        # _POLL_WALL_CAP_PERIODIC_MS by construction (no attempt starts
+        # RPC_POLL_WALL_CAP_PERIODIC_MS by construction (no attempt starts
         # unless its timeout fits the cap); firing later than this would
         # leave the lock held when the single poll wakes.
         safe_fire_latest = (
             single_poll_window_start
-            - _POLL_WALL_CAP_PERIODIC_MS / 1000.0
+            - _tc.RPC_POLL_WALL_CAP_PERIODIC_MS / 1000.0
             - _tc.RPC_PERIODIC_TO_SINGLE_POLL_SAFETY_BUFFER_SECONDS
         )
         k = max(1, int((now - round_open) // period) + 1)
@@ -1599,8 +1584,8 @@ class RpcPoller:
         in eth_getLogs ranges of _GETLOGS_CHUNK_BLOCKS, until caught up to
         bloXroute's head.
 
-        Wall-clock capped (``_POLL_WALL_CAP_SINGLE_MS`` /
-        ``_POLL_WALL_CAP_PERIODIC_MS``, further tightened by ``deadline_ms``
+        Wall-clock capped (``RPC_POLL_WALL_CAP_SINGLE_MS`` /
+        ``RPC_POLL_WALL_CAP_PERIODIC_MS``, further tightened by ``deadline_ms``
         when the engine passes one): no RPC attempt is started unless its
         timeout fits inside the cap, and each attempt's wall time is bounded
         by the socket total= budget — the poll's duration is capped up to a
@@ -1633,7 +1618,10 @@ class RpcPoller:
             t_start = time.time()
             is_single = label == "single"
             attempts = _RPC_ATTEMPTS_SINGLE if is_single else _RPC_ATTEMPTS_PERIODIC
-            cap_ms = _POLL_WALL_CAP_SINGLE_MS if is_single else _POLL_WALL_CAP_PERIODIC_MS
+            cap_ms = (
+                _tc.RPC_POLL_WALL_CAP_SINGLE_MS if is_single
+                else _tc.RPC_POLL_WALL_CAP_PERIODIC_MS
+            )
             if deadline_ms > 0:
                 cap_ms = min(cap_ms, deadline_ms)
             abort_at = time.monotonic() + cap_ms / 1000.0
