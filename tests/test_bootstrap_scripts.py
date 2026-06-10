@@ -109,11 +109,16 @@ def test_py_helper_compiles(helper):
 # -- pure-logic checks -----------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not (_REPO_ROOT / ".env").exists(),
+    reason="repo-root .env exists only on the dev host (the VM keeps "
+           "secrets in /etc/pancakebot/*.env via EnvironmentFile)",
+)
 def test_config_check_passes_on_real_repo():
     sys.path.insert(0, str(_BOOT))
     from common import config_check
-    # Real repo has config.toml (tracked) + .env (local). Webhooks may warn but
-    # are not blockers.
+    # Dev-host repo has config.toml (tracked) + .env (local). Webhooks may
+    # warn but are not blockers.
     blockers = config_check.check(repo_root=_REPO_ROOT, env={})
     assert blockers == [], f"unexpected blockers: {blockers}"
 
