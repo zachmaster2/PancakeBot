@@ -1,21 +1,21 @@
-# OKX kline lag — actual root cause is CLOCK SKEW, not connection affinity
+﻿# OKX kline lag â€” actual root cause is CLOCK SKEW, not connection affinity
 
 ## TL;DR
 
 The hypothesis "connection-reuse-induced backend affinity" was **partially
 right and partially wrong**:
 
-- ✓ It correctly diagnosed the **stuck-cache mode** (5.8% of pre-fix rounds,
+- âœ“ It correctly diagnosed the **stuck-cache mode** (5.8% of pre-fix rounds,
   306s+ same-response-served-across-rounds). Commit `6767e85` (per-round
   warmup session reset) eliminated this entirely.
 
-- ✗ It was **wrong about the 1-3s lag mode** (75% of pre-fix rounds).
+- âœ— It was **wrong about the 1-3s lag mode** (75% of pre-fix rounds).
   The dominant cause is **system clock skew**: the bot's local clock
   is 1.6-2.3s AHEAD of OKX's clock, so `time.time()`-based fetch
   scheduling causes the bot to query OKX BEFORE the requested window
   has had time to materialize in OKX's frame.
 
-The bot CANNOT compensate for this skew in code — the timing budget
+The bot CANNOT compensate for this skew in code â€” the timing budget
 between `cutoff + 0.25s` (fetch) and `lock - 1s` (safety margin) is
 0.75s in local time, while skew is 2.3s. **The system clock must be
 synchronized.**
@@ -33,7 +33,7 @@ Initial diagnostic A/B (`research/okx_connection_ab.py`) showed:
 
 This LOOKED like fresh-conn fixed the lag. But the probe asks OKX for
 "latest 1 candle" without an `after=` parameter, which returns the
-in-progress candle (close_time = now, lag ≈ 0). So fresh-conn vs
+in-progress candle (close_time = now, lag â‰ˆ 0). So fresh-conn vs
 session-reuse only measured the secondary effect of stuck-routing,
 not the primary effect that affects the bot.
 
@@ -44,24 +44,24 @@ Two fix attempts deployed and measured:
   | revision | n | any-lag | mean | stuck-cache |
   |---|---:|---:|---:|---:|
   | pre-fix | 145 | 76.6% | 1000ms median | 5.5% (8 events) |
-  | 6767e85 (per-round reset) | 17 | 100% | 1765ms | 0% ✓ |
-  | 27e8e36 (per-fetch fresh) | 7 | 100% | 2000ms | 0% ✓ |
+  | 6767e85 (per-round reset) | 17 | 100% | 1765ms | 0% âœ“ |
+  | 27e8e36 (per-fetch fresh) | 7 | 100% | 2000ms | 0% âœ“ |
 
-**Stuck-cache eliminated** (real win — 0% post-fix vs 5.5% pre-fix),
+**Stuck-cache eliminated** (real win â€” 0% post-fix vs 5.5% pre-fix),
 but 1-3s lag persists at higher rate after the fixes than before.
 
 ### Phase 3: Parallel-probe variant D matches bot pattern
 
 Modified the probe to use the bot's exact pattern:
 parallel-3 fetches with fresh sessions and `after=` parameter
-(`research/okx_parallel_probe.py`):
+(probe script not retained in-repo; the surviving companion from this investigation is `research/okx_artificial_delay_probe.py`):
 
   | variant | n | mean | p50 | max |
   |---|---:|---:|---:|---:|
   | C: parallel-3 BTC fresh, no after= | 15 | +164ms | +271 | +1441 |
   | **D: parallel-3 fresh + after= (FULL bot pattern)** | 15 | **+351ms** | +394 | +1604 |
 
-Probe D shows mean lag 351ms — much LOWER than bot's measured 2000ms.
+Probe D shows mean lag 351ms â€” much LOWER than bot's measured 2000ms.
 Discrepancy: ~1650ms.
 
 ### Phase 4: Clock skew accounting
@@ -136,25 +136,25 @@ rearchitecting the timing pipeline.**
 ## What Phase 1-3 fixes accomplished
 
 `6767e85` (per-round `OkxClient.warmup()` session reset):
-- ✓ **Eliminated stuck-cache mode** (0/24 post-fix vs 8/145 pre-fix).
+- âœ“ **Eliminated stuck-cache mode** (0/24 post-fix vs 8/145 pre-fix).
   This was a real, separate problem from the skew issue. KEEP.
 
 `27e8e36` (per-fetch fresh Session in `fetch_1s_klines`):
-- ✗ No measurable benefit (1-3s lag mode unchanged at 100%).
-- ✗ Adds ~150ms TLS handshake overhead per fetch.
+- âœ— No measurable benefit (1-3s lag mode unchanged at 100%).
+- âœ— Adds ~150ms TLS handshake overhead per fetch.
 - **REVERTED** in commit `d93cb22`.
 
 `1cb2b20` (opt-in OKX header capture):
-- ✓ Diagnostic infrastructure, no behavior change. KEEP.
+- âœ“ Diagnostic infrastructure, no behavior change. KEEP.
 
 `ec5605e` (kline capture infrastructure):
-- ✓ Foundation for divergence A/B analysis. KEEP.
+- âœ“ Foundation for divergence A/B analysis. KEEP.
 
 `dd14ec6` (`--kline-source captured` backtest replay):
-- ✓ Foundation for divergence A/B analysis. KEEP.
+- âœ“ Foundation for divergence A/B analysis. KEEP.
 
 `eeaad8f` (`archive_lingering_crash_file` always-archive policy):
-- ✓ Independent fix for false-CRASHED supervisor incident. KEEP.
+- âœ“ Independent fix for false-CRASHED supervisor incident. KEEP.
 
 ## Recommended fix path
 
@@ -162,7 +162,7 @@ The clock-skew root cause needs an **environmental fix** (sync the
 system clock) or a **deeper architectural change** (anchor scheduling
 to OKX time or BSC chain time, not local time).
 
-### Option 1: Sync the system clock (RECOMMENDED — simplest)
+### Option 1: Sync the system clock (RECOMMENDED â€” simplest)
 
 ```powershell
 # As Administrator:
@@ -217,7 +217,7 @@ of which other path is chosen.
 
 If clock sync isn't an option (e.g. server policy forbids it), then
 the strategy needs a fundamental redesign that doesn't depend on
-1-second-fresh OKX data — likely WSS subscription or different data
+1-second-fresh OKX data â€” likely WSS subscription or different data
 source.
 
 ## Surface to user

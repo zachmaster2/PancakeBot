@@ -1,9 +1,10 @@
 """One-shot test-message poster for the 3 PancakeBot Discord webhooks.
 
-Reads the three Machine-level env vars the supervisor uses and POSTs a
-distinguishable test payload to each. Run manually once after setting
-up the webhooks; user confirms each channel receives its test message
-before we flip schtasks to --alert.
+Reads the three PANCAKEBOT_*_DISCORD_WEBHOOK_URL env vars the supervisor
+uses (on the VM they come from /etc/pancakebot/pancakebot.env) and POSTs
+a distinguishable test payload to each. Run manually once after setting
+up the webhooks; confirm each channel receives its test message before
+relying on the alert taxonomy.
 
 Usage:
     python scripts/_smoke_discord_send_test.py
