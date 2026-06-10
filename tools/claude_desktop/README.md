@@ -5,7 +5,7 @@ watches/manages the bot) alive on the Windows machine. The BOT itself runs
 on the Frankfurt Linux VM and needs none of this — see `bootstrap/` for the
 bot's install path. Split out of `bootstrap/windows/` + `scripts/` in
 Phase 3c-1 (2026-06-10) when the Windows-bot-service cluster was archived
-to `Downloads/OLD/pancakebot_old/`.
+to `Downloads/OLD/pancakebot/2026_06_10_phase3_repo_archive/`.
 
 | File | Purpose |
 |---|---|

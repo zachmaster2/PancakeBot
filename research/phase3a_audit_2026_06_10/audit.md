@@ -2,7 +2,7 @@
 
 **Method.** Inventory of every file at every visibility level on BOTH hosts: Windows (canonical git clone, `master` @ `b3b06db`) and the Frankfurt VM (`/root/pancakebot`, now a git worktree of `/srv/pancakebot.git` via push-to-deploy). Tracked sync is verified by git itself (worktree status); untracked/ignored cross-host comparisons use CR-normalized SHA-1. READ-ONLY: nothing was moved, deleted, or committed by this audit.
 
-**Action legend.** KEEP = current, no action. COMMIT = untracked file that belongs in git (KEEP-equivalent for untracked). ARCHIVE = move to `Downloads/OLD/pancakebot_old/` (preserve directory structure). UPDATE = content fix needed (flagged, separate work). CONSOLIDATE = merge/move within the repo docs structure. DELETE = no archival value. TBD = owner decision.
+**Action legend.** KEEP = current, no action. COMMIT = untracked file that belongs in git (KEEP-equivalent for untracked). ARCHIVE = move to `Downloads/OLD/pancakebot/2026_06_10_phase3_repo_archive/` (preserve directory structure). UPDATE = content fix needed (flagged, separate work). CONSOLIDATE = merge/move within the repo docs structure. DELETE = no archival value. TBD = owner decision.
 
 ## Executive summary
 
@@ -283,7 +283,7 @@ Four dead entries (`old_experiments_scripts_tests.zip`, `AUTONOMY_DIRECTIVE.md`,
    - `scripts/setup_autologon.ps1` — the real implementation; the `bootstrap/windows/setup_autologon.ps1` WRAPPER folds into it (they are wrapper+implementation, NOT duplicates — verified)
    - `scripts/notify_user_followup.py` + `scripts/notify_user_mark_answered.py`
    - NEW note needed: Autologon.exe provisioning loses its home (was auto-downloaded by the archived `install_services.ps1`)
-3. **Archive `Downloads/OLD/pancakebot_old/`** (preserve structure): the Windows-bot-service cluster (13 files, import-coupling verified): `pancakebot/service/{windows_platform,common,live_service,dry_service}.py`, `bootstrap/windows/setup_service.py`, `bootstrap/{install,uninstall}.ps1`, `scripts/{install,uninstall}_services.ps1`, `scripts/{enable,disable}_{live,dry}.ps1`; plus `bootstrap/MIGRATION.md`, the Windows test splits, the 31 ARCHIVE-tracked files (1a), the 2b untracked set, and the section-3 old logs.
+3. **Archive `Downloads/OLD/pancakebot/2026_06_10_phase3_repo_archive/`** (preserve structure): the Windows-bot-service cluster (13 files, import-coupling verified): `pancakebot/service/{windows_platform,common,live_service,dry_service}.py`, `bootstrap/windows/setup_service.py`, `bootstrap/{install,uninstall}.ps1`, `scripts/{install,uninstall}_services.ps1`, `scripts/{enable,disable}_{live,dry}.ps1`; plus `bootstrap/MIGRATION.md`, the Windows test splits, the 31 ARCHIVE-tracked files (1a), the 2b untracked set, and the section-3 old logs.
 
 **Code/test follow-ups the moves force** (must land in the SAME commit): `service/__init__.py` + `service/supervise.py` win32 branches; `tests/test_service_lifecycle.py` (3 Windows tests: L330/L349/L490); `tests/test_service_platform.py` (~9 skipif-Windows tests, L125-292); `tests/test_bootstrap_scripts.py` (existence-asserts the exact archived/moved paths — WILL fail post-move otherwise).
 
@@ -298,7 +298,7 @@ Four dead entries (`old_experiments_scripts_tests.zip`, `AUTONOMY_DIRECTIVE.md`,
 
 1. COMMIT batch (2a, 12 files — pull the 2 VM-only summaries back first).
 2. DELETE batch on the VM (2c, 8 files; `shred -u` the .env.bak) + resolve the TBD wallet file (2d).
-3. ARCHIVE batch (1a + 2b + section-3 logs) -> `Downloads/OLD/pancakebot_old/` preserving structure, then `git rm` the tracked ones.
+3. ARCHIVE batch (1a + 2b + section-3 logs) -> `Downloads/OLD/pancakebot/2026_06_10_phase3_repo_archive/` preserving structure, then `git rm` the tracked ones.
 4. Restructure (section 4) + the forced test/code updates in the SAME commit.
 5. UPDATE batch (1b + findings 1-3).
 6. 3d verification: `git status` clean on both hosts; ignored = var/.venv (+.env/.idea per call).

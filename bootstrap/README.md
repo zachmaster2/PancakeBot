@@ -7,7 +7,7 @@ systemd units are tracked files under `linux/systemd/`, installed verbatim
 
 Phase 3c-1 (2026-06-10): this directory is Linux-bot-only. The Windows-bot
 service installers (SCM/pywin32) and the retired Python supervisor stack
-live in the offline archive (`Downloads/OLD/pancakebot_old/`); the Claude
+live in the offline archive (`Downloads/OLD/pancakebot/2026_06_10_phase3_repo_archive/`); the Claude
 operator-desktop scaffolding (autologon, elevated launcher, AUMID stamper
 notes) lives in `tools/claude_desktop/`.
 
