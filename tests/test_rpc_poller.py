@@ -293,9 +293,9 @@ def test_set_round_phase_same_epoch_same_lock_at_is_noop():
 def test_set_round_phase_advancing_epoch_drops_past_round_pools(monkeypatch):
     """When epoch advances, past-round pool entries are dropped (covers
     both the normal advance case AND the multi-round skip case where
-    intermediate epochs were never set as current). The newly-introduced
-    _on_epoch_advance hook is mocked here — its own behavior is covered
-    by dedicated tests below."""
+    intermediate epochs were never set as current). The drop is committed
+    inside _on_epoch_advance's atomic round-transition section, so this
+    runs the REAL hook with its RPCs stubbed."""
     p = _make_poller()
     p._current_epoch = 100
     p._lock_at = 1000
@@ -315,8 +315,12 @@ def test_set_round_phase_advancing_epoch_drops_past_round_pools(monkeypatch):
     p._processed_bet_log_ids[100] = {"b:0"}
     p._processed_bet_log_ids[101] = set()
 
-    # Don't actually try to fetch from test.example.com.
-    monkeypatch.setattr(p, "_on_epoch_advance", lambda **kw: None)
+    # Stub the hook's RPCs (no network).
+    monkeypatch.setattr(p, "_compute_round_start_block", lambda ts: None)
+    monkeypatch.setattr(
+        p, "_bloxroute_block_number",
+        lambda **kw: (_ for _ in ()).throw(RuntimeError("no network")),
+    )
 
     p.set_round_phase(current_epoch=101, lock_at=2000)
 
@@ -326,52 +330,19 @@ def test_set_round_phase_advancing_epoch_drops_past_round_pools(monkeypatch):
     assert 99 not in p._processed_bet_log_ids
     assert 100 not in p._processed_bet_log_ids
     assert 101 in p._processed_bet_log_ids
+    assert p._current_epoch == 101 and p._lock_at == 2000
 
 
 # ---------------------------------------------------------------------------
-# _compute_round_start_block (cache-first, RPC fallback)
+# _compute_round_start_block (always-RPC, ms-precise, errs early)
 # ---------------------------------------------------------------------------
 
-def test_compute_round_start_block_uses_cache_when_available():
-    """If _block_ts has a recent-enough anchor, no RPC call needed.
-
-    Bundle 4 (2026-05-14): block-time divisor is BSC_BLOCK_TIME_MS=450
-    (post-Lorentz empirical), down from 500. With a 30s anchor delta,
-    blocks-ahead = round(30000/450) = 67 (was 60 with 500ms divisor).
-    """
-    p = _make_poller()
-    target_ts = 10_000  # Unix-second-ish
-    # Anchor 30s before target with block 5000.
-    p._block_ts[5000] = target_ts - 30
-    rs = p._compute_round_start_block(target_ts)
-    # 30s * 1000 / 450ms_per_block = round(66.67) = 67 blocks ahead of anchor.
-    assert rs == 5000 + 67
-
-
-def test_compute_round_start_block_rejects_stale_anchor():
-    """If the cached anchor is more than 60s before round_start_ts,
-    cache is rejected; falls through to RPC."""
-    p = _make_poller()
-    target_ts = 10_000
-    p._block_ts[5000] = target_ts - 120  # 120s old, too stale
-    # No mock for RPC -> should return None (RPC fails to test.example.com).
-    # We mock the helper to confirm it's invoked.
-    invoked = {"n": 0}
-
-    def fake_header(**kw):
-        invoked["n"] += 1
-        return (10000, target_ts + 10, None)
-
-    p._bloxroute_latest_header = fake_header  # type: ignore[assignment]
-    rs = p._compute_round_start_block(target_ts)
-    # Bundle 4: head_ts = target+10 -> 10s back -> round(10000/450)=22
-    # blocks back from 10000 = 9978 (was 9980 with 500ms divisor).
-    assert rs == 9978
-    assert invoked["n"] == 1, "RPC fallback should have been invoked"
-
-
-def test_compute_round_start_block_falls_back_to_rpc_when_cache_empty():
-    """Empty cache forces the RPC path."""
+def test_compute_round_start_block_seconds_fallback_errs_early():
+    """Seconds-granularity header (no BEP-520 ms): ceil + 3-block margin —
+    the truncated head timestamp can hide up to ~950ms (~2.1 blocks) of
+    span, and the estimate must land at-or-before the true round-start
+    block (an overshoot would silently skip the round's earliest bets,
+    invisible to F0's one-sided coverage check)."""
     p = _make_poller()
 
     def fake_header(**kw):
@@ -379,10 +350,63 @@ def test_compute_round_start_block_falls_back_to_rpc_when_cache_empty():
 
     p._bloxroute_latest_header = fake_header  # type: ignore[assignment]
     rs = p._compute_round_start_block(round_start_ts=49_000)
-    # Bundle 4: delta_seconds = 50000 - 49000 = 1000s -> round(1_000_000/450) = 2222
-    # blocks at 450ms/block. round_start_block = 1_000_000 - 2222 = 997_778
-    # (was 998_000 with 500ms divisor).
-    assert rs == 997_778
+    # span = 1000s -> ceil(1_000_000/450) = 2223, +3 margin -> 2226.
+    # rs = 1_000_000 - 2226 = 997_774.
+    assert rs == 997_774
+
+
+def test_compute_round_start_block_ms_precise_exact_ceiling():
+    """With the head's BEP-520 ms available, delta = ceil(span_ms/450)
+    exactly — no fallback margin needed (delay-only jitter means
+    blocks-in-span <= span/450, so head - delta is at-or-before the
+    boundary block by construction)."""
+    p = _make_poller()
+    rs_ts = 49_000
+    # head at 49_010.350 -> span 10_350ms -> ceil(10350/450) = 23.
+    head_milli = (rs_ts + 10) * 1000 + 350
+
+    def fake_header(**kw):
+        return (10_000, rs_ts + 10, head_milli)
+
+    p._bloxroute_latest_header = fake_header  # type: ignore[assignment]
+    rs = p._compute_round_start_block(rs_ts)
+    assert rs == 10_000 - 23
+
+
+def test_compute_round_start_block_ms_adverse_alignment_no_overshoot():
+    """The exact adverse case that overshot the seconds-only math: head
+    sub-second phase at 950ms, round-start on the whole second. With ms
+    precision the estimate lands a hair EARLY (never past the boundary)."""
+    p = _make_poller()
+    rs_ts = 49_000
+    # head block at 49_008.950: span_ms = 8_950 -> ceil(8950/450) = 20.
+    # True blocks-produced-in-span <= 8950/450 = 19.9, so rs <= true rs. Safe.
+    def fake_header(**kw):
+        return (10_000, rs_ts + 8, rs_ts * 1000 + 8_950)
+
+    p._bloxroute_latest_header = fake_header  # type: ignore[assignment]
+    rs = p._compute_round_start_block(rs_ts)
+    assert rs == 10_000 - 20
+
+
+def test_compute_round_start_block_ignores_block_ts_cache():
+    """No cache path: the estimate always comes from a FRESH head (the
+    forward extrapolation from a cached bet-block timestamp erred in the
+    UNSAFE direction and was deleted, 2026-06-10). A poisoned cache entry
+    must have no effect."""
+    p = _make_poller()
+    p._block_ts[5000] = 9_990  # would have been a 'usable anchor' before
+    invoked = {"n": 0}
+
+    def fake_header(**kw):
+        invoked["n"] += 1
+        return (10_000, 10_010, None)
+
+    p._bloxroute_latest_header = fake_header  # type: ignore[assignment]
+    rs = p._compute_round_start_block(10_000)
+    assert invoked["n"] == 1, "must always take the RPC path"
+    # span 10s -> ceil(10_000/450)=23 +3 = 26 -> rs = 10_000 - 26.
+    assert rs == 10_000 - 26
 
 
 def test_compute_round_start_block_returns_none_on_rpc_failure():
@@ -423,24 +447,22 @@ def _prep_for_epoch_advance(p: RpcPoller) -> None:
 
 
 def test_on_epoch_advance_clamps_cursor_after_long_silence():
-    """Cursor far behind -> clamped to round_start - 1."""
+    """Cursor far behind (outage recovery) -> jumped to round_start - 1."""
     p = _make_poller()
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 1_000  # very stale
 
-    # Mock: round_start_block = 99_900; head_num = 100_000.
-    p._bloxroute_latest_header = lambda **kw: (100_000, 1_000_050, None)  # type: ignore[assignment]
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
-
-    # head_ts = 1_000_300, lock_at = 1_000_350, round_start_ts = 1_000_050.
-    # Bundle 4: delta = 250s -> round(250_000/450) = 556 blocks ->
-    # rs = 100_000 - 556 = 99_444 (was 99_500 with 500ms divisor).
+    p._bloxroute_block_number = lambda **kw: 100_000  # type: ignore[assignment]
+    # head_ts = 1_000_300 (seconds-only header: ms None), lock_at = 1_000_350,
+    # round_start_ts = 1_000_050. Seconds fallback errs EARLY:
+    # delta = ceil(250_000/450) + 3 = 556 + 3 = 559 -> rs = 100_000 - 559
+    # = 99_441.
     p._bloxroute_latest_header = lambda **kw: (100_000, 1_000_300, None)  # type: ignore[assignment]
 
     p._on_epoch_advance(lock_at=1_000_350, current_epoch=101)
 
-    # Cursor should now be 99_444 - 1 = 99_443 (Bundle 4 ms-precise correction).
-    assert p._last_polled_block_number == 99_443
+    # Cursor at rs - 1 = 99_440 (re-polls the boundary block itself).
+    assert p._last_polled_block_number == 99_440
 
 
 def test_on_epoch_advance_does_not_rewind_cursor_when_in_round():
@@ -538,6 +560,179 @@ def test_on_epoch_advance_handles_compute_round_start_failure_gracefully():
     # Should not raise; cursor stays put.
     p._on_epoch_advance(lock_at=1_000_350, current_epoch=101)
     assert p._last_polled_block_number == 1_000
+
+
+# ---------------------------------------------------------------------------
+# Atomic round transition (2026-06-10): the daemon must never observe
+# (fresh lock_at, un-jumped cursor) — every piece of round state commits
+# in ONE critical section, with the rs_block RPC outside the lock.
+# ---------------------------------------------------------------------------
+
+def test_epoch_advance_atomic_no_torn_state_during_rs_rpc(monkeypatch):
+    """While the rs_block RPC is in flight, a concurrent reader sees the
+    OLD (lock_at, cursor, epoch) snapshot — fully consistent. After
+    set_round_phase returns, it sees the fully-NEW snapshot. The torn
+    pairing (new lock_at + old cursor) is unobservable."""
+    import time as _t
+    p = _make_poller()
+    _prep_for_epoch_advance(p)          # epoch=100, lock_at=1_000_000
+    p._last_polled_block_number = 1_000  # stale (outage recovery)
+    new_lock_at = int(_t.time()) + 300
+
+    seen_during_rpc: dict = {}
+
+    def fake_rs(round_start_ts):
+        # Simulates the daemon's atomic snapshot while the RPC runs.
+        with p._lock:
+            seen_during_rpc["lock_at"] = p._lock_at
+            seen_during_rpc["cursor"] = p._last_polled_block_number
+            seen_during_rpc["epoch"] = p._current_epoch
+        return 99_500
+
+    monkeypatch.setattr(p, "_compute_round_start_block", fake_rs)
+    p._bloxroute_block_number = lambda **kw: 99_510  # type: ignore[assignment]
+
+    p.set_round_phase(current_epoch=101, lock_at=new_lock_at)
+
+    # During the RPC: everything still the OLD round's (consistent-stale).
+    assert seen_during_rpc == {
+        "lock_at": 1_000_000, "cursor": 1_000, "epoch": 100,
+    }, "rs_block RPC must run against fully-OLD state (the daemon fence)"
+    # After: everything the NEW round's, committed together.
+    with p._lock:
+        assert p._lock_at == new_lock_at
+        assert p._current_epoch == 101
+        assert p._last_polled_block_number == 99_499  # rs - 1, jumped
+
+
+def test_epoch_advance_cursor_jump_respects_concurrent_daemon_advance(monkeypatch):
+    """The jump is committed as max(current_cursor, rs_block - 1) under the
+    lock: if a daemon poll advanced the cursor PAST the jump target while
+    the rs_block RPC was in flight, the commit must not rewind it."""
+    import time as _t
+    p = _make_poller()
+    _prep_for_epoch_advance(p)
+    p._last_polled_block_number = 99_000
+
+    def fake_rs(round_start_ts):
+        # While the RPC runs, a daemon poll advances the cursor beyond
+        # what the jump would set (99_500 - 1).
+        with p._lock:
+            p._last_polled_block_number = 99_800
+        return 99_500
+
+    monkeypatch.setattr(p, "_compute_round_start_block", fake_rs)
+    p._bloxroute_block_number = lambda **kw: 99_810  # type: ignore[assignment]
+
+    p.set_round_phase(current_epoch=101, lock_at=int(_t.time()) + 300)
+    assert p._last_polled_block_number == 99_800, (
+        "forward-only commit: max() must keep the daemon's higher cursor"
+    )
+
+
+def test_epoch_advance_rs_failure_still_commits_transition(monkeypatch):
+    """rs_block RPC failure must NOT stall the round: lock_at + epoch +
+    pool drops still commit (cursor un-jumped -> bounded catch-up crunch
+    fallback), and a distinct ALERT surfaces the un-jumped cursor."""
+    import time as _t
+    import pancakebot.chain.rpc_poller as mod
+    p = _make_poller()
+    _prep_for_epoch_advance(p)
+    p._last_polled_block_number = 1_000
+    p._pools[99] = _EpochPool()
+    p._processed_bet_log_ids[99] = set()
+    new_lock_at = int(_t.time()) + 300
+
+    monkeypatch.setattr(p, "_compute_round_start_block", lambda ts: None)
+    p._bloxroute_block_number = lambda **kw: 1_005  # type: ignore[assignment]
+    warns: list = []
+    monkeypatch.setattr(mod, "warn", lambda action, msg: warns.append((action, msg)))
+
+    p.set_round_phase(current_epoch=101, lock_at=new_lock_at)
+
+    assert p._lock_at == new_lock_at and p._current_epoch == 101
+    assert p._last_polled_block_number == 1_000, "cursor un-jumped on RPC failure"
+    assert 99 not in p._pools, "pool drop still committed"
+    assert any(
+        a == "ALERT" and "cursor not jumped" in m for a, m in warns
+    ), f"expected the un-jumped-cursor ALERT, got {warns}"
+
+
+def test_epoch_advance_prunes_block_ts_round_aware(monkeypatch):
+    """_block_ts evicts on the round boundary (ts < round_start_ts), the
+    same semantics as the pools/dedup drops — and with NO entry-count cap:
+    a pathological many-bet-block round keeps every current-round entry
+    (the old magic-number 1000/500 prune could evict current-round
+    recovery entries; round-aware cannot)."""
+    import time as _t
+    p = _make_poller()
+    _prep_for_epoch_advance(p)
+    new_lock_at = int(_t.time()) + 300
+    round_start_ts = new_lock_at - 300
+
+    # 1500 current-round entries (over the old 1000 cap) + 50 stale ones.
+    for i in range(1500):
+        p._block_ts[200_000 + i] = round_start_ts + 1 + i
+    for i in range(50):
+        p._block_ts[100_000 + i] = round_start_ts - 10 - i
+
+    monkeypatch.setattr(p, "_compute_round_start_block", lambda ts: 200_000)
+    p._bloxroute_block_number = lambda **kw: 200_010  # type: ignore[assignment]
+
+    p.set_round_phase(current_epoch=101, lock_at=new_lock_at)
+
+    assert len(p._block_ts) == 1500, (
+        "ALL current-round entries kept (no count cap), ALL stale dropped"
+    )
+    assert all(bn >= 200_000 for bn in p._block_ts), "stale entries pruned"
+
+
+def test_init_cursor_clears_infeas_flag_on_rpc_failure():
+    """Y1 failure-path fix (2026-06-10): if the cold-start header RPC
+    fails, a flag poisoned by a racing daemon tick (against the
+    uninitialized cursor=0) is still cleared — the honest skip reason
+    while unseeded is cold_start_in_progress, not INFEAS."""
+    p = _make_poller()
+    p._lock_at = 1_000_000
+    p._catchup_infeasible_for_round = True  # poisoned by a racing tick
+
+    p._bloxroute_latest_header = (  # type: ignore[assignment]
+        lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    p._initialize_cursor_from_head()
+
+    assert p._catchup_infeasible_for_round is False, (
+        "failure path must clear the poisoned flag like the success exits do"
+    )
+
+
+def test_rs_block_from_header_ms_never_overshoots_boundary():
+    """Property sweep for the safe-direction invariant: across sub-second
+    phases and span lengths, the ms-precise estimate is always at-or-before
+    the last block whose milli_ts <= round_start (here: synthetic grid with
+    delay-only jitter)."""
+    from pancakebot.chain.rpc_poller import RpcPoller as _P
+    rs_ts = 50_000
+    rs_milli = rs_ts * 1000
+    # Synthetic chain: blocks every 450ms + occasional 50ms delays.
+    # Build blocks back from the head; find the true boundary block.
+    for head_phase_ms in (0, 350, 500, 950):
+        for n_blocks in (1, 3, 22, 600):
+            head_milli = rs_milli + n_blocks * 450 + head_phase_ms
+            head_num = 1_000_000
+            # True boundary: walking back exact-450 grid from head, the
+            # first block with milli_ts <= rs_milli is head - k where
+            # k = ceil((head_milli - rs_milli)/450). With delay-only
+            # jitter, real chains have FEWER blocks in the span, so the
+            # true boundary block number is >= head - k.
+            est = _P._rs_block_from_header(head_num, head_milli // 1000,
+                                           head_milli, rs_ts)
+            k = -(-(head_milli - rs_milli) // 450)
+            assert est == head_num - k
+            assert est <= head_num - n_blocks + 0, (
+                f"estimate must be at-or-before the boundary "
+                f"(phase={head_phase_ms}, n={n_blocks})"
+            )
 
 
 def test_first_call_set_round_phase_does_not_invoke_clamp(monkeypatch):
@@ -1282,26 +1477,21 @@ def test_init_cursor_positions_at_round_start_minus_1_when_feasible():
     is performed — the daemon's first periodic tick does that.
 
     Regression for the 621-block bug: cursor target must be scoped to
-    the CURRENT round only (head - delta_blocks_in_round - safety),
+    the CURRENT round only (head - delta_blocks_in_round - margin),
     NOT to a head-relative full-round lookback.
 
-    Bundle 5 v2 (2026-05-14): safety margin +5 → +0 (Q2 fix). The
-    post-Lorentz chain's empirical "misses only delay, never advance"
-    property means actual blocks-elapsed is at most
-    ``ceil((head_ts - round_start_ts) * 1000 / 450)`` — slot misses
-    produce fewer blocks than the divisor predicts, never more. So
-    ``round(...)`` is already an upper bound (modulo ≤ 0.5 block of
-    rounding noise) and cursor at ``head - delta_blocks`` lands at or
-    before round_start_block by construction. New expected cursor:
-    delta_blocks = round(10000/450) = 22, cursor = head - 22 - 1
-    = 99_977.
+    Era 12b (2026-06-10): cursor seeding uses the shared safe-direction
+    estimator _rs_block_from_header. With a seconds-only header (ms
+    None, as stubbed here): delta = ceil(10000/450) + 3 = 23 + 3 = 26,
+    cursor = head - 26 - 1 = 99_973 (errs early; pre-round blocks are
+    epoch-gated, overshoot would silently skip early bets).
     """
     import time as _t
     p = _make_poller()
     now = int(_t.time())
     p._lock_at = now + 290  # 10s into round
     p._bloxroute_latest_header = lambda **kw: (100_000, now, None)  # type: ignore[assignment]
-    # cursor-init must NOT call _fetch_and_process_blocks: blow up if it does.
+    # cursor-init must NOT fetch: blow up if it does.
     p._fetch_and_process_logs = (  # type: ignore[assignment]
         lambda *a, **kw: pytest.fail("init_cursor must not fetch batches")
     )
@@ -1312,11 +1502,11 @@ def test_init_cursor_positions_at_round_start_minus_1_when_feasible():
     # Cursor init must NOT flip _connected — that's the first-poll latch.
     assert p._connected is False
     assert p._cold_start_done.is_set() is False
-    # Bundle 5 v2: 10s into round = round(10000/450) = 22 blocks
-    # behind head -> cursor at head - 22 - 1 = 99_977.
-    assert p._last_polled_block_number == 99_977, (
+    # 10s into round, seconds fallback: ceil(10000/450)+3 = 26 blocks
+    # behind head -> cursor at head - 26 - 1 = 99_973.
+    assert p._last_polled_block_number == 99_973, (
         f"cursor positioned at {p._last_polled_block_number}; "
-        f"expected 99_977 (head-22-1 under Bundle 5 v2 +0 safety math). "
+        f"expected 99_973 (head-26-1, safe-direction seconds fallback). "
         f">630 blocks back would indicate the head-relative full-round "
         f"lookback regression."
     )
