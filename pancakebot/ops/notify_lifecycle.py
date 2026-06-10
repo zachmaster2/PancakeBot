@@ -291,9 +291,13 @@ def main(
         )
         if new_history is not None:
             write_history(art["restart_history"], new_history)
+        # The 3c-2 validation harness runs a "pancakebot-test" unit; its
+        # alerts route to the DRY channel (the router only knows live/dry,
+        # and validation noise belongs with dry watchers).
+        notify_mode = "dry" if mode == "test" else mode
         for kind, fields, detail in alerts:
             outcome = notifications.notify(
-                mode=mode, kind=kind, fields=fields, art=art, detail=detail,
+                mode=notify_mode, kind=kind, fields=fields, art=art, detail=detail,
             )
             print(f"notify_lifecycle: {unit} {event} -> {kind} ({outcome})")
         if not alerts:
