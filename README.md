@@ -86,6 +86,25 @@ The dry/live bot runs on a Linux VM (production: Frankfurt, systemd
 units installed by `bootstrap/install.sh`). Backtest/sync/research run
 anywhere.
 
+### Deploying (push-to-deploy, 2026-06-10)
+
+The VM hosts a bare repo (`/srv/pancakebot.git`) whose `post-receive`
+hook checks `master` out into `/root/pancakebot` atomically (tracked
+copy + one-time setup recipe: `bootstrap/linux/git_post_receive.sh`).
+Per deploy:
+
+```
+git push vm master          # hook prints "deployed <sha> -> /root/pancakebot"
+# code only — restart manually when greenlit:
+ssh root@<vm> systemctl restart pancakebot-live
+```
+
+The dev clone is the sole canonical history (no public remote) — keep
+periodic offline backups: `git bundle create <path>.bundle --all`.
+Untracked VM files (`var/`, `.env`, `.venv`) are never touched by the
+checkout. `git status` works on the VM via the `/root/pancakebot/.git`
+gitdir pointer.
+
 ### Clock-sync prerequisite (dry + live modes)
 
 The critical-path scheduling relies on the local OS clock being within
