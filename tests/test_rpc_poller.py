@@ -2084,15 +2084,26 @@ def test_submit_deadline_boundary_at_exactly_quantum_msbacks_off():
 # Bundle 5 v2 (2026-05-14): per-round single anchor poll
 # ---------------------------------------------------------------------------
 
+def _fresh_anchor_block(*, age_ms: int = 450, number: int = 98_000_000) -> dict:
+    """A Lorentz-encoded 'latest' block whose ms-timestamp is ``age_ms``
+    behind the local clock (anchor tests must track wall-time now that
+    fire_anchor_poll rejects grossly stale anchors)."""
+    import time as _t
+    milli = int(_t.time() * 1000) - age_ms
+    ms_part = milli % 1000
+    return {
+        "number": hex(number),
+        "timestamp": hex(milli // 1000),
+        "mixHash": "0x" + "00" * 30 + f"{ms_part:04x}",
+    }
+
+
 def test_fire_anchor_poll_returns_anchor_state_on_success(monkeypatch):
     """Happy path: RPC returns a valid Lorentz-encoded block; fire_anchor_poll
     decodes the mixHash and returns an AnchorState."""
+    import time as _t
     p = _make_poller()
-    block = {
-        "number": hex(98_000_000),
-        "timestamp": hex(1778712807),
-        "mixHash": "0x" + "00" * 30 + "0352",  # 850ms quantum
-    }
+    block = _fresh_anchor_block(age_ms=450)  # ~1 block old: healthy
     monkeypatch.setattr(
         p, "_bloxroute_call",
         lambda method, params, **kw: block,
@@ -2100,7 +2111,11 @@ def test_fire_anchor_poll_returns_anchor_state_on_success(monkeypatch):
     anchor = p.fire_anchor_poll(timeout_s=0.200)
     assert anchor is not None
     assert anchor.block_number == 98_000_000
-    assert anchor.milli_ts == 1778712807 * 1000 + 850
+    expected_milli = int(block["timestamp"], 16) * 1000 + int(
+        block["mixHash"][-4:], 16
+    )
+    assert anchor.milli_ts == expected_milli
+    assert abs(int(_t.time() * 1000) - anchor.milli_ts) < 1350
 
 
 def test_fire_anchor_poll_returns_none_on_rpc_error(monkeypatch):
@@ -2157,17 +2172,14 @@ def test_fire_anchor_poll_passes_timeout_through_single_attempt(monkeypatch):
     never a retry inside the ~200ms ceiling)."""
     p = _make_poller()
     captured: dict = {}
+    block = _fresh_anchor_block(age_ms=450)
 
     def _capture(method, params, *, timeout_ms, attempts, abort_at=None):
         captured["method"] = method
         captured["params"] = params
         captured["timeout_ms"] = timeout_ms
         captured["attempts"] = attempts
-        return {
-            "number": hex(1),
-            "timestamp": hex(1778712807),
-            "mixHash": "0x" + "00" * 30 + "0352",
-        }
+        return block
 
     monkeypatch.setattr(p, "_bloxroute_call", _capture)
     p.fire_anchor_poll(timeout_s=0.200)
@@ -2175,6 +2187,66 @@ def test_fire_anchor_poll_passes_timeout_through_single_attempt(monkeypatch):
     assert captured["attempts"] == 1
     assert captured["method"] == "eth_getBlockByNumber"
     assert captured["params"] == ["latest", False]
+
+
+# ---------------------------------------------------------------------------
+# Anchor gross-staleness backstop (2026-06-10): a well-formed but
+# many-blocks-old "latest" is discarded -> static fallback + loud ALERT.
+# ---------------------------------------------------------------------------
+
+def test_fire_anchor_poll_rejects_grossly_stale_anchor(monkeypatch):
+    """An anchor >1350ms (~3 blocks) behind the local clock returns None
+    (static fallback) and emits a distinct ANCHOR STALE ALERT — a silently
+    desynced endpoint must not feed the dynamic deadline math."""
+    import pancakebot.chain.rpc_poller as mod
+    p = _make_poller()
+    block = _fresh_anchor_block(age_ms=5_000)  # ~11 blocks stale
+    monkeypatch.setattr(
+        p, "_bloxroute_call", lambda method, params, **kw: block,
+    )
+    warns: list = []
+    monkeypatch.setattr(mod, "warn", lambda action, msg: warns.append((action, msg)))
+
+    assert p.fire_anchor_poll(timeout_s=0.200) is None
+    assert any(
+        a == "ALERT" and "ANCHOR STALE" in m for a, m in warns
+    ), f"expected a distinct ANCHOR STALE ALERT, got {warns}"
+
+
+def test_fire_anchor_poll_accepts_normal_one_to_two_block_age(monkeypatch):
+    """1-2 blocks of anchor age is the NORMAL regime (block production +
+    RTT) and must pass — the backstop is for gross desync only (the
+    450ms-grid walk in predict_predecessor_milli_ts makes 1-2 block
+    staleness harmless to the prediction)."""
+    p = _make_poller()
+    block = _fresh_anchor_block(age_ms=950)  # ~2 blocks + clock margin: max normal
+    monkeypatch.setattr(
+        p, "_bloxroute_call", lambda method, params, **kw: block,
+    )
+    anchor = p.fire_anchor_poll(timeout_s=0.200)
+    assert anchor is not None, "normal-age anchor must not be rejected"
+
+
+def test_fire_anchor_poll_stale_records_fallback_outcome(monkeypatch):
+    """A stale-rejected anchor counts as a static fallback in the rolling
+    fallback-rate monitor (reason='stale_anchor'), so a sustained desync
+    regime also surfaces via the existing anchor_static_fallback ALERT."""
+    p = _make_poller()
+    block = _fresh_anchor_block(age_ms=5_000)
+    monkeypatch.setattr(
+        p, "_bloxroute_call", lambda method, params, **kw: block,
+    )
+    outcomes: list = []
+    orig = p._record_anchor_outcome
+
+    def _spy(**kw):
+        outcomes.append(kw)
+        return orig(**kw)
+
+    monkeypatch.setattr(p, "_record_anchor_outcome", _spy)
+    p.fire_anchor_poll(timeout_s=0.200)
+    assert outcomes and outcomes[-1]["fell_back"] is True
+    assert outcomes[-1]["reason"] == "stale_anchor"
 
 
 # ---------------------------------------------------------------------------
