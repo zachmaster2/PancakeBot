@@ -159,14 +159,21 @@ def ensure_cycle_audit_csv(path: str, *, reset: bool = False) -> list[str]:
         if resolved in _CYCLE_AUDIT_HEADER_OK_PATHS:
             return header_cols
         try:
-            with open(path, "r", newline="") as f:
+            # encoding pinned + errors="replace": the read must be
+            # platform-deterministic and must NEVER raise on garbage bytes
+            # (partial-write crash artifact) — undecodable bytes become
+            # replacement chars -> header mismatch -> rotate. Linux's strict
+            # utf-8 default would otherwise raise UnicodeDecodeError here
+            # and block bot startup on a corrupted file.
+            with open(path, "r", newline="", encoding="utf-8",
+                      errors="replace") as f:
                 r = csv.reader(f)
                 existing_header = next(r, None)
         except (OSError, csv.Error, StopIteration):
-            # Malformed CSV (partial-write crash artifact, encoding glitch,
-            # truncated bytes, etc.). Treat as "no usable header" and let
-            # the rotate path replace it. Bot startup must not be blocked
-            # by a corrupted file. (Y4 fix 2026-05-12.)
+            # Malformed CSV beyond encoding (truncated structure etc.).
+            # Treat as "no usable header" and let the rotate path replace
+            # it. Bot startup must not be blocked by a corrupted file.
+            # (Y4 fix 2026-05-12.)
             existing_header = None
         if existing_header is not None and existing_header == header_cols:
             _CYCLE_AUDIT_HEADER_OK_PATHS.add(resolved)

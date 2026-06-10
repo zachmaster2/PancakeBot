@@ -24,9 +24,18 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(r"C:\Users\zking\Documents\GitHub\PancakeBot")
-WORKTREE = REPO / ".claude" / "worktrees" / "stupefied-bell-4d955c"
-sys.path.insert(0, str(WORKTREE))
+REPO = Path(__file__).resolve().parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+_DATASET = REPO / "var" / "closed_rounds.jsonl"
+# The canonical-rounds dataset lives on the Windows dev host (var/ is
+# per-host runtime state, not tracked); on hosts without it (the VM)
+# this suite skips rather than erroring.
+pytestmark = pytest.mark.skipif(
+    not _DATASET.exists(),
+    reason="needs var/closed_rounds.jsonl (research dataset, dev host only)",
+)
 
 from research.p3a_wallet_features import (  # noqa: E402
     FEATURE_NAMES, build_features_chronological, compute_features,
@@ -42,7 +51,7 @@ SLICE_HI = 437661  # 100 rounds
 def slice_rounds():
     """Load 100 canonical-data rounds with full bet event records."""
     out = []
-    with open(REPO / "var" / "closed_rounds.jsonl", encoding="utf-8") as f:
+    with open(_DATASET, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
