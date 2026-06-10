@@ -136,6 +136,20 @@ _BLX_BLOCK_TS_TIMEOUT_MS: int = 250  # getBlockByNumber(bn), > ~5.9x p99 42ms
 # serve) other calls, so a blip is momentary — a short pause beats a long one.
 _BLX_RETRY_BACKOFF_MS: int = 25
 
+# Anchor gross-staleness ceiling: how far the anchor block's BEP-520 ms-ts
+# may trail the local clock before the anchor is discarded for the round
+# (static-deadline fallback + loud ALERT). A "latest" block is normally
+# <= ~1 block old when it arrives (<= ~700ms: up to 450ms block age + RTT)
+# and the local clock is NTP-disciplined to well under +-250ms, so a healthy
+# anchor reads <= ~950ms behind local time. 3 blocks (1350ms) clears that
+# normal band by ~400ms while catching the failure this guards against: a
+# silently desynced endpoint serving a many-blocks-old "latest", whose
+# timestamp would otherwise feed the predecessor prediction unchecked.
+# (1-2 block staleness is harmless to the prediction itself — the 450ms-grid
+# walk in predict_predecessor_milli_ts snaps both to the same answer; the
+# danger is multi-block desync accumulating un-modeled jitter error.)
+_ANCHOR_STALENESS_MS: int = 1350
+
 # Per-call-site attempt counts, derived from each site's time budget:
 # the single poll runs inside the lock-2500ms -> critical-path window (wall
 # cap 1000ms below), so one retry per call is all the budget affords; the
@@ -599,6 +613,24 @@ class RpcPoller:
         milli_ts = compute_milli_ts(block)
         if milli_ts is None:
             self._record_anchor_outcome(fell_back=True, reason="malformed_milli_ts")
+            return None
+        # Gross-staleness backstop: a well-formed but many-blocks-old
+        # "latest" (silently desynced endpoint) must not feed the dynamic
+        # deadline math. Discard -> static fallback (the bet still goes
+        # out on the conservative static schedule) + a loud distinct
+        # ALERT. If this fires repeatedly, suspect the LOCAL clock as
+        # much as the endpoint — the comparison can't tell them apart.
+        staleness_ms = int(time.time() * 1000) - milli_ts
+        if staleness_ms > _ANCHOR_STALENESS_MS:
+            warn(
+                "ALERT",
+                f"ANCHOR STALE: latest block {bn} milli_ts is "
+                f"{staleness_ms}ms behind the local clock "
+                f"(> {_ANCHOR_STALENESS_MS}ms / ~3 blocks) — endpoint "
+                f"desync or local-clock fault. Using the static deadline "
+                f"fallback for this round.",
+            )
+            self._record_anchor_outcome(fell_back=True, reason="stale_anchor")
             return None
         self._record_anchor_outcome(
             fell_back=False, reason="ok", block_number=bn, milli_ts=milli_ts,
