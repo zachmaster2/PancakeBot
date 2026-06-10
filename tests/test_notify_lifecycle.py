@@ -227,6 +227,24 @@ def test_main_bad_instance_exits_2(capsys):
     assert nl.main(["nonsense"]) == 2
 
 
+def test_main_test_mode_routes_to_dry_channel(tmp_path, monkeypatch):
+    """The pancakebot-test validation unit's alerts go to the DRY channel
+    (the router only knows live/dry)."""
+    sent = []
+    monkeypatch.setattr(
+        nl.notifications, "notify",
+        lambda **kw: (sent.append(kw), "SENT")[1],
+    )
+    rc = nl.main(
+        ["pancakebot-test-stopped"],
+        run_cmd=_fake_runner("Result=oom-kill\nExecMainStatus=9\nNRestarts=0\n"),
+        env={}, now=1.0, repo_root=tmp_path,
+    )
+    assert rc == 0
+    assert sent[0]["mode"] == "dry"
+    assert sent[0]["kind"] == "CRASHED"
+
+
 def test_main_never_raises_on_internal_error(tmp_path, monkeypatch):
     """Alerting must not cascade: an exploding notify is swallowed."""
     def _boom(**kw):
