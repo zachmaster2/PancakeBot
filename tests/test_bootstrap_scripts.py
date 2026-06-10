@@ -23,7 +23,9 @@ _TOOLS = _REPO_ROOT / "tools" / "claude_desktop"
 # Phase 3c-1 (2026-06-10): the Windows-bot-service cluster (install.ps1,
 # windows/setup_service.py, SCM scripts) is archived; bootstrap/ is
 # Linux-bot-only and the Claude operator-desktop scaffolding lives in
-# tools/claude_desktop/.
+# tools/claude_desktop/. Phase 3c-2: systemd is the supervisor — the units
+# are TRACKED files (installed verbatim by install.sh STEP 5), so they get
+# content checks here.
 _SH_SCRIPTS = [
     _BOOT / "install.sh",
     _BOOT / "uninstall.sh",
@@ -38,15 +40,18 @@ _PY_HELPERS = [
     _BOOT / "common" / "python_setup.py",
     _BOOT / "common" / "config_check.py",
     _BOOT / "common" / "health_check.py",
-    _BOOT / "common" / "service_specs.py",
-    _BOOT / "linux" / "setup_service.py",
     _TOOLS / "notify_user_followup.py",
     _TOOLS / "notify_user_mark_answered.py",
+]
+_UNIT_FILES = [
+    _BOOT / "linux" / "systemd" / "pancakebot-live.service",
+    _BOOT / "linux" / "systemd" / "pancakebot-dry.service",
+    _BOOT / "linux" / "systemd" / "pancakebot-notify@.service",
 ]
 
 
 def test_all_expected_files_exist():
-    for f in _SH_SCRIPTS + _PS1_SCRIPTS + _PY_HELPERS + [
+    for f in _SH_SCRIPTS + _PS1_SCRIPTS + _PY_HELPERS + _UNIT_FILES + [
         _BOOT / "README.md",
         _TOOLS / "README.md",
         _TOOLS / "AUMID_stamper" / "README.md",
@@ -124,17 +129,40 @@ def test_config_check_flags_missing_secrets(tmp_path):
     assert any(".env missing" in b for b in blockers)
 
 
-def test_service_specs_build():
-    sys.path.insert(0, str(_BOOT))
-    from common.service_specs import build_spec
-    spec = build_spec(mode="live", repo_root=_REPO_ROOT, venv_python=Path("/x/python"))
-    assert spec.args == ("-m", "pancakebot.service.supervise", "--mode", "live")
-    assert spec.conflicts_with == "pancakebot-dry"  # live conflicts with dry
-    # E: relaxed OUTER restart policy — 5 starts / hour (was 3 / 24h).
-    assert spec.restart_max_attempts == 5
-    assert spec.restart_reset_window_s == 3600
-    # systemd unit name (Linux-only since Phase 3c-1)
-    assert spec.name == "pancakebot-live"
+@pytest.mark.parametrize("mode", ["live", "dry"])
+def test_bot_unit_structure(mode):
+    """The tracked bot units carry the systemd-direct invariants: direct
+    run.py ExecStart (no Python supervisor layer), restart-on-failure with
+    the StartLimitBurst crashloop brake, live<->dry mutual exclusion, and
+    the notify hooks on both lifecycle edges."""
+    text = (_BOOT / "linux" / "systemd" / f"pancakebot-{mode}.service").read_text(
+        encoding="utf-8")
+    other = "dry" if mode == "live" else "live"
+    for marker in (
+        f"ExecStart=/root/pancakebot/.venv/bin/python -u run.py --{mode}",
+        f"Conflicts=pancakebot-{other}.service",
+        "Restart=on-failure",
+        "StartLimitBurst=5",
+        "StartLimitIntervalSec=900",
+        "KillMode=control-group",
+        "ExecStartPost=-/usr/bin/systemctl start --no-block "
+        "pancakebot-notify@%p-started.service",
+        "ExecStopPost=-/usr/bin/systemctl start --no-block "
+        "pancakebot-notify@%p-stopped.service",
+        "EnvironmentFile=-/etc/pancakebot/alerts.env",
+    ):
+        assert marker in text, f"pancakebot-{mode}.service missing: {marker!r}"
+
+
+def test_notify_unit_least_privilege():
+    """The notify template loads ONLY alerts.env — the wallet key
+    (pancakebot.env) must never enter the notify process."""
+    text = (_BOOT / "linux" / "systemd" / "pancakebot-notify@.service").read_text(
+        encoding="utf-8")
+    env_lines = [ln.strip() for ln in text.splitlines()
+                 if ln.strip().startswith("EnvironmentFile=")]
+    assert env_lines == ["EnvironmentFile=-/etc/pancakebot/alerts.env"], env_lines
+    assert "notify_lifecycle %i" in text
 
 
 def test_python_setup_venv_python_path():

@@ -1,197 +1,134 @@
-# PancakeBot Supervisor
+# PancakeBot supervision (systemd-direct)
 
-Out-of-process health monitoring for the dry and live bots. Catches crashes
-and silent process deaths that log-tailing alone will miss.
+Out-of-process health monitoring for the dry and live bots: crash restart,
+crashloop braking, and Discord lifecycle alerts. Catches process deaths
+that log-tailing alone would miss.
 
-## What it does
+## Architecture
 
-A pair of systemd units on the Linux VM (`pancakebot-live` and
-`pancakebot-dry`, installed by `bootstrap/install.sh`) each run
-`pancakebot.service.supervise --mode <live|dry>`, which supervises its bot
-child subprocess (source in `pancakebot/service/`). Every 1 second, the
-supervisor classifies the bot's state from the Popen handle +
-`var/<mode>/crash.json` and restarts the bot on death. (The original
-Windows-service variant of the same SupervisorCore — pywin32/SCM — remains
-in source for the retired Windows-host era; Phase 3 archives it and also
-plans the systemd-direct simplification, collapsing the
-systemd→supervisor→bot double-wrap to systemd→run.py.)
+**systemd IS the supervisor** (Phase 3c-2, cut over 2026-06-10). Each bot
+unit runs `run.py` directly — there is no Python supervisor layer:
 
-Replaced the legacy one-shot `scripts/supervisor.py` (schtask-driven, every
-3 min, heartbeat-mtime-based liveness) on 2026-05-23. Heartbeat-staleness
-classification was removed on 2026-05-27 (Step 27a) because the 5s
-threshold was firing on transient BSC RPC timeouts (under the then-hedged
-read pool) that auto-resolve on the next round — ~12 false-positive
-restarts/24h with no real bot dysfunction. **Process-death detection via
-`Popen.poll()` is the authoritative liveness signal; there is no longer
-any heartbeat file.**
-
-## The four classifications
-
-| STATUS         | Meaning                                                            |
-|----------------|--------------------------------------------------------------------|
-| UP             | Bot Popen handle is alive, past startup grace (30s default)        |
-| STARTING       | Bot Popen handle is alive, still inside startup grace              |
-| CRASHED        | Bot process is dead AND `crash.json` is present                    |
-| DOWN           | Bot process is dead, no `crash.json` (terminated without exception)|
-| UNINSTRUMENTED | (classify_state only) bot process detected outside service control |
-
-Precedence is first-match-wins in the order above. `classify_running_bot`
-(the in-loop classifier) returns UP / STARTING / CRASHED / DOWN.
-`classify_state` is a legacy artifact-only variant used for first-run /
-no-Popen-handle scenarios.
-
-## Restart-pattern aggregation (Step 27a, 2026-05-27)
-
-Discord notifications for `CRASHED` / `DOWN` are aggregated by restart
-pattern: the first two restarts in any 1-hour rolling window go to the
-SCM event log only (no Discord). The third restart in 1h fires a Discord
-notification. Independently, ≥8 restarts in 24h fires
-`SLOW_CRASHLOOP_WARNING` as a separate severity signal. The fast-crashloop
-limiter (≥3 restarts in 15 min → `SUPPRESSED_FAST_CRASHLOOP`, restart
-refused) is unchanged.
-
-Constants in `pancakebot/service/common.py`:
-- `_FAST_RESTART_MAX = 3`, `_FAST_RESTART_WINDOW_S = 900` (15 min)
-- `_SLOW_RESTART_MAX = 8`, `_SLOW_RESTART_WINDOW_S = 86400` (24 h)
-
-## Install
-
-Services are registered via pywin32. From an elevated PowerShell:
-
-```powershell
-.\scripts\install_services.ps1
+```
+systemd
+  ├─ pancakebot-live.service   ExecStart=.venv/bin/python -u run.py --live
+  ├─ pancakebot-dry.service    ExecStart=.venv/bin/python -u run.py --dry
+  └─ pancakebot-notify@.service (oneshot template, fired on lifecycle edges)
+        └─ python -m pancakebot.ops.notify_lifecycle <unit>-<event>
+              └─ pancakebot.service.notifications  (Discord alert executor)
 ```
 
-This registers `PancakeBotLive` and `PancakeBotDry` with SCM, both set to
-Manual start by default. Use `scripts\enable_live.ps1` / `enable_dry.ps1`
-to flip to Automatic and start them.
+The unit files are TRACKED at `bootstrap/linux/systemd/` and installed
+verbatim by `bootstrap/install.sh` STEP 5 (`cp` + `daemon-reload`; rerun
+after a unit-file change lands via push-to-deploy). Key choices, all
+visible in the unit files:
 
-The live-priority mutex (Dry refuses to start while Live is running) is
-enforced inside each service's SvcDoRun via SCM ControlService calls.
+| Mechanism            | Setting                                            |
+|----------------------|----------------------------------------------------|
+| Crash restart        | `Restart=on-failure`, `RestartSec=60`              |
+| Crashloop brake      | `StartLimitBurst=5` / `StartLimitIntervalSec=900` — after 5 failed starts in 15 min systemd stops retrying (`Result=start-limit-hit`) |
+| One bot at a time    | mutual `Conflicts=` (starting one STOPS the other — see Pitfall below) |
+| Tree kill            | `KillMode=control-group`, `TimeoutStopSec=25`      |
+| Lifecycle alerts     | `ExecStartPost`/`ExecStopPost` → `systemctl start --no-block pancakebot-notify@%p-{started,stopped}` |
+| Least privilege      | bot units load `pancakebot.env` + `alerts.env`; the notify template loads ONLY `alerts.env` (webhooks) — the wallet key never enters the notify process |
+
+`--no-block` + the `-` prefix on the Exec hooks mean a slow or failing
+Discord POST can never delay or fail the bot's own lifecycle.
+
+## The notify flow
+
+`notify_lifecycle` (in `pancakebot/ops/`) reads unit state from
+`systemctl show <unit> -p Result,ExecMainStatus,NRestarts` — systemd
+retains these after the service exits, which is what makes the
+detached-oneshot design work (`$SERVICE_RESULT`/`$EXIT_STATUS` exist only
+inside the main unit's own ExecStopPost environment and do NOT propagate
+through `systemctl start`; they are still preferred when present).
+
+Decision table (thresholds carried over from the prior supervisor):
+
+```
+started, NRestarts==0 (fresh/manual start):
+    system uptime < 10 min  -> REBOOTED
+    crash evidence          -> RECOVERY_AFTER_CRASH
+    else                    -> STARTED
+started, NRestarts>0 (systemd auto-restart after a failure):
+    append var/<mode>/restart_history.jsonl, then:
+    >=3 restarts / 15 min   -> SUPPRESSED_FAST_CRASHLOOP
+    >=8 restarts / 24 h     -> SLOW_CRASHLOOP_WARNING
+    else                    -> silent (CRASHED already fired per failure)
+stopped:
+    Result=success          -> STOPPED (intentional, INFO)
+    Result=start-limit-hit  -> SUPPRESSED_FAST_CRASHLOOP (terminal: systemd
+                               gave up; manual intervention required)
+    anything else           -> CRASHED (Result + exit status + last journal
+                               line; crash.json traceback rendered when present)
+```
+
+"Crash evidence" is `crash.json` present OR a `crash_archive_*.json`
+renamed within the last 2 minutes — `run.py` archives a lingering
+crash.json within milliseconds of starting, racing the detached notify
+unit, so a fresh rename counts as evidence for the current start.
+
+Known edge: a `start-limit-hit` transition fires no ExecStopPost of its
+own. Coverage comes from the started-side counter (the fast-crashloop
+alert fires on the restart BEFORE the limit trips) plus the stopped-side
+branch as defense-in-depth.
+
+All six failure scenarios were validated live on the VM (2026-06-10,
+parallel `pancakebot-test` unit, real Discord sends): exit-code crash,
+SIGKILL, cgroup OOM-kill, clean stop, fast crashloop (suppression + halt
+at NRestarts=5), seeded slow-loop warning — 6/6 alert kinds correct.
 
 ## Discord alerting
 
-### 1. Create three Discord webhooks
+Three webhooks, set in `/etc/pancakebot/alerts.env` (0600):
 
-In your Discord server, create one webhook per channel:
+| Env var                                     | Channel                  |
+|---------------------------------------------|--------------------------|
+| `PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL` | `pancakebot-live-alerts` |
+| `PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL`  | `pancakebot-dry-alerts`  |
+| `PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL`     | `pancakebot-general`     |
 
-| Webhook name           | Channel                  | Routed alerts                                                                            |
-|------------------------|--------------------------|------------------------------------------------------------------------------------------|
-| PancakeBot Dry Alerts  | `pancakebot-dry-alerts`  | CRASHED / DOWN + escalations for **dry** bot                                             |
-| PancakeBot Live Alerts | `pancakebot-live-alerts` | Same as dry, but for the **live** bot                                                    |
-| PancakeBot General     | `pancakebot-general`     | `UNINSTRUMENTED` (legacy bot outside service control) + supervisor-self errors (rare)    |
+Unset env var → `DISABLED` (soft fallback, no HTTP). HTTP failure →
+`SEND_FAILED` logged to stderr (journald), never raises. Rate limit: one
+alert per `(mode, kind)` per 5 minutes, tracked in
+`var/<mode>/last_alert.json`. The executor (`notifications.py`) prefixes
+every alert `[LIVE]`/`[DRY]` with an INFO/WARN/CRIT severity tag.
 
-Three separate channels keep the actionable alerts clean.
+## Operations
 
-### 2. Set environment variables (persisted, Machine-scope)
-
-```powershell
-# Machine-scope so the Windows Service sees the vars (services don't
-# inherit User-scope env). Requires elevated PowerShell.
-setx PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL  "https://discord.com/api/webhooks/..." /M
-setx PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL "https://discord.com/api/webhooks/..." /M
-setx PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL     "https://discord.com/api/webhooks/..." /M
+```bash
+systemctl status pancakebot-live          # state, PID, NRestarts, recent journal
+journalctl -u pancakebot-live -n 100      # bot stdout/stderr
+journalctl -u 'pancakebot-notify@*' -n 20 # notify outcomes (SENT/RATE_LIMITED/...)
+systemctl stop pancakebot-live            # clean stop -> STOPPED (intentional)
 ```
 
-`setx /M` writes to `HKLM`. Restart the services for the new vars to take
-effect.
+**Pitfall — `Conflicts=` is an eviction, not a refusal**: `systemctl start
+pancakebot-dry` on a box where live is running SILENTLY STOPS live (this
+took the live bot down for 77s on 2026-06-10). The health check
+(`bootstrap/common/health_check.py`) refuses to start a unit whose partner
+is active; prefer it over raw `systemctl start` when unsure.
 
-Verify the names are set:
+**After a crashloop halt** (`start-limit-hit`): fix the root cause (see
+`var/<mode>/crash.json` + journal), then
 
-```powershell
-[Environment]::GetEnvironmentVariables("Machine").GetEnumerator() |
-  Where-Object { $_.Key -like "PANCAKEBOT*" } |
-  ForEach-Object { $_.Key }
-```
-
-### Behavior when env vars are missing
-
-`alert=DISABLED` — soft fallback, no HTTP attempted. The classification
-still goes to SCM event log via `servicemanager.LogInfoMsg`. HTTP failures
-(bad URL, timeout, 4xx/5xx) log to stderr via `safe_stderr_write`, never
-crash the supervisor.
-
-Rate limit: max one alert per `(mode, kind)` per 5 minutes, tracked in
-`var/<mode>/last_alert.json`.
-
-## Verify the service is running
-
-```powershell
-Get-Service -Name PancakeBot*
-```
-
-To surface the actual bot child PID (not the service host PID):
-
-```powershell
-$svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='PancakeBotLive'"
-$children = Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$($svc.ProcessId)"
-$children | Select-Object ProcessId, CommandLine
-```
-
-`scripts\enable_live.ps1` and `enable_dry.ps1` do this automatically and
-print the bot child PID on a successful start.
-
-## Pause / resume / uninstall
-
-Stop without deregistering:
-
-```powershell
-Stop-Service -Name PancakeBotLive
-Stop-Service -Name PancakeBotDry
-```
-
-Flip to Manual start type (won't auto-start at boot):
-
-```powershell
-Set-Service -Name PancakeBotLive -StartupType Manual
-Set-Service -Name PancakeBotDry -StartupType Manual
-```
-
-Fully uninstall:
-
-```powershell
-.\scripts\install_services.ps1 -Uninstall
-```
-
-## Troubleshooting
-
-**`STATUS=UNINSTRUMENTED` for a running bot** — the bot was launched
-outside the service (e.g., from an interactive shell). Kill any
-out-of-service bot processes before starting the service to avoid the
-mode-mutex tripping.
-
-**`STATUS=DOWN` for a bot you think is running** — the cmdline check in
-`_pid_is_our_bot` requires `run.py --<mode>` in the process cmdline. A
-bot launched via a shell shim with a different cmdline will get
-misclassified. Verify with `Get-CimInstance Win32_Process -Filter "Name =
-'python.exe'" | Select CommandLine`.
-
-**Discord alerts not arriving** — confirm the env vars are Machine-scope
-(`setx /M`), not User-scope. Services don't inherit User env. Restart the
-service after setting. Check the SCM event log for `alert=SEND_FAILED`
-lines; common cause: `401`/`404` = wrong webhook URL.
-
-**Restart loop** — the fast-tier limiter cuts off at 3 restarts in 15 min
-with `SUPPRESSED_FAST_CRASHLOOP`. If you're still loop-restarting after
-that fires, check `var/<mode>/crash.json` for the root cause and
-`var/<mode>/logs/*_err.log` for the last bot's traceback. After fixing,
-clear the loop with:
-
-```powershell
-Remove-Item var\<mode>\restart_history.jsonl
-Remove-Item var\<mode>\crash.json
+```bash
+systemctl reset-failed pancakebot-live    # clear the start-limit state
+rm -f var/live/restart_history.jsonl      # optional: reset loop counters
+systemctl start pancakebot-live
 ```
 
 ## Files produced
 
-| Path                               | Writer     | Purpose                                     |
-|------------------------------------|------------|---------------------------------------------|
-| `var/<mode>/bot.pid`               | bot        | PID on startup, cleared on clean exit       |
-| `var/<mode>/crash.json`            | bot        | Uncaught-exception dump (atomic write)      |
-| `var/<mode>/last_alert.json`       | supervisor | Per-classification alert cooldown timestamps|
-| `var/<mode>/restart_history.jsonl` | supervisor | Restart events, pruned at slow-window age   |
-| `var/<mode>/logs/*.log`            | spawned bot| stdout/stderr of supervisor-spawned bots    |
-| `var/<mode>/runtime.log`           | bot        | Per-cycle structured runtime log            |
-| `var/<mode>/cycle_audit.csv`       | bot        | Per-cycle audit row for backtest replay     |
+| Path                               | Writer            | Purpose                                  |
+|------------------------------------|-------------------|------------------------------------------|
+| `var/<mode>/bot.pid`               | bot (`run.py`)    | PID on startup, cleared on clean exit    |
+| `var/<mode>/crash.json`            | bot (`run.py`)    | Uncaught-exception dump (atomic write); archived to `crash_archive_*.json` on next start |
+| `var/<mode>/last_alert.json`       | notify oneshot    | Per-(mode,kind) alert cooldown timestamps|
+| `var/<mode>/restart_history.jsonl` | notify oneshot    | Auto-restart events, pruned at 24h age   |
+| `var/<mode>/runtime.log`           | bot               | Per-cycle structured runtime log         |
+| `var/<mode>/cycle_audit.csv`       | bot               | Per-cycle audit row for backtest replay  |
 
-None of these are committed to git (`var/` is in `.gitignore`).
+None of these are committed to git (`var/` is in `.gitignore`). The bot's
+stdout/stderr go to journald (no separate log-capture files).

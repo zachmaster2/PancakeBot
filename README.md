@@ -179,7 +179,7 @@ predicted predecessor block (Bundle 5 v2, 2026-05-14).
   (CAPTURE), complete before the critical-path wake (COMPLETION), and
   its wall cap must clear the anchor poll (ANCHOR CLEARANCE).
 - `max_consecutive_kline_fetch_failures = 5` — streak counter before bot
-  crashes (supervisor restart + Discord alert).
+  crashes (systemd restart + Discord alert).
 
 ### Empirical constants
 

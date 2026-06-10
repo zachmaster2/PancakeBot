@@ -11,9 +11,9 @@ Description=PancakeBot Live Trading
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 Conflicts=pancakebot-dry.service
-# Crashloop brake (replaces SupervisorCore's fast-restart limiter): after 5
-# failed starts within 15 min systemd stops retrying (Result=start-limit-hit,
-# alerted as SUPPRESSED_FAST_CRASHLOOP by the notify hook).
+# Crashloop brake: after 5 failed starts within 15 min systemd stops
+# retrying (Result=start-limit-hit, alerted as SUPPRESSED_FAST_CRASHLOOP
+# by the notify hook).
 StartLimitBurst=5
 StartLimitIntervalSec=900
 

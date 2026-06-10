@@ -65,7 +65,7 @@ def _read_pending(path: Path) -> list[dict]:
 
 
 def _atomic_write_jsonl(path: Path, entries: list[dict]) -> None:
-    """tempfile + os.replace -- supervisor already uses this pattern."""
+    """tempfile + os.replace -- same atomic-write pattern as the bot."""
     path.parent.mkdir(parents=True, exist_ok=True)
     body = "\n".join(
         json.dumps(e, sort_keys=True, separators=(",", ":")) for e in entries

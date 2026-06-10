@@ -176,9 +176,9 @@ def run_from_config(
 
     # Bundle 5 2026-05-14: persist every structured log line to a
     # rotating file under ``var/{mode}/runtime.log``. The stdout writer
-    # (consumed by the Windows pythonw redirect into the supervisor's
-    # stdout capture) is preserved; the file sink is purely additive
-    # and survives a crash that takes the stdout consumer down with it.
+    # (collected by journald under the systemd units) is preserved; the
+    # file sink is purely additive and survives a crash that takes the
+    # stdout consumer down with it.
     _runtime_log_path = (
         paths.DRY_RUNTIME_LOG_PATH if dry else paths.LIVE_RUNTIME_LOG_PATH
     )

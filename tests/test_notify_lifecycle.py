@@ -1,10 +1,9 @@
 """Tests for pancakebot.ops.notify_lifecycle (Phase 3c-2 systemd-direct).
 
 Covers the pure decision table (event + unit state -> alert kinds), the
-two-tier crashloop logic at SupervisorCore's carried-over thresholds, the
-systemctl-show/env state reading, instance parsing, and the end-to-end
-main() wiring with injected runner + captured notify calls. No systemd, no
-network.
+two-tier crashloop thresholds, the systemctl-show/env state reading,
+instance parsing, crash evidence, and the end-to-end main() wiring with
+injected runner + captured notify calls. No systemd, no network.
 """
 from __future__ import annotations
 
@@ -75,6 +74,39 @@ def test_query_unit_state_survives_empty_output():
     assert (result, status, n) == ("unknown", "?", 0)
 
 
+# -- crash evidence (RECOVERY_AFTER_CRASH vs run.py's archive race) ----------
+
+def test_crash_evidence_direct_crash_json(tmp_path):
+    art = {"crash": tmp_path / "crash.json"}
+    art["crash"].write_text("{}", encoding="utf-8")
+    assert nl.crash_evidence(art, now=1000.0) is True
+
+
+def test_crash_evidence_fresh_archive_counts(tmp_path):
+    """run.py archives the lingering crash.json before the detached notify
+    unit looks — a just-renamed (fresh st_ctime) archive IS crash evidence."""
+    art = {"crash": tmp_path / "crash.json"}
+    (tmp_path / "crash_archive_20260610-120000.json").write_text(
+        "{}", encoding="utf-8")
+    now = 1000.0
+    assert nl.crash_evidence(art, now=now, ctime_of=lambda p: now - 5.0) is True
+
+
+def test_crash_evidence_stale_archive_ignored(tmp_path):
+    """Archives from past crashes (old ctime) must NOT flag a clean start."""
+    art = {"crash": tmp_path / "crash.json"}
+    (tmp_path / "crash_archive_20260601-000000.json").write_text(
+        "{}", encoding="utf-8")
+    now = 1000.0
+    assert nl.crash_evidence(
+        art, now=now, ctime_of=lambda p: now - 3600.0) is False
+
+
+def test_crash_evidence_empty_dir(tmp_path):
+    art = {"crash": tmp_path / "crash.json"}
+    assert nl.crash_evidence(art, now=1000.0) is False
+
+
 # -- decision table: started ------------------------------------------------
 
 def _decide(**kw):
@@ -103,7 +135,7 @@ def test_fresh_start_with_crash_json_is_recovery():
 
 
 def test_reboot_beats_recovery():
-    """Matches SupervisorCore._classify_first_run ordering: uptime first."""
+    """First-run classification ordering: uptime check beats crash.json."""
     alerts, _ = _decide(crash_exists=True, uptime_s=60.0)
     assert [k for k, _, _ in alerts] == ["REBOOTED"]
 

@@ -75,8 +75,8 @@ def configure_file_logging(log_path: str) -> RotatingFileHandler:
     (the directory that contains the ``pancakebot/`` package), NOT
     ``os.getcwd()``. This prevents log-file misplacement when an
     operator launches the bot from a non-repo-root working directory
-    (the supervisor's systemd unit already sets WorkingDirectory to the
-    repo root, but ad-hoc operator launches drift if we resolve via cwd).
+    (the systemd units already set WorkingDirectory to the repo root,
+    but ad-hoc operator launches drift if we resolve via cwd).
     Absolute paths pass through unchanged.
     """
     if os.path.isabs(log_path):

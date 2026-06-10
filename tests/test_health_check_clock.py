@@ -99,30 +99,43 @@ def test_clock_sync_skips_without_chronyc(monkeypatch):
 def test_run_refuses_to_start_when_conflicting_unit_is_running(monkeypatch):
     """Conflicts= guard (2026-06-10 incident): the live/dry units are
     mutually exclusive, so health-checking the STOPPED one on a box where
-    the partner is RUNNING must FAIL EARLY — starting it would silently
+    the partner is active must FAIL EARLY — starting it would silently
     stop the running (production) bot."""
     import bootstrap.common.health_check as hc
-    from pancakebot.service import ServiceState
 
     monkeypatch.setattr(hc, "_clock_sync_ok", lambda: (True, "test"))
-    started: list[str] = []
+    started: list[list[str]] = []
 
-    class FakePlatform:
-        def service_status(self, name):
-            return (
-                ServiceState.RUNNING if name == "pancakebot-live"
-                else ServiceState.STOPPED
-            )
+    def fake_systemctl(argv):
+        if argv[0] == "show":
+            active = "active" if argv[1] == "pancakebot-live" else "inactive"
+            return f"LoadState=loaded\nActiveState={active}\n"
+        if argv[0] == "start":
+            started.append(argv)
+        return ""
 
-        def start_service(self, name):
-            started.append(name)
-
+    monkeypatch.setattr(hc, "_run_systemctl", fake_systemctl)
     ok = hc.run(
         mode="dry", service_name="pancakebot-dry",
         start_timeout_s=1.0, ready_timeout_s=1.0,
-        platform=FakePlatform(),
     )
     assert ok is False
     assert started == [], (
-        "must refuse BEFORE start_service — starting dry would stop live"
+        "must refuse BEFORE systemctl start — starting dry would stop live"
     )
+
+
+def test_run_fails_on_unregistered_unit(monkeypatch):
+    """A unit systemd doesn't know (LoadState=not-found) fails step 1."""
+    import bootstrap.common.health_check as hc
+
+    monkeypatch.setattr(hc, "_clock_sync_ok", lambda: (True, "test"))
+    monkeypatch.setattr(
+        hc, "_run_systemctl",
+        lambda argv: "LoadState=not-found\nActiveState=inactive\n",
+    )
+    ok = hc.run(
+        mode="dry", service_name="pancakebot-nonexistent",
+        start_timeout_s=1.0, ready_timeout_s=1.0,
+    )
+    assert ok is False

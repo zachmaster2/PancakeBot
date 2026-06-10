@@ -1,7 +1,7 @@
-"""Local HTTP catcher for supervisor smoke test #3.
+"""Local HTTP catcher for Discord-webhook smoke test #3.
 
 Runs a single-shot HTTP server on localhost, captures ONE POST, prints the
-JSON payload + headers, then exits. Supervisor points its webhook URL at
+JSON payload + headers, then exits. Point the webhook env var at
 http://localhost:<port>/catch.
 """
 from __future__ import annotations

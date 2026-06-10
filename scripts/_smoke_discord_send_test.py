@@ -1,7 +1,7 @@
 """One-shot test-message poster for the 3 PancakeBot Discord webhooks.
 
-Reads the three PANCAKEBOT_*_DISCORD_WEBHOOK_URL env vars the supervisor
-uses (on the VM they come from /etc/pancakebot/pancakebot.env) and POSTs
+Reads the three PANCAKEBOT_*_DISCORD_WEBHOOK_URL env vars the alerting
+uses (on the VM they come from /etc/pancakebot/alerts.env) and POSTs
 a distinguishable test payload to each. Run manually once after setting
 up the webhooks; confirm each channel receives its test message before
 relying on the alert taxonomy.
@@ -47,7 +47,7 @@ CHANNELS = [
         "emoji": ":pancakes:",
         "position": "Test 3/3",
         "expected_channel": "pancakebot-general",
-        "purpose": "UNINSTRUMENTED + supervisor-self errors",
+        "purpose": "cross-cutting general-channel alerts",
     },
 ]
 

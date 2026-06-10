@@ -16,7 +16,7 @@ pool_cutoff_seconds = 6
 
 # Streak counter on the live decision path. After this many consecutive
 # OKX kline fetch failures the gate raises InvariantError, the bot
-# crashes, and the supervisor restarts + fires a Discord alert.
+# crashes, and systemd restarts it + fires a Discord alert.
 max_consecutive_kline_fetch_failures = 5
 
 [dry]

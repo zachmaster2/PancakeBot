@@ -178,7 +178,7 @@ RETRY_SYNC = RetryPolicy(max_attempts=5, backoff_seconds=(2.0, 4.0, 8.0, 16.0))
 # wall-clock + rate-budget cost for no operational benefit. The gate's
 # ``max_consecutive_kline_fetch_failures`` streak counter (configured per
 # MomentumGateConfig) handles escalation: N consecutive -> bot crashes
-# with InvariantError -> supervisor restart + Discord alert.
+# with InvariantError -> systemd restart + Discord alert.
 RETRY_NONE = RetryPolicy(max_attempts=1, backoff_seconds=())
 
 # Test fixture only (tests/test_okx_warmup_transient.py exercises the
@@ -287,7 +287,7 @@ class OkxClient:
         Pre-fix history: OKX sporadically resets established sockets
         (`WinError 10054 / ConnectionResetError`). The uncaught re-raise
         here killed the dry bot twice in 24h (2026-04-22 22:58 EDT and
-        2026-04-22 23:59 EDT). Supervisor reported CRASHED correctly both
+        2026-04-22 23:59 EDT). CRASHED was alerted correctly both
         times but the process was still dead until manual restart.
 
         Note on error contract: a fully-failed network underneath warmup

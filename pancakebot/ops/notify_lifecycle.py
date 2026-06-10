@@ -16,12 +16,15 @@ what makes the separate-unit design work — ``$SERVICE_RESULT`` /
 and do NOT propagate through ``systemctl start``. (They are still read
 preferentially when present, so direct ExecStopPost invocation also works.)
 
-Event -> kind mapping (reuses the existing notifications.py taxonomy +
-SupervisorCore's thresholds verbatim):
+Event -> kind mapping (the notifications.py taxonomy):
 
   started, NRestarts==0 (fresh/manual start):
       uptime < 10min        -> REBOOTED
-      crash.json present    -> RECOVERY_AFTER_CRASH
+      crash evidence        -> RECOVERY_AFTER_CRASH (crash.json present, OR a
+                               crash_archive_*.json freshly renamed by run.py
+                               — run.py archives the lingering crash.json
+                               within milliseconds of starting, racing this
+                               detached --no-block notify unit)
       else                  -> STARTED
   started, NRestarts>0 (systemd auto-restart after a failure):
       append to var/<mode>/restart_history.jsonl, then two-tier check:
@@ -55,7 +58,7 @@ from pancakebot.service import notifications
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Thresholds — carried over from SupervisorCore verbatim.
+# Crashloop / reboot-detection thresholds (validated live 2026-06-10).
 _FAST_RESTART_MAX = 3
 _FAST_RESTART_WINDOW_S = 15 * 60.0
 _SLOW_RESTART_MAX = 8
@@ -64,6 +67,10 @@ _REBOOT_DETECT_S = 10 * 60.0
 
 _JOURNAL_TAIL_LINES = 30
 _DETAIL_JOURNAL_CHARS = 160
+
+# How recently a crash_archive_*.json must have been renamed (st_ctime) to
+# count as crash evidence for the CURRENT start — see crash_evidence().
+_CRASH_ARCHIVE_FRESH_S = 120.0
 
 RunCmd = Callable[[list[str]], str]
 
@@ -151,7 +158,32 @@ def _last_journal_line(tail: str) -> str:
     return ""
 
 
-# -- restart history (same JSONL shape the supervisor wrote) ----------------
+def crash_evidence(
+    art: Mapping[str, Path], now: float,
+    ctime_of: Callable[[Path], float] | None = None,
+) -> bool:
+    """Did a crash precede the CURRENT start?
+
+    ``crash.json`` present is direct evidence. But run.py archives a
+    lingering crash.json (rename -> ``crash_archive_*.json``) within
+    milliseconds of starting — usually BEFORE this detached ``--no-block``
+    notify unit gets to look. A freshly-renamed archive is equivalent
+    evidence: the rename refreshes ``st_ctime`` (Linux inode-change time),
+    so "archived within the last 2 minutes" means "archived by this start".
+    """
+    if art["crash"].exists():
+        return True
+    get_ctime = ctime_of or (lambda p: p.stat().st_ctime)
+    try:
+        for p in art["crash"].parent.glob("crash_archive_*.json"):
+            if (now - get_ctime(p)) <= _CRASH_ARCHIVE_FRESH_S:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+# -- restart history (same JSONL shape, var/<mode>/restart_history.jsonl) ---
 
 def read_history(path: Path) -> list[dict]:
     entries: list[dict] = []
@@ -285,7 +317,7 @@ def main(
         history = read_history(art["restart_history"])
         alerts, new_history = decide(
             event=event, result=result, exit_status=exit_status,
-            n_restarts=n_restarts, crash_exists=art["crash"].exists(),
+            n_restarts=n_restarts, crash_exists=crash_evidence(art, now_ts),
             uptime_s=_system_uptime_s(), history=history, now=now_ts,
             journal_line=_last_journal_line(tail),
         )

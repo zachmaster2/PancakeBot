@@ -1,18 +1,15 @@
-"""Discord notification state machine for the bot supervisor service.
+"""Discord alert executor for bot lifecycle events.
 
-Pure logic plus a single HTTP call (``requests.post``). Extracted from
-``scripts/supervisor.py`` Phase 2c code, extended with the new states
-introduced by the service refactor (REBOOTED, STOPPED, MODE_TRANSITION,
-MODE_TRANSITION_REFUSED, STARTED, SERVICE_CRASHED).
+Pure logic plus a single HTTP call (``requests.post``). Fired by
+``pancakebot.ops.notify_lifecycle`` — the ``pancakebot-notify@`` oneshot
+that the systemd bot units trigger on start/stop edges (docs/SUPERVISOR.md).
 
-Channels (env-var names unchanged from legacy):
+Channels:
   PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL  -> live mode events
   PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL   -> dry mode events
-  PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL      -> cross-cutting (UNINSTRUMENTED,
-                                                  SERVICE_CRASHED, supervisor-
-                                                  self errors)
+  PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL      -> cross-cutting kinds
 
-Rate limit: one alert per (mode, kind) per 5 minutes (matches legacy).
+Rate limit: one alert per (mode, kind) per 5 minutes.
 Unset env var: silent fallback (no HTTP, no crash). HTTP failure: logged
 to stderr, never raises.
 
@@ -29,7 +26,6 @@ import os
 import socket
 import sys
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +33,7 @@ from typing import Any
 # Constants & routing tables
 # ---------------------------------------------------------------------------
 
-_ALERT_COOLDOWN_S: float = 300.0  # 5 min, matches legacy supervisor
+_ALERT_COOLDOWN_S: float = 300.0  # 5 min per (mode, kind)
 
 LIVE_WEBHOOK_ENV = "PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL"
 DRY_WEBHOOK_ENV = "PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL"
@@ -138,7 +134,7 @@ def rate_limit_ok(last_alert_path: Path, key: str, now: float, cooldown_s: float
     """True if we haven't alerted for ``key`` within ``cooldown_s``.
 
     Updates last_alert.json on every attempt (success OR failure) so a flapping
-    endpoint doesn't cause the supervisor to hammer it.
+    endpoint doesn't get hammered with retries.
     """
     data = _safe_read_json(last_alert_path) or {}
     last_ts = 0.0
@@ -207,9 +203,9 @@ def build_message(
     local = _local_time_str()
 
     severity = _SEVERITY_BY_KIND.get(kind, "INFO")
-    # D4: STOPPED is INFO when intentional (admin/SCM stop, mode mutex, deploy)
-    # and CRIT otherwise. The supervisor passes ``intentional=True`` on the clean
-    # stop path; any future unintentional STOPPED stays CRIT.
+    # D4: STOPPED is INFO when intentional (systemctl stop, mode mutex, deploy)
+    # and CRIT otherwise. notify_lifecycle passes ``intentional=True`` on the
+    # Result=success stop path; any unintentional STOPPED stays CRIT.
     if kind == "STOPPED":
         severity = "INFO" if fields.get("intentional") else "CRIT"
     # D5: [MODE] prefix on EVERY alert (matches the bet-alert channel prefix) —
@@ -303,37 +299,16 @@ def notify(
     ok, send_detail = _send_discord(webhook, mode, msg)
     if ok:
         return "SENT"
-    # safe_stderr_write handles sys.stderr=None when hosted by
-    # pythonservice.exe (otherwise an AttributeError crashes the service —
-    # caught 2026-05-23 post-reboot when first-run Discord POST failed on
-    # not-yet-resolved DNS and the SEND_FAILED branch took down the supervisor).
-    from pancakebot.service.supervision import safe_stderr_write
-    safe_stderr_write(
-        f"discord_send_failed mode={mode} kind={kind} detail={send_detail}"
-    )
+    # stderr -> journald under the systemd-hosted callers. Guarded so the
+    # diagnostic write can never escalate a SEND_FAILED into a crash of the
+    # alerting process (2026-05-23: an unguarded stderr write here took the
+    # alerter down when the first-run Discord POST failed on unresolved DNS).
+    try:
+        print(
+            f"discord_send_failed mode={mode} kind={kind} detail={send_detail}",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
     return "SEND_FAILED"
 
-
-def notify_service_error(*, mode: str, exc: BaseException) -> None:
-    """Fire a best-effort general-channel alert when the service itself errors.
-
-    Called from outer except-blocks in service SvcDoRun. No rate-limit
-    persistence (no art dict available in a crash path). Never raises.
-    """
-    try:
-        webhook = os.environ.get(GENERAL_WEBHOOK_ENV, "").strip()
-        if not webhook:
-            return
-        hostname = socket.gethostname()
-        local = _local_time_str()
-        tb = _clip_text(traceback.format_exc(), max_lines=20, max_chars=1500)
-        msg = "\n".join([
-            f"[CRIT] **SERVICE_CRASHED** `PancakeBot-{mode}` on `{hostname}` at `{local}`",
-            f"exc: `{type(exc).__name__}`",
-            f"repr: `{exc!r}`",
-            "```\n" + tb + "\n```" if tb else "",
-        ]).strip()
-        _send_discord(webhook, mode, msg)
-    except Exception:
-        # Last-ditch; never let an alert failure cascade from an already-failing context.
-        pass
