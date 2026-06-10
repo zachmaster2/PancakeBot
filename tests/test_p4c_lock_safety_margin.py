@@ -152,6 +152,59 @@ def test_pool_cutoff_too_small_for_single_poll_capture_rejected(tmp_path):
     assert "single_poll_fires_before_cutoff_available" in str(raised)
 
 
+# ---------------------------------------------------------------------------
+# ANCHOR-CLEARANCE invariant (Era 12b follow-up, 2026-06-10): a wall-cap-bound
+# single poll must release the engine thread before the anchor poll fires.
+# cap + tail <= single_poll_wakeup - ANCHOR_POLL_OFFSET. Keyed to the ANCHOR
+# offset (the next event on the engine thread), NOT critical_path — the old
+# critical_path-keyed engine deadline (1105ms vs the real 1000ms gap) is the
+# misalignment that masked the cap/anchor adjacency until the Era 12b review.
+# ---------------------------------------------------------------------------
+
+def test_anchor_clearance_holds_at_canonical_constants(tmp_path):
+    """Positive: the canonical constants satisfy cap + tail <= anchor gap
+    (with exact equality today: 950 + 50 == 2500 - 1500), and config load
+    succeeds. If this fails, someone moved the rail, the anchor offset, the
+    wall cap, or the tail margin without co-updating the others."""
+    gap = (
+        tc.SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS
+        - tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS
+    )
+    assert tc.RPC_POLL_WALL_CAP_SINGLE_MS + tc.RPC_POLL_TAIL_MARGIN_MS <= gap
+    # Pin the current exact-equality relationship so a drift in EITHER
+    # direction is a conscious decision (slack would mean the cap is
+    # tighter than the budget affords; deficit fails the load below).
+    assert tc.RPC_POLL_WALL_CAP_SINGLE_MS + tc.RPC_POLL_TAIL_MARGIN_MS == gap
+    load_app_config(str(_write_cfg(tmp_path)))  # must not raise
+
+
+def test_anchor_clearance_rejects_oversized_wall_cap(tmp_path, monkeypatch):
+    """Negative: raising the wall cap past the anchor gap must fail config
+    load with single_poll_wall_cap_collides_with_anchor — a cap-bound poll
+    would still be running when the anchor fires."""
+    monkeypatch.setattr(
+        tc, "RPC_POLL_WALL_CAP_SINGLE_MS",
+        tc.SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS
+        - tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS
+        - tc.RPC_POLL_TAIL_MARGIN_MS
+        + 1,  # 1ms past the boundary
+    )
+    with pytest.raises(InvariantError, match="single_poll_wall_cap_collides_with_anchor"):
+        load_app_config(str(_write_cfg(tmp_path)))
+
+
+def test_anchor_clearance_rejects_moved_anchor_offset(tmp_path, monkeypatch):
+    """Negative: moving the anchor poll EARLIER (larger offset) shrinks the
+    single poll's gap; without co-shrinking the wall cap the invariant must
+    fire. This is the co-update-discipline tripwire."""
+    monkeypatch.setattr(
+        tc, "ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS",
+        tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS + 100,  # 1500 -> 1600
+    )
+    with pytest.raises(InvariantError, match="single_poll_wall_cap_collides_with_anchor"):
+        load_app_config(str(_write_cfg(tmp_path)))
+
+
 def test_pool_cutoff_default_is_6(tmp_path):
     cfg = load_app_config(str(_write_cfg(tmp_path)))
     assert cfg.pool_cutoff_seconds == 6

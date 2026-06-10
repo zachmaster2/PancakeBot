@@ -908,6 +908,41 @@ def load_app_config(path: str) -> AppConfig:
             f"RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE."
         )
 
+    # --- Startup invariant (ANCHOR CLEARANCE, Era 12b 2026-06-10): a
+    # wall-cap-bound single poll must release the engine thread before the
+    # anchor poll fires. The single poll runs SYNCHRONOUSLY on the engine
+    # thread from its wake (lock - single_poll_wakeup) until at most the
+    # wall cap + the post-cap processing tail; the next event on that
+    # thread is the anchor poll at lock - ANCHOR_POLL_OFFSET. Every ms a
+    # capped poll runs past that gap delays the anchor 1:1 and eats the
+    # critical path's slack. Keyed to the ANCHOR offset — the actual next
+    # downstream event — NOT critical_path: the engine's deadline was
+    # historically derived from critical_path (1105ms budget vs the real
+    # 1000ms anchor gap), which masked exactly this adjacency until the
+    # Era 12b pre-deploy review. The engine derives single_poll
+    # deadline_ms from this same expression; fires if anyone moves the
+    # rail, the anchor offset, the wall cap, or the tail margin without
+    # co-updating the others. ---
+    _single_poll_anchor_gap = (
+        single_poll_wakeup_offset_before_lock_ms
+        - _tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS
+    )
+    if (
+        _tc.RPC_POLL_WALL_CAP_SINGLE_MS + _tc.RPC_POLL_TAIL_MARGIN_MS
+        > _single_poll_anchor_gap
+    ):
+        raise InvariantError(
+            f"single_poll_wall_cap_collides_with_anchor: "
+            f"wall_cap={_tc.RPC_POLL_WALL_CAP_SINGLE_MS}ms "
+            f"+ tail={_tc.RPC_POLL_TAIL_MARGIN_MS}ms "
+            f"> anchor_gap={_single_poll_anchor_gap}ms "
+            f"(single_poll_wakeup={single_poll_wakeup_offset_before_lock_ms}ms "
+            f"- anchor_offset={_tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS}ms). "
+            f"A cap-bound single poll would still be running when the anchor "
+            f"poll fires. Lower RPC_POLL_WALL_CAP_SINGLE_MS or move the "
+            f"rail/anchor offset consciously (timing co-update discipline)."
+        )
+
     # Candidate C (2026-06-06): the 3-leg ramp ladder + its per-leg interval
     # invariants are retired. The first scheduled wake in the round is now
     # okx_warmup, then preflight, then the single poll — all strictly

@@ -647,15 +647,15 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         info("READY", f"send-cache refreshed: {cfg.contract.send_cache_summary()}")
 
         # -- Single RPC poll (Candidate C, 2026-06-06) --
-        # ONE batched catch-up before the critical-path snapshot, replacing
+        # ONE getLogs catch-up before the critical-path snapshot, replacing
         # the 3-leg ramp ladder. Fires at lock_at -
-        # single_poll_wakeup_offset_before_lock_ms (= ~4.75s at canonical
-        # pool_cutoff=6 — the latest offset that still captures the cutoff
-        # block with the availability + safety cushion). The retained 8s
-        # periodic poll keeps the cursor within ~1 interval, so this catches
-        # only the ~5-20 blocks since the last periodic. deadline_ms = gap to
-        # critical_path - safety; on RTT-exceeds-deadline the round-aware
-        # feasibility check (INFEAS) drives the skip, not this poll. Label
+        # single_poll_wakeup_offset_before_lock_ms (fixed 2500ms rail since
+        # the 2026-06-06 VM re-baseline, bracketed by the CAPTURE +
+        # COMPLETION + ANCHOR-CLEARANCE invariants in config.py). The
+        # retained 8s periodic poll keeps the cursor within ~1 interval, so
+        # this catches only the ~5-20 blocks since the last periodic. On a
+        # capped/failed poll the round-aware feasibility check (INFEAS) and
+        # the F0 coverage gate drive the skip, not this poll. Label
         # "single" is 6 chars, fits the log SUB_W=6.
         if cfg.rpc_poller is not None:
             single_poll_wake_ts = (
@@ -666,11 +666,22 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 reason="wait_for_single_poll",
                 epoch=current_epoch,
             )
+            # deadline = the gap to the ANCHOR POLL fire (the next event on
+            # this thread, at lock - ANCHOR_POLL_OFFSET) minus the post-cap
+            # processing tail. Keyed to the anchor offset, NOT critical_path:
+            # the poll blocks this thread, so what bounds its time is when
+            # the anchor must fire — deriving from critical_path (further
+            # from lock by 305ms at canonical values) yielded a 1105ms
+            # budget against the real 1000ms gap, the misalignment that
+            # masked the wall-cap/anchor adjacency until the 2026-06-10
+            # review. Same expression as the ANCHOR-CLEARANCE startup
+            # invariant; the poller additionally takes
+            # min(deadline_ms, RPC_POLL_WALL_CAP_SINGLE_MS).
             single_poll_deadline_ms = max(
                 0,
                 cfg.single_poll_wakeup_offset_before_lock_ms
-                - cfg.critical_path_wakeup_offset_before_lock_ms
-                - 200,  # safety
+                - _tc.ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS
+                - _tc.RPC_POLL_TAIL_MARGIN_MS,
             )
             cfg.rpc_poller.poll(deadline_ms=single_poll_deadline_ms)
 

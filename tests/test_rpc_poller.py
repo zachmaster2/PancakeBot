@@ -955,7 +955,7 @@ def test_periodic_timeout_suspend_when_safe_fire_latest_has_passed():
     below on next_at, safe_fire_latest, and window_start positions: they
     pin the test to the overrun branch, not in-window suspend.
     """
-    from pancakebot.chain.rpc_poller import _POLL_WALL_CAP_PERIODIC_MS
+    from pancakebot.timing_constants import RPC_POLL_WALL_CAP_PERIODIC_MS
     p = RpcPoller(
         interval_seconds=300,
         single_poll_wakeup_offset_before_lock_ms=9500,
@@ -969,7 +969,7 @@ def test_periodic_timeout_suspend_when_safe_fire_latest_has_passed():
     round_open = lock_at - 300
     window_start = lock_at - 9.5
     safe_fire_latest = (
-        window_start - _POLL_WALL_CAP_PERIODIC_MS / 1000.0 - 0.05
+        window_start - RPC_POLL_WALL_CAP_PERIODIC_MS / 1000.0 - 0.05
     )  # = lock_at - 13.55
     k = max(1, int((now - round_open) // 8) + 1)
     next_at = round_open + k * 8
