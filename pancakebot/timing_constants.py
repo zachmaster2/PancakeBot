@@ -259,19 +259,23 @@ BSC_BET_SUBMIT_ONE_WAY_MS: int = 75
 
 # --- RPC poll timing (Era 11: 2026-05-07 pivot) ---------------------------
 #
-# Replaces the WSS-subscription pool watcher with deterministic
-# batched-RPC polling. WSS arrival timing is no longer relevant on the
-# decision path; the pool aggregate is built from periodic + single
-# polls of `eth_getBlockReceipts(blockHash)` over HTTP. See
+# Replaces the WSS-subscription pool watcher with deterministic RPC
+# polling. WSS arrival timing is no longer relevant on the decision path;
+# the pool aggregate is built from periodic + single polls (eth_getLogs
+# range queries since Era 12). See
 # var/design/rpc_polling_architecture_2026_05_07.md for the full
 # architecture and var/incident_reports/2026_05_07_rpc_polling_spike_results.md
 # for the empirical provenance.
 
-# Per-batch p99 round-trip time, indexed by batch size. The single-poll
-# startup invariant looks up size 20 (EXPECTED_SINGLE_POLL_BATCH_SIZE);
-# ``_estimated_catchup_ms`` interpolates for partial-batch remainders.
+# Per-batch p99 round-trip time, indexed by batch size — the RECEIPTS-ERA
+# RTT model, retained ONLY as the conservative cost model in config.py's
+# single-poll completion invariant (lookup at
+# EXPECTED_SINGLE_POLL_BATCH_SIZE=20 -> 240ms; the live getLogs chunk p99 is
+# ~145ms, so the invariant overestimates the poll cost — safe direction).
+# The runtime feasibility estimate uses _GETLOGS_FETCH_RTT_P99_MS in
+# rpc_poller.py, not this table.
 #
-# This is a NETWORK RTT (bot host -> hedged RPC endpoints), so it is
+# This is a NETWORK RTT (bot host -> RPC endpoints), so it is
 # host/network-specific BY DEFINITION and is measured on the host the bot
 # actually runs on. Re-baselined home -> Frankfurt VM 2026-06-06: the home
 # values were ~5x larger purely because of the home host's route to the
@@ -282,14 +286,9 @@ BSC_BET_SUBMIT_ONE_WAY_MS: int = 75
 #
 # Source: research/probe_batch_receipts_p99_3ep_2026_06_03.py run ON THE VM
 # (output probe_batch_receipts_p99_3ep_FROM_VM_2026_06_03_summary.json), n=100
-# per size, 0 failures, fire-to-all across READ_PATH_HEDGED_ENDPOINTS (the
-# 3-endpoint min-wins hedge), bot stopped (no same-host contention).
+# per size, 0 failures, fire-to-all across the then-3-endpoint dataseed
+# hedge, bot stopped (no same-host contention).
 # Per-size p99: {2:79, 5:122, 10:222, 15:229, 20:240}.
-#
-# Consumer: ``_estimated_catchup_ms`` (catch-up feasibility / INFEAS gate).
-# Runtime graceful degradation absorbs any under-measurement via the
-# per-batch deadline check + per-batch try/except in ``RpcPoller._poll_now``
-# (partial failures downgrade to ``pool_not_ready`` rather than crashing).
 RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE: dict[int, int] = {
     2: 79,
     5: 122,
@@ -298,44 +297,31 @@ RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE: dict[int, int] = {
     20: 240,   # VM fire-to-all p99 n=100, 2026-06-03 (was 1319 home)
 }
 
-# Block availability delay — block production (BEP-520 ms) to first
-# successful eth_getBlockReceipts. NODE-SIDE receipt-indexing latency plus
+# Block availability delay — block production (BEP-520 ms) to the block's
+# data being queryable on the read endpoint. NODE-SIDE indexing latency plus
 # the host's RTT tail; like every network-touching constant it is measured
 # on the host the bot runs on (see feedback: network-rtt-host-dependent).
 #
 # Feeds the single-poll CAPTURE invariant (config.py): the fixed 2500ms rail
-# must fire after the cutoff block's receipts are available. At 2500 the
+# must fire after the cutoff block's data is available. At 2500 the
 # margin is ~2200ms, so this value is not load-bearing at the current rail —
 # but it is held at a VM-measured, conservative ceiling so a future tighter
 # rail stays honest.
 #
 # Source: research/probe_block_availability_vm_2026_06_06.py, VM, 25 samples
-# on the production read endpoints (binance/defibit; publicnode 403s raw
-# urllib): per-endpoint p99 518-624ms, pooled p99 624ms. 625 covers the
-# observed max (the poll granularity adds up to +100ms, so the true value is
-# likely ~525). Prior home value 600 (drpc 596 / publicnode 436, 2026-05-07).
+# (measured via eth_getBlockReceipts on the then-current dataseed read pool;
+# binance/defibit — publicnode 403s raw urllib): per-endpoint p99 518-624ms,
+# pooled p99 624ms. 625 covers the observed max (the poll granularity adds up
+# to +100ms, so the true value is likely ~525). The 12h bloXroute getLogs
+# soak (2026-06-09, head-lag max +5 polls at 8s granularity) is consistent
+# with bloXroute availability at or under this ceiling.
 RPC_BLOCK_AVAILABILITY_DELAY_P99_MS: int = 625
 
-# Hard cap on batch size. publicnode tested up to 100 (p50 3092ms;
-# unusable for deadline path) and 200 (response-too-large rejection).
-# 20 is the operating cap for both deadline-driven polls and cold-start
-# (a larger batch is fine for cold-start latency-wise but giving it the
-# same cap simplifies the implementation).
-RPC_BATCH_MAX_BLOCKS: int = 20
-
-# Per-request HTTP timeout for batched JSON-RPC (eth_getBlockReceipts +
-# eth_getBlockByNumber bundles, batch_size <= RPC_BATCH_MAX_BLOCKS).
-# 5s detects unreachable-endpoint scenarios fast while staying well above
-# the empirical p99 single-batch RTT (RPC_BATCH_RECEIPTS_RTT_P99_MS_BY_SIZE:
-# batch=20 -> 240ms VM fire-to-all, 2026-06-03). Was 30s; reduced 2026-05-08
-# after a publicnode outage where 30s hangs grew the catch-up backlog by
-# ~60 blocks per failed poll.
-RPC_HTTP_BATCH_TIMEOUT_SECONDS: int = 5
-
-# Per-request HTTP timeout for single (non-batched) RPC calls
-# (eth_blockNumber, eth_getBlockByNumber). Smaller request, same 5s
-# timeout for consistency.
-RPC_HTTP_SINGLE_TIMEOUT_SECONDS: int = 5
+# (Per-request RPC timeouts live in pancakebot/chain/rpc_poller.py as tight
+# per-call constants sized from measured bloXroute p99 — _GETLOGS_TIMEOUT_MS,
+# _BLX_HEAD_TIMEOUT_MS, _BLX_HEADER_TIMEOUT_MS, _BLX_BLOCK_TS_TIMEOUT_MS —
+# bounded by the poll wall caps _POLL_WALL_CAP_{SINGLE,PERIODIC}_MS. The old
+# blanket 5s HTTP timeouts are gone, Era 12b 2026-06-10.)
 
 # How long either TX path (bet OR claim) waits for its receipt before giving
 # up. Decoupled from buffer_seconds + padding (the refund-eligibility math) —
@@ -349,19 +335,20 @@ TX_RECEIPT_WAIT_TIMEOUT_SECONDS: int = 10
 # cadence, ~67 BSC blocks accumulate between polls (BSC block ~0.45s,
 # rounded to BSC_BLOCK_TIME_MS=500). 67 blocks forces multi-batch
 # catch-up that often exceeds available time before lock. 8s cadence
-# = ~17.8 blocks per poll = single batch at batch_size=20 with margin.
+# = ~17.8 blocks per poll = one getLogs chunk with huge margin.
 # Any poll failure costs less cursor advance; periodic poll's job is
 # keeping cursor close to head.
 RPC_PERIODIC_POLL_INTERVAL_SECONDS: int = 8
 
-# Defense-in-depth pad on top of RPC_HTTP_BATCH_TIMEOUT_SECONDS when
-# deciding the latest safe time a periodic poll may fire before the
-# single-poll window opens.
+# Defense-in-depth pad on top of the periodic poll's wall-clock cap
+# (``_POLL_WALL_CAP_PERIODIC_MS`` in rpc_poller.py) when deciding the
+# latest safe time a periodic poll may fire before the single-poll
+# window opens.
 #
 # What it protects: the race where a periodic poll's ``_poll_lock``
 # release barely overlaps with the engine-driven single poll's wake and
 # non-blocking acquire. If a periodic poll anchored just before
-# single_poll_window_start hits its full HTTP timeout (5s), it completes
+# single_poll_window_start runs to its full wall cap, it completes
 # IN-FLIGHT against the single poll's wake at lock_at − single_poll_offset.
 # Even a few ms of overlap causes the single poll's
 # ``_poll_lock.acquire(blocking=False)`` to fail and silently drop it.
@@ -406,8 +393,10 @@ RPC_POLL_DEADLINE_SAFETY_BUFFER_MS: int = 200
 # 3-leg ramp ladder with ONE batched poll before the critical path; the
 # retained 8s periodic poll keeps the cursor within one interval of head, so
 # the single poll's worst case = one periodic interval (8s) at BSC 0.45s
-# blocks ≈ 17.8 blocks → batch=20 (clamped at RPC_BATCH_MAX_BLOCKS). Runtime
-# batches are dynamic (= blocks since last periodic poll).
+# blocks ≈ 17.8 blocks → batch=20. Runtime polls are getLogs ranges (Era 12);
+# this size + the receipts-era RTT table survive ONLY as the conservative
+# completion-invariant model in config.py (getLogs p99 ~145ms < the table's
+# 240ms at size 20, so the invariant overestimates — safe direction).
 EXPECTED_SINGLE_POLL_BATCH_SIZE: int = 20
 
 # Fixed single-poll wake offset (ms before lock). Candidate C originally
@@ -436,12 +425,10 @@ def rpc_rtt_p99_for_batch(batch_size: int) -> int:
                   * (n - k_lo) / (k_hi - k_lo))
       - ``batch_size > largest``     -> ``table[largest]`` (ceiling at large end)
 
-    All current callers (config.py invariants + rpc_poller._estimated_catchup_ms
-    with ``_batch_size=20``) pass exact measured keys, so the change is
-    pure-passthrough at canonical config. Interpolation only matters when
-    ``_estimated_catchup_ms`` calls with a per-batch remainder (e.g. 7, 12, 18)
-    after the batch-size-aware refactor; there it tightens the estimate vs
-    the prior ceiling lookup, reducing false-INFEAS at small backlogs.
+    Sole current caller: config.py's single-poll completion invariant, which
+    looks up the exact measured key EXPECTED_SINGLE_POLL_BATCH_SIZE=20 —
+    pure passthrough at canonical config. (The runtime feasibility estimate
+    moved to the getLogs chunk model in rpc_poller.py, Era 12.)
 
     For sizes above the largest measured key, the ceiling fallback is
     informational; if it fires, the calling code is provisioning a batch

@@ -27,7 +27,7 @@ from pancakebot.runtime import engine
 from pancakebot.market_data.sync import sync_runtime_market_data
 from pancakebot.util import InvariantError
 from pancakebot.log import configure_file_logging, info
-from pancakebot.chain.rpc_poller import RpcPoller, READ_PATH_HEDGED_ENDPOINTS
+from pancakebot.chain.rpc_poller import RpcPoller
 from pancakebot import paths
 
 
@@ -242,19 +242,15 @@ def run_from_config(
     import atexit as _atexit
     _atexit.register(momentum_gate.shutdown)
 
-    # RPC poller: deterministic poll schedule (cold-start backfill +
-    # periodic + ramp + final) over batched eth_getBlockReceipts.
-    # Replaces the WSS-subscription pool watcher (Era 11, 2026-05-07);
-    # see var/design/rpc_polling_architecture_2026_05_07.md.
-    #
-    # Every JSON-RPC call fires in parallel to every endpoint in
-    # READ_PATH_HEDGED_ENDPOINTS via a shared urllib3.PoolManager (persistent
-    # HTTP/1.1 connections); first 200 response wins. No selection logic
-    # — if an endpoint misbehaves, remove it from the constant. See
-    # var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md.
+    # RPC poller: deterministic poll schedule (cold-start init + periodic +
+    # engine single poll) over eth_getLogs range queries. Replaces the
+    # WSS-subscription pool watcher (Era 11, 2026-05-07); see
+    # var/design/rpc_polling_architecture_2026_05_07.md. Every read RPC goes
+    # to the single bloXroute endpoint (RPC_BLOXROUTE_ENDPOINT, Era 12b) via
+    # a shared urllib3.PoolManager with tight per-attempt timeouts, bounded
+    # retries, and wall-clock-capped polls.
     rpc_poller = RpcPoller(
         interval_seconds=interval_seconds,
-        endpoint_pool=READ_PATH_HEDGED_ENDPOINTS,
         single_poll_wakeup_offset_before_lock_ms=cfg.single_poll_wakeup_offset_before_lock_ms,
         pool_cutoff_seconds=cfg.pool_cutoff_seconds,
     )

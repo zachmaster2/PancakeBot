@@ -3,14 +3,21 @@
 Era 11 (2026-05-07): replaces the WSS-subscription pool watcher.
 Era 12 (2026-06-09): bet events fetched via ``eth_getLogs`` range queries
 (replaced the per-block ``eth_getBlockReceipts`` firehose — byte-identical
-extraction, day-rate ~60 GB -> ~7 MB; the dataseed pool rejects getLogs, so
-the scan runs against ``BET_EVENTS_GETLOGS_ENDPOINT``). Head/anchor/block-ts
-calls stay ``eth_blockNumber``/``eth_getBlockByNumber`` on the hedged pool.
-Architecture: deterministic poll schedule. See:
+extraction, day-rate ~60 GB -> ~7 MB).
+Era 12b (2026-06-10): single-source read path. EVERY read RPC (getLogs +
+head + anchor + round-start header + bet-block timestamps) goes to
+``RPC_BLOXROUTE_ENDPOINT`` through ``_bloxroute_call`` — tight per-attempt
+timeouts sized from measured p99, bounded per-call-site retries, and a
+wall-clock cap on each poll operation. The prior 3-endpoint hedged dataseed
+pool is gone: it could not serve getLogs (so it never provided event-fetch
+failover), its head was redundant as a cross-check (the F0 coverage gate
+compares the cursor's block-time against the CONTRACT-anchored cutoff, a
+node-independent reference), and min(ref_head, bloxroute_head) could
+false-skip rounds when the dataseeds lagged bloXroute. Failure layering:
+momentary blip -> in-call retry; sustained degradation -> wall-cap abort /
+feasibility -> F0 skip. Architecture: deterministic poll schedule. See:
 - ``var/design/rpc_polling_architecture_2026_05_07.md`` (architecture)
 - ``var/incident_reports/2026_05_07_rpc_polling_spike_results.md`` (provenance)
-- ``var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md``
-  (transport + hedging redesign)
 
 The poller has three trigger paths:
 
@@ -30,32 +37,26 @@ The poller has three trigger paths:
    ``_latch_first_successful_poll_locked``; until then
    ``is_pool_ready`` returns ``cold_start_in_progress``. Off the
    critical path; failures are non-fatal (next periodic poll retries).
+   Wall-clock cap ``_POLL_WALL_CAP_PERIODIC_MS`` bounds each tick.
 
 3. **Single poll** — engine-driven catch-up before the critical path
    (Candidate C, 2026-06-06), called from the wake schedule.
-   Synchronous; deadline-aware. RTT-exceeds-deadline marks
-   ``_last_poll_too_slow=True`` for diagnostics, but skips are driven
-   by the round-aware feasibility check
-   (``catchup_infeasible_for_round``), not by individual slow polls.
-   Single transient failures are recoverable; the integrating
-   feasibility signal is what matters at decision time.
+   Synchronous; wall-clock capped at ``_POLL_WALL_CAP_SINGLE_MS`` (no
+   single RPC attempt is even STARTED unless it can finish inside the
+   cap, so the engine's downstream anchor/submit budget is protected
+   by construction). RTT-exceeds-cap marks ``_last_poll_too_slow=True``
+   for diagnostics, but skips are driven by the round-aware feasibility
+   check (``catchup_infeasible_for_round``) and the F0 coverage gate,
+   not by individual slow polls.
 
 Public interface mirrors ``PoolEventWatcher`` where feasible
 (``get_pool``, ``set_round_phase``, ``connected``, ``current_endpoint``,
 ``is_pool_ready``) so the engine call sites are minimally affected.
 
-**Endpoint hedging (fire-to-all-pool, 2026-05-11)**: every JSON-RPC
-call fires in parallel to ALL endpoints in ``READ_PATH_HEDGED_ENDPOINTS``
-via a shared ``ThreadPoolExecutor``. The first successful response
-wins; the rest are abandoned. There is no endpoint selection logic,
-no per-endpoint health tracking, no fan-out knob — if an endpoint
-misbehaves chronically, the operator removes it from the pool by
-editing the constant. Validated 2026-05-11: max wallclock dropped
-from 4.745s to 2.502s vs the prior pick_n + urllib transport.
-
-Persistent HTTP/1.1 connections via ``urllib3.PoolManager`` mean each
+Persistent HTTP/1.1 connections via ``urllib3.PoolManager`` mean the
 endpoint's TLS handshake amortizes across the bot's lifetime — after
-warmup, every hedged batch reuses already-open sockets.
+warmup, every call (including the parallel block-ts fan-out) reuses
+already-open sockets.
 """
 from __future__ import annotations
 
@@ -83,51 +84,32 @@ _BET_BULL_TOPIC = "0x438122d8cff518d18388099a5181f0d17a12b4f1b55faedf6e4a6acee00
 _BET_BEAR_TOPIC = "0x0d8c1fe3e67ab767116a81f122b83c2557a8c2564019cb7c4f83de1aeb1f1f0d"
 
 
-# Hedged endpoint pool for the poller's SINGLE-call RPCs: eth_blockNumber
-# (head) + eth_getBlockByNumber (anchor poll + lazy bet-block timestamps).
-# Every such call fans out in parallel to every URL here; the first 200 wins.
-# No selection logic — if an endpoint misbehaves chronically (sustained
-# timeouts, wrong-chain responses), remove it from this list manually.
+# THE read endpoint (Era 12b, 2026-06-10). Single source for every read RPC:
+# eth_getLogs (bet events), eth_blockNumber (head), eth_getBlockByNumber
+# (anchor poll + round-start header + lazy bet-block timestamps).
 #
-# NOTE (Era 12, 2026-06-09): the bet-event scan no longer runs on this pool.
-# It moved from per-block eth_getBlockReceipts to a single eth_getLogs range
-# query against BET_EVENTS_GETLOGS_ENDPOINT (below) — these 3 dataseed
-# endpoints REJECT eth_getLogs (-32005 "limit exceeded" / 403). So this pool
-# now carries only the small header / blockNumber calls.
-#
-# 3-endpoint pool (Bundle 6 trim, 2026-05-15): one endpoint per fault domain.
-# Per-endpoint probe (n=15 isolated calls, 6s spacing) from
-# research/probe_per_endpoint_isolated_2026_05_15.py — anchor p50/p95 is the
-# metric that still applies (the batch columns measured the retired receipts
-# path):
-#   bsc-dataseed1.binance.org    anchor  30ms /  837ms   (AS14618 AWS EC2)
-#   bsc-dataseed1.defibit.io     anchor 128ms / 1194ms   (AS16509 AWS GA)
-#   bsc-rpc.publicnode.com       anchor 103ms /  822ms   (AS13335 Cloudflare)
-#
-# One endpoint per ASN-family (AWS EC2 + AWS GA + Cloudflare) bounds the
-# cold-start concurrent-connection burst that previously tripped all-pool
-# HedgedAllFailed timeouts. If AWS us-east drops entirely, publicnode remains.
-# (bsc.rpc.blxrbdn.com — same AS16509 family — was dropped from THIS pool in
-# the trim, but is re-added below as the dedicated eth_getLogs endpoint, the
-# only validated no-key option for that role.)
-READ_PATH_HEDGED_ENDPOINTS: list[str] = [
-    "https://bsc-dataseed1.binance.org",
-    "https://bsc-dataseed1.defibit.io",
-    "https://bsc-rpc.publicnode.com",
-]
-
-# Dedicated bet-event fetch endpoint (eth_getLogs). SEPARATE from the hedged
-# pool above by necessity: the 3 dataseed endpoints reject eth_getLogs
-# (-32005 "limit exceeded" / 403 — verified 2026-06-09 across the whole free-
-# dataseed set, research/survey_getlogs_endpoints_2026_06_09.py). bloXroute
-# serves it with no practical range cap (~90ms for 1000 blocks) and byte-
-# identical extraction to the old getBlockReceipts path
-# (research/parity_getlogs_v2_blxr_2026_06_09.py: 114==114, IDENTICAL).
-# SINGLE endpoint by design: a getLogs failure degrades to a skipped poll
-# (the same failure mode as the prior all-pool receipts failure), so no hedge
-# is needed; add a 2nd validated endpoint here as a list only if redundancy is
-# later wanted. block-ts / anchor / head calls stay on the hedged pool.
-BET_EVENTS_GETLOGS_ENDPOINT: str = "https://bsc.rpc.blxrbdn.com"
+# Why bloXroute, alone:
+#   - getLogs: the only validated no-key endpoint that serves it (the free
+#     dataseed set rejects it with -32005 "limit exceeded" / 403 — verified
+#     2026-06-09, research/survey_getlogs_endpoints_2026_06_09.py); byte-
+#     identical extraction vs the retired getBlockReceipts path
+#     (research/parity_getlogs_v2_blxr_2026_06_09.py: 114==114, IDENTICAL);
+#     12h soak 2026-06-09: 5400 polls, 0 errors, 675/675 parity clean.
+#   - block-ts: bloXroute served the bet log, so it PROVABLY has that block —
+#     resolving the timestamp on the same endpoint makes the null-result
+#     ("node hasn't synced block N yet") failure mode structurally impossible.
+#   - head: the getLogs toBlock is bloXroute's own head, so a range beyond its
+#     synced tip (-32000 "invalid block range params") cannot be requested by
+#     construction, and a dataseed pool lagging bloXroute can no longer cap
+#     the cursor below the pool cutoff (false F0 skip).
+#   - latency (VM, n=100 each, 2026-06-10): blockNumber p50 28 / p99 69;
+#     getBlockByNumber(latest) p50 29 / p99 71; getBlockByNumber(bn) p50 30 /
+#     p99 42; getLogs soak p50 19 / p99 145 / max 492.
+# Failure layering: momentary blip -> in-call retry (_bloxroute_call);
+# sustained degradation -> wall-cap abort / feasibility -> F0 skip. A getLogs-
+# endpoint failure means no bet data regardless of any other endpoint, so a
+# second read source would add cross-node skew, not availability.
+RPC_BLOXROUTE_ENDPOINT: str = "https://bsc.rpc.blxrbdn.com"
 
 # Max blocks per eth_getLogs range. Sized to cover every fetch path in ONE
 # call: steady ~8s poll (~18 blocks), engine single poll (~18), and cold-start
@@ -138,6 +120,58 @@ _GETLOGS_CHUNK_BLOCKS: int = 750
 # in the catch-up feasibility estimate. Soak p99 ~137ms (18-block ranges) /
 # survey ~90ms (1000-block); 250ms leaves headroom for tail latency.
 _GETLOGS_FETCH_RTT_P99_MS: int = 250
+
+# -- Per-attempt RPC timeouts (ms), sized comfortably above measured p99 ----
+# (VM measurements above). A timeout is a FAIL-FAST bound, not a budget: a
+# healthy call returns in p50 ~20-30ms; a call that hits one of these is
+# treated as failed and retried (or surfaced) instead of hanging the poll.
+_GETLOGS_TIMEOUT_MS: int = 600       # > soak max 492ms
+_BLX_HEAD_TIMEOUT_MS: int = 250      # eth_blockNumber, > ~3.6x p99 69ms
+_BLX_HEADER_TIMEOUT_MS: int = 250    # getBlockByNumber(latest), > ~3.5x p99 71ms
+_BLX_BLOCK_TS_TIMEOUT_MS: int = 250  # getBlockByNumber(bn), > ~5.9x p99 42ms
+# (anchor poll keeps its own 200ms ceiling via timing_constants.ANCHOR_POLL_TIMEOUT_MS,
+# attempts=1 — its recovery path is the engine's static-deadline fallback.)
+
+# Backoff between retry attempts. The endpoint just served (or is about to
+# serve) other calls, so a blip is momentary — a short pause beats a long one.
+_BLX_RETRY_BACKOFF_MS: int = 25
+
+# Per-call-site attempt counts, derived from each site's time budget:
+# the single poll runs inside the lock-2500ms -> critical-path window (wall
+# cap 1000ms below), so one retry per call is all the budget affords; the
+# periodic poll has the 8s interval (wall cap 4000ms), affording two.
+# Sustained failure is NOT the retries' job — that is the wall cap +
+# feasibility check + F0 gate, which skip the round cleanly.
+_RPC_ATTEMPTS_SINGLE: int = 2
+_RPC_ATTEMPTS_PERIODIC: int = 3
+
+# -- Wall-clock caps: hard bound on one whole poll operation (head fetch +
+# getLogs chunks + block-ts resolution, including all retries). Enforced
+# BEFORE each RPC attempt ("would this attempt's timeout overrun the cap?"),
+# so a poll can never run past its cap — by construction, not estimation.
+#   single:   fires at lock - single_poll_offset (2500ms canonical); must
+#             leave the anchor poll (lock-1500ms) + critical path intact.
+#             1000ms < the engine's deadline_ms budget (~1105ms canonical);
+#             _poll_now takes min(deadline_ms, cap) so a tighter engine
+#             budget always wins.
+#   periodic: must release _poll_lock well inside the 8s cadence so ticks
+#             never pile up and the single poll's wake finds the lock free
+#             (see _compute_periodic_timeout's safe_fire_latest, which
+#             assumes this cap as the worst-case hold).
+# On cap-abort mid-chunk the cursor is NOT advanced past that chunk; the next
+# poll re-fetches the same range, and if coverage is short at decision time
+# F0 skips the round.
+_POLL_WALL_CAP_SINGLE_MS: int = 1000
+_POLL_WALL_CAP_PERIODIC_MS: int = 4000
+
+# Parallel block-ts resolution fan-out width. The single poll's chunk can
+# carry up to ~20 unique bet blocks; resolving serially would put K
+# sequential RPCs on the critical path (unbounded in K), so all K fire
+# concurrently on the executor and total time is ~attempts x timeout
+# INDEPENDENT of K. Width 8: bloXroute serves ~1.7x throughput at 20-wide
+# (VM probe 2026-06-10) — wider fan-out inflates per-call latency without
+# cutting wall time, and 8 keeps the connection pool small.
+_BLOCK_TS_PARALLEL_WORKERS: int = 8
 
 _USER_AGENT = "pancakebot-rpc-poller/1.0"
 
@@ -309,24 +343,6 @@ def compute_submit_deadline_ms(
     return bet_inclusion_deadline - one_way_ms
 
 
-class HedgedAllFailed(Exception):
-    """Composite exception raised when every endpoint in a hedged
-    fan-out fails. Carries the per-endpoint (endpoint, exception)
-    pairs so the operator log line surfaces all failures at once.
-    """
-
-    def __init__(self, errors: list[tuple[str, BaseException]]) -> None:
-        self.errors: list[tuple[str, BaseException]] = list(errors)
-        msg_parts = [
-            f"{endpoint}: {type(e).__name__}: {e}"
-            for endpoint, e in errors
-        ]
-        super().__init__(
-            f"all_hedged_endpoints_failed ({len(errors)}): "
-            + "; ".join(msg_parts)
-        )
-
-
 class RpcPoller:
     """Polls PredictionV2 bet events from BSC via ``eth_getLogs`` range
     queries over HTTP.
@@ -340,10 +356,8 @@ class RpcPoller:
         self,
         *,
         interval_seconds: int,
-        endpoint_pool: list[str],
         contract_address: str = PREDICTION_V2_CONTRACT_ADDRESS,
         periodic_poll_interval_s: int = _tc.RPC_PERIODIC_POLL_INTERVAL_SECONDS,
-        batch_size: int = _tc.RPC_BATCH_MAX_BLOCKS,
         single_poll_wakeup_offset_before_lock_ms: int = 4750,
         pool_cutoff_seconds: int = 6,
     ) -> None:
@@ -351,58 +365,36 @@ class RpcPoller:
             raise InvariantError("interval_seconds_nonpositive")
         if periodic_poll_interval_s <= 0:
             raise InvariantError("periodic_poll_interval_nonpositive")
-        if batch_size <= 0 or batch_size > _tc.RPC_BATCH_MAX_BLOCKS:
-            raise InvariantError(
-                f"batch_size_out_of_range: {batch_size} "
-                f"(max {_tc.RPC_BATCH_MAX_BLOCKS})"
-            )
         if single_poll_wakeup_offset_before_lock_ms <= 0:
             raise InvariantError("single_poll_wakeup_offset_ms_nonpositive")
-
-        pool = list(endpoint_pool)
-        if not pool:
-            raise InvariantError("endpoint_pool_empty")
 
         self._interval_seconds = int(interval_seconds)
         # F0 pool-coverage gate (Era 12): get_pool sizes the bet from bets with
         # block_ts < lock - pool_cutoff_seconds; is_pool_ready refuses to bet
         # unless the cursor has polled THROUGH that cutoff block — the hard
         # guarantee that sizing uses COMPLETE data despite the getLogs endpoint
-        # (bloXroute) possibly lagging the reference pool. See
+        # (bloXroute) possibly lagging real time. See
         # _pool_coverage_shortfall_locked.
         self._pool_cutoff_seconds = int(pool_cutoff_seconds)
-        self._endpoint_pool: list[str] = pool
 
-        # ThreadPoolExecutor for parallel fan-out across the full pool.
-        # Sized to 3 * len(pool) so abandoned-future stragglers from a
-        # previous call (whose urllib3 sockets haven't timed out yet)
-        # can't block the next call's submit. Workers are lazily
-        # spawned, so unused slots are free.
-        # Always constructed — the pool-size-1 fast path in
-        # _do_hedged_post bypasses it, but a never-used executor is
-        # cheap (no threads spawned until submit()).
+        # ThreadPoolExecutor for the parallel block-ts fan-out in
+        # _process_bet_logs. Workers are lazily spawned, so polls with no
+        # unresolved bet blocks (cache hits / no bets) cost nothing here.
         self._executor: concurrent.futures.ThreadPoolExecutor = (
             concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, 3 * len(self._endpoint_pool)),
-                thread_name_prefix="rpc-hedge",
+                max_workers=_BLOCK_TS_PARALLEL_WORKERS,
+                thread_name_prefix="rpc-blockts",
             )
         )
 
-        # urllib3 PoolManager: persistent HTTP/1.1 connections per host.
-        # Eliminates per-call DNS+TCP+TLS handshake cost — the bottleneck
-        # that caused parallel calls to exceed the 5s deadline at ~10%
-        # rate under bare urllib. Validated 2026-05-11 (max wallclock
-        # 4.745s → 2.502s); see
-        # var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md.
-        # ``num_pools`` and ``maxsize`` sized to len(pool) + 1 so every hedged
-        # endpoint AND the separate eth_getLogs host (BET_EVENTS_GETLOGS_ENDPOINT,
-        # POSTed via _rpc_post through this same PoolManager) each keep one
-        # persistent connection — without the +1 the 4th distinct host
-        # (bloXroute) would churn the LRU pool cache against the 3 hedged hosts
-        # every poll, paying a TLS handshake per getLogs call.
+        # urllib3 PoolManager: persistent HTTP/1.1 connections to bloXroute.
+        # Eliminates per-call DNS+TCP+TLS handshake cost. ``maxsize`` covers
+        # the block-ts fan-out width plus the poll thread's own call, so the
+        # parallel resolves each hold a persistent connection instead of
+        # churning sockets.
         self._pool: urllib3.PoolManager = urllib3.PoolManager(
-            num_pools=max(1, len(self._endpoint_pool) + 1),
-            maxsize=max(1, len(self._endpoint_pool) + 1),
+            num_pools=1,
+            maxsize=_BLOCK_TS_PARALLEL_WORKERS + 2,
             headers={
                 "User-Agent": _USER_AGENT,
                 "Content-Type": "application/json",
@@ -411,7 +403,6 @@ class RpcPoller:
 
         self._contract_addr = contract_address.lower()
         self._periodic_poll_interval_s = int(periodic_poll_interval_s)
-        self._batch_size = int(batch_size)
         # Engine-side single-poll lock-relative offset (config-derived in
         # production via pancakebot/config.py from pool_cutoff_seconds;
         # canonical value at pool_cutoff=6 is 4750ms). Used by the
@@ -445,10 +436,6 @@ class RpcPoller:
         # _latch_first_successful_poll_locked. Until then, is_pool_ready
         # returns (False, "cold_start_in_progress") and the engine skips.
         self._connected: bool = False
-        # Most-recently-used endpoint URL (informational; updated by
-        # the hedging transport on each successful call). Display/log
-        # only — every call still fires to every endpoint in the pool.
-        self._current_endpoint: str = self._endpoint_pool[0]
         self._cold_start_done: threading.Event = threading.Event()
         self._cold_start_in_progress: bool = False
         self._last_poll_succeeded: bool = False
@@ -531,14 +518,14 @@ class RpcPoller:
 
     @property
     def current_endpoint(self) -> str:
-        return self._current_endpoint
+        return RPC_BLOXROUTE_ENDPOINT
 
     @property
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "connected": self._connected,
-                "current_endpoint": self._current_endpoint,
+                "current_endpoint": RPC_BLOXROUTE_ENDPOINT,
                 "poll_count": self._poll_count,
                 "last_poll_at": self._last_poll_at,
                 "last_poll_rtt_ms": self._last_poll_rtt_ms,
@@ -547,7 +534,6 @@ class RpcPoller:
                 "last_polled_block": self._last_polled_block_number,
                 "epochs_tracked": len(self._pools),
                 "total_events": self._total_events,
-                "endpoint_pool_size": len(self._endpoint_pool),
             }
 
     # ------------------------------------------------------------------
@@ -572,8 +558,8 @@ class RpcPoller:
 
         The bot's mainnet target is post-Lorentz, so ms-encoding is
         expected. A None return signals either:
-          - RPC timeout / transport failure (network glitch, all hedged
-            endpoints stalled), OR
+          - RPC timeout / transport failure (network glitch, bloXroute
+            stalled), OR
           - The latest block's mixHash decoded to milli_ts that didn't
             parse (malformed encoding — unexpected on a Lorentz chain
             and would indicate an out-of-spec validator).
@@ -582,16 +568,15 @@ class RpcPoller:
         for this round" — no per-session memory of the failure, no
         retry. The next round fires a fresh anchor poll.
         """
-        # urllib3.PoolManager already imposes a per-request timeout via
-        # ``_rpc_call_single`` (uses ``RPC_HTTP_SINGLE_TIMEOUT_SECONDS``).
-        # We additionally enforce a tight ceiling via the hedged
-        # transport's own ``timeout_seconds``: the engine wants any
-        # response slower than ~200ms to count as "missed the window",
-        # not just "transport-level timeout".
+        # attempts=1: the anchor's hard ~200ms ceiling has no room for a
+        # retry, and unlike the data-completeness calls it doesn't need
+        # one — the engine's static-deadline fallback IS the recovery
+        # path. Any response slower than the ceiling counts as "missed
+        # the window", not just transport-level timeout.
         try:
-            block = self._rpc_call_single_with_timeout(
+            block = self._bloxroute_call(
                 "eth_getBlockByNumber", ["latest", False],
-                timeout_s=timeout_s,
+                timeout_ms=int(timeout_s * 1000), attempts=1,
             )
         except Exception:  # noqa: BLE001
             # Anchor poll timeout / transport error: fallback to static wake.
@@ -764,10 +749,10 @@ class RpcPoller:
         )
         self._periodic_thread.start()
         info("START",
-             f"RPC poller started endpoint={self._current_endpoint} "
-             f"getlogs_endpoint={BET_EVENTS_GETLOGS_ENDPOINT} "
+             f"RPC poller started endpoint={RPC_BLOXROUTE_ENDPOINT} "
              f"periodic={self._periodic_poll_interval_s}s "
-             f"getlogs_chunk={_GETLOGS_CHUNK_BLOCKS}")
+             f"getlogs_chunk={_GETLOGS_CHUNK_BLOCKS} "
+             f"wall_caps={_POLL_WALL_CAP_SINGLE_MS}/{_POLL_WALL_CAP_PERIODIC_MS}ms")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -978,7 +963,7 @@ class RpcPoller:
         # Feasibility check: how far behind are we vs how much time
         # remains, with a single fresh head fetch.
         try:
-            head = self._rpc_eth_block_number()
+            head = self._bloxroute_block_number(attempts=_RPC_ATTEMPTS_PERIODIC)
         except Exception:  # noqa: BLE001
             return  # leave _catchup_infeasible_for_round at False; next
                     # poll/round will reassess.
@@ -1032,7 +1017,9 @@ class RpcPoller:
 
         # Method 2 — RPC fallback.
         try:
-            head_num, head_ts = self._rpc_eth_get_latest_block_header()
+            head_num, head_ts, _head_milli = self._bloxroute_latest_header(
+                attempts=_RPC_ATTEMPTS_PERIODIC,
+            )
         except Exception:  # noqa: BLE001
             return None
         if head_ts <= 0 or head_num <= 0:
@@ -1187,7 +1174,9 @@ class RpcPoller:
                 # head_timestamp in one call — both needed to derive
                 # round_start_block from lock_at - interval_seconds.
                 try:
-                    head, head_ts = self._rpc_eth_get_latest_block_header()
+                    head, head_ts, _head_milli = self._bloxroute_latest_header(
+                        attempts=_RPC_ATTEMPTS_PERIODIC,
+                    )
                 except Exception as e:  # noqa: BLE001
                     warn("ALERT", f"init_cursor: eth_getBlockByNumber(latest) failed: {type(e).__name__}: {e}")
                     return
@@ -1395,10 +1384,10 @@ class RpcPoller:
             (sleep past lock and let the post-lock branch resume).
             (Example: single_poll_window_start=lock_at−4.75s, next_at=lock_at−2s.)
 
-          * The anchored tick is just BEFORE the window, but its HTTP
-            timeout (5s) plus jitter could extend it past
+          * The anchored tick is just BEFORE the window, but its worst-case
+            duration (the periodic wall cap) plus jitter could extend it past
             single_poll_window_start. Try to fire earlier, at
-            ``single_poll_window_start − max_rtt − safety``, so a full-timeout
+            ``single_poll_window_start − wall_cap − safety``, so a cap-bound
             poll completes before the single poll's wake. If the latest safe
             fire time has already PASSED (the prior poll overran),
             suspend rather than fire a doomed poll.
@@ -1420,14 +1409,15 @@ class RpcPoller:
         single_poll_window_start = (
             lock_at - self._single_poll_wakeup_offset_ms / 1000.0
         )
-        # Latest moment a worst-case-RTT periodic poll can BEGIN and
-        # still finish before the single-poll window opens. A poll that hits
-        # the full HTTP timeout (RPC_HTTP_BATCH_TIMEOUT_SECONDS) holds
-        # ``_poll_lock`` for that long; firing later than this would
+        # Latest moment a worst-case periodic poll can BEGIN and still
+        # finish before the single-poll window opens. The wall-clock cap
+        # bounds a periodic poll's _poll_lock hold to
+        # _POLL_WALL_CAP_PERIODIC_MS by construction (no attempt starts
+        # unless its timeout fits the cap); firing later than this would
         # leave the lock held when the single poll wakes.
         safe_fire_latest = (
             single_poll_window_start
-            - _tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS
+            - _POLL_WALL_CAP_PERIODIC_MS / 1000.0
             - _tc.RPC_PERIODIC_TO_SINGLE_POLL_SAFETY_BUFFER_SECONDS
         )
         k = max(1, int((now - round_open) // period) + 1)
@@ -1445,12 +1435,12 @@ class RpcPoller:
         # (the previous poll overran), suspend instead of firing a doomed
         # poll that would still overlap.
         # Example (reschedule): canonical config (period=8, single_poll=4.75,
-        #   max_rtt=5, safety=0.05) → safe_fire_latest=lock_at−9.8. At
-        #   now=lock_at−10, anchored next_at=lock_at−9 falls in
-        #   (safe_fire_latest=lock_at−9.8, single_poll_window_start=lock_at−4.75).
-        #   Reschedule to lock_at−9.8.
-        # Example (overrun → suspend): previous poll completed at lock_at−9.7
-        #   (overran past safe_fire_latest=lock_at−9.8 by 100 ms). No safe
+        #   wall_cap=4, safety=0.05) → safe_fire_latest=lock_at−8.8. At
+        #   now=lock_at−9, anchored next_at=lock_at−8.5 falls in
+        #   (safe_fire_latest=lock_at−8.8, single_poll_window_start=lock_at−4.75).
+        #   Reschedule to lock_at−8.8.
+        # Example (overrun → suspend): previous poll completed at lock_at−8.7
+        #   (overran past safe_fire_latest=lock_at−8.8 by 100 ms). No safe
         #   time remains; suspend and let the single poll absorb the backlog.
         if next_at > safe_fire_latest:
             if safe_fire_latest > now:
@@ -1483,13 +1473,20 @@ class RpcPoller:
 
     def _poll_now(self, *, deadline_ms: int, label: str) -> None:
         """Core poll: fetch new blocks since _last_polled_block_number,
-        in eth_getLogs ranges of _GETLOGS_CHUNK_BLOCKS, until caught up to head.
+        in eth_getLogs ranges of _GETLOGS_CHUNK_BLOCKS, until caught up to
+        bloXroute's head.
+
+        Wall-clock capped (``_POLL_WALL_CAP_SINGLE_MS`` /
+        ``_POLL_WALL_CAP_PERIODIC_MS``, further tightened by ``deadline_ms``
+        when the engine passes one): no RPC attempt is started unless its
+        timeout fits inside the cap, so the poll's total duration is bounded
+        by construction. A cap-abort mid-chunk raises out of the chunk's
+        processing, the cursor is NOT advanced past that chunk, and the next
+        poll re-fetches the same range (F0 skips the round if coverage is
+        short at decision time).
 
         Updates _last_poll_succeeded / _last_poll_too_slow / etc on
-        completion. ``deadline_ms`` is the soft RTT budget; if any
-        single batch's RTT exceeds it, _last_poll_too_slow is set to
-        True (but the poll still completes normally — we want the
-        data that did come back).
+        completion.
         """
         if not self._poll_lock.acquire(blocking=False):
             # Another poll is in flight; skip this one. Periodic polls
@@ -1498,7 +1495,7 @@ class RpcPoller:
             # critical-path event (cursor advance skipped on the wake the
             # engine scheduled), so surface it (guard audit 1.2); periodic
             # drops stay silent by design.
-            if label in ("ramp", "final"):
+            if label == "single":
                 warn(
                     "ALERT",
                     f"{label} poll dropped: poll-lock contended (another poll "
@@ -1509,36 +1506,32 @@ class RpcPoller:
             self._poll_in_progress = True
         try:
             t_start = time.time()
+            is_single = label == "single"
+            attempts = _RPC_ATTEMPTS_SINGLE if is_single else _RPC_ATTEMPTS_PERIODIC
+            cap_ms = _POLL_WALL_CAP_SINGLE_MS if is_single else _POLL_WALL_CAP_PERIODIC_MS
+            if deadline_ms > 0:
+                cap_ms = min(cap_ms, deadline_ms)
+            abort_at = time.monotonic() + cap_ms / 1000.0
+
+            # Head = bloXroute's own tip. The getLogs toBlock can never
+            # exceed what bloXroute has synced (-32000 "invalid block range
+            # params") because it IS bloXroute's reported head. The cursor
+            # tracks bloXroute's polled position contiguously — NO block is
+            # skipped — and the F0 gate in is_pool_ready is the hard
+            # guarantee that we never BET while the cursor is short of the
+            # pool-cutoff block (the cutoff is contract+clock-anchored, so
+            # bloXroute lagging real time cannot hide from it).
             try:
-                head = self._rpc_eth_block_number()
+                head = self._bloxroute_block_number(
+                    attempts=attempts, abort_at=abort_at,
+                )
             except Exception as e:  # noqa: BLE001
                 with self._lock:
                     self._last_poll_succeeded = False
                     self._last_poll_error = f"head_fetch:{type(e).__name__}:{e}"
-                warn("ALERT", f"{label} poll: eth_blockNumber failed: {self._last_poll_error}")
-                return
-
-            # Era 12 clamp: getLogs runs against bloXroute, whose head can lag
-            # the reference pool by a block during propagation. Clamp the poll
-            # head to bloXroute's own tip so a getLogs range never requests a
-            # toBlock beyond what bloXroute has synced (which returns -32000
-            # "invalid block range params"). The cursor then tracks bloXroute's
-            # polled position; any block the reference pool has but bloXroute
-            # hasn't is picked up next tick — the cursor is contiguous, so NO
-            # block is skipped. The F0 gate in is_pool_ready is the hard
-            # guarantee that we never BET while the cursor is short of the
-            # pool-cutoff block.
-            try:
-                bloxroute_head = self._bloxroute_block_number()
-            except Exception as e:  # noqa: BLE001
-                with self._lock:
-                    self._last_poll_succeeded = False
-                    self._last_poll_error = f"bloxroute_head_fetch:{type(e).__name__}:{e}"
                 warn("ALERT",
                      f"{label} poll: bloXroute eth_blockNumber failed: {self._last_poll_error}")
                 return
-            if bloxroute_head < head:
-                head = bloxroute_head
 
             with self._lock:
                 from_block = self._last_polled_block_number + 1
@@ -1591,22 +1584,25 @@ class RpcPoller:
             blocks_polled = 0
             error_seen: str | None = None
 
-            # Fetch in eth_getLogs ranges. Deadline check is total-RTT-based:
-            # if cumulative time since poll start exceeds deadline_ms at any
-            # point, abort remaining chunks (process what we got, mark
-            # too_slow). The engine passes deadline_ms = (next_wake - now) - safety.
+            # Fetch in eth_getLogs ranges, wall-clock capped. Between chunks:
+            # abort cleanly (completed chunks' data is kept, cursor advanced
+            # through them). Mid-chunk: _fetch_and_process_logs raises on its
+            # own cap check, which lands in the except below — the cursor is
+            # NOT advanced past that chunk.
             for chunk_start in range(from_block, head + 1, _GETLOGS_CHUNK_BLOCKS):
-                if deadline_ms > 0:
+                if time.monotonic() >= abort_at:
                     elapsed_ms = int((time.time() - t_start) * 1000)
-                    if elapsed_ms > deadline_ms:
-                        warn("ALERT",
-                             f"{label} poll deadline exceeded after chunk_start={chunk_start}: "
-                             f"elapsed={elapsed_ms}ms > deadline={deadline_ms}ms; "
-                             f"aborting remaining chunks")
-                        break
+                    warn("ALERT",
+                         f"{label} poll wall-cap exceeded before chunk_start={chunk_start}: "
+                         f"elapsed={elapsed_ms}ms > cap={cap_ms}ms; "
+                         f"aborting remaining chunks")
+                    break
                 chunk_end = min(chunk_start + _GETLOGS_CHUNK_BLOCKS - 1, head)
                 try:
-                    self._fetch_and_process_logs(chunk_start, chunk_end)
+                    self._fetch_and_process_logs(
+                        chunk_start, chunk_end,
+                        attempts=attempts, abort_at=abort_at,
+                    )
                 except Exception as e:  # noqa: BLE001
                     error_seen = f"getlogs[{chunk_start}..{chunk_end}]: {type(e).__name__}: {e}"
                     # Transient getLogs-endpoint failures: the cursor is NOT
@@ -1617,10 +1613,15 @@ class RpcPoller:
                     break
                 blocks_polled += (chunk_end - chunk_start + 1)
                 with self._lock:
-                    self._last_polled_block_number = chunk_end
+                    # Forward-only: a poll whose range was snapshotted before
+                    # an epoch-advance cursor jump must never stomp the jump
+                    # backward with its (lower) chunk_end values.
+                    self._last_polled_block_number = max(
+                        self._last_polled_block_number, chunk_end,
+                    )
 
             rtt_ms = int((time.time() - t_start) * 1000)
-            too_slow = (deadline_ms > 0 and rtt_ms > deadline_ms)
+            too_slow = rtt_ms > cap_ms
             with self._lock:
                 self._last_poll_at = time.time()
                 self._last_poll_rtt_ms = rtt_ms
@@ -1652,10 +1653,13 @@ class RpcPoller:
                 self._poll_in_progress = False
             self._poll_lock.release()
 
-    def _fetch_and_process_logs(self, from_block: int, to_block: int) -> None:
+    def _fetch_and_process_logs(
+        self, from_block: int, to_block: int,
+        *, attempts: int = 1, abort_at: float | None = None,
+    ) -> None:
         """Fetch Bet logs in [from_block, to_block] via a SINGLE eth_getLogs
-        range query against ``BET_EVENTS_GETLOGS_ENDPOINT`` (server-side
-        filtered by contract address + Bet topic0), then process them.
+        range query (server-side filtered by contract address + Bet topic0),
+        then process them.
 
         Era 12 (2026-06-09) replacement for the per-block eth_getBlockReceipts
         firehose: receipts returned every full receipt in the range (~315
@@ -1664,10 +1668,10 @@ class RpcPoller:
         only the Bet logs (~KB), byte-identical extraction
         (research/parity_getlogs_v2_blxr_2026_06_09.py: 114==114), at ~7 MB/day.
 
-        Raises on transport/RPC error so the caller aborts the chunk loop with
-        the cursor un-advanced — the next poll re-fetches the same range. A
-        range fetch is all-or-nothing, so there are no partial-block skips to
-        track (this replaces the old per-block receipt-skip retry queue).
+        Raises on transport/RPC failure (after ``attempts`` tries) or on the
+        wall-clock cap so the caller aborts the chunk loop with the cursor
+        un-advanced — the next poll re-fetches the same range. A range fetch
+        is all-or-nothing, so there are no partial-block skips to track.
         """
         flt = {
             "fromBlock": hex(from_block),
@@ -1675,24 +1679,21 @@ class RpcPoller:
             "address": self._contract_addr,
             "topics": [[_BET_BULL_TOPIC, _BET_BEAR_TOPIC]],
         }
-        body = json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs", "params": [flt],
-        }).encode()
-        resp_bytes = self._rpc_post(
-            BET_EVENTS_GETLOGS_ENDPOINT, body,
-            timeout_seconds=_tc.RPC_HTTP_BATCH_TIMEOUT_SECONDS,
+        logs = self._bloxroute_call(
+            "eth_getLogs", [flt],
+            timeout_ms=_GETLOGS_TIMEOUT_MS, attempts=attempts,
+            abort_at=abort_at,
         )
-        payload = json.loads(resp_bytes)
-        if "error" in payload:
-            raise InvariantError(f"getlogs_rpc_error:{payload['error']}")
-        logs = payload.get("result")
         if not isinstance(logs, list):
             raise InvariantError(
                 f"getlogs_result_not_list: {type(logs).__name__}"
             )
-        self._process_bet_logs(logs)
+        self._process_bet_logs(logs, attempts=attempts, abort_at=abort_at)
 
-    def _process_bet_logs(self, logs: list[dict]) -> None:
+    def _process_bet_logs(
+        self, logs: list[dict],
+        *, attempts: int = 1, abort_at: float | None = None,
+    ) -> None:
         """Extract BetBull/BetBear events from a batch of eth_getLogs log
         objects (which may span multiple blocks) and update the local pool
         state. Same log-id dedup + epoch-gate + lazy block_ts resolution as
@@ -1702,9 +1703,19 @@ class RpcPoller:
         (parity-verified 2026-06-09).
 
         Logs arrive server-side-filtered (address + Bet topic0); the address /
-        topic guards below are a defensive re-check. block_ts is resolved once
-        per bet-containing block via a single eth_getBlockByNumber (cached in
-        ``_block_ts`` + this call's local cache), off the critical path.
+        topic guards below are a defensive re-check.
+
+        block_ts resolution: parse + epoch-gate ALL logs first (gate-dropped
+        archive bets never cost an RPC), then resolve every still-missing
+        block timestamp IN PARALLEL on the executor — total resolution time
+        is ~attempts x timeout independent of how many unique bet blocks the
+        chunk carries. The wall-clock cap is enforced when gathering: if the
+        cap expires with resolutions pending, this raises and the caller
+        leaves the cursor un-advanced (the next poll re-fetches; abandoned
+        workers still populate ``_block_ts`` when they finish, so the
+        re-fetch hits cache). Bets are appended only after the full chunk
+        resolves — a cap-abort loses the whole chunk cleanly, never a
+        partial append (dedup makes the re-fetch idempotent regardless).
         """
         bet_logs: list[dict] = []
         for log in logs:
@@ -1722,9 +1733,8 @@ class RpcPoller:
         if not bet_logs:
             return  # no bets in this range — nothing to do
 
-        # block_ts resolved once per block — cache hit if a prior pass (or an
-        # earlier log in this batch) already resolved it; otherwise one RPC.
-        block_ts_local: dict[int, int] = {}
+        # Phase 1 — parse + epoch-gate (no RPC).
+        parsed: list[tuple[int, str, int, int, str, Any]] = []
         for log in bet_logs:
             topic0 = log.get("topics", [None])[0]
             side = "Bull" if topic0 == _BET_BULL_TOPIC else "Bear"
@@ -1736,19 +1746,61 @@ class RpcPoller:
                 continue
             if amount_wei <= 0:
                 continue
-            # Epoch gate
+            # Epoch gate — BEFORE any block_ts cost.
             if self._current_epoch >= 0 and epoch not in (
                 self._current_epoch, self._current_epoch + 1
             ):
                 continue
-            block_ts = block_ts_local.get(bn)
-            if block_ts is None:
-                with self._lock:
-                    cached_ts = self._block_ts.get(bn, 0)
-                block_ts = cached_ts if cached_ts > 0 else self._resolve_block_ts(bn)
-                block_ts_local[bn] = block_ts
-            tx_hash = log.get("transactionHash", "")
-            log_idx = log.get("logIndex", "")
+            parsed.append((
+                epoch, side, amount_wei, bn,
+                log.get("transactionHash", ""), log.get("logIndex", ""),
+            ))
+        if not parsed:
+            return
+
+        # Phase 2 — resolve block_ts for every unique bet block: cache first,
+        # then one parallel wave for the misses.
+        unique_bns = {p[3] for p in parsed}
+        ts_map: dict[int, int] = {}
+        with self._lock:
+            for bn in unique_bns:
+                cached = self._block_ts.get(bn, 0)
+                if cached > 0:
+                    ts_map[bn] = cached
+        missing = sorted(unique_bns - ts_map.keys())
+        if missing:
+            if abort_at is not None and time.monotonic() >= abort_at:
+                raise InvariantError(
+                    f"poll_wall_cap_exceeded:block_ts_not_started:"
+                    f"{len(missing)}_blocks"
+                )
+            fut_to_bn = {
+                self._executor.submit(
+                    self._resolve_block_ts, bn, attempts=attempts,
+                ): bn
+                for bn in missing
+            }
+            timeout_s = (
+                None if abort_at is None
+                else max(0.001, abort_at - time.monotonic())
+            )
+            done, pending = concurrent.futures.wait(
+                fut_to_bn.keys(), timeout=timeout_s,
+            )
+            if pending:
+                # Abandoned workers run to completion on their own (each is
+                # bounded by attempts x timeout) and cache their results.
+                raise InvariantError(
+                    f"poll_wall_cap_exceeded:block_ts_pending:"
+                    f"{len(pending)}_of_{len(missing)}"
+                )
+            for fut in done:
+                # _resolve_block_ts never raises; 0 = unresolved (the
+                # sizing-time drop + ALERT in get_pool is the backstop).
+                ts_map[fut_to_bn[fut]] = fut.result()
+
+        # Phase 3 — dedup + append.
+        for epoch, side, amount_wei, bn, tx_hash, log_idx in parsed:
             bet_log_id = f"{tx_hash}:{log_idx}"
             with self._lock:
                 processed_log_ids = self._processed_bet_log_ids.setdefault(epoch, set())
@@ -1759,27 +1811,40 @@ class RpcPoller:
                     self._pools[epoch] = _EpochPool()
                 self._pools[epoch].bets.append(_Bet(
                     epoch=epoch, side=side, amount_wei=amount_wei,
-                    block_number=bn, block_ts=block_ts,
+                    block_number=bn, block_ts=ts_map.get(bn, 0),
                 ))
                 self._total_events += 1
 
-    def _resolve_block_ts(self, block_number: int) -> int:
-        """Best-effort lazy fetch of a block's timestamp via a single
-        ``eth_getBlockByNumber(hex(bn), false)`` call. Returns 0 on any
-        failure (transport error, malformed response). On success,
-        caches the result in ``_block_ts`` and returns the timestamp
-        in chain seconds.
+    def _resolve_block_ts(self, block_number: int, *, attempts: int = 1) -> int:
+        """Best-effort lazy fetch of a block's timestamp via
+        ``eth_getBlockByNumber(hex(bn), false)`` on bloXroute. Returns 0
+        after ``attempts`` failed tries (25ms backoff between them); never
+        raises. On success, caches the result in ``_block_ts`` and returns
+        the timestamp in chain seconds.
 
-        Called from ``_process_bet_logs`` when a bet log is
-        detected. Sparse bet rate (~5-20 per round) means this fires
-        at most ~5-20 times per round, off the critical path.
+        bloXroute served the bet log this block number came from, so it
+        provably has the block — a null result ("node hasn't synced block N
+        yet", the old hedged-pool drop cause) is structurally impossible
+        here; the retries cover momentary transport blips only. Residual
+        (all attempts fail) is the sizing-time drop + ALERT in ``get_pool``.
+
+        Runs on the block-ts executor (parallel across a chunk's unique
+        blocks); per-call bound = attempts x (timeout + backoff).
         """
-        try:
-            result = self._rpc_call_single(
-                "eth_getBlockByNumber", [hex(block_number), False],
-            )
-        except Exception:  # noqa: BLE001
-            return 0
+        result: Any = None
+        for i in range(attempts):
+            if i:
+                time.sleep(_BLX_RETRY_BACKOFF_MS / 1000.0)
+            try:
+                result = self._bloxroute_call(
+                    "eth_getBlockByNumber", [hex(block_number), False],
+                    timeout_ms=_BLX_BLOCK_TS_TIMEOUT_MS, attempts=1,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(result, dict):
+                break
+            result = None
         if not isinstance(result, dict):
             return 0
         ts_hex = result.get("timestamp")
@@ -1796,46 +1861,86 @@ class RpcPoller:
         return ts
 
     # ------------------------------------------------------------------
-    # Internal: HTTP RPC helpers (single + batched)
+    # Internal: HTTP RPC helpers (all bloXroute)
     # ------------------------------------------------------------------
 
-    def _rpc_eth_block_number(self) -> int:
-        """Return current head block number via single eth_blockNumber
-        call. Raises on error (caller marks last_poll_succeeded=False)."""
-        result = self._rpc_call_single("eth_blockNumber", [])
+    def _bloxroute_call(
+        self, method: str, params: list, *,
+        timeout_ms: int, attempts: int, abort_at: float | None = None,
+    ) -> Any:
+        """THE transport for every read RPC: a JSON-RPC POST to
+        ``RPC_BLOXROUTE_ENDPOINT`` with a tight per-attempt timeout and up to
+        ``attempts`` tries (``_BLX_RETRY_BACKOFF_MS`` between them). Returns
+        the decoded ``result`` field; raises the last error on exhaustion.
+
+        ``abort_at`` (``time.monotonic()`` seconds) is the enclosing poll's
+        wall-clock cap: an attempt whose timeout could not complete before
+        the cap is NOT started (raises ``poll_wall_cap_exceeded``), which is
+        what makes the cap a hard bound on the whole poll rather than an
+        advisory check between calls.
+
+        Retries cover momentary blips only (the backoff is deliberately
+        short); sustained endpoint degradation is handled one level up by
+        the wall cap + feasibility check + F0 gate, which skip cleanly.
+        """
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+        }).encode()
+        last_error: Exception | None = None
+        for i in range(attempts):
+            if i:
+                time.sleep(_BLX_RETRY_BACKOFF_MS / 1000.0)
+            if (
+                abort_at is not None
+                and time.monotonic() + timeout_ms / 1000.0 > abort_at
+            ):
+                raise InvariantError(
+                    f"poll_wall_cap_exceeded:{method}:attempt_{i + 1}_not_started"
+                )
+            try:
+                resp_bytes = self._rpc_post(
+                    RPC_BLOXROUTE_ENDPOINT, body,
+                    timeout_seconds=timeout_ms / 1000.0,
+                )
+                payload = json.loads(resp_bytes)
+                if "error" in payload:
+                    raise InvariantError(f"rpc_error:{method}:{payload['error']}")
+                return payload.get("result")
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+        assert last_error is not None  # attempts >= 1 guaranteed by callers
+        raise last_error
+
+    def _bloxroute_block_number(
+        self, *, attempts: int, abort_at: float | None = None,
+    ) -> int:
+        """Current head block number as seen by bloXroute. This IS the poll
+        head: a getLogs range never requests a toBlock beyond it, so the
+        -32000 "invalid block range params" reply (range past the endpoint's
+        synced tip) is unreachable by construction. Raises on transport/RPC
+        error; the caller fails the poll (the next poll retries)."""
+        result = self._bloxroute_call(
+            "eth_blockNumber", [],
+            timeout_ms=_BLX_HEAD_TIMEOUT_MS, attempts=attempts,
+            abort_at=abort_at,
+        )
         if not isinstance(result, str):
             raise InvariantError(f"eth_blockNumber_unexpected_result: {result!r}")
         return int(result, 16)
 
-    def _bloxroute_block_number(self) -> int:
-        """Current head block number as seen by the getLogs endpoint
-        (``BET_EVENTS_GETLOGS_ENDPOINT`` / bloXroute). The poll head is clamped
-        to this so a getLogs range never requests a toBlock beyond bloXroute's
-        synced tip — which returns -32000 "invalid block range params" when
-        bloXroute momentarily lags the reference pool during propagation.
-        Single-endpoint POST (NOT the hedged pool). Raises on transport/RPC
-        error; the caller treats that as 'getLogs endpoint unavailable' and
-        fails the poll, exactly like a read-pool head-fetch failure."""
-        body = json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": [],
-        }).encode()
-        resp_bytes = self._rpc_post(
-            BET_EVENTS_GETLOGS_ENDPOINT, body,
-            timeout_seconds=float(_tc.RPC_HTTP_SINGLE_TIMEOUT_SECONDS),
+    def _bloxroute_latest_header(
+        self, *, attempts: int,
+    ) -> tuple[int, int, int | None]:
+        """Return ``(head_block_number, head_ts_seconds, head_milli_ts)``
+        via ``eth_getBlockByNumber("latest", false)``. ``head_milli_ts`` is
+        the BEP-520 ms-precise timestamp (``compute_milli_ts``), or None if
+        the mixHash decode fails (callers fall back to seconds-granularity
+        math with extra margin). Used by cursor-init and the round-start
+        computation. Raises on error."""
+        result = self._bloxroute_call(
+            "eth_getBlockByNumber", ["latest", False],
+            timeout_ms=_BLX_HEADER_TIMEOUT_MS, attempts=attempts,
         )
-        payload = json.loads(resp_bytes)
-        if "error" in payload:
-            raise InvariantError(f"bloxroute_blocknumber_rpc_error:{payload['error']}")
-        result = payload.get("result")
-        if not isinstance(result, str):
-            raise InvariantError(f"bloxroute_blocknumber_unexpected_result: {result!r}")
-        return int(result, 16)
-
-    def _rpc_eth_get_latest_block_header(self) -> tuple[int, int]:
-        """Return ``(head_block_number, head_block_timestamp)`` via a
-        single ``eth_getBlockByNumber("latest", false)`` call. Used by
-        the round-start clamp's RPC fallback path. Raises on error."""
-        result = self._rpc_call_single("eth_getBlockByNumber", ["latest", False])
         if not isinstance(result, dict):
             raise InvariantError(
                 f"eth_getBlockByNumber_unexpected_result: {result!r}"
@@ -1846,20 +1951,18 @@ class RpcPoller:
             raise InvariantError(
                 f"eth_getBlockByNumber_missing_fields: {result!r}"
             )
-        return int(num_hex, 16), int(ts_hex, 16)
+        return int(num_hex, 16), int(ts_hex, 16), compute_milli_ts(result)
 
     def _rpc_post(self, url: str, body: bytes, *, timeout_seconds: float) -> bytes:
-        """Single-endpoint HTTP POST via the shared urllib3 PoolManager.
-        Returns the raw response body. Raises on transport-level failure
+        """HTTP POST via the shared urllib3 PoolManager. Returns the raw
+        response body. Raises on transport-level failure
         (``urllib3.exceptions.HTTPError`` subclasses: TimeoutError,
         MaxRetryError, ConnectTimeoutError, etc.) or non-200 status.
         The caller parses JSON and decodes the JSON-RPC envelope.
 
-        Persistent connections via the shared PoolManager mean the
-        first call to each host pays the TLS handshake; subsequent
-        calls reuse the open connection. See
-        var/incident_reports/2026_05_11_parallel_request_transport_bottleneck.md
-        for measured impact.
+        Persistent connections via the shared PoolManager mean the first
+        call (per pooled connection) pays the TLS handshake; subsequent
+        calls reuse the open socket.
         """
         resp = self._pool.request(
             "POST", url, body=body,
@@ -1874,96 +1977,3 @@ class RpcPoller:
                 f"http_{resp.status}: {resp.reason}"
             )
         return resp.data
-
-    def _do_hedged_post(self, body: bytes, *, timeout_seconds: float) -> tuple[str, bytes]:
-        """Hedged HTTP POST against every endpoint in the pool.
-
-        Fires one request per endpoint in parallel; the first endpoint
-        to return a 200 wins. The rest are abandoned (urllib3 has no
-        real cancellation — abandoned sockets time out on their own
-        and free their executor worker).
-
-        Returns ``(winner_endpoint, response_bytes)``. Raises
-        ``HedgedAllFailed`` (with the per-endpoint exceptions) when
-        every endpoint fails before ``timeout_seconds``.
-        """
-        # Special-case length 1 to skip executor overhead. Same call
-        # shape as the multi-endpoint path so callers see no difference.
-        if len(self._endpoint_pool) == 1:
-            url = self._endpoint_pool[0]
-            try:
-                resp = self._rpc_post(url, body, timeout_seconds=timeout_seconds)
-            except BaseException as e:  # noqa: BLE001
-                raise HedgedAllFailed([(url, e)]) from e
-            self._current_endpoint = url
-            return url, resp
-
-        # Fire one request per endpoint.
-        fut_to_endpoint: dict[concurrent.futures.Future, str] = {
-            self._executor.submit(
-                self._rpc_post, ep, body, timeout_seconds=timeout_seconds,
-            ): ep
-            for ep in self._endpoint_pool
-        }
-
-        pending = set(fut_to_endpoint.keys())
-        errors: list[tuple[str, BaseException]] = []
-        deadline = time.monotonic() + float(timeout_seconds)
-
-        while pending:
-            remaining = max(0.001, deadline - time.monotonic())
-            done, pending = concurrent.futures.wait(
-                pending,
-                timeout=remaining,
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-            if not done:
-                # Deadline fired; record the still-pending as timeouts.
-                for fut in pending:
-                    errors.append((
-                        fut_to_endpoint[fut],
-                        TimeoutError(f"hedged_timeout_after_{timeout_seconds}s"),
-                    ))
-                break
-            for fut in done:
-                ep = fut_to_endpoint[fut]
-                try:
-                    resp = fut.result()
-                except BaseException as e:  # noqa: BLE001
-                    errors.append((ep, e))
-                    continue
-                # First success wins. Pending futures are abandoned
-                # (no cancellation; their sockets time out on their
-                # own and the executor reclaims the workers).
-                self._current_endpoint = ep
-                return ep, resp
-
-        raise HedgedAllFailed(errors)
-
-    def _rpc_call_single(self, method: str, params: list) -> Any:
-        """Single JSON-RPC call. Raises on transport error or RPC
-        error; returns the ``result`` field on success. Hedged across
-        every endpoint in the pool; first success wins.
-        """
-        return self._rpc_call_single_with_timeout(
-            method, params, timeout_s=float(_tc.RPC_HTTP_SINGLE_TIMEOUT_SECONDS),
-        )
-
-    def _rpc_call_single_with_timeout(
-        self, method: str, params: list, *, timeout_s: float,
-    ) -> Any:
-        """Single JSON-RPC call with an explicit timeout (seconds, may be
-        fractional). Hedged across every endpoint in the pool; first
-        success wins. Used by the Bundle 5 v2 anchor poll, which wants
-        a 200ms ceiling rather than the default 5s.
-        """
-        body = json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
-        }).encode()
-        _ep, resp_bytes = self._do_hedged_post(
-            body, timeout_seconds=timeout_s,
-        )
-        payload = json.loads(resp_bytes)
-        if "error" in payload:
-            raise InvariantError(f"rpc_error:{payload['error']}")
-        return payload.get("result")
