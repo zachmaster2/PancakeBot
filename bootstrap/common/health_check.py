@@ -7,7 +7,10 @@ Steps (each logged):
                                      skipped where chronyc is unavailable)
   1. unit registered?               (systemctl show: LoadState=loaded)
   2. start it                       (systemctl start; refused if the
-                                     Conflicts= partner unit is active)
+                                     Conflicts= partner unit is active;
+                                     an ALREADY-active unit short-circuits
+                                     to a runtime-log freshness check —
+                                     its boot READY is long past)
   3. transitions to active          (poll ActiveState, timeout)
   4. bot emits READY                (tail var/<mode>/runtime.log for "READY",
                                      timeout)
@@ -30,6 +33,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # chrony-disciplined host sits at ~30-60 MICROseconds, so tripping this
 # means sync is genuinely broken, not merely loose.
 _CLOCK_OFFSET_TOLERANCE_S = 0.25
+
+# Proof-of-life bound for a unit that is ALREADY active when the check
+# runs: the bot logs READY once at boot (nothing new to wait for), so
+# health = the runtime log is being actively written. The bot logs many
+# times per ~5-min round; 10 min of silence from an active unit is wrong.
+_ACTIVE_LOG_FRESH_S = 600.0
 
 # The live and dry systemd units declare mutual Conflicts= (one bot at a
 # time): systemctl-starting one SILENTLY STOPS the other. Starting the
@@ -162,19 +171,35 @@ def run(
         return False
     _log(f"unit {service_name!r} registered (ActiveState={active_state})")
 
-    started_at = time.time()
-    if active_state != "active":
-        partner = _CONFLICTING_SERVICE.get(service_name)
-        if partner is not None and _unit_state(partner)[1] == "active":
-            _log(
-                f"FAIL: refusing to start {service_name!r} — conflicting unit "
-                f"{partner!r} is active (systemd Conflicts= would stop it). "
-                f"Run the health check against {partner!r}, or stop it "
-                f"explicitly first."
-            )
+    if active_state == "active":
+        # Already running — there is no boot READY to wait for (the bot
+        # logs READY once at startup, long scrolled away by now). Health =
+        # the runtime log is being actively written.
+        log_path = _runtime_log(mode)
+        try:
+            age_s = time.time() - log_path.stat().st_mtime
+        except OSError:
+            _log(f"FAIL: unit is active but {log_path} is unreadable/missing")
             return False
-        _log(f"starting {service_name!r}")
-        _run_systemctl(["start", service_name])
+        if age_s > _ACTIVE_LOG_FRESH_S:
+            _log(f"FAIL: unit is active but {log_path} is stale "
+                 f"({age_s:.0f}s > {_ACTIVE_LOG_FRESH_S:.0f}s)")
+            return False
+        _log(f"already active; runtime log fresh ({age_s:.0f}s old)")
+        return True
+
+    started_at = time.time()
+    partner = _CONFLICTING_SERVICE.get(service_name)
+    if partner is not None and _unit_state(partner)[1] == "active":
+        _log(
+            f"FAIL: refusing to start {service_name!r} — conflicting unit "
+            f"{partner!r} is active (systemd Conflicts= would stop it). "
+            f"Run the health check against {partner!r}, or stop it "
+            f"explicitly first."
+        )
+        return False
+    _log(f"starting {service_name!r}")
+    _run_systemctl(["start", service_name])
 
     deadline = time.time() + start_timeout_s
     while time.time() < deadline:
