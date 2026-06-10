@@ -24,8 +24,9 @@ You can disable Autologon at any time by running:
 or by clearing HKLM\...\Winlogon\AutoAdminLogon = 0.
 
 .NOTES
-Requires Administrator. Autologon.exe path is hard-coded to the
-expected install location from install_services.ps1's auto-download.
+Requires Administrator. Autologon.exe path defaults to C:\Tools\Autologon\
+— download it from Sysinternals manually if absent (the old auto-download
+lived in the archived Windows-bot installer, retired Phase 3c-1 2026-06-10).
 
 PowerShell 7+ has cleaner SecureString -> plaintext APIs (ConvertFrom-
 SecureString -AsPlainText); we use the BSTR dance to stay compatible
@@ -44,7 +45,7 @@ if (-not $isAdmin) {
 }
 
 if (-not (Test-Path $AutologonExe)) {
-    throw "Autologon.exe not found at $AutologonExe. Re-run scripts\install_services.ps1 (which auto-downloads it), or download from https://learn.microsoft.com/en-us/sysinternals/downloads/autologon manually."
+    throw "Autologon.exe not found at $AutologonExe. Download it from https://learn.microsoft.com/en-us/sysinternals/downloads/autologon and place it there."
 }
 
 $user = $env:USERNAME

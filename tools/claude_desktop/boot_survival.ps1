@@ -4,14 +4,14 @@
   relaunch of the Claude desktop app + AUMID stamping. Idempotent.
 
 .DESCRIPTION
-  NONE of this is required for the trading bot. The bot survives reboots via
-  the SCM Automatic-start services alone (no logon session needed). This chain
-  exists only so the OPERATOR's Claude desktop app comes back elevated after a
-  reboot. It is opt-in (install.ps1 -IncludeOperatorUI).
+  NONE of this is required for the trading bot (which runs on the Linux VM).
+  This chain exists only so the OPERATOR's Claude desktop app comes back
+  elevated after a reboot of the Windows operator machine. Run standalone:
+      powershell -ExecutionPolicy Bypass -File tools\claude_desktop\boot_survival.ps1
 
-  The chain (per the live Windows host as of 2026-06-04):
+  The chain (per the live operator host as of 2026-06-04):
     1. Sysinternals Autologon  -> restores the interactive desktop session
-       (delegated to setup_autologon.ps1 / scripts\setup_autologon.ps1).
+       (delegated to setup_autologon.ps1, co-located in this directory).
     2. ClaudeLaunchElevated scheduled task (AtLogon, RunLevel=Highest) ->
        runs C:\Tools\launch_claude_admin_direct.vbs, which queries the
        registered Claude AppX package (PackageFamilyName Claude_pzs8sxrjxfjjc)
@@ -25,12 +25,12 @@
        the next logon. Launch-if-down only; the AppXSvc/reboot recovery cascade
        stays in the AtLogon task (a persistent lock must not be hit every 5 min).
 
-  The launcher VBS (launch_claude_admin_direct.vbs) is repo-tracked under
-  bootstrap\windows\ and is DEPLOYED to ToolsDir by this script, so a fresh
-  clone + install.ps1 -IncludeOperatorUI reproduces it. The AUMID stamper
-  (stamp_claude_aumid.exe) + Autologon remain out-of-repo binaries — this
-  script verifies the stamper exists. See bootstrap\windows\AUMID_stamper\
-  README.md for how to rebuild the stamper.
+  The launcher VBS (launch_claude_admin_direct.vbs) is repo-tracked in this
+  directory (tools\claude_desktop\) and is DEPLOYED to ToolsDir by this
+  script, so a fresh clone reproduces it. The AUMID stamper
+  (stamp_claude_aumid.exe) + Autologon.exe remain out-of-repo binaries —
+  this script verifies the stamper exists. See AUMID_stamper\README.md
+  (same directory) for how to rebuild the stamper.
 #>
 [CmdletBinding()]
 param(
@@ -55,7 +55,7 @@ New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
 Copy-Item $repoVbs $vbs -Force
 Log "deployed launcher: $repoVbs -> $vbs"
 if (-not (Test-Path $stamper)) {
-    throw "missing AUMID stamper: $stamper (out-of-repo binary; see bootstrap\windows\AUMID_stamper\README.md to rebuild)"
+    throw "missing AUMID stamper: $stamper (out-of-repo binary; see tools\claude_desktop\AUMID_stamper\README.md to rebuild)"
 }
 Log "AUMID stamper present: $stamper"
 

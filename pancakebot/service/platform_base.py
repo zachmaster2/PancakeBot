@@ -1,21 +1,20 @@
-"""Cross-platform service-supervision abstraction.
+"""Service-supervision abstraction.
 
 ``ServicePlatform`` is the OS-agnostic contract the supervisor (and the
-bootstrap tooling) call through, so the bot core never imports pywin32 /
-systemd directly. Two adapters implement it:
+bootstrap tooling) call through, so the bot core never imports systemd
+plumbing directly. One adapter implements it:
 
-- ``WindowsServicePlatform`` (pywin32 SCM / Job Object) — see windows_platform.py
-- ``LinuxServicePlatform``   (systemd / systemctl / sd_notify) — see linux_platform.py
+- ``LinuxServicePlatform`` (systemd / systemctl / sd_notify) — see linux_platform.py
 
-``get_platform()`` in ``pancakebot/service/__init__.py`` selects the adapter
-by ``sys.platform`` at import time.
+(The pywin32/SCM ``WindowsServicePlatform`` adapter was archived with the
+Windows-bot host in Phase 3c-1, 2026-06-10 — Downloads/OLD/pancakebot_old/.
+The ABC survives it unchanged: it is what made the Windows->Linux cutover a
+pure adapter swap, and it keeps the supervision core unit-testable via fake
+platforms.)
 
-Scope note (Phase 1): this introduces the abstraction + both adapters +
-factory. The Windows supervisor (``common.py``) delegates its
-behaviour-identical primitives (Job-Object kill-tree, SCM mode-mutex query)
-to the Windows adapter. The Linux adapter is complete but not yet deployed.
-The service-management methods (install/enable/restart-policy/deps) are used
-by the Phase-2 bootstrap scripts, not the running supervision loop.
+``get_platform()`` in ``pancakebot/service/__init__.py`` returns the Linux
+adapter. The service-management methods (install/enable/restart-policy/deps)
+are used by the bootstrap scripts, not the running supervision loop.
 """
 from __future__ import annotations
 

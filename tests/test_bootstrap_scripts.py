@@ -18,17 +18,21 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 _BOOT = _REPO_ROOT / "bootstrap"
+_TOOLS = _REPO_ROOT / "tools" / "claude_desktop"
 
+# Phase 3c-1 (2026-06-10): the Windows-bot-service cluster (install.ps1,
+# windows/setup_service.py, SCM scripts) is archived; bootstrap/ is
+# Linux-bot-only and the Claude operator-desktop scaffolding lives in
+# tools/claude_desktop/.
 _SH_SCRIPTS = [
     _BOOT / "install.sh",
     _BOOT / "uninstall.sh",
     _BOOT / "linux" / "install_python313.sh",
+    _BOOT / "linux" / "git_post_receive.sh",
 ]
 _PS1_SCRIPTS = [
-    _BOOT / "install.ps1",
-    _BOOT / "uninstall.ps1",
-    _BOOT / "windows" / "setup_autologon.ps1",
-    _BOOT / "windows" / "boot_survival.ps1",
+    _TOOLS / "setup_autologon.ps1",
+    _TOOLS / "boot_survival.ps1",
 ]
 _PY_HELPERS = [
     _BOOT / "common" / "python_setup.py",
@@ -36,24 +40,26 @@ _PY_HELPERS = [
     _BOOT / "common" / "health_check.py",
     _BOOT / "common" / "service_specs.py",
     _BOOT / "linux" / "setup_service.py",
-    _BOOT / "windows" / "setup_service.py",
+    _TOOLS / "notify_user_followup.py",
+    _TOOLS / "notify_user_mark_answered.py",
 ]
 
 
 def test_all_expected_files_exist():
     for f in _SH_SCRIPTS + _PS1_SCRIPTS + _PY_HELPERS + [
-        _BOOT / "README.md", _BOOT / "MIGRATION.md",
-        _BOOT / "windows" / "AUMID_stamper" / "README.md",
-        _BOOT / "windows" / "launch_claude_admin_direct.vbs",
+        _BOOT / "README.md",
+        _TOOLS / "README.md",
+        _TOOLS / "AUMID_stamper" / "README.md",
+        _TOOLS / "launch_claude_admin_direct.vbs",
     ]:
-        assert f.exists(), f"missing bootstrap file: {f}"
+        assert f.exists(), f"missing bootstrap/tools file: {f}"
 
 
 def test_vbs_launcher_structure():
     """The repo-tracked Claude launcher keeps its Task-F hardening + the core
     elevated CreateProcess-on-exe path. (No VBScript linter exists; this is a
     content sanity check — runtime behavior is validated via its /check mode.)"""
-    vbs = _BOOT / "windows" / "launch_claude_admin_direct.vbs"
+    vbs = _TOOLS / "launch_claude_admin_direct.vbs"
     text = vbs.read_text(encoding="utf-8", errors="replace")
     for marker in (
         "Option Explicit",
@@ -123,12 +129,12 @@ def test_service_specs_build():
     from common.service_specs import build_spec
     spec = build_spec(mode="live", repo_root=_REPO_ROOT, venv_python=Path("/x/python"))
     assert spec.args == ("-m", "pancakebot.service.supervise", "--mode", "live")
-    assert spec.conflicts_with  # live conflicts with dry
+    assert spec.conflicts_with == "pancakebot-dry"  # live conflicts with dry
     # E: relaxed OUTER restart policy — 5 starts / hour (was 3 / 24h).
     assert spec.restart_max_attempts == 5
     assert spec.restart_reset_window_s == 3600
-    # name differs by OS convention
-    assert spec.name in ("PancakeBotLive", "pancakebot-live")
+    # systemd unit name (Linux-only since Phase 3c-1)
+    assert spec.name == "pancakebot-live"
 
 
 def test_python_setup_venv_python_path():
