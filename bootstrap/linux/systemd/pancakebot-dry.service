@@ -1,0 +1,28 @@
+# PancakeBot Dry (paper trading) — systemd-direct (Phase 3c-2, 2026-06-10).
+# Mirror of pancakebot-live.service; see that file for the design notes.
+
+[Unit]
+Description=PancakeBot Dry Paper Trading
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+Conflicts=pancakebot-live.service
+StartLimitBurst=5
+StartLimitIntervalSec=900
+
+[Service]
+Type=exec
+WorkingDirectory=/root/pancakebot
+EnvironmentFile=-/etc/pancakebot/pancakebot.env
+EnvironmentFile=-/etc/pancakebot/alerts.env
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_TRIM_THRESHOLD_=131072
+ExecStart=/root/pancakebot/.venv/bin/python -u run.py --dry
+ExecStartPost=-/usr/bin/systemctl start --no-block pancakebot-notify@%p-started.service
+ExecStopPost=-/usr/bin/systemctl start --no-block pancakebot-notify@%p-stopped.service
+Restart=on-failure
+RestartSec=60
+KillMode=control-group
+TimeoutStopSec=25
+
+[Install]
+WantedBy=multi-user.target

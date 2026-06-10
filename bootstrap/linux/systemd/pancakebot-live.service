@@ -1,0 +1,42 @@
+# PancakeBot Live — systemd-direct (Phase 3c-2, 2026-06-10).
+# systemd IS the supervisor: restart-on-failure, crashloop brake
+# (StartLimitBurst), cgroup tree-kill, one-bot-at-a-time (Conflicts=).
+# Lifecycle Discord alerts fire via the pancakebot-notify@ oneshot template
+# (--no-block: a slow webhook never delays the bot's lifecycle; the notify
+# unit loads ONLY alerts.env — the wallet key never enters it).
+# Installed by bootstrap/install.sh (cp to /etc/systemd/system/ + daemon-reload).
+
+[Unit]
+Description=PancakeBot Live Trading
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+Conflicts=pancakebot-dry.service
+# Crashloop brake (replaces SupervisorCore's fast-restart limiter): after 5
+# failed starts within 15 min systemd stops retrying (Result=start-limit-hit,
+# alerted as SUPPRESSED_FAST_CRASHLOOP by the notify hook).
+StartLimitBurst=5
+StartLimitIntervalSec=900
+
+[Service]
+Type=exec
+WorkingDirectory=/root/pancakebot
+# Secrets (wallet key, Graph key) + webhooks; '-' => optional so the unit
+# still starts when a file is absent (e.g. fresh box pre-configuration).
+EnvironmentFile=-/etc/pancakebot/pancakebot.env
+EnvironmentFile=-/etc/pancakebot/alerts.env
+# glibc allocator tuning: cap arenas + trim eagerly (multi-threaded workers
+# otherwise ratchet RSS; diagnosed 2026-06-04 dry soak).
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_TRIM_THRESHOLD_=131072
+ExecStart=/root/pancakebot/.venv/bin/python -u run.py --live
+# Lifecycle alerts. '-' prefix: a notify trigger failure must not fail the
+# bot unit. %p = "pancakebot-live".
+ExecStartPost=-/usr/bin/systemctl start --no-block pancakebot-notify@%p-started.service
+ExecStopPost=-/usr/bin/systemctl start --no-block pancakebot-notify@%p-stopped.service
+Restart=on-failure
+RestartSec=60
+KillMode=control-group
+TimeoutStopSec=25
+
+[Install]
+WantedBy=multi-user.target

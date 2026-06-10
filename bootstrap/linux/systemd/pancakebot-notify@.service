@@ -1,0 +1,21 @@
+# PancakeBot lifecycle notifier (Phase 3c-2, 2026-06-10) — oneshot template.
+# Instantiated by the bot units' ExecStartPost/ExecStopPost as
+# pancakebot-notify@pancakebot-{live,dry}-{started,stopped}.service.
+#
+# LEAST PRIVILEGE: loads ONLY alerts.env (the 3 Discord webhooks). The
+# wallet/Graph keys in pancakebot.env never enter this process.
+#
+# State is read from `systemctl show <unit>` (systemd retains Result/
+# ExecMainStatus/NRestarts after exit) — $SERVICE_RESULT/$EXIT_STATUS only
+# exist inside the main unit's ExecStopPost environment and do NOT
+# propagate through `systemctl start`, which is why notify_lifecycle
+# queries systemd instead of relying on inherited env.
+
+[Unit]
+Description=PancakeBot lifecycle Discord notifier (%i)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/pancakebot
+EnvironmentFile=-/etc/pancakebot/alerts.env
+ExecStart=/root/pancakebot/.venv/bin/python -m pancakebot.ops.notify_lifecycle %i
