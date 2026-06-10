@@ -1,0 +1,44 @@
+{
+  "soak": "bloxroute_getlogs_2026_06_09",
+  "final": true,
+  "stopped_early": null,
+  "started_utc": "2026-06-09T04:34:45Z",
+  "updated_utc": "2026-06-09T16:34:45Z",
+  "elapsed_hours": 12.0,
+  "config": {
+    "poll_interval_s": 8,
+    "settle_blocks": 3,
+    "parity_every": 8,
+    "endpoint": "https://bsc.rpc.blxrbdn.com"
+  },
+  "blxr_getlogs": {
+    "polls": 5400,
+    "ok": 5400,
+    "errors": 0,
+    "error_rate": 0.0,
+    "error_breakdown": {},
+    "latency_ms_ok": {
+      "p50": 17.8,
+      "p95": 77.9,
+      "p99": 144.5,
+      "max": 492.2
+    },
+    "bytes_total": 3858400,
+    "bytes_per_day_est": 7716799,
+    "total_bets_seen": 5762
+  },
+  "parity_vs_receipts": {
+    "checks": 675,
+    "clean": 675,
+    "divergences": 0,
+    "oracle_failures": 0,
+    "diff_detail": [],
+    "receipts_bytes_total": 4636709205
+  },
+  "head_lag_blxr_minus_ref": {
+    "samples": 5400,
+    "min": -1,
+    "p50": 1.0,
+    "max": 5
+  }
+}
