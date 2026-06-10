@@ -1,7 +1,8 @@
 """Supervisor artifacts: PID file + crash dump.
 
-Written by the runtime (dry/live) and consumed by the supervisor
-(SupervisorCore under the systemd units).
+Written by the runtime (dry/live); ``crash.json`` is consumed by the
+lifecycle notifier (``pancakebot.ops.notify_lifecycle`` via the
+``pancakebot-notify@`` oneshots) as crash evidence and alert detail.
 
 Two artifacts per mode:
   - ``var/<mode>/bot.pid``: contains the OS pid as plain text. Written at
@@ -13,7 +14,7 @@ Two artifacts per mode:
 
 All writes are atomic (tempfile + fsync + os.replace) with a bounded retry
 on PermissionError (Windows file-lock race with antivirus / indexer).
-The supervisor uses ``Popen.poll()`` as the authoritative liveness signal;
+systemd's process tracking is the authoritative liveness signal;
 these artifacts are passive forensic records, not heartbeat polls.
 """
 from __future__ import annotations
@@ -123,10 +124,10 @@ def write_crash(path: Path, exc: BaseException, *, last_epoch: int | None) -> No
 # new bot is calling this helper must be from a previous bot incarnation;
 # the new bot has just acquired the PID file slot, so it isn't its own
 # crash. Leaving a lingering crash.json in place caused 2026-04-25
-# false-CRASHED events where the supervisor saw an old crash.json an
+# false-CRASHED events where the then-supervisor saw an old crash.json an
 # hour after the original crash and killed a healthy bot. The previous
 # 60s threshold was justified as "give the writer time to finish" --
-# but the writer is the dead previous bot, and the supervisor's CRASHED
+# but the writer is the dead previous bot, and the CRASHED
 # alert (the only other reader) has already fired by the time it
 # triggers --restart.
 _LINGERING_CRASH_MIN_AGE_SECONDS: float = 0.0
@@ -135,8 +136,8 @@ _LINGERING_CRASH_MIN_AGE_SECONDS: float = 0.0
 def archive_lingering_crash_file(crash_path: Path, *, min_age_seconds: float = _LINGERING_CRASH_MIN_AGE_SECONDS) -> Path | None:
     """Rename an existing crash.json to crash_archive_<ts>.json on bot startup.
 
-    Preserves forensic data (no deletion) while preventing the supervisor from
-    classifying a fresh bot as CRASHED based on a leftover crash marker from a
+    Preserves forensic data (no deletion) while preventing a fresh bot from
+    being classified as CRASHED based on a leftover crash marker from a
     previous bot. Called from run.py immediately after the bot writes its PID
     file, before the main runtime loop begins.
 

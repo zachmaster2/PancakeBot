@@ -1,28 +1,28 @@
 # PancakeBot bootstrap — Linux bot deploy
 
 Fresh clone → working bot on the Linux VM, idempotent, reversible. The
-shared logic (venv, config check, health check, service spec) lives in
-`common/` and runs through the `ServicePlatform` abstraction
-(`pancakebot/service/`, Linux/systemd adapter).
+shared logic (venv, config check, health check) lives in `common/`; the
+systemd units are tracked files under `linux/systemd/`, installed verbatim
+(systemd IS the supervisor — Phase 3c-2, see docs/SUPERVISOR.md).
 
 Phase 3c-1 (2026-06-10): this directory is Linux-bot-only. The Windows-bot
-service installers (SCM/pywin32) live in the offline archive
-(`Downloads/OLD/pancakebot_old/`); the Claude operator-desktop scaffolding
-(autologon, elevated launcher, AUMID stamper notes) moved to
-`tools/claude_desktop/`.
+service installers (SCM/pywin32) and the retired Python supervisor stack
+live in the offline archive (`Downloads/OLD/pancakebot_old/`); the Claude
+operator-desktop scaffolding (autologon, elevated launcher, AUMID stamper
+notes) lives in `tools/claude_desktop/`.
 
 ```
 bootstrap/
   install.sh           orchestrator (idempotent, verbose, validating)
-  uninstall.sh         reversible companion (--purge also removes venv + env file)
+  uninstall.sh         reversible companion (--purge also removes venv + env files)
   common/
     python_setup.py    venv create + deps install (asserts Python >= 3.13)
     config_check.py    config.toml + .env + webhook presence (no mutation)
-    health_check.py    post-install: clock sync -> registered -> RUNNING -> READY
+    health_check.py    post-install: clock sync -> registered -> active -> READY
                        (refuses to start a unit whose Conflicts= partner runs)
-    service_specs.py   shared live/dry ServiceSpec builder (systemd units)
   linux/
-    setup_service.py   install systemd units (live + dry) via the adapter
+    systemd/           tracked units: pancakebot-{live,dry}.service +
+                       pancakebot-notify@.service (cp'd by install.sh STEP 5)
     install_python313.sh  pyenv build of 3.13 (additive; system py untouched)
     git_post_receive.sh   push-to-deploy hook (tracked copy + setup recipe)
 ```
@@ -30,26 +30,34 @@ bootstrap/
 ## Prerequisites
 
 A fresh clone has `config.toml` (tracked). Secrets live OUTSIDE the repo on
-the VM: `/etc/pancakebot/pancakebot.env` (0600, systemd `EnvironmentFile`)
-carries `BSC_WALLET_PRIVATE_KEY`, `THE_GRAPH_API_KEY`, and the 3
-`PANCAKEBOT_{LIVE_ALERTS,DRY_ALERTS,GENERAL}_DISCORD_WEBHOOK_URL` hooks
-(install.sh scaffolds the file; fill it in).
+the VM, split for least privilege (the notify unit loads only the webhooks,
+never the wallet key):
+
+- `/etc/pancakebot/pancakebot.env` (0600) — `BSC_WALLET_PRIVATE_KEY`,
+  `THE_GRAPH_API_KEY` (bot units only)
+- `/etc/pancakebot/alerts.env` (0600) — the 3
+  `PANCAKEBOT_{LIVE_ALERTS,DRY_ALERTS,GENERAL}_DISCORD_WEBHOOK_URL` hooks
+  (bot units + notify template)
+
+install.sh scaffolds both; fill them in.
 
 ## Install (AlmaLinux 9.x)
 
 ```bash
 sudo git clone <repo> /root/pancakebot && cd /root/pancakebot
 sudo bash bootstrap/install.sh   # py3.13 + venv + units (disabled) + chrony drop-in
-# fill /etc/pancakebot/pancakebot.env, then:
+# fill /etc/pancakebot/{pancakebot,alerts}.env, then:
 sudo systemctl enable --now pancakebot-dry      # dry soak
 ```
 
 Python 3.13 is built additively via pyenv (system `python3.9`/`python3.12`
-untouched). Units carry `Conflicts=` (live evicts dry and vice versa —
-one bot at a time), `Restart=on-failure`, `KillMode=control-group`,
-`Type=notify`. STEP 6 installs the chrony drop-in
-(`/etc/chrony.d/pancakebot.conf`) bounding clock-step detection to ~64s.
-Reverse with `sudo bash bootstrap/uninstall.sh`.
+untouched). The bot units run `run.py` directly (`Type=exec`), carry
+`Conflicts=` (live evicts dry and vice versa — one bot at a time),
+`Restart=on-failure` + `StartLimitBurst=5/900s` (crashloop brake),
+`KillMode=control-group`, and trigger `pancakebot-notify@` oneshots on
+start/stop edges for Discord lifecycle alerts. STEP 6 installs the chrony
+drop-in (`/etc/chrony.d/pancakebot.conf`) bounding clock-step detection to
+~64s. Reverse with `sudo bash bootstrap/uninstall.sh`.
 
 ## Deploys after install
 

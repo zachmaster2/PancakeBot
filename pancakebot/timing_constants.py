@@ -102,7 +102,7 @@ from __future__ import annotations
 # runtime tolerance is the streak counter
 # (``max_consecutive_kline_fetch_failures``), which absorbs up to N
 # consecutive ``got_<N-1>_expected_N`` outcomes before crashing the bot
-# (-> supervisor restart + Discord alert).
+# (-> systemd restart + Discord alert).
 #
 # Empirically measured distribution (kept here so future operators don't
 # re-derive what we've already paid the cost to measure):

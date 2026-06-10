@@ -1,4 +1,4 @@
-"""Tiny helper for supervisor smoke tests.
+"""Tiny helper for lifecycle-alert smoke tests.
 
 Usage:
     python scripts/_smoke_write_artifacts.py <mode> <kind> [extra...]
@@ -10,7 +10,7 @@ Kinds:
     history_slow       - populates restart_history.jsonl with 9 entries spanning last 12 h
     history_48h        - drops a 48h-old entry into restart_history.jsonl
 
-All writes are plain (not atomic) -- this is test-only glue, not supervisor code.
+All writes are plain (not atomic) -- this is test-only glue, not bot code.
 """
 from __future__ import annotations
 

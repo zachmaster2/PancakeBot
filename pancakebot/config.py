@@ -327,7 +327,7 @@ class AppConfig:
     - ``pool_cutoff_seconds``: data horizon for the pool aggregate (only
       bets with block_ts < lock_at - this are counted).
     - ``max_consecutive_kline_fetch_failures``: streak counter before the bot
-      crashes with InvariantError + supervisor restart.
+      crashes with InvariantError + systemd restart.
 
     Derived (computed at config-load time from
     ``pancakebot/timing_constants.py``; not user-tunable):
@@ -776,7 +776,7 @@ def load_app_config(path: str) -> AppConfig:
 
     # ``max_consecutive_kline_fetch_failures``: streak counter for OKX
     # transient failures on the live decision path. After this many in a
-    # row, the gate raises InvariantError -> bot crashes -> supervisor
+    # row, the gate raises InvariantError -> bot crashes -> systemd
     # restart + Discord alert.
     max_consecutive_kline_fetch_failures = _opt_int(
         runtime, "max_consecutive_kline_fetch_failures", 5,

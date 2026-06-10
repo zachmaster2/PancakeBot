@@ -36,9 +36,9 @@ def _truncate_tx_hash(tx_hash: str) -> str:
 # verification that larger TXs land reliably across all WRITE_PATH_RPC_URLS.
 _MAX_CLAIM_EPOCHS_PER_TX = 10
 
-# Env vars holding the per-mode Discord webhook URLs. Mirror the supervisor's
+# Env vars holding the per-mode Discord webhook URLs. Mirror the lifecycle alerts'
 # ``_env_var_for_mode(...)`` definitions so a misrouted webhook here would
-# produce the same operator-visible miss as a supervisor-side issue.
+# produce the same operator-visible miss as a lifecycle-alert issue.
 _LIVE_ALERTS_WEBHOOK_ENV = "PANCAKEBOT_LIVE_ALERTS_DISCORD_WEBHOOK_URL"
 _DRY_ALERTS_WEBHOOK_ENV = "PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL"
 
@@ -81,7 +81,7 @@ def _send_claim_failure_alert(
     ``reason`` is one of ``"revert"`` or ``"timeout"``. Best-effort: any
     exception (missing env var, transport error, non-2xx response) is
     swallowed with a WARN log so the operational claim-scan loop never
-    crashes on a webhook hiccup. Distinct from the supervisor's status
+    crashes on a webhook hiccup. Distinct from the lifecycle status
     classifications -- this is a point-in-time alert at the moment the
     claim failure is observed inside the bot.
     """
@@ -213,7 +213,7 @@ def _post_mode_alert(channel: AlertChannel, content: str, *, label: str, ctx: st
 def send_bot_ready_alert(*, channel: AlertChannel, bankroll_bnb: float) -> None:
     """[INFO] BOT READY — fired once per bot start after the first successful
     wallet-balance read, so the first BET SUBMITTED has a reference point.
-    Bot-owned (not the supervisor's STARTED alert)."""
+    Bot-owned (not the lifecycle STARTED alert)."""
     _post_mode_alert(
         channel,
         f"[INFO] **BOT READY** `{channel.username}` — bankroll `{bankroll_bnb:.4f}` BNB",

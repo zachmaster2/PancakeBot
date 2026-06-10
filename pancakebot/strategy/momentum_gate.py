@@ -79,7 +79,7 @@ class MomentumGateConfig:
 
     ``max_consecutive_kline_fetch_failures`` is the streak counter: after this
     many consecutive ``kline_fetch_transient_failure`` rounds, the gate
-    raises InvariantError -> bot crashes -> supervisor restart + Discord
+    raises InvariantError -> bot crashes -> systemd restart + Discord
     alert. Threaded from ``cfg.max_consecutive_kline_fetch_failures``.
     """
     enabled: bool
@@ -121,7 +121,7 @@ class MomentumGate:
 
     Error handling:
     - Any ``InvariantError`` from any symbol → reraise (bot crashes →
-      supervisor restart). These indicate OKX returned a malformed window
+      systemd restart). These indicate OKX returned a malformed window
       (length/contiguity/boundary violation) and should never silently
       skip.
     - Any ``TransientOkxError`` (any subset of symbols) → record per-symbol

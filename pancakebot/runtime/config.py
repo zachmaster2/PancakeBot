@@ -76,7 +76,7 @@ class RuntimeConfig:
     claim_tx_receipt_timeout_seconds: int
 
     # User-tunable. Streak counter for OKX transient failures; bot
-    # crashes (-> supervisor restart + Discord alert) after this many
+    # crashes (-> systemd restart + Discord alert) after this many
     # consecutive `kline_fetch_transient_failure` rounds.
     max_consecutive_kline_fetch_failures: int
 

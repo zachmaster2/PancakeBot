@@ -1,8 +1,8 @@
 """Tests for supervisor_artifacts.archive_lingering_crash_file.
 
 Verifies the bot-startup housekeeping that renames a leftover crash.json to
-a timestamped archive filename so the supervisor doesn't re-fire CRASHED
-alerts every 3 minutes after a previous bot's death.
+a timestamped archive filename so a previous bot's death can't be
+misattributed to the fresh bot (notify_lifecycle reads crash evidence).
 
 Run:
     python -m pytest tests/test_archive_lingering_crash_file.py -v
@@ -66,7 +66,7 @@ def test_default_always_archives_regardless_of_age():
     crash hasn't happened yet). Previously the default was 60s, which
     caused 2026-04-25 false-CRASHED events: a bot crashed at T=0,
     auto-restart spawned a new bot at T=58s (under threshold), the
-    crash.json sat un-archived, and the supervisor's next 3-minute cycle
+    crash.json sat un-archived, and the then-supervisor's next 3-minute cycle
     classified the healthy new bot as CRASHED based on the lingering file
     and killed it. Always archiving fixes this without losing forensic
     data (the file is renamed, not deleted).

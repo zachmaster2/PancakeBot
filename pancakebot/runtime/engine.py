@@ -381,7 +381,7 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
     if not cfg.dry:
         # BOT READY (Bundle 7): fired once per start after the first successful
         # wallet-balance read, so the first BET SUBMITTED has a bankroll
-        # reference point. Bot-owned (distinct from the supervisor STARTED
+        # reference point. Bot-owned (distinct from the lifecycle STARTED
         # alert). Best-effort — the sender swallows all webhook errors.
         send_bot_ready_alert(channel=LIVE_CHANNEL, bankroll_bnb=bankroll_bnb)
 
@@ -397,7 +397,7 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         #   - preflight wake: SKIP round with risk_bankroll_stale
         #   - _sleep_and_claim close_ts: bounded local retry (same pattern as handshake)
         #   - claim_scan_cursor callers: fail-soft (log warn + continue)
-        #   - bet submission: crash → supervisor restart (round was lost anyway)
+        #   - bet submission: crash → systemd restart (round was lost anyway)
         # No top-level catch — there is no remaining bubble path where a
         # generic 10s-sleep-and-retry helps.
         _run_one_iteration(cfg, closed_state)
@@ -1621,7 +1621,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     # Bounded local retry around ``contract.close_ts`` — the only RPC call
     # in this function with real budget before the claim wake. Mirrors the
     # pattern in ``_epoch_handshake``. Exhaust → InvariantError → bot crashes
-    # → supervisor restart (cleaner than top-level sleep-and-retry).
+    # → systemd restart (cleaner than top-level sleep-and-retry).
     close_ts: int | None = None
     for idx, delay_seconds in enumerate([0] + list(RETRY_BACKOFF_SECONDS)):
         if delay_seconds > 0:

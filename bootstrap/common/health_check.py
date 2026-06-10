@@ -1,18 +1,18 @@
-"""Post-install validation: the host clock is sync'd, the service is
-registered, starts, and the bot reaches READY — driven through the
-cross-platform ``ServicePlatform``.
+"""Post-install validation: the host clock is sync'd, the systemd unit is
+registered, starts, and the bot reaches READY.
 
 Steps (each logged):
   0. clock synchronized?            (chronyc tracking: Leap status Normal +
                                      offset inside tolerance; Linux only —
                                      skipped where chronyc is unavailable)
-  1. service registered?            (service_status != UNKNOWN)
-  2. start it                       (platform.start_service)
-  3. transitions to RUNNING         (poll service_status, timeout)
+  1. unit registered?               (systemctl show: LoadState=loaded)
+  2. start it                       (systemctl start; refused if the
+                                     Conflicts= partner unit is active)
+  3. transitions to active          (poll ActiveState, timeout)
   4. bot emits READY                (tail var/<mode>/runtime.log for "READY",
                                      timeout)
 
-Exit 0 = healthy. Intended to run at the end of install.{sh,ps1}; safe to run
+Exit 0 = healthy. Intended to run at the end of install.sh; safe to run
 standalone for a spot-check.
 """
 from __future__ import annotations
@@ -101,6 +101,34 @@ def _clock_sync_ok() -> tuple[bool, str]:
     return _parse_chronyc_tracking(proc.stdout)
 
 
+def _run_systemctl(argv: list[str]) -> str:
+    """Run ``systemctl <argv>`` and return stdout ('' on any failure).
+    Module-level so tests monkeypatch it."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", *argv], capture_output=True, text=True, timeout=15,
+        )
+        return proc.stdout or ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def _unit_state(service_name: str) -> tuple[str, str]:
+    """Return ``(load_state, active_state)`` for the unit.
+
+    LoadState: ``loaded`` when registered, ``not-found`` otherwise.
+    ActiveState: ``active`` / ``activating`` / ``inactive`` / ``failed``.
+    """
+    out = _run_systemctl(
+        ["show", service_name, "-p", "LoadState", "-p", "ActiveState"],
+    )
+    parsed: dict[str, str] = {}
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        parsed[key.strip()] = value.strip()
+    return parsed.get("LoadState", "unknown"), parsed.get("ActiveState", "unknown")
+
+
 def _runtime_log(mode: str) -> Path:
     return _REPO_ROOT / "var" / mode / "runtime.log"
 
@@ -120,45 +148,42 @@ def _tail_has_ready_since(path: Path, since_ts: float) -> bool:
 def run(
     *, mode: str, service_name: str,
     start_timeout_s: float = 30.0, ready_timeout_s: float = 90.0,
-    platform=None,
 ) -> bool:
-    from pancakebot.service import ServiceState, get_platform
-    p = platform if platform is not None else get_platform()
-
     clock_ok, clock_detail = _clock_sync_ok()
     if not clock_ok:
         _log(f"FAIL: clock sync — {clock_detail}")
         return False
     _log(f"clock sync ok ({clock_detail})")
 
-    st = p.service_status(service_name)
-    if st == ServiceState.UNKNOWN:
-        _log(f"FAIL: service {service_name!r} is not registered")
+    load_state, active_state = _unit_state(service_name)
+    if load_state != "loaded":
+        _log(f"FAIL: unit {service_name!r} is not registered "
+             f"(LoadState={load_state})")
         return False
-    _log(f"service {service_name!r} registered (state={st})")
+    _log(f"unit {service_name!r} registered (ActiveState={active_state})")
 
     started_at = time.time()
-    if st != ServiceState.RUNNING:
+    if active_state != "active":
         partner = _CONFLICTING_SERVICE.get(service_name)
-        if partner is not None and p.service_status(partner) == ServiceState.RUNNING:
+        if partner is not None and _unit_state(partner)[1] == "active":
             _log(
                 f"FAIL: refusing to start {service_name!r} — conflicting unit "
-                f"{partner!r} is RUNNING (systemd Conflicts= would stop it). "
+                f"{partner!r} is active (systemd Conflicts= would stop it). "
                 f"Run the health check against {partner!r}, or stop it "
                 f"explicitly first."
             )
             return False
         _log(f"starting {service_name!r}")
-        p.start_service(service_name)
+        _run_systemctl(["start", service_name])
 
     deadline = time.time() + start_timeout_s
     while time.time() < deadline:
-        if p.service_status(service_name) == ServiceState.RUNNING:
-            _log("service is RUNNING")
+        if _unit_state(service_name)[1] == "active":
+            _log("unit is active")
             break
         time.sleep(1.0)
     else:
-        _log(f"FAIL: {service_name!r} did not reach RUNNING within {start_timeout_s}s")
+        _log(f"FAIL: {service_name!r} did not reach active within {start_timeout_s}s")
         return False
 
     log_path = _runtime_log(mode)
