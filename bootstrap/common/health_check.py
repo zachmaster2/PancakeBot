@@ -31,6 +31,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # means sync is genuinely broken, not merely loose.
 _CLOCK_OFFSET_TOLERANCE_S = 0.25
 
+# The live and dry systemd units declare mutual Conflicts= (one bot at a
+# time): systemctl-starting one SILENTLY STOPS the other. Starting the
+# checked service is part of this health check, so on a box where the
+# partner unit is running, proceeding would take down a production bot
+# (exactly what happened on 2026-06-10: a dry health check stopped
+# pancakebot-live for ~77s). Refuse instead.
+_CONFLICTING_SERVICE = {
+    "pancakebot-live": "pancakebot-dry",
+    "pancakebot-dry": "pancakebot-live",
+}
+
 
 def _log(msg: str) -> None:
     print(f"[health_check] {msg}", flush=True)
@@ -128,6 +139,15 @@ def run(
 
     started_at = time.time()
     if st != ServiceState.RUNNING:
+        partner = _CONFLICTING_SERVICE.get(service_name)
+        if partner is not None and p.service_status(partner) == ServiceState.RUNNING:
+            _log(
+                f"FAIL: refusing to start {service_name!r} — conflicting unit "
+                f"{partner!r} is RUNNING (systemd Conflicts= would stop it). "
+                f"Run the health check against {partner!r}, or stop it "
+                f"explicitly first."
+            )
+            return False
         _log(f"starting {service_name!r}")
         p.start_service(service_name)
 

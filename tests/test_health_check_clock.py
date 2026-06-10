@@ -94,3 +94,35 @@ def test_clock_sync_skips_without_chronyc(monkeypatch):
     ok, detail = _clock_sync_ok()
     assert ok is True
     assert "skipped" in detail
+
+
+def test_run_refuses_to_start_when_conflicting_unit_is_running(monkeypatch):
+    """Conflicts= guard (2026-06-10 incident): the live/dry units are
+    mutually exclusive, so health-checking the STOPPED one on a box where
+    the partner is RUNNING must FAIL EARLY — starting it would silently
+    stop the running (production) bot."""
+    import bootstrap.common.health_check as hc
+    from pancakebot.service import ServiceState
+
+    monkeypatch.setattr(hc, "_clock_sync_ok", lambda: (True, "test"))
+    started: list[str] = []
+
+    class FakePlatform:
+        def service_status(self, name):
+            return (
+                ServiceState.RUNNING if name == "pancakebot-live"
+                else ServiceState.STOPPED
+            )
+
+        def start_service(self, name):
+            started.append(name)
+
+    ok = hc.run(
+        mode="dry", service_name="pancakebot-dry",
+        start_timeout_s=1.0, ready_timeout_s=1.0,
+        platform=FakePlatform(),
+    )
+    assert ok is False
+    assert started == [], (
+        "must refuse BEFORE start_service — starting dry would stop live"
+    )
