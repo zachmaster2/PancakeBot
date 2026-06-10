@@ -5,19 +5,25 @@ and silent process deaths that log-tailing alone will miss.
 
 ## What it does
 
-A pair of Windows Services (`PancakeBotLive` and `PancakeBotDry`,
-registered via pywin32 / SCM, source in `pancakebot/service/`) each
-supervise their bot child subprocess. Every 1 second, the supervisor
-classifies the bot's state from the Popen handle + `var/<mode>/crash.json`
-and restarts the bot on death.
+A pair of systemd units on the Linux VM (`pancakebot-live` and
+`pancakebot-dry`, installed by `bootstrap/install.sh`) each run
+`pancakebot.service.supervise --mode <live|dry>`, which supervises its bot
+child subprocess (source in `pancakebot/service/`). Every 1 second, the
+supervisor classifies the bot's state from the Popen handle +
+`var/<mode>/crash.json` and restarts the bot on death. (The original
+Windows-service variant of the same SupervisorCore — pywin32/SCM — remains
+in source for the retired Windows-host era; Phase 3 archives it and also
+plans the systemd-direct simplification, collapsing the
+systemd→supervisor→bot double-wrap to systemd→run.py.)
 
 Replaced the legacy one-shot `scripts/supervisor.py` (schtask-driven, every
 3 min, heartbeat-mtime-based liveness) on 2026-05-23. Heartbeat-staleness
 classification was removed on 2026-05-27 (Step 27a) because the 5s
-threshold was firing on transient BSC RPC hedged-timeouts that auto-resolve
-on the next round — ~12 false-positive restarts/24h with no real bot
-dysfunction. **Process-death detection via `Popen.poll()` is the
-authoritative liveness signal; there is no longer any heartbeat file.**
+threshold was firing on transient BSC RPC timeouts (under the then-hedged
+read pool) that auto-resolve on the next round — ~12 false-positive
+restarts/24h with no real bot dysfunction. **Process-death detection via
+`Popen.poll()` is the authoritative liveness signal; there is no longer
+any heartbeat file.**
 
 ## The four classifications
 

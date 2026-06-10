@@ -77,42 +77,46 @@ var/
 
 1. Create `.env` with required env vars (see mode table above)
 2. Review `config.toml`
-3. **Tighten Windows Time Service** — see [W32Time prerequisite](#w32time-prerequisite-dry--live-modes) below
+3. **Verify clock sync on the bot host** — see [clock-sync prerequisite](#clock-sync-prerequisite-dry--live-modes) below
 4. Run `python run.py --sync` to fetch data
 5. Run `python run.py --backtest` to verify
 6. Run `python run.py --dry` for paper trading
 
-### W32Time prerequisite (dry + live modes)
+The dry/live bot runs on a Linux VM (production: Frankfurt, systemd
+units installed by `bootstrap/install.sh`). Backtest/sync/research run
+anywhere.
+
+### Clock-sync prerequisite (dry + live modes)
 
 The critical-path scheduling relies on the local OS clock being within
-a few milliseconds of true NTP. Windows Time Service (W32Time) defaults
-to a max poll interval of 1024s (~17 min), which lets the local clock
-drift up to ~270ms (P95) between syncs — too sloppy for the bot's
-sub-second timing budgets.
+a few milliseconds of true NTP. On the Linux bot host, `chronyd`
+disciplines the clock continuously (frequency steering between polls):
+measured residual offset is ~30-60 **micro**seconds RMS — four orders
+of magnitude inside the bot's timing budget, with no extra tuning
+needed for steady-state drift.
 
-Tighten the service to a 32s max poll interval. Run in an **elevated
-PowerShell** (Run as Administrator):
+The one VM-specific risk is a clock **step** (host pause/live-migration
+jumps the guest clock). `bootstrap/install.sh` installs a chrony
+drop-in (`/etc/chrony.d/pancakebot.conf`: `maxpoll 6` + `makestep`)
+that bounds step *detection* to ~64s instead of chrony's default
+~17-minute worst case. The post-install health check
+(`bootstrap/common/health_check.py`) verifies the clock is
+synchronized with the offset inside tolerance; spot-check manually:
 
 ```
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config" /v MaxPollInterval /t REG_DWORD /d 5 /f
-w32tm /config /update
-net stop w32time
-net start w32time
+chronyc tracking    # want: Leap status: Normal, System time offset ~microseconds
 ```
 
-Verify with `w32tm /query /status` — the output should show
-`Poll Interval: 5 (32s)` (the 5 is `log2(32)`).
-
-The change persists across reboots. Backtest and sync modes do not
-require this (they are not timing-critical).
+Backtest and sync modes do not require this (they are not
+timing-critical).
 
 **The bot has no application-level NTP layer.** The prior `NtpSync`
 (per-round NTP query that measured `local − ntp` and applied the
-offset inside `_utc_now()`) was retired in Bundle 5 v2 (2026-05-14)
-alongside the W32Time tightening. The OS clock — kept tight by
-W32Time — is now the sole source of truth. If you skip the W32Time
-step, the bot's sub-second bet-timing margins may be too tight; there
-is no in-app fallback.
+offset inside `_utc_now()`) was retired in Bundle 5 v2 (2026-05-14);
+it existed to work around the original Windows host's W32Time drift
+(~270ms P95 at its default 1024s poll). The OS clock — chrony-
+disciplined — is the sole source of truth; there is no in-app
+fallback.
 
 ## Architecture
 
@@ -134,10 +138,11 @@ predicted predecessor block (Bundle 5 v2, 2026-05-14).
 | Wake | Anchor + offset (static fallback) | Activities |
 |---|---|---|
 | `wait_for_okx_warmup` | `lock_at - 7000ms` | Pre-establish OKX TLS connections by calling `MomentumGate.warmup_okx_session()` (proxies to `OkxClient.warmup`). Idempotent when sockets are already warm. Added 2026-05-21 (commit `5c496b1`) after a BSC RPC outage left the OKX session cold and the recovery round paid 500-800ms TLS handshakes on the critical-path kline fetch |
-| `wait_for_preflight` | `lock_at - 5970ms` | Off-critical-path setup: (1) refresh wallet balance (live = BSC RPC; dry = in-memory simulated bankroll) feeding the risk gates + `decide_open_round`; (2) prefetch the send **nonce** + **gas price** and warm all 3 write endpoints (keep-alive ≥30s) so the bet path makes no RPC but `send_raw` — drops the post-decision critical path from ~270ms (two cold rotated RPCs) to ~50ms (pre-cache, 2026-06-06) |
-| Anchor poll | `lock_at - 1300ms` | Single sub-second poll of chain head's BEP-520-encoded ms timestamp; drives dynamic critical-path scheduling |
-| `wait_for_critical_path` | `lock_at - 970ms` | Single critical-path entry. Sequentially: pool snapshot from RPC poller (Era 11; `pool_cutoff_seconds = 6` data horizon) → 3 parallel OKX `/history-candles` GETs (BTC/ETH/SOL) → signal compute → bet submit |
-| Pre-bet timing guard | `lock_at - 625ms` | Abort if decision-ready past the safety margin (TX would mine after lock). Before submission, `assert_gas_cap_not_breached()` reads the **cached** `eth.gas_price` (refreshed off-path at the preflight wake) and raises `GasPriceCapBreachedError` — fail-loud — if it exceeds `MAX_GAS_PRICE_WEI` (1 Gwei) or the cache is unpopulated/stale. The bet TX uses the **cached nonce** (no inline `get_transaction_count`). Bets are posted at `MAX_GAS_PRICE_WEI` deterministically; on breach the bot SKIPs the round + fires a CRITICAL Discord alert |
+| `wait_for_preflight` | `lock_at - 6195ms` | Off-critical-path setup: (1) refresh wallet balance (live = BSC RPC; dry = in-memory simulated bankroll) feeding the risk gates + `decide_open_round`; (2) prefetch the send **nonce** + **gas price** and warm all 3 write endpoints (keep-alive ≥30s) so the bet path makes no RPC but `send_raw` — drops the post-decision critical path from ~270ms (two cold rotated RPCs) to ~50ms (pre-cache, 2026-06-06) |
+| `wait_for_single_poll` | `lock_at - 2500ms` (fixed rail) | ONE `eth_getLogs` range catch-up against the single bloXroute read endpoint (Era 12b) — the ~5-20 blocks since the last 8s periodic tick. Wall-clock capped at 950ms (`RPC_POLL_WALL_CAP_SINGLE_MS`) so a degraded poll can never delay the anchor poll; bracketed by the CAPTURE + COMPLETION + ANCHOR-CLEARANCE startup invariants |
+| Anchor poll | `lock_at - 1500ms` | Single sub-second poll of chain head's BEP-520-encoded ms timestamp (200ms timeout, bloXroute); drives dynamic critical-path scheduling. Grossly stale anchors (>1350ms behind the local clock) are rejected to the static fallback with an `ANCHOR STALE` alert |
+| `wait_for_critical_path` | `lock_at - 1195ms` | Single critical-path entry. Sequentially: pool snapshot from RPC poller (Era 11; `pool_cutoff_seconds = 6` data horizon; F0 coverage gate skips the round if the cursor hasn't polled through the cutoff block) → 3 parallel OKX `/history-candles` GETs (BTC/ETH/SOL) → signal compute → bet submit |
+| Pre-bet timing guard | `lock_at - 789ms` | Abort if decision-ready past the safety margin (TX would mine after lock). Before submission, `assert_gas_cap_not_breached()` reads the **cached** `eth.gas_price` (refreshed off-path at the preflight wake) and raises `GasPriceCapBreachedError` — fail-loud — if it exceeds `MAX_GAS_PRICE_WEI` (1 Gwei) or the cache is unpopulated/stale. The bet TX uses the **cached nonce** (no inline `get_transaction_count`). Bets are posted at `MAX_GAS_PRICE_WEI` deterministically; on breach the bot SKIPs the round + fires a CRITICAL Discord alert |
 | `wait_for_claim` | `close_at(prev_locked) + buffer_seconds + 5s` (≈ 35s post-close) | Sleep for previous round's settlement; claim winnings (live; receipt-waited with `claim_tx_receipt_timeout_seconds ≈ 10s`, revert/timeout fires Discord `CLAIM FAILED` alert) |
 
 ### Configurable knobs (`config.toml [runtime]`)
@@ -150,9 +155,10 @@ predicted predecessor block (Bundle 5 v2, 2026-05-14).
   P95 ≈ 700ms, P99 ≈ 1300ms (informational; see
   `pancakebot/timing_constants.py`).
 - `pool_cutoff_seconds = 6` — pool-aggregate data horizon for BSC events.
-  Cross-validated at load against the RPC poll schedule (final-poll
-  offset must accommodate batch RTT p99 + safety buffer before the
-  critical-path wake reads the pool snapshot).
+  Cross-validated at load against the RPC poll schedule: the fixed
+  single-poll rail must fire after the cutoff block is available
+  (CAPTURE), complete before the critical-path wake (COMPLETION), and
+  its wall cap must clear the anchor poll (ANCHOR CLEARANCE).
 - `max_consecutive_kline_fetch_failures = 5` — streak counter before bot
   crashes (supervisor restart + Discord alert).
 
@@ -160,6 +166,7 @@ predicted predecessor block (Bundle 5 v2, 2026-05-14).
 
 Maintained in `pancakebot/timing_constants.py` with per-constant
 provenance: probe script, measurement date, percentile, sample size.
-Re-deriving any value requires re-running the corresponding probe in
-`research/p4c_*_probe.py` and updating the constant co-locked with a
-new measurement date.
+Re-deriving any value requires re-running the probe named in that
+constant's comment (under `research/`) **on the host the bot runs on**
+(network RTTs are host-dependent by definition) and updating the
+constant co-locked with a new measurement date.

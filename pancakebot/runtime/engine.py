@@ -63,9 +63,9 @@ from time import sleep as sleep_seconds
 #     full executeRound settlement window before raising the *_exhausted
 #     invariants.
 # Both contexts need a small extra window beyond the contract's chain-level
-# buffer_seconds to absorb RPC hedged-endpoint lag. (TX receipt timeouts —
-# bet AND claim — are NOT sized from this; they use the flat
-# TX_RECEIPT_WAIT_TIMEOUT_SECONDS, set in app.py.)
+# buffer_seconds to absorb RPC endpoint lag (node-side indexing + RTT tail).
+# (TX receipt timeouts — bet AND claim — are NOT sized from this; they use
+# the flat TX_RECEIPT_WAIT_TIMEOUT_SECONDS, set in app.py.)
 _RPC_ALIGNMENT_PADDING_SECONDS = 5
 
 
@@ -94,32 +94,35 @@ def _reset_regime_monitors() -> None:
     _OKX_KLINE_RTT_MONITOR = _build_okx_kline_rtt_monitor()
 
 
-# -- NTP clock sync ----------------------------------------------------------
-# The bot's scheduling uses chain-anchored timestamps (lock_at from BSC, in
+# -- Clock sync ---------------------------------------------------------------
 # Time source (Bundle 5 v2, 2026-05-14): the bot trusts the OS clock
 # directly. Previously the bot maintained its own per-round NTP query
-# (``NtpSync`` in ``pancakebot/runtime/ntp_sync.py``) that measured
-# ``(local - ntp)`` once per round and applied the correction inside
-# ``_utc_now()``. That layer was a workaround for Windows Time Service's
-# default 1024s poll cadence, which let the local clock drift up to
-# ~270ms (P95) between syncs — too sloppy for sub-second bet timing.
+# (``NtpSync``) that measured ``(local - ntp)`` once per round and applied
+# the correction inside ``_utc_now()`` — a workaround for the original
+# Windows host's W32Time, whose default 1024s poll cadence let the clock
+# drift up to ~270ms (P95) between syncs. Too sloppy for sub-second bet
+# timing, so the host clock had to be disciplined externally and the
+# application layer retired.
 #
-# The W32Time prerequisite documented in README.md tightens
-# ``MaxPollInterval`` to 5 (= 32s), bringing residual drift well under
-# 10ms (P95). With that in place the application-level NTP layer is
-# redundant — ``time.time()`` is the authoritative truth source, and
-# ``_utc_now()`` is a thin alias preserved for readability at the
-# call sites that compare local time to chain-anchored values
-# (lock_at, cutoff_ts, claim_ts).
+# The bot now runs on the Frankfurt Linux VM, where chronyd disciplines the
+# clock continuously (frequency steering between polls): measured residual
+# offset ~30-60 MICROseconds RMS (2026-06-10), four orders of magnitude
+# inside the bot's timing budget. ``time.time()`` is the authoritative
+# truth source, and ``_utc_now()`` is a thin alias preserved for
+# readability at the call sites that compare local time to chain-anchored
+# values (lock_at, cutoff_ts, claim_ts).
 #
-# If the W32Time tightening is NOT applied, the bot's timing budgets
-# may be too tight; the operator is responsible for verifying via
-# ``w32tm /query /status`` (expected ``Poll Interval: 5``).
+# Bootstrap installs a chrony drop-in (bootstrap/install.sh: maxpoll 6 +
+# makestep) that bounds clock-STEP detection after a VM pause/migration to
+# ~64s — the one Linux risk class; steady-state drift is a non-issue under
+# chrony. The post-install health check (bootstrap/common/health_check.py)
+# verifies the clock is synchronized and the offset is inside tolerance;
+# spot-check manually with ``chronyc tracking``.
 
 
 def _utc_now() -> float:
-    """Current wallclock seconds. Trusts the OS clock (kept tight by
-    W32Time per the README setup steps). Preserved as a separate
+    """Current wallclock seconds. Trusts the OS clock (chrony-disciplined
+    on the VM; see the clock-sync note above). Preserved as a separate
     function from ``time.time()`` so callers that compare local time
     against chain-anchored values remain self-documenting."""
     return time.time()
@@ -336,12 +339,12 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
     closed_state = _init_closed_state(cfg)
 
     # Bundle 5 v2 (2026-05-14): no application-level NTP bootstrap. The
-    # bot trusts the OS clock (Windows Time Service kept tight via
-    # MaxPollInterval=5; see README "W32Time prerequisite"). The prior
-    # NtpSync bootstrap + per-round refresh was retired alongside the
-    # continuous fine-phase chain-anchor poll — both layers existed to
-    # paper over W32Time's default 1024s poll cadence; the W32Time
-    # tightening obviates them.
+    # bot trusts the OS clock (chrony-disciplined on the VM; see the
+    # clock-sync note at the top of this module). The prior NtpSync
+    # bootstrap + per-round refresh was retired alongside the continuous
+    # fine-phase chain-anchor poll — both layers existed to paper over
+    # the original Windows host's W32Time drift; a disciplined host
+    # clock obviates them.
 
     bnbusd_price = _fetch_current_bnb_price_usd(cfg)
     if cfg.dry:
@@ -530,14 +533,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
 
         # Bundle 5 v2 (2026-05-14): the per-round NTP sync wake is gone.
         # Previously the bot woke at ``lock - 11095ms`` to refresh its own
-        # ``(local - ntp)`` offset measurement. The W32Time prerequisite
-        # (MaxPollInterval=5, see README) keeps the OS clock within a
-        # few ms of NTP truth directly, so there is no application-level
-        # NTP layer to refresh. Candidate C (2026-06-06): the first pre-lock
-        # wake is now the OKX warmup (= lock - 7000ms); the RPC catch-up is a
-        # single batched poll just before the critical path (was a 3-leg ramp
-        # ladder — ramp_1/ramp_2 removed, the final poll became the single
-        # poll below).
+        # ``(local - ntp)`` offset measurement. The OS clock is disciplined
+        # directly (chrony on the VM; see the clock-sync note at the top of
+        # this module), so there is no application-level NTP layer to
+        # refresh. Candidate C (2026-06-06): the first pre-lock wake is now
+        # the OKX warmup (= lock - 7000ms); the RPC catch-up is ONE getLogs
+        # poll just before the critical path (was a 3-leg ramp ladder —
+        # ramp_1/ramp_2 removed, the final poll became the single poll
+        # below).
 
         # -- Bankroll wake --
         # Refreshes wallet balance so risk gates + decide_open_round
@@ -1711,8 +1714,8 @@ def _sleep_until_ts(target_ts: float, *, reason: str, epoch: int | None = None) 
     """Sleep until OKX/UTC time hits ``target_ts``.
 
     *target_ts* is treated as a chain-anchored / OKX-frame UTC second,
-    compared against ``_utc_now()`` (the OS wall clock, kept tight by
-    W32Time per the README setup). There is no minimum-sleep
+    compared against ``_utc_now()`` (the OS wall clock, chrony-disciplined
+    on the VM per the README setup). There is no minimum-sleep
     short-circuit: any target still in the future is slept until, so
     sub-second dynamic wakes are honored exactly. A target already at or
     past now returns immediately.

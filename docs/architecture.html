@@ -596,11 +596,6 @@
         <div class="ls-desc">Query BSC for current epoch and round timing. Identifies the open round (currently accepting bets) and the just-locked round (awaiting settlement).</div>
       </div>
       <div class="loop-step">
-        <div class="ls-title">Ramp Poll 1</div>
-        <div class="ls-desc">First batched <code>eth_getBlockReceipts</code> ramp poll. Catches up an 8s-periodic-interval worth of blocks (worst case ~18 blocks) so the critical-path snapshot has the freshest BetBull/BetBear events. Era 11 (2026-05-07): the RpcPoller replaced the prior WSS subscription path with deterministic ramp+final polls.</div>
-        <div class="ls-time">lock_at &minus; ramp_poll_1_wakeup_offset_before_lock_ms &rarr; ~7.55s before lock</div>
-      </div>
-      <div class="loop-step">
         <div class="ls-title">OKX Warmup Wake</div>
         <div class="ls-desc">Pre-establish OKX TLS connections via <code>MomentumGate.warmup_okx_session()</code> (proxies to <code>OkxClient.warmup</code>). Idempotent when sockets are already warm. Added 2026-05-21 (commit <code>5c496b1</code>) after a BSC RPC outage left the OKX session cold and the recovery round paid 500-800ms TLS handshakes on the critical-path kline fetch. Errors are swallowed inside warmup; a fully-failed warmup just means the round pays the cold fetch like before.</div>
         <div class="ls-time">lock_at &minus; okx_warmup_wakeup_offset_before_lock_ms &rarr; ~7.00s before lock</div>
@@ -608,27 +603,27 @@
       <div class="loop-step">
         <div class="ls-title">Preflight Wake</div>
         <div class="ls-desc">Off-critical-path setup. (1) Refresh wallet balance (live = BSC RPC ~50-200ms p99; dry = in-memory simulated bankroll), feeding the risk gates + decide_open_round. (2) Pre-cache (2026-06-06): prefetch the send nonce + gas price and warm all 3 write endpoints (keep-alive &ge;30s) so the bet path makes zero RPCs but send_raw &mdash; dropping the post-decision critical path from ~270ms (two cold rotated RPCs) to ~50ms. 5s wake budget covers any plausible RPC stall.</div>
-        <div class="ls-time">lock_at &minus; preflight_wakeup_offset_before_lock_ms &rarr; ~5.97s before lock</div>
+        <div class="ls-time">lock_at &minus; preflight_wakeup_offset_before_lock_ms &rarr; ~6.20s before lock</div>
       </div>
       <div class="loop-step">
-        <div class="ls-title">Ramp Poll 2 + Final RPC Poll</div>
-        <div class="ls-desc">Ramp poll 2 (incremental ~4-block top-up) at <code>~5.85s</code>, then the final RPC poll at <code>~4.75s</code>. The final poll must complete (block availability + batched RTT + safety) before the critical-path wake reads the pool snapshot.</div>
-        <div class="ls-time">lock_at &minus; {ramp_poll_2, final_rpc_poll}_wakeup_offset_before_lock_ms &rarr; ~5.85s / ~4.75s before lock</div>
+        <div class="ls-title">Single RPC Poll</div>
+        <div class="ls-desc">ONE <code>eth_getLogs</code> range catch-up against the single bloXroute read endpoint (Era 12b, 2026-06-10; Candidate C 2026-06-06 collapsed the prior 3-leg ramp ladder). The retained 8s periodic poll keeps the cursor within ~1 interval, so this catches only the ~5-20 blocks since the last periodic tick. Wall-clock capped (950ms) so a degraded poll can never delay the anchor poll; cap-aborts leave the cursor un-advanced and the F0 coverage gate skips the round if the pool is incomplete at decision time. Bracketed by the CAPTURE + COMPLETION + ANCHOR-CLEARANCE startup invariants.</div>
+        <div class="ls-time">lock_at &minus; single_poll_wakeup_offset_before_lock_ms &rarr; 2.50s before lock (fixed rail)</div>
       </div>
       <div class="loop-step">
         <div class="ls-title">Anchor Poll</div>
         <div class="ls-desc">Single sub-second poll of chain head's BEP-520-encoded ms timestamp (200ms timeout). On success: the predicted predecessor block's milli_ts drives a dynamic critical-path wake (typically tighter than the static fallback) AND a dynamic bet-submit deadline. On timeout/malformed: fall back to the static critical-path + static deadline below.</div>
-        <div class="ls-time">lock_at &minus; ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS &rarr; ~1.30s before lock</div>
+        <div class="ls-time">lock_at &minus; ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS &rarr; 1.50s before lock</div>
       </div>
       <div class="loop-step data">
         <div class="ls-title">Critical-path Wake</div>
         <div class="ls-desc">Single critical-path entry. Sequentially: read pool aggregate from the RpcPoller's in-memory accumulator (BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds, in-memory ~5ms) &rarr; fire 3 parallel OKX /history-candles GETs (BTC/ETH/SOL; BNB disabled, see MomentumGate._OKX_SYMBOLS_FETCHED) &rarr; compute multi-TF signal + sizing. The bet-submit deadline gate at lock_at &minus; bet_submit_deadline_offset_before_lock_ms gates the actual TX submission below. SSOT-derived (commit <code>261beac</code>, 2026-05-21): the wake is computed as <code>compute_submit_deadline_ms(...) − (KLINE_RTT_P99 + SIGNAL_COMPUTE + POOL_READ)</code> so the wake and the deadline share the same back-off math.</div>
-        <div class="ls-time">lock_at &minus; critical_path_wakeup_offset_before_lock_ms &rarr; ~970ms before lock (static fallback)</div>
+        <div class="ls-time">lock_at &minus; critical_path_wakeup_offset_before_lock_ms &rarr; ~1195ms before lock (static fallback)</div>
       </div>
       <div class="loop-step action">
         <div class="ls-title">Timing Guard + Execute</div>
         <div class="ls-desc">Abort if decision-ready is within bet_submit_deadline_offset_before_lock_ms of lock_at (TX submitted that close would land after lock and revert). Before submission, <code>assert_gas_cap_not_breached()</code> reads the <strong>cached</strong> <code>eth.gas_price</code> (refreshed off-path at the preflight wake) and raises <code>GasPriceCapBreachedError</code> &mdash; fail-loud &mdash; if it exceeds <code>MAX_GAS_PRICE_WEI</code> (1 Gwei, deterministic) OR the cache is unpopulated/stale. On breach: skip the round, fire a CRITICAL Discord alert, continue running. The bet TX uses the <strong>cached nonce</strong> (no inline get_transaction_count), so the post-decision path is just build-encode + ECDSA sign + send_raw. Otherwise submit bet at <code>MAX_GAS_PRICE_WEI</code> (commit <code>f73d704</code>, 2026-05-21 &mdash; replaces the prior <code>eth.gas_price</code> path that returned 0.05 Gwei on today's BSC mainnet and lost lock-block priority). Receipt-waited with <code>bet_tx_receipt_timeout_seconds &asymp; 10s</code>. Live mode: clamp to min bet when <code>min_bet_only=true</code>.</div>
-        <div class="ls-time">lock_at &minus; bet_submit_deadline_offset_before_lock_ms &rarr; ~625ms before lock (static fallback)</div>
+        <div class="ls-time">lock_at &minus; bet_submit_deadline_offset_before_lock_ms &rarr; ~789ms before lock (static fallback)</div>
       </div>
       <div class="loop-step settle">
         <div class="ls-title">Claim Wake</div>

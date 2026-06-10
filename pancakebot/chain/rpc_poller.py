@@ -362,7 +362,9 @@ class RpcPoller:
         interval_seconds: int,
         contract_address: str = PREDICTION_V2_CONTRACT_ADDRESS,
         periodic_poll_interval_s: int = _tc.RPC_PERIODIC_POLL_INTERVAL_SECONDS,
-        single_poll_wakeup_offset_before_lock_ms: int = 4750,
+        single_poll_wakeup_offset_before_lock_ms: int = (
+            _tc.SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS
+        ),
         pool_cutoff_seconds: int = 6,
     ) -> None:
         if interval_seconds <= 0:
@@ -407,13 +409,14 @@ class RpcPoller:
 
         self._contract_addr = contract_address.lower()
         self._periodic_poll_interval_s = int(periodic_poll_interval_s)
-        # Engine-side single-poll lock-relative offset (config-derived in
-        # production via pancakebot/config.py from pool_cutoff_seconds;
-        # canonical value at pool_cutoff=6 is 4750ms). Used by the
-        # lock-anchored _periodic_loop to suspend periodic ticks that
-        # would otherwise land inside the (lock - single_poll_offset, lock]
-        # window and race the engine-driven single poll for the
-        # non-blocking _poll_lock (Candidate C, 2026-06-06).
+        # Engine-side single-poll lock-relative offset (in production the
+        # fixed SINGLE_POLL_WAKEUP_OFFSET_BEFORE_LOCK_MS rail = 2500ms,
+        # passed through pancakebot/config.py; the ctor default is the same
+        # SSOT constant). Used by the lock-anchored _periodic_loop to
+        # suspend periodic ticks that would otherwise land inside the
+        # (lock - single_poll_offset, lock] window and race the
+        # engine-driven single poll for the non-blocking _poll_lock
+        # (Candidate C, 2026-06-06).
         self._single_poll_wakeup_offset_ms = int(single_poll_wakeup_offset_before_lock_ms)
 
         self._lock = threading.Lock()
