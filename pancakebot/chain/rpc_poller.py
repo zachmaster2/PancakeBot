@@ -785,8 +785,16 @@ class RpcPoller:
 
         Triggers cursor initialization on the first call (~1 RPC,
         non-blocking; daemon's periodic ticks drive the catch-up).
-        Subsequent calls drop past-round state and update tracked
-        epochs via _on_epoch_advance.
+        Subsequent calls hand the WHOLE round transition to
+        _on_epoch_advance, which commits every piece of round state
+        (epoch, pools drop, lock_at, cursor jump, block_ts prune) in
+        ONE critical section — see its docstring for why atomicity is
+        load-bearing. This method's own lock section is validation-only
+        on the advance path; the engine thread is the sole writer of
+        round state, so validate-then-commit across two acquisitions
+        cannot be invalidated in between (the daemon only reads these
+        fields, and only advances the cursor — which the commit handles
+        with a forward-only max()).
         """
         if current_epoch < 0:
             raise InvariantError("set_round_phase_negative_epoch")
@@ -794,7 +802,6 @@ class RpcPoller:
             raise InvariantError("set_round_phase_lock_at_nonpositive")
 
         is_first_call = False
-        is_epoch_advance = False
         with self._lock:
             prev_epoch = self._current_epoch
             is_first_call = (prev_epoch == -1)
@@ -815,28 +822,7 @@ class RpcPoller:
             if is_first_call:
                 info("START", f"RPC poll initialized at epoch {current_epoch}")
                 self._current_epoch = current_epoch
-            else:
-                # Drop past-round epochs (strictly less than new
-                # current_epoch) from both _pools and
-                # _processed_bet_log_ids. The "+1" next-epoch entries
-                # are kept. The two dicts share the same epoch keyset
-                # by construction (see population site in
-                # _process_bet_logs), so a single key list
-                # suffices for both deletes.
-                epochs_to_drop = [e for e in self._pools if e < current_epoch]
-                for e in epochs_to_drop:
-                    del self._pools[e]
-                    del self._processed_bet_log_ids[e]
-                self._current_epoch = current_epoch
-                is_epoch_advance = True
-
-            self._lock_at = lock_at
-
-            # Bounded _block_ts: keep most recent 500 once we exceed 1000.
-            if len(self._block_ts) > 1000:
-                sorted_blocks = sorted(self._block_ts.keys())
-                for bn in sorted_blocks[:-500]:
-                    del self._block_ts[bn]
+                self._lock_at = lock_at
 
         if is_first_call:
             # Bundle 2 (2026-05-13): synchronous cursor-init only — fast
@@ -851,12 +837,12 @@ class RpcPoller:
             # and returns None if decoding fails. A None return for a
             # round means "use static fallback for this round" — no
             # persistent state, no detection-failure mode.
-        elif is_epoch_advance:
-            # Round-aware cursor clamp + catch-up feasibility check.
-            # Past rounds are archive-only — the bot only bets on the
-            # CURRENT round, so polling cursor must not lag into prior
-            # rounds. Failed RPC calls leave state untouched and the
-            # next epoch advance retries.
+        else:
+            # Full round transition (epoch + lock_at + pools + cursor jump
+            # + block_ts prune) committed atomically inside; the rs_block
+            # RPC runs BEFORE the commit while every piece of round state
+            # is still the previous round's (the stale-lock_at feasibility
+            # fence keeps the daemon from crunching during that window).
             self._on_epoch_advance(lock_at=lock_at, current_epoch=current_epoch)
 
     def get_pool(self, epoch: int, *, max_ts: int) -> tuple[float, float]:
@@ -917,51 +903,87 @@ class RpcPoller:
     # ------------------------------------------------------------------
 
     def _on_epoch_advance(self, *, lock_at: int, current_epoch: int) -> None:
-        """Round-aware bookkeeping at epoch boundaries.
+        """Atomic round transition + catch-up feasibility check.
 
-        Two responsibilities:
+        Phase 1 (no lock): compute the new round's start block via one
+        RPC (``_compute_round_start_block``). Every piece of round state
+        is still the PREVIOUS round's during this window, so a daemon
+        poll that fires concurrently sees a consistent old snapshot and
+        — if a large backlog exists (outage recovery) — aborts on the
+        stale-lock_at feasibility fence without fetching anything.
 
-        1. **Cursor clamp**: advance ``_last_polled_block_number`` to the
-           current round's start block (or just behind it). Forward-only —
-           never rewinds, so normal in-round operation is a no-op. After
-           a publicnode outage spanning N rounds, the clamp jumps the
-           cursor forward, skipping ~N*660 past-round blocks; past
-           rounds are archive-only.
+        Phase 2 (ONE critical section): commit the entire transition —
+        drop past-round pools, advance ``_current_epoch``, write
+        ``_lock_at``, clear the infeasibility flag + detail, jump the
+        cursor forward to ``rs_block - 1`` (forward-only via max(),
+        re-polling the round-start block itself), and prune ``_block_ts``
+        round-aware. Because the daemon snapshots (lock_at, cursor)
+        under the same lock in ``_poll_now``, the torn pairing
+        (fresh lock_at + un-jumped cursor) — which previously let a
+        post-outage daemon tick start a multi-chunk archive crunch or
+        spuriously INFEAS-flag the recovery round — is unobservable BY
+        CONSTRUCTION. (Verified interleaving audit 2026-06-10; the
+        complementary guard is _poll_now's forward-only per-chunk
+        cursor write, which stops a crunch that legitimately started
+        under the PRIOR round's lock_at from stomping this jump.)
 
-        2. **Feasibility check**: compute estimated catch-up wallclock
-           from blocks-behind and the single-batch p99 RTT. If the
-           estimate exceeds time-until-lock, set
-           ``_catchup_infeasible_for_round`` so the engine skips with
-           reason ``catchup_infeasible_for_round``.
+        ``_block_ts`` prune: drop entries with ``ts < round_start_ts``
+        (older than the new round). Same round-aware semantics as the
+        pools/dedup drops above it — all three caches now evict on the
+        same boundary. Every remaining consumer is current-round-only:
+        the process-path cache check and get_pool's null-recovery
+        re-check. No entry count cap: even a pathological 600-bet-block
+        round keeps every entry (bounded by the round's block count).
 
-        Both halves degrade gracefully on RPC failure: if the RPC calls
-        needed for either step error out, we leave state untouched and
-        rely on the next epoch advance to retry.
+        Phase 3 (no lock): catch-up feasibility against a fresh head;
+        sets ``_catchup_infeasible_for_round`` (pre-lock only) so the
+        engine skips with reason ``catchup_infeasible_for_round``.
+
+        RPC-failure fallback: if Phase 1's RPC fails (rs_block None),
+        Phase 2 still commits the transition WITHOUT the cursor jump —
+        the round must proceed, and the un-jumped cursor degrades to a
+        bounded daemon catch-up crunch (~128 getLogs chunks / ~32s for
+        a 12h outage; archive bets are epoch-gate-dropped before any
+        block-ts cost) gated by is_pool_ready while in flight.
         """
-        # Always reset the infeasibility flag at round start; otherwise
-        # a past-round flag would carry forward into rounds where the
-        # cursor has been clamped and catch-up is now feasible. Reset
-        # the detail tuple too so a SKIP in a later round can't surface
-        # carried-over numbers from a past infeasibility event.
+        round_start_ts = lock_at - self._interval_seconds
+
+        # Phase 1 — RPC outside the lock, old state fences the daemon.
+        rs_block = self._compute_round_start_block(round_start_ts)
+
+        # Phase 2 — single critical section: the whole round transition.
         with self._lock:
+            epochs_to_drop = [e for e in self._pools if e < current_epoch]
+            for e in epochs_to_drop:
+                del self._pools[e]
+                del self._processed_bet_log_ids[e]
+            self._current_epoch = current_epoch
+            self._lock_at = lock_at
+            # Reset the infeasibility verdict at round start; otherwise a
+            # past-round flag would carry forward into rounds where the
+            # cursor has been jumped and catch-up is now feasible. Reset
+            # the detail tuple too so a SKIP in a later round can't
+            # surface carried-over numbers.
             self._catchup_infeasible_for_round = False
             self._last_catchup_detail = None
+            if rs_block is not None:
+                self._last_polled_block_number = max(
+                    self._last_polled_block_number, rs_block - 1,
+                )
+            stale_bns = [
+                bn for bn, ts in self._block_ts.items() if ts < round_start_ts
+            ]
+            for bn in stale_bns:
+                del self._block_ts[bn]
 
-        round_start_ts = lock_at - self._interval_seconds
-        rs_block = self._compute_round_start_block(round_start_ts)
         if rs_block is None:
-            return  # RPC + cache both failed; leave state, retry next round
+            warn("ALERT",
+                 "epoch advance: round-start block RPC failed; cursor not "
+                 "jumped (bounded catch-up fallback — next poll crunches "
+                 "the backlog, archive bets epoch-gated)")
 
-        # Forward-only cursor advance.
-        with self._lock:
-            prev_cursor = self._last_polled_block_number
-            new_cursor = rs_block - 1  # re-poll round_start block itself
-        if new_cursor > prev_cursor:
-            with self._lock:
-                self._last_polled_block_number = new_cursor
-
-        # Feasibility check: how far behind are we vs how much time
-        # remains, with a single fresh head fetch.
+        # Phase 3 — feasibility check: how far behind are we vs how much
+        # time remains, with a single fresh head fetch.
         try:
             head = self._bloxroute_block_number(attempts=_RPC_ATTEMPTS_PERIODIC)
         except Exception:  # noqa: BLE001
@@ -989,48 +1011,69 @@ class RpcPoller:
                 # at Phase B v2 (the round is going to be skipped anyway;
                 # one operator line per skip is enough).
 
-    def _compute_round_start_block(self, round_start_ts: int) -> int | None:
-        """Return the block-number whose timestamp ~= round_start_ts.
+    @staticmethod
+    def _rs_block_from_header(
+        head_num: int, head_ts: int, head_milli: int | None,
+        round_start_ts: int,
+    ) -> int:
+        """Pure math: the round-start block estimate from a fresh head
+        header, erring EARLY by construction (an estimate at or before
+        the true round-start block — over-fetching a few pre-round
+        blocks is ~free since they're epoch-gated, while overshooting
+        would silently skip the round's earliest bets, a hole F0 cannot
+        see because its coverage check is one-sided).
 
-        Strategy:
+        ms path (mixHash decoded): delta = ceil(span_ms / 450). With
+        BSC's delay-only jitter (gaps >= 450ms — see
+        predict_predecessor_milli_ts), blocks-produced-in-span <=
+        span/450 <= delta, so head - delta lands at or before the
+        boundary block exactly.
 
-        1. **Cache lookup** (free): pick the newest entry in
-           ``_block_ts`` with ts <= round_start_ts and within 60s of it,
-           then extrapolate forward by ``BSC_BLOCK_TIME_MS``.
-        2. **RPC fallback**: ``eth_getBlockByNumber("latest", false)``
-           returns ``(head_num, head_ts)``; extrapolate backward.
+        seconds fallback (no BEP-520 ms): header timestamps truncate to
+        whole seconds, understating the true span by up to ~950ms ≈ 2.1
+        blocks (the head block's sub-second phase) — add 3 blocks of
+        margin on top of the ceil.
 
-        Returns None if RPC fails AND cache has no usable anchor.
+        Callers subtract 1 more (cursor = rs_block - 1) to re-poll the
+        boundary block itself.
         """
-        # Method 1 — cache lookup.
-        with self._lock:
-            cached = [(b, t) for b, t in self._block_ts.items()
-                      if t > 0 and t <= round_start_ts]
-        if cached:
-            b, t = max(cached, key=lambda x: x[1])
-            # Reject anchors more than 60s before round_start_ts —
-            # extrapolation accuracy degrades with distance.
-            if round_start_ts - t <= 60:
-                delta_blocks = round((round_start_ts - t) * 1000
-                                     / _tc.BSC_BLOCK_TIME_MS)
-                return b + delta_blocks
+        if head_milli is not None:
+            span_ms = head_milli - round_start_ts * 1000
+            if span_ms <= 0:
+                return head_num
+            delta_blocks = -(-span_ms // _tc.BSC_BLOCK_TIME_MS)  # ceil
+        else:
+            if head_ts <= round_start_ts:
+                return head_num
+            span_ms = (head_ts - round_start_ts) * 1000
+            delta_blocks = -(-span_ms // _tc.BSC_BLOCK_TIME_MS) + 3
+        return max(0, head_num - delta_blocks)
 
-        # Method 2 — RPC fallback.
+    def _compute_round_start_block(self, round_start_ts: int) -> int | None:
+        """Return the block-number whose timestamp ~= round_start_ts, from
+        one fresh ``eth_getBlockByNumber("latest")`` + backward
+        extrapolation (``_rs_block_from_header``, ms-precise when the head's
+        BEP-520 mixHash decodes). Returns None on RPC failure (caller falls
+        back to the bounded catch-up crunch).
+
+        Always-RPC by design: the result is forward-only-consumed (a no-op
+        in normal rounds where the cursor is already past round-start), so
+        it only does real work in outage recovery — exactly when any cached
+        block-ts anchor would be stale. The extrapolation span is at most
+        ~seconds-into-round (the head is fetched fresh), REGARDLESS of how
+        long an outage lasted.
+        """
         try:
-            head_num, head_ts, _head_milli = self._bloxroute_latest_header(
+            head_num, head_ts, head_milli = self._bloxroute_latest_header(
                 attempts=_RPC_ATTEMPTS_PERIODIC,
             )
         except Exception:  # noqa: BLE001
             return None
         if head_ts <= 0 or head_num <= 0:
             return None
-        if head_ts <= round_start_ts:
-            # Round hasn't started yet according to head-ts — treat the
-            # cursor as already past.
-            return head_num
-        delta_blocks = round((head_ts - round_start_ts) * 1000
-                             / _tc.BSC_BLOCK_TIME_MS)
-        return max(0, head_num - delta_blocks)
+        return self._rs_block_from_header(
+            head_num, head_ts, head_milli, round_start_ts,
+        )
 
     def _estimated_catchup_ms(self, blocks_behind: int) -> int:
         """Estimated wallclock to catch up ``blocks_behind`` blocks via
@@ -1137,13 +1180,16 @@ class RpcPoller:
         fail and skips that tick cleanly.
 
         Belt-and-suspenders: cursor-init also clears
-        ``_catchup_infeasible_for_round = False`` on every successful
-        exit (feasible or head-behind-round-start branch). Covers the
+        ``_catchup_infeasible_for_round = False`` on every exit —
+        successful (feasible or head-behind-round-start branch) AND the
+        header-RPC-failure returns (2026-06-10; previously the failure
+        path left the flag poisoned, mislabeling the cold-start skip as
+        INFEAS instead of cold_start_in_progress). Covers the
         microsecond window where the daemon may have acquired
         ``_poll_lock`` before cursor-init did and already poisoned the
-        flag — by the time cursor-init lands, the daemon's bad poll has
-        completed and we authoritatively reset the verdict against the
-        correct cursor.
+        flag against the uninitialized cursor=0 sentinel — by the time
+        cursor-init lands, the daemon's bad poll has completed and we
+        authoritatively reset the verdict.
 
         Round-aware: round_start_block is derived from
         ``lock_at - interval_seconds``, NOT from a head-relative
@@ -1171,17 +1217,28 @@ class RpcPoller:
 
             try:
                 # eth_getBlockByNumber('latest') returns head_number AND
-                # head_timestamp in one call — both needed to derive
-                # round_start_block from lock_at - interval_seconds.
+                # head_timestamp (+ BEP-520 ms when the mixHash decodes)
+                # in one call — all needed to derive round_start_block
+                # from lock_at - interval_seconds.
                 try:
-                    head, head_ts, _head_milli = self._bloxroute_latest_header(
+                    head, head_ts, head_milli = self._bloxroute_latest_header(
                         attempts=_RPC_ATTEMPTS_PERIODIC,
                     )
                 except Exception as e:  # noqa: BLE001
                     warn("ALERT", f"init_cursor: eth_getBlockByNumber(latest) failed: {type(e).__name__}: {e}")
+                    # Y1 safeguard, failure path: a daemon tick that raced
+                    # this init against the uninitialized cursor=0 sentinel
+                    # may have INFEAS-poisoned the flag. Clear it here like
+                    # the success exits do — the honest skip reason while
+                    # the cursor is unseeded is cold_start_in_progress
+                    # (_connected False), not a poisoned INFEAS verdict.
+                    with self._lock:
+                        self._catchup_infeasible_for_round = False
                     return
                 if head <= 0 or head_ts <= 0:
                     warn("ALERT", f"init_cursor: invalid header head={head} ts={head_ts}")
+                    with self._lock:
+                        self._catchup_infeasible_for_round = False
                     return
 
                 with self._lock:
@@ -1204,28 +1261,17 @@ class RpcPoller:
                          f"head={head} (no in-round blocks yet)")
                     return
 
-                # delta_blocks: how many blocks since round_start.
-                # Bundle 5 v2 (2026-05-14): no forward safety margin. The
-                # post-Lorentz chain's empirical "misses only delay, never
-                # advance" property means actual blocks-elapsed is at most
-                # ``ceil((head_ts - round_start_ts) * 1000 / 450)`` — slot
-                # misses produce FEWER blocks than the nominal divisor
-                # predicts, never more. So ``round(...)`` is an upper bound
-                # (modulo ≤ 0.5 block of rounding noise); cursor at
-                # ``head - delta_blocks`` lands at or before
-                # round_start_block by construction. Any over-fetched
+                # round_start_block via the shared safe-direction estimator
+                # (_rs_block_from_header): ms-exact ceil when the head's
+                # BEP-520 mixHash decodes, seconds-fallback +3-block margin
+                # otherwise. Errs EARLY by construction — over-fetched
                 # pre-round blocks are filtered by the epoch gate in
-                # _process_receipts.
-                #
-                # Prior versions added +20 (compensating for the old 500ms
-                # divisor's ~10% under-count) and then +5 (over-defensive
-                # carryover after the divisor was made exact in Bundle 4).
-                # Q2 fix (2026-05-14, Bundle 5 v2): both are gone.
-                delta_blocks = round(
-                    (head_ts - round_start_ts) * 1000
-                    / _tc.BSC_BLOCK_TIME_MS
+                # _process_bet_logs, while overshooting would silently skip
+                # the round's earliest bets (invisible to F0's one-sided
+                # coverage check).
+                round_start_block = self._rs_block_from_header(
+                    head, head_ts, head_milli, round_start_ts,
                 )
-                round_start_block = max(0, head - delta_blocks)
                 blocks_to_backfill = max(0, head - round_start_block + 1)
 
                 # Feasibility check: can the upcoming periodic tick catch up
