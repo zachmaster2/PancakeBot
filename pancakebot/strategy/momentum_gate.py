@@ -1,7 +1,8 @@
 """Multi-timeframe momentum gate over OKX 1s klines for BTC with independent ETH/SOL signals.
 
-Requires BTC multi-TF returns (configured via ``GateConfig.mtf_lookbacks``)
-to all agree in direction and exceed ``GateConfig.mtf_min_return_threshold``, and emits
+Requires BTC multi-TF returns (``MomentumGateConfig.mtf_lookbacks``, threaded
+from ``[strategy.gate]`` by app.py)
+to all agree in direction and exceed the min-return threshold, and emits
 independent ETH and SOL multi-TF directions plus confirmation strengths for
 use by the pipeline's sizing and regime-2 logic.
 
@@ -28,8 +29,8 @@ fail on any symbol -> TransientOkxError -> gate skips with
 historical fetch via sync.py) where there's no time pressure.
 
 The wake-time offset is derived from timing_constants.py and applied
-by the engine via ``RuntimeConfig.kline_fetch_wakeup_offset_ms``; the
-gate itself just consumes ``lock_at_ms``.
+by the engine via ``RuntimeConfig.critical_path_wakeup_offset_before_lock_ms``;
+the gate itself just consumes ``lock_at_ms``.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ _MAX_CONSECUTIVE_FETCH_FAILURES = 5
 # BNB temporarily removed from the live fetch -- the strategy doesn't
 # consume BNB closes for signal computation, and the bot already has
 # BNB price-via-chain (lock_price on the locked round) for any
-# downstream needs. See var/design/phase_2_robustness_design.md sec 2.1.
+# downstream needs (Phase 2 robustness §2.1; design note archived offline).
 # To re-enable: add "bnb" back to this tuple, restore the "bnb" entry
 # in the symbols dict in evaluate(), bump _executor max_workers to 4,
 # and reinstate the _bnb_arr extraction below the validation block.
@@ -115,7 +116,7 @@ class MomentumGate:
     Decision-time work: 3 parallel HTTP GETs to OKX (pooled RTT
     p50=258ms, p95=289ms, p99=363ms per probe n=1000 2026-05-03).
     The wake-time offset is set by the engine via
-    ``RuntimeConfig.kline_fetch_wakeup_offset_ms``; the gate consumes
+    ``RuntimeConfig.critical_path_wakeup_offset_before_lock_ms``; the gate consumes
     ``lock_at_ms``. BNB fetch is currently disabled (see
     ``_OKX_SYMBOLS_FETCHED`` for re-enable instructions).
 

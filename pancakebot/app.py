@@ -19,7 +19,7 @@ from pancakebot.market_data.okx_client import OkxClient
 from pancakebot.strategy.momentum_gate import MomentumGate, MomentumGateConfig
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.market_data.graph_client import GraphClient
-from pancakebot.chain.rpc_pool import choose_rpc_url
+from pancakebot.chain.rpc_chooser import choose_rpc_url
 from pancakebot.chain.contract_config import Web3ContractConfig
 from pancakebot.chain.prediction_contract import Web3PredictionContract
 from pancakebot.runtime.config import RuntimeConfig
@@ -244,8 +244,8 @@ def run_from_config(
 
     # RPC poller: deterministic poll schedule (cold-start init + periodic +
     # engine single poll) over eth_getLogs range queries. Replaces the
-    # WSS-subscription pool watcher (Era 11, 2026-05-07); see
-    # var/design/rpc_polling_architecture_2026_05_07.md. Every read RPC goes
+    # WSS-subscription pool watcher (Era 11, 2026-05-07); architecture
+    # reference: pancakebot/chain/rpc_poller.py module docstring. Every read RPC goes
     # to the single bloXroute endpoint (RPC_BLOXROUTE_ENDPOINT, Era 12b) via
     # a shared urllib3.PoolManager with tight per-attempt timeouts, bounded
     # retries, and wall-clock-capped polls.

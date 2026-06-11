@@ -65,6 +65,10 @@ class Round:
 
     @staticmethod
     def from_json(obj: dict[str, Any], *, interval_seconds: int = 300) -> "Round":
+        # interval_seconds=300 is the frozen PCS V2 round interval the
+        # canonical on-disk dataset depends on; the round_store reload path
+        # intentionally uses this default rather than the live constants
+        # cache (lock_at = start_at + interval).
         bets_raw = obj.get("bets") or []
         if not isinstance(bets_raw, list):
             raise InvariantError("round_bets_not_list")

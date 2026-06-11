@@ -15,8 +15,8 @@ Steps (each logged):
   4. bot emits READY                (tail var/<mode>/runtime.log for "READY",
                                      timeout)
 
-Exit 0 = healthy. Intended to run at the end of install.sh; safe to run
-standalone for a spot-check.
+Exit 0 = healthy. install.sh prints this as its final validation hint;
+run it manually post-install or for a spot-check.
 """
 from __future__ import annotations
 

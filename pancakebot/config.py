@@ -55,12 +55,11 @@ class BacktestConfig:
 
 # -- Strategy config ----------------------------------------------------------
 #
-# 14 knobs exposed for TOML configuration. Four sections match the strategy's
-# logical layers: pool-admission filters, BTC primary signal, ETH+SOL fallback,
-# and the strong-signal bypass. Other strategy values (multi-TF lookbacks,
-# sizing slopes, cross-pair weights) remain as module-level constants in
-# pancakebot/strategy/momentum_pipeline.py — they're more like algorithm
-# identity than experiment knobs.
+# All strategy parameters are TOML-exposed across six [strategy.*] sections
+# matching the strategy's logical layers: pool_filter (admission), gate
+# (multi-TF lookbacks/threshold), btc_primary (signal+sizing), eth_sol_fallback
+# (regime-2), tier2_sizing (cross-regime sizing knobs; historical name), and
+# risk (bankroll gates / drawdown breaker / cooldown).
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +143,10 @@ class GateConfig:
 @dataclass(frozen=True, slots=True)
 class Tier2SizingConfig:
     """Cross-regime sizing knobs.
+
+    NAMING NOTE: "tier2" is historical — these knobs apply to BOTH the
+    BTC-primary and regime-2 paths (README calls the secondary signal
+    "Regime-2"; the TOML section name is kept for config compatibility).
 
     - eth_sol_signal_weight: coefficient applied to BOTH ETH and SOL
       signal strengths in the BTC-primary confirmation boost AND in the
@@ -351,10 +354,9 @@ class AppConfig:
     # Other
     dry_initial_bankroll_bnb: float
     live_min_bet_only: bool
-    backtest_round_count: int
-    backtest_initial_bankroll_bnb: float
 
-    # Full BacktestConfig with validation (kept as inner dataclass).
+    # Full BacktestConfig with validation (kept as inner dataclass);
+    # backtest knobs live ONLY here (cfg.backtest.*).
     backtest: BacktestConfig
     # Full StrategyConfig.
     strategy: StrategyConfig
@@ -836,7 +838,7 @@ def load_app_config(path: str) -> AppConfig:
 
     # --- RPC poll wake schedule (Era 11: 2026-05-07 pivot; Candidate C
     # single-poll: 2026-06-06) ---
-    # See var/design/rpc_polling_architecture_2026_05_07.md. The single-poll
+    # See pancakebot/chain/rpc_poller.py (module docstring). The single-poll
     # offset doesn't depend on the rtt_p99 lookup; the startup invariant below
     # checks the chosen offset still accommodates the actual p99 + safety,
     # failing-fast with a clear InvariantError if rtt_p99 drifts past what the
@@ -1001,8 +1003,6 @@ def load_app_config(path: str) -> AppConfig:
         okx_warmup_wakeup_offset_before_lock_ms=okx_warmup_wakeup_offset_before_lock_ms,
         dry_initial_bankroll_bnb=dry_initial_bankroll_bnb,
         live_min_bet_only=live_min_bet_only,
-        backtest_round_count=backtest_round_count,
-        backtest_initial_bankroll_bnb=bt_bankroll,
         backtest=backtest_cfg,
         strategy=strategy_cfg,
     )

@@ -151,10 +151,18 @@ def _compute_bet_size(
 
 
 class MomentumOnlyPipeline:
-    """Momentum-only pipeline: satisfies the StrategyPipeline interface.
+    """Momentum-only pipeline: satisfies ``strategy.base.StrategyPipeline``.
 
     In live/dry mode pass `gate` (a MomentumGate backed by OKX client).
     In backtest mode leave `gate=None`; the pipeline uses cached 1s klines.
+
+    Config duality note: ``config`` (MomentumGateConfig) parameterizes the
+    LIVE gate path; the backtest path (``_evaluate_from_cache``) computes
+    from ``strategy_config.gate``. The two carry overlapping fields
+    (mtf_lookbacks, thresholds) and agree because app.py threads one into
+    the other at construction — when building configs by hand (research
+    drivers), keep them consistent or live and backtest will compute
+    different signals.
     """
 
     def __init__(
@@ -192,7 +200,7 @@ class MomentumOnlyPipeline:
         self._bankroll_tracker: BankrollTracker | None = bankroll_tracker
 
     # ------------------------------------------------------------------
-    # Required interface: StrategyPipeline-compatible
+    # Required interface: strategy.base.StrategyPipeline
     # ------------------------------------------------------------------
 
     @property

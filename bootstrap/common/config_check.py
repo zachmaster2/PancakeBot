@@ -5,8 +5,8 @@ Checks (fail-fast, no mutation):
     top-level sections.
   - ``.env`` exists with the required secret KEYS present and non-empty
     (values are never printed).
-  - The Discord webhook env vars are set in the environment (machine-scope on
-    Windows / EnvironmentFile on Linux). Missing webhooks are a WARNING, not a
+  - The Discord webhook env vars are set in the environment (EnvironmentFile
+    on the VM / process env elsewhere). Missing webhooks are a WARNING, not a
     hard failure — the bot runs without alerts.
 
 Exit code 0 = ready to install; non-zero = blockers found.

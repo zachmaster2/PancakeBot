@@ -1,6 +1,7 @@
 """Cross-platform venv creation + dependency install (idempotent).
 
-Used by ``bootstrap/install.sh`` and ``bootstrap/install.ps1``. Creates
+Used by ``bootstrap/install.sh``; also runnable directly on any host
+(including Windows dev boxes — it handles Scripts/ vs bin/). Creates
 ``<repo>/.venv`` with the given interpreter (must satisfy the minimum version)
 and installs ``requirements.txt``. Re-running is safe: an existing venv with a
 satisfactory interpreter is reused; ``pip install`` is naturally idempotent.

@@ -15,9 +15,11 @@ compares the cursor's block-time against the CONTRACT-anchored cutoff, a
 node-independent reference), and min(ref_head, bloxroute_head) could
 false-skip rounds when the dataseeds lagged bloXroute. Failure layering:
 momentary blip -> in-call retry; sustained degradation -> wall-cap abort /
-feasibility -> F0 skip. Architecture: deterministic poll schedule. See:
-- ``var/design/rpc_polling_architecture_2026_05_07.md`` (architecture)
-- ``var/incident_reports/2026_05_07_rpc_polling_spike_results.md`` (provenance)
+feasibility -> F0 skip. Architecture: deterministic poll schedule. (This
+docstring is the canonical architecture reference; the 2026-05-07 design +
+WSS-spike notes lived in var/ and were archived offline — the spike showed
+cross-subscription event ordering is NOT preserved on public WSS endpoints,
+which is what motivated deterministic getLogs polling.)
 
 The poller has three trigger paths:
 

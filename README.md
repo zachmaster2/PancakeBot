@@ -6,7 +6,7 @@ Automated trading bot for PancakeSwap Prediction V2 on BNB Smart Chain.
 
 | Mode     | Command                    | Env vars                   | Description                                   |
 |----------|----------------------------|----------------------------|-----------------------------------------------|
-| Sync     | `python run.py --sync`     | `THE_GRAPH_API_KEY`        | Fetch rounds + klines + contract constants    |
+| Sync     | `python run.py --sync`     | `THE_GRAPH_API_KEY`        | Fetch rounds + klines + contract constants (depth = `[backtest] backtest_round_count`) |
 | Backtest | `python run.py --backtest` | (none)                     | Replay historical data, compute PnL           |
 | Dry      | `python run.py --dry`      | (none)                     | Real-time paper trading                       |
 | Live     | `python run.py --live`     | `BSC_WALLET_PRIVATE_KEY`   | Real on-chain bets                            |
@@ -23,6 +23,21 @@ Running with no flags prints help. Modes are mutually exclusive.
 
 **Filters:** Pool minimum (1.5 BNB), payout floor (1.5x); small pools
 (< 3.0 BNB) admitted only on a strong signal (>= 0.0002).
+
+### Changing the strategy
+
+Two binding rules for any strategy change:
+
+1. **Bit-identity or gauntlet.** A change must either keep the canonical
+   5-fold backtest bit-identical (`_EXPECTED_5FOLD_HASH` in
+   `tests/test_in_process_runner.py` — the suite enforces it) or be
+   promoted as a new candidate through the full gauntlet: 5-fold CV, the
+   frozen holdout, the extension_v2 OOS slice, and a permutation-null
+   pass (see [docs/holdout_2026_04_24.md](docs/holdout_2026_04_24.md)).
+2. **The pipeline seam is `pancakebot/strategy/base.py`**
+   (`StrategyPipeline` Protocol). A new pipeline must satisfy it; the
+   construction sites are `runtime/dry.py:_build_momentum_pipeline`
+   (dry + live) and `backtest/runner.py`.
 
 ## Project Structure
 
@@ -41,7 +56,7 @@ pancakebot/
 
     chain/                               # BSC chain interaction
         prediction_contract.py           # Web3 contract wrapper
-        contract_config.py, rpc_pool.py
+        contract_config.py, rpc_chooser.py
         rpc_poller.py                    # Era 12b (2026-06-10): single bloXroute read
                                          # path, eth_getLogs pool event accumulation
 
@@ -95,8 +110,32 @@ var/
 The dry/live bot runs on a Linux VM (production: Frankfurt, systemd
 units installed by `bootstrap/install.sh`; supervision + Discord
 lifecycle alerting: see [docs/SUPERVISOR.md](docs/SUPERVISOR.md)).
-Backtest/sync/research run anywhere, and dry/live can also be run
-directly (`python run.py --dry|--live`) on any host for development.
+Backtest/sync/research run anywhere.
+
+### Direct run (development)
+
+Dry/live also run directly — no service wrapper — on any host
+(the only path on Windows since the service stack moved Linux-only):
+
+1. Python 3.13+; `python bootstrap/common/python_setup.py` creates
+   `.venv` and installs deps (handles `Scripts/` vs `bin/`), or plain
+   `python -m venv .venv` + `pip install -r requirements.txt`.
+2. `.env` at the repo root (loaded via python-dotenv).
+3. `python run.py --dry` (no secrets needed) or `--live`.
+
+Notes: a missing `BSC_WALLET_PRIVATE_KEY` fails fast with
+`missing_env_var`; one bot per mode is enforced by a process-scan mutex;
+network timing constants are tuned for the production VM, so a high-RTT
+dev host will log occasional benign `head_fetch`/`getlogs` timeout
+ALERTs (the poller retries). For a fast end-to-end check, set
+`[backtest] backtest_round_count = 100` before `--sync`.
+
+### Deploy gate
+
+"Greenlit" for a deploy means: full suite green on the dev clone
+(`python -m pytest`) **before** `git push vm master`, and green on the
+VM (`.venv/bin/python -m pytest`) after checkout, before restarting the
+unit. The suite includes the canonical-hash bit-identity test.
 
 ### Deploying (push-to-deploy, 2026-06-10)
 

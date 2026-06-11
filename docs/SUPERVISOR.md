@@ -89,6 +89,10 @@ Three webhooks, set in `/etc/pancakebot/alerts.env` (0600):
 | `PANCAKEBOT_DRY_ALERTS_DISCORD_WEBHOOK_URL`  | `pancakebot-dry-alerts`  |
 | `PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL`     | `pancakebot-general`     |
 
+Verify delivery after (re)configuring webhooks:
+`.venv/bin/python scripts/_smoke_discord_send_test.py` (with the
+alerts.env vars exported) posts a distinguishable test message per channel.
+
 Unset env var → `DISABLED` (soft fallback, no HTTP). HTTP failure →
 `SEND_FAILED` logged to stderr (journald), never raises. Rate limit: one
 alert per `(mode, kind)` per 5 minutes, tracked in

@@ -39,7 +39,13 @@ never the wallet key):
   `PANCAKEBOT_{LIVE_ALERTS,DRY_ALERTS,GENERAL}_DISCORD_WEBHOOK_URL` hooks
   (bot units + notify template)
 
-install.sh scaffolds both; fill them in.
+install.sh scaffolds both; fill them in. **Also create a repo-root
+`.env`** with `BSC_WALLET_PRIVATE_KEY` + `THE_GRAPH_API_KEY` before
+running install.sh — its STEP 3 config check (and any direct
+`run.py --sync`) reads secrets from `.env`/process env; the
+`/etc/pancakebot` EnvironmentFiles are what the systemd units load.
+Verify webhook delivery with
+`.venv/bin/python scripts/_smoke_discord_send_test.py`.
 
 ## Install (AlmaLinux 9.x)
 
