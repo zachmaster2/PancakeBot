@@ -29,8 +29,8 @@ from pancakebot.types import Round
 
 
 # The decision schema + skip_context validation rules are strategy-invariant
-# and live at the seam (strategy/base.py); re-exported here because the
-# engine, audit, and tests historically import them from this module.
+# and live at the seam (strategy/base.py); re-exported for the historical
+# import path (existing tests import StrategyPipelineDecision from here).
 from pancakebot.strategy.base import (  # noqa: F401  (re-export)
     _SKIP_CONTEXT_SCHEMA,
     StrategyPipelineDecision,
