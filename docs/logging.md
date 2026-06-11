@@ -8,14 +8,19 @@ new emissions against these principles; the structured logger
 
 Each has one job — don't conflate them:
 
-1. **`var/<mode>/runtime.log` (INFO and above)** — operator-scannable
+1. **stdout + `var/<mode>/runtime.log` (INFO and above)** — operator-scannable
    narrative. Rare events. Only what a human needs to see while watching
-   the bot run.
+   the bot run. stdout carries the identical rendered lines and is
+   persisted by journald under the systemd units (`journalctl -u
+   pancakebot-live` is the primary narrative sink on the VM);
+   `runtime.log` is the additive rotating file sink (25MB / 7 backups;
+   each line gains a write-time `HH:MM:SS.mmm` handler prefix) and the
+   sole persistent sink for ad-hoc non-systemd launches.
 2. **`var/<mode>/cycle_audit.csv`** — per-round structured data. The
    analysis source of truth. pandas-loadable; one row per round-decision.
 3. **Other audit CSVs as needed** — for sub-round or non-round structured
-   data that doesn't fit `cycle_audit.csv` (e.g. `dry_trades.csv` for
-   per-bet settlement, `var/live/latency.jsonl` for per-TX timing).
+   data that doesn't fit `cycle_audit.csv` (e.g. `var/<mode>/trades.csv`
+   for per-bet settlement, `var/live/latency.jsonl` for per-TX timing).
 
 **DEBUG goes away as a production concept.** No persistent DEBUG-level
 logging from production code. Python's `logging.DEBUG` stays available

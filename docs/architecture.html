@@ -401,7 +401,7 @@
     <p>
       A binary prediction game running on the BNB Smart Chain. Every 5 minutes, a new round opens.
       Players bet whether the BNB price will go <strong>up (Bull)</strong> or <strong>down (Bear)</strong>
-      before the round locks. If you're right, you split the losing side's pool (minus a 3% fee).
+      before the round locks. If you're right, winners split the entire pool pro-rata, net of a 3% treasury fee taken from the total pool.
       PancakeBot automates this by reading real-time market data and placing bets when it detects momentum.
     </p>
     <div class="game-grid">
@@ -420,7 +420,7 @@
       <div class="game-step">
         <div class="step-num">3</div>
         <div class="step-title">Round Closes</div>
-        <div class="step-desc">The "close price" is recorded. If close > lock, Bulls win. Otherwise, Bears win.</div>
+        <div class="step-desc">The "close price" is recorded. If close > lock, Bulls win; if close < lock, Bears win; an exact tie pays no one (house takes the pool).</div>
         <div class="step-time">t = 10:00</div>
       </div>
     </div>
@@ -453,8 +453,8 @@
         <text x="110" y="163" text-anchor="middle" fill="#c4b5fd" font-size="9.5">Closed round history</text>
 
         <rect x="20" y="210" width="180" height="60" rx="10" fill="#1a2e1a" stroke="#4ade80" stroke-width="1.5"/>
-        <text x="110" y="235" text-anchor="middle" fill="#4ade80" font-size="11" font-weight="600">BSC RPC</text>
-        <text x="110" y="253" text-anchor="middle" fill="#86efac" font-size="9.5">Round state, bets, pool events</text>
+        <text x="110" y="235" text-anchor="middle" fill="#4ade80" font-size="11" font-weight="600">BSC reads: bloXroute</text>
+        <text x="110" y="253" text-anchor="middle" fill="#86efac" font-size="9.5">getLogs / head / anchor / block-ts</text>
 
         <!-- ---- Arrows from sources ---- -->
         <line x1="200" y1="60" x2="280" y2="110" stroke="#22d3ee" stroke-width="1.2" marker-end="url(#arrow)"/>
@@ -507,7 +507,7 @@
 
         <!-- ---- Arrow back to BSC ---- -->
         <path d="M 905,260 L 905,300 Q 905,320 885,320 L 150,320 Q 130,320 130,300 L 130,270" fill="none" stroke="#4ade80" stroke-width="1.2" marker-end="url(#arrow-green)"/>
-        <text x="500" y="338" text-anchor="middle" fill="#4ade80" font-size="8.5">signed transaction broadcast to BSC</text>
+        <text x="500" y="338" text-anchor="middle" fill="#4ade80" font-size="8.5">signed transaction broadcast to BSC &mdash; write path: defibit &times;3 (separate from the bloXroute read endpoint)</text>
 
         <!-- ---- Settlement (bottom) ---- -->
         <rect x="350" y="380" width="320" height="100" rx="12" fill="#1a1d2e" stroke="#fb923c" stroke-width="1.5"/>
@@ -583,7 +583,20 @@
           <div class="sz-label">ETH/SOL Boost</div>
           <div class="sz-value">+0.3x each</div>
         </div>
+        <div class="sizing-item">
+          <div class="sz-label">Pool Filter</div>
+          <div class="sz-value">&ge;1.5 BNB pool, &ge;1.5x payout</div>
+        </div>
+        <div class="sizing-item">
+          <div class="sz-label">Risk Gates</div>
+          <div class="sz-value">&le;5% bankroll; 15% drawdown breaker + 72-round cooldown</div>
+        </div>
       </div>
+      <p style="font-size: 0.8rem; color: #64748b; margin-top: 0.6rem;">
+        The risk layer is operationally decisive: the drawdown breaker + cooldown
+        (config.toml <code>[strategy.risk]</code>) can suppress betting entirely
+        through a losing regime &mdash; sizing is not bounded by the floor/cap alone.
+      </p>
     </div>
   </div>
 
@@ -612,12 +625,12 @@
       </div>
       <div class="loop-step">
         <div class="ls-title">Anchor Poll</div>
-        <div class="ls-desc">Single sub-second poll of chain head's BEP-520-encoded ms timestamp (200ms timeout). On success: the predicted predecessor block's milli_ts drives a dynamic critical-path wake (typically tighter than the static fallback) AND a dynamic bet-submit deadline. On timeout/malformed: fall back to the static critical-path + static deadline below.</div>
+        <div class="ls-desc">Single sub-second poll of chain head's BEP-520-encoded ms timestamp (200ms timeout). On success: the predicted predecessor block's milli_ts drives a dynamic critical-path wake (typically tighter than the static fallback) AND a dynamic bet-submit deadline. On timeout/malformed, OR a well-formed anchor &gt;1350ms gross-stale vs the local clock (endpoint lag; fires an <code>ANCHOR STALE</code> alert, still arms the F0 coverage reference): fall back to the static critical-path + static deadline below.</div>
         <div class="ls-time">lock_at &minus; ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS &rarr; 1.50s before lock</div>
       </div>
       <div class="loop-step data">
         <div class="ls-title">Critical-path Wake</div>
-        <div class="ls-desc">Single critical-path entry. Sequentially: read pool aggregate from the RpcPoller's in-memory accumulator (BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds, in-memory ~5ms) &rarr; fire 3 parallel OKX /history-candles GETs (BTC/ETH/SOL; BNB disabled, see MomentumGate._OKX_SYMBOLS_FETCHED) &rarr; compute multi-TF signal + sizing. The bet-submit deadline gate at lock_at &minus; bet_submit_deadline_offset_before_lock_ms gates the actual TX submission below. SSOT-derived (commit <code>261beac</code>, 2026-05-21): the wake is computed as <code>compute_submit_deadline_ms(...) − (KLINE_RTT_P99 + SIGNAL_COMPUTE + POOL_READ)</code> so the wake and the deadline share the same back-off math.</div>
+        <div class="ls-desc">Single critical-path entry. Sequentially: read pool aggregate from the RpcPoller's in-memory accumulator (BetBull/BetBear events with block_ts &lt; lock_at &minus; pool_cutoff_seconds, in-memory ~5ms) &rarr; fire 3 parallel OKX /history-candles GETs (BTC/ETH/SOL; BNB disabled, see momentum_gate._OKX_SYMBOLS_FETCHED) &rarr; compute multi-TF signal + sizing. The bet-submit deadline gate at lock_at &minus; bet_submit_deadline_offset_before_lock_ms gates the actual TX submission below. SSOT-derived (commit <code>261beac</code>, 2026-05-21): the wake is computed as <code>compute_submit_deadline_ms(...) − (KLINE_RTT_P99 + SIGNAL_COMPUTE + POOL_READ)</code> so the wake and the deadline share the same back-off math.</div>
         <div class="ls-time">lock_at &minus; critical_path_wakeup_offset_before_lock_ms &rarr; ~1195ms before lock (static fallback)</div>
       </div>
       <div class="loop-step action">
@@ -664,7 +677,7 @@
   </div>
 
   <div class="footer">
-    PancakeBot Architecture Diagram &middot; Auto-generated
+    PancakeBot Architecture Diagram &middot; hand-maintained, last refreshed 2026-06-11 (Era 12b / systemd-direct)
   </div>
 
 </div>

@@ -1,4 +1,4 @@
-"""Tests for pancakebot.service.notifications — the Discord alert executor.
+"""Tests for pancakebot.ops.notifications — the Discord alert executor.
 
 Channel routing per kind, rate-limit cooldown enforcement, message building
 (severity tags, [MODE] prefix, crash-artifact rendering), and the
@@ -20,7 +20,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from pancakebot.service import notifications  # noqa: E402
+from pancakebot.ops import notifications  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

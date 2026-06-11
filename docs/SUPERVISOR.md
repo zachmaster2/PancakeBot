@@ -15,7 +15,7 @@ systemd
   ├─ pancakebot-dry.service    ExecStart=.venv/bin/python -u run.py --dry
   └─ pancakebot-notify@.service (oneshot template, fired on lifecycle edges)
         └─ python -m pancakebot.ops.notify_lifecycle <unit>-<event>
-              └─ pancakebot.service.notifications  (Discord alert executor)
+              └─ pancakebot.ops.notifications  (Discord alert executor)
 ```
 
 The unit files are TRACKED at `bootstrap/linux/systemd/` and installed

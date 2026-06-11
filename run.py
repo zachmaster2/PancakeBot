@@ -102,8 +102,10 @@ def main() -> None:
         atexit.register(clear_pid_file, pid_path)
         # Archive any crash.json left behind by a previous bot (renamed with
         # its original mtime as a timestamp suffix -- forensic data preserved,
-        # not deleted). Prevents the supervisor from re-firing CRASHED alerts
-        # on every invocation after a previous bot died. A crash.json newer
+        # not deleted). Prevents the lifecycle notifier (pancakebot-notify@ ->
+        # notify_lifecycle.crash_evidence) from counting a stale crash.json as
+        # crash evidence (RECOVERY_AFTER_CRASH) on every later start; a
+        # just-renamed archive still counts for the immediate restart. A crash.json newer
         # than 60s is left alone to avoid clobbering a report that's still
         # being processed by whatever wrote it.
         archived = archive_lingering_crash_file(crash_path)

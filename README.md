@@ -21,17 +21,18 @@ Running with no flags prints help. Modes are mutually exclusive.
 
 **Sizing:** Continuous adaptive based on signal strength, ETH/SOL confirmation, and payout odds.
 
-**Filters:** Pool minimum (1.5 BNB), payout floor (1.5x), strong-signal bypass for small pools.
+**Filters:** Pool minimum (1.5 BNB), payout floor (1.5x); small pools
+(< 3.0 BNB) admitted only on a strong signal (>= 0.0002).
 
 ## Project Structure
 
 ```
 pancakebot/
-    constants.py, errors.py, log.py     # Shared foundations
-    money.py, time.py, path.py
+    constants.py, util.py, log.py        # Shared foundations (exceptions, money fmt)
+    paths.py, timing_constants.py        # var/ layout; timing single source of truth
     config.py                            # All config: TOML, env, dataclasses
     types.py, pool_amounts.py            # Domain types (Bet, Round)
-    settlement.py                        # PnL computation
+    settlement.py, bankroll_tracker.py   # PnL computation; risk gates (breaker/cooldown)
     app.py                               # Mode dispatch
 
     strategy/                            # Signal + sizing
@@ -41,7 +42,8 @@ pancakebot/
     chain/                               # BSC chain interaction
         prediction_contract.py           # Web3 contract wrapper
         contract_config.py, rpc_pool.py
-        rpc_poller.py                    # Era 11 (2026-05-07+): batched RPC pool event accumulation
+        rpc_poller.py                    # Era 12b (2026-06-10): single bloXroute read
+                                         # path, eth_getLogs pool event accumulation
 
     market_data/                         # Data fetch + store
         okx_client.py                    # OKX REST with session pooling
@@ -56,6 +58,14 @@ pancakebot/
         engine.py                        # Two-phase loop, epoch handshake
         dry.py                           # Dry state, audit, settlement
         live.py                          # Claim scanning
+        audit.py, bet_ledger.py          # cycle_audit.csv; bets.jsonl ledger
+        regime_telemetry.py              # REGIME_DRIFT monitors
+        single_instance.py               # One-bot-per-mode lock
+        supervisor_artifacts.py          # bot.pid + crash.json (read by ops/)
+
+    ops/                                 # systemd-facing alerting (docs/SUPERVISOR.md)
+        notify_lifecycle.py              # pancakebot-notify@ oneshot entry
+        notifications.py                 # Discord alert executor
 
     backtest/
         runner.py                        # Offline replay + equity plot
@@ -68,7 +78,7 @@ var/
     closed_rounds.jsonl                  # Synced round history
     {bnb,btc,eth,sol}_spot_prices.jsonl  # Synced 1s klines
     contract_constants.json              # Chain constants (from --sync)
-    dry/                                 # Dry mode state (archived on restart)
+    dry/                                 # Dry mode state (resumed on restart; archived on --fresh)
     live/                                # Live mode state
     backtest/                            # Backtest results + equity plot
 ```
@@ -83,8 +93,10 @@ var/
 6. Run `python run.py --dry` for paper trading
 
 The dry/live bot runs on a Linux VM (production: Frankfurt, systemd
-units installed by `bootstrap/install.sh`). Backtest/sync/research run
-anywhere.
+units installed by `bootstrap/install.sh`; supervision + Discord
+lifecycle alerting: see [docs/SUPERVISOR.md](docs/SUPERVISOR.md)).
+Backtest/sync/research run anywhere, and dry/live can also be run
+directly (`python run.py --dry|--live`) on any host for development.
 
 ### Deploying (push-to-deploy, 2026-06-10)
 
@@ -160,7 +172,7 @@ predicted predecessor block (Bundle 5 v2, 2026-05-14).
 | `wait_for_preflight` | `lock_at - 6195ms` | Off-critical-path setup: (1) refresh wallet balance (live = BSC RPC; dry = in-memory simulated bankroll) feeding the risk gates + `decide_open_round`; (2) prefetch the send **nonce** + **gas price** and warm all 3 write endpoints (keep-alive ≥30s) so the bet path makes no RPC but `send_raw` — drops the post-decision critical path from ~270ms (two cold rotated RPCs) to ~50ms (pre-cache, 2026-06-06) |
 | `wait_for_single_poll` | `lock_at - 2500ms` (fixed rail) | ONE `eth_getLogs` range catch-up against the single bloXroute read endpoint (Era 12b) — the ~5-20 blocks since the last 8s periodic tick. Wall-clock capped at 950ms (`RPC_POLL_WALL_CAP_SINGLE_MS`) so a degraded poll can never delay the anchor poll; bracketed by the CAPTURE + COMPLETION + ANCHOR-CLEARANCE startup invariants |
 | Anchor poll | `lock_at - 1500ms` | Single sub-second poll of chain head's BEP-520-encoded ms timestamp (200ms timeout, bloXroute); drives dynamic critical-path scheduling. Grossly stale anchors (>1350ms behind the local clock) are rejected to the static fallback with an `ANCHOR STALE` alert |
-| `wait_for_critical_path` | `lock_at - 1195ms` | Single critical-path entry. Sequentially: pool snapshot from RPC poller (Era 11; `pool_cutoff_seconds = 6` data horizon; F0 coverage gate skips the round if the cursor hasn't polled through the cutoff block) → 3 parallel OKX `/history-candles` GETs (BTC/ETH/SOL) → signal compute → bet submit |
+| `wait_for_critical_path` | `lock_at - 1195ms` | Single critical-path entry. Sequentially: pool snapshot from the RPC poller (`pool_cutoff_seconds = 6` data horizon; F0 coverage gate skips the round if the cursor hasn't polled through the cutoff block) → 3 parallel OKX `/history-candles` GETs (BTC/ETH/SOL) → signal compute → bet submit |
 | Pre-bet timing guard | `lock_at - 789ms` | Abort if decision-ready past the safety margin (TX would mine after lock). Before submission, `assert_gas_cap_not_breached()` reads the **cached** `eth.gas_price` (refreshed off-path at the preflight wake) and raises `GasPriceCapBreachedError` — fail-loud — if it exceeds `MAX_GAS_PRICE_WEI` (1 Gwei) or the cache is unpopulated/stale. The bet TX uses the **cached nonce** (no inline `get_transaction_count`). Bets are posted at `MAX_GAS_PRICE_WEI` deterministically; on breach the bot SKIPs the round + fires a CRITICAL Discord alert |
 | `wait_for_claim` | `close_at(prev_locked) + buffer_seconds + 5s` (≈ 35s post-close) | Sleep for previous round's settlement; claim winnings (live; receipt-waited with `claim_tx_receipt_timeout_seconds ≈ 10s`, revert/timeout fires Discord `CLAIM FAILED` alert) |
 
