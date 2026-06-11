@@ -68,3 +68,22 @@ def test_sync_summary_has_per_symbol_count_fields():
             f"means a successful --sync would silently skip {sym_short.upper()} "
             f"counts in the operator's CORE/SYNC/DONE log line."
         )
+
+
+def test_sync_integrity_check_is_subset_not_equality():
+    """The Phase-3 integrity assertion must verify the kline TARGET set
+    (the cache_n tail the backtest consumes) is covered by each kline
+    store -- NOT equality against the whole round store. The Graph sync
+    pages in 1000-round chunks, so a fresh clone with cache_n=100 stores
+    1000 rounds while klines target only the 100-round tail; an equality
+    check falsely trips sync_integrity_mismatch (caught in the 2026-06-11
+    fresh-clone validation)."""
+    src = inspect.getsource(sync_module.sync_runtime_market_data)
+    assert "target_epochs - store.load_done_epochs()" in src, (
+        "integrity check must be a subset/coverage check over the kline "
+        "target epochs (the cache_n tail)"
+    )
+    assert "final_round_epochs != store_epochs" not in src, (
+        "equality against the full round store breaks fresh-clone syncs "
+        "whose cache_n is not a multiple of The Graph's 1000-round page"
+    )

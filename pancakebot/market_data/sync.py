@@ -164,6 +164,12 @@ def sync_runtime_market_data(
     # a successful Phase 2 means every pair has the full expected epoch set by
     # construction. Any fetch failure would have raised InvariantError already.
     # We keep the assertion as a hard-stop tripwire for unexpected drift.
+    #
+    # The contract is "every round the backtest will consume (the cache_n
+    # tail) has klines in every store" -- a SUBSET check. The round store may
+    # legitimately hold MORE rounds than the kline target: The Graph sync
+    # pages in 1000-round chunks, so a fresh clone with cache_n=100 stores
+    # 1000 rounds while the klines target only the 100-round tail.
     all_stores = [
         ("BNB-USDT", bnb_store),
         ("BTC-USDT", btc_store),
@@ -171,19 +177,21 @@ def sync_runtime_market_data(
         ("SOL-USDT", sol_store),
     ]
     final_rounds = list(round_store.iter_closed_rounds())
-    final_round_epochs = {int(r.epoch) for r in final_rounds}
+    target_epochs = {int(r.epoch) for r in tail_rounds}
     for inst_id, store in all_stores:
-        store_epochs = store.load_done_epochs()
-        if final_round_epochs != store_epochs:
+        missing = target_epochs - store.load_done_epochs()
+        if missing:
             raise InvariantError(
-                f"sync_integrity_mismatch: rounds={len(final_round_epochs)} "
-                f"{inst_id}={len(store_epochs)}"
+                f"sync_integrity_mismatch: {inst_id} missing "
+                f"{len(missing)} of {len(target_epochs)} target epochs "
+                f"(e.g. {sorted(missing)[:3]})"
             )
 
     info(
         "PROGRESS",
-        f"Stores aligned: {len(final_round_epochs)} epochs "
-        f"[{min(final_round_epochs)}..{max(final_round_epochs)}]",
+        f"Stores aligned: {len(target_epochs)} target epochs "
+        f"[{min(target_epochs)}..{max(target_epochs)}] "
+        f"(round store holds {len(final_rounds)})",
     )
 
     stored_closed_round_count = len(final_rounds)
