@@ -29,8 +29,8 @@
   directory (tools\claude_desktop\) and is DEPLOYED to ToolsDir by this
   script, so a fresh clone reproduces it. The AUMID stamper
   (stamp_claude_aumid.exe) + Autologon.exe remain out-of-repo binaries —
-  this script verifies the stamper exists. See AUMID_stamper\README.md
-  (same directory) for how to rebuild the stamper.
+  this script verifies the stamper exists. See the "AUMID stamper" section
+  of README.md (same directory) for how to rebuild it.
 #>
 [CmdletBinding()]
 param(
@@ -55,7 +55,7 @@ New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
 Copy-Item $repoVbs $vbs -Force
 Log "deployed launcher: $repoVbs -> $vbs"
 if (-not (Test-Path $stamper)) {
-    throw "missing AUMID stamper: $stamper (out-of-repo binary; see tools\claude_desktop\AUMID_stamper\README.md to rebuild)"
+    throw "missing AUMID stamper: $stamper (out-of-repo binary; see the AUMID stamper section of tools\claude_desktop\README.md to rebuild)"
 }
 Log "AUMID stamper present: $stamper"
 

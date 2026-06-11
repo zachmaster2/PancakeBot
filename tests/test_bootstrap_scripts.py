@@ -54,7 +54,6 @@ def test_all_expected_files_exist():
     for f in _SH_SCRIPTS + _PS1_SCRIPTS + _PY_HELPERS + _UNIT_FILES + [
         _BOOT / "README.md",
         _TOOLS / "README.md",
-        _TOOLS / "AUMID_stamper" / "README.md",
         _TOOLS / "launch_claude_admin_direct.vbs",
     ]:
         assert f.exists(), f"missing bootstrap/tools file: {f}"
