@@ -73,12 +73,11 @@ def test_epoch_handshake_retries_on_locked_lock_price_zero():
     cfg = _make_handshake_cfg(contract)
 
     with mock.patch("pancakebot.runtime.engine.sleep_seconds") as m_sleep:
-        locked_r, open_r, ep, open_rd = engine._epoch_handshake(cfg)
+        locked_r, open_r, ep = engine._epoch_handshake(cfg)
 
     assert ep == 101
     assert locked_r.lock_price == 350.0
     assert int(open_r.lock_at) == 1_700_000_600
-    assert open_rd is open_settled
     # Exactly one retry -> one backoff sleep (RETRY_BACKOFF_SECONDS[0] = 2s).
     assert m_sleep.call_count == 1
     assert m_sleep.call_args_list[0].args == (2,)
@@ -110,11 +109,10 @@ def test_epoch_handshake_retries_on_open_lock_ts_zero():
     cfg = _make_handshake_cfg(contract)
 
     with mock.patch("pancakebot.runtime.engine.sleep_seconds") as m_sleep:
-        locked_r, open_r, ep, open_rd = engine._epoch_handshake(cfg)
+        locked_r, open_r, ep = engine._epoch_handshake(cfg)
 
     assert ep == 101
     assert locked_r.lock_price == 350.0
     assert int(open_r.lock_at) == 1_700_000_600
-    assert open_rd is open_settled
     assert m_sleep.call_count == 1
     assert m_sleep.call_args_list[0].args == (2,)

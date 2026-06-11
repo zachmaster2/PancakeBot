@@ -44,16 +44,33 @@ install.sh scaffolds both; fill them in. **Also create a repo-root
 running install.sh — its STEP 3 config check (and any direct
 `run.py --sync`) reads secrets from `.env`/process env; the
 `/etc/pancakebot` EnvironmentFiles are what the systemd units load.
-Verify webhook delivery with
-`.venv/bin/python scripts/_smoke_discord_send_test.py`.
+Precedence: under systemd the EnvironmentFiles win (`load_dotenv` never
+overrides an already-set var); direct `run.py` invocations read the
+repo-root `.env`. Keep the two copies in sync when rotating secrets.
+Verify webhook delivery (the script reads process env, so source the
+file first):
+
+```bash
+set -a; . /etc/pancakebot/alerts.env; set +a
+.venv/bin/python scripts/_smoke_discord_send_test.py
+```
 
 ## Install (AlmaLinux 9.x)
 
 ```bash
-sudo git clone <repo> /root/pancakebot && cd /root/pancakebot
+# Fresh-VM bring-up order (the dev clone is the only canonical history —
+# there is no public remote to clone from):
+#   1. on the VM: create the bare repo + post-receive hook per
+#      bootstrap/linux/git_post_receive.sh (incl. mkdir /root/pancakebot)
+#   2. on the dev box: git remote add vm ssh://root@<vm>/srv/pancakebot.git
+#      && git push vm master   (checks the tree out into /root/pancakebot)
+cd /root/pancakebot
+# create repo-root .env with BSC_WALLET_PRIVATE_KEY + THE_GRAPH_API_KEY
+# first (STEP 3's config check blocks without it — see Prerequisites)
 sudo bash bootstrap/install.sh   # py3.13 + venv + units (disabled) + chrony drop-in
 # fill /etc/pancakebot/{pancakebot,alerts}.env, then:
 sudo systemctl enable --now pancakebot-dry      # dry soak
+# going live after the soak: see docs/SUPERVISOR.md "Going live"
 ```
 
 Python 3.13 is built additively via pyenv (system `python3.9`/`python3.12`
