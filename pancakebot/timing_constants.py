@@ -48,7 +48,7 @@ honest about what's a scheduled event vs what's intra-wake sequencing.
 The preflight wake offset above the critical path is deliberately a
 LITERAL 5-second gap rather than derived from tightly measured query
 budgets. Non-critical-path wakes are sized for robustness against
-environmental drift (network spikes, Windows update kicks, OKX RPC
+environmental drift (network spikes, VM scheduling pauses, OKX RPC
 pauses) — a 5s gap dwarfs every observed worst case (~50-200ms wallet
 RPC). See ``PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS`` for the rationale.
 
@@ -123,7 +123,7 @@ from __future__ import annotations
 
 # OKX REST round-trip time for /history-candles fetches: p99 of the
 # "max-of-3" parallel symbol fetch (BTC, ETH, SOL — the decision-critical
-# trio; BNB is fetched but off the strategy path). The decision waits on
+# trio; BNB is not fetched — disabled, see momentum_gate._OKX_SYMBOLS_FETCHED). The decision waits on
 # the SLOWEST of the three parallel fetches, so max-of-3 p99 is the correct
 # deadline statistic; a pooled-per-symbol p99 understates it (one symbol can
 # sit in its tail while the max is still on the body).
@@ -534,8 +534,8 @@ PREFLIGHT_WAKEUP_OFFSET_BEFORE_CRITICAL_PATH_MS: int = 5000
 # ~25 minutes; on the recovery round, fetch_ms ran 734-850ms vs typical
 # 270ms, contributing to a missed lock-block inclusion.
 #
-# Slot rationale: the first pre-lock wake (lock - 7000ms), ~1030ms before
-# preflight (lock - 5970ms), leaving headroom for a slow warmup (~270ms
+# Slot rationale: the first pre-lock wake (lock - 7000ms), ~805ms before
+# preflight (lock - 6195ms), leaving headroom for a slow warmup (~270ms
 # typical, ~800ms worst-case cold). Doesn't touch the
 # critical path; even a fully-failed warmup (rare; OkxClient.warmup
 # swallows transient errors) just means the bet round pays the cold

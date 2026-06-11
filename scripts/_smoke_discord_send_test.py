@@ -61,8 +61,9 @@ def main() -> int:
     if missing:
         for c in missing:
             print(f"[MISSING] env var not set: {c['env']}")
-        print("\nHint: `setx /M <NAME> \"<URL>\"` in an elevated PowerShell,")
-        print("then restart the shell so the current process inherits the new env.")
+        print("\nHint: on the VM the webhooks live in /etc/pancakebot/alerts.env")
+        print("(`set -a; . /etc/pancakebot/alerts.env`); on a dev box export them")
+        print("in the shell before running.")
         # Keep going for any channels that ARE set -- partial coverage is
         # still informative and we don't want to hide a send failure behind
         # an unrelated missing var.
@@ -100,7 +101,7 @@ def main() -> int:
         return 2
     if failures:
         return 1
-    print("\nAll three sent. Confirm receipt in Discord, then proceed to schtasks /change.")
+    print("\nAll three sent. Confirm receipt in Discord.")
     return 0
 
 

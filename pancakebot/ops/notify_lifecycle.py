@@ -54,7 +54,7 @@ import time
 from pathlib import Path
 from typing import Callable, Mapping
 
-from pancakebot.service import notifications
+from pancakebot.ops import notifications
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
