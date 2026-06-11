@@ -1,8 +1,9 @@
 """OKX public REST client with centralized retry + error classification.
 
 Single canonical fetch primitive: ``kline_fetch_window``. Always uses
-``/history-candles`` (per memory ``project_pancakebot_okx_endpoint_divergence.md``,
-this endpoint has lower lag than ``/candles``). Caller passes the explicit
+``/history-candles`` — measured (2026-04) to publish closed 1s candles with
+lower lag than ``/candles``, which matters at the 2s decision cutoff.
+Caller passes the explicit
 ``[oldest_open_ms, newest_open_ms_inclusive]`` range; retry behaviour is
 parameterised via ``RetryPolicy``:
 

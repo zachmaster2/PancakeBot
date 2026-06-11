@@ -3,9 +3,9 @@ live → var/live/cycle_audit.csv.
 
 Added 2026-05-20 alongside the live-mode cycle_audit refactor. Verifies:
 
-1. ``_record_cycle_audit`` with ``cfg.dry=True`` writes to
+1. ``record_cycle_audit`` with ``cfg.dry=True`` writes to
    ``DRY_CYCLE_AUDIT_PATH``.
-2. ``_record_cycle_audit`` with ``cfg.dry=False`` writes to
+2. ``record_cycle_audit`` with ``cfg.dry=False`` writes to
    ``LIVE_CYCLE_AUDIT_PATH``.
 3. Both write the same column schema (single source of truth in
    ``audit.py``).
@@ -29,7 +29,7 @@ from pancakebot.runtime.audit import (  # noqa: E402
     ensure_cycle_audit_csv,
     _CYCLE_AUDIT_HEADER_OK_PATHS,
 )
-from pancakebot.runtime.dry import _record_cycle_audit, _ClosedState  # noqa: E402
+from pancakebot.runtime.dry import record_cycle_audit, RuntimeState  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -50,21 +50,21 @@ def _make_cfg(dry: bool):
 
 
 def _call(cfg, tmp_path, monkeypatch, dry_path, live_path):
-    """Patch the path constants to use tmp_path and call _record_cycle_audit
+    """Patch the path constants to use tmp_path and call record_cycle_audit
     with a minimal but complete row. open_round=None is fine because the
     function uses the RPC-fetched pool values when pool_bull_bnb>0 (we set
     those) and only falls back to open_round.bets when both are zero."""
     from pancakebot import paths as _paths_mod
     monkeypatch.setattr(_paths_mod, "DRY_CYCLE_AUDIT_PATH", str(dry_path), raising=True)
     monkeypatch.setattr(_paths_mod, "LIVE_CYCLE_AUDIT_PATH", str(live_path), raising=True)
-    # _record_cycle_audit reads _paths.DRY_CYCLE_AUDIT_PATH / .LIVE_... via
+    # record_cycle_audit reads _paths.DRY_CYCLE_AUDIT_PATH / .LIVE_... via
     # the module alias `_paths`. The monkeypatches on the original module
     # propagate through that alias.
 
-    closed = _ClosedState()
+    closed = RuntimeState()
     closed.simulated_bankroll_bnb = 5.0
 
-    _record_cycle_audit(
+    record_cycle_audit(
         cfg, closed,
         current_epoch=124,
         locked_epoch=123,
@@ -203,8 +203,8 @@ def test_cycle_audit_logs_actual_fetch_fire_time(tmp_path, monkeypatch):
 
     for dry, path in ((True, dry_path), (False, live_path)):
         _CYCLE_AUDIT_HEADER_OK_PATHS.clear()
-        closed = _ClosedState()
-        _record_cycle_audit(
+        closed = RuntimeState()
+        record_cycle_audit(
             _make_cfg(dry=dry), closed,
             current_epoch=486441, locked_epoch=486440, lock_ts=1780411538, cutoff_ts=1780411536,
             locked_price_bnbusd=600.0, action="BET", decision_stage="pipeline",
@@ -244,7 +244,7 @@ def test_live_bet_writes_cycle_audit_row(tmp_path, monkeypatch):
     bet path now does: cfg.dry=False, action='BET', live bankroll pair
     (pre-bet wallet read -> projected = wallet - stake - gas cap).
 
-    Before the hoist, the BET ``_record_cycle_audit`` call lived only inside
+    Before the hoist, the BET ``record_cycle_audit`` call lived only inside
     the dry ``else:`` branch, so live bets produced zero BET rows. The
     structural guarantee that the engine now reaches this call in BOTH modes
     is asserted separately in ``test_bet_audit_callsite_is_mode_agnostic``."""
@@ -254,9 +254,9 @@ def test_live_bet_writes_cycle_audit_row(tmp_path, monkeypatch):
     monkeypatch.setattr(_paths_mod, "DRY_CYCLE_AUDIT_PATH", str(dry_path), raising=True)
     monkeypatch.setattr(_paths_mod, "LIVE_CYCLE_AUDIT_PATH", str(live_path), raising=True)
 
-    closed = _ClosedState()  # strategy_pipeline defaults to None (router_mode skipped)
+    closed = RuntimeState()  # strategy_pipeline defaults to None (router_mode skipped)
     cfg = _make_cfg(dry=False)
-    _record_cycle_audit(
+    record_cycle_audit(
         cfg, closed,
         current_epoch=999, locked_epoch=998, lock_ts=1300, cutoff_ts=1298,
         locked_price_bnbusd=600.0,
@@ -287,7 +287,7 @@ def test_live_bet_writes_cycle_audit_row(tmp_path, monkeypatch):
 
 def test_bet_audit_callsite_is_mode_agnostic():
     """Structural guard for the hoist fix: in engine.py ``_run_one_iteration``
-    there is exactly ONE ``_record_cycle_audit(action="BET")`` call, and it is
+    there is exactly ONE ``record_cycle_audit(action="BET")`` call, and it is
     NOT nested inside any ``cfg.dry``-conditioned ``if/else`` block — so both
     the live and dry bet branches reach it. This directly guards against the
     original regression (BET audit trapped in the dry-only branch) recurring."""
@@ -311,7 +311,7 @@ def test_bet_audit_callsite_is_mode_agnostic():
 
     def _is_bet_audit_call(node: ast.AST) -> bool:
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "_record_cycle_audit"):
+                and node.func.id == "record_cycle_audit"):
             return False
         for kw in node.keywords:
             if (kw.arg == "action" and isinstance(kw.value, ast.Constant)
@@ -321,7 +321,7 @@ def test_bet_audit_callsite_is_mode_agnostic():
 
     bet_calls = [n for n in ast.walk(fn) if _is_bet_audit_call(n)]
     assert len(bet_calls) == 1, (
-        f"expected exactly 1 _record_cycle_audit(action='BET') call in "
+        f"expected exactly 1 record_cycle_audit(action='BET') call in "
         f"_run_one_iteration, found {len(bet_calls)}"
     )
 

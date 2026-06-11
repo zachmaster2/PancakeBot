@@ -165,4 +165,4 @@ def test_wallet_balance_retry_exhausted_named():
     with mock.patch.object(dry, "sleep_seconds"), \
             mock.patch.object(dry, "warn"):
         with pytest.raises(InvariantError, match="wallet_balance_retry_exhausted"):
-            dry._fetch_wallet_balance_bnb_with_retries(cfg=cfg, reason="boot")
+            dry.fetch_wallet_balance_bnb_with_retries(cfg=cfg, reason="boot")

@@ -114,6 +114,29 @@ took the live bot down for 77s on 2026-06-10). The health check
 (`bootstrap/common/health_check.py`) refuses to start a unit whose partner
 is active; prefer it over raw `systemctl start` when unsure.
 
+**Going live after the dry soak** (the install flow ends at the dry
+soak deliberately — no auto-start of a live bot):
+
+```bash
+systemctl disable --now pancakebot-dry      # release the Conflicts= pair
+systemctl enable --now pancakebot-live      # STARTED alert fires via notify
+journalctl -u pancakebot-live -f            # watch to READY + first rounds
+```
+
+**Reading the journal** — a healthy round is ~5 minutes of quiet plus:
+
+```
+INFO   READY     send-cache refreshed: nonce=... gas_age=30ms   (preflight, 1/round)
+INFO   SKIP      Skipped epoch N: gate did not fire             (the common case)
+INFO   BET       Bet 0.0010 BNB on Bull for epoch N (tx ...)    (~3% of rounds)
+```
+
+Benign WARNs you will see occasionally: transient `head_fetch`/`getlogs`
+ReadTimeout ALERTs (the poller retries; chronic ones are a problem),
+`incomplete kline data` SKIPs (graceful degradation), and
+`REGIME_DRIFT`/`_RECOVERED` pairs (telemetry, self-resolving). `ERROR`
+lines and unpaired `REGIME_DRIFT` are act-now signals (docs/logging.md).
+
 **After a crashloop halt** (`start-limit-hit`): fix the root cause (see
 `var/<mode>/crash.json` + journal), then
 

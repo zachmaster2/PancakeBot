@@ -1,6 +1,6 @@
 """Shared dry+live runtime state and the pipeline factory for BOTH modes.
 
-Despite the module name, ``_ClosedState`` is the engine's per-process state
+Despite the module name, ``RuntimeState`` is the engine's per-process state
 object in live mode too, and ``_build_momentum_pipeline`` is the only
 runtime pipeline factory. The dry-only parts are the simulated bankroll,
 dry-bet settlement, and archiving of prior dry runs.
@@ -26,7 +26,7 @@ from pancakebot.runtime.audit import (
     ensure_audit_csv as _ensure_dry_audit_csv,
     ensure_cycle_audit_csv as _ensure_dry_cycle_audit_csv,
     load_settled_epochs_from_audit as _load_dry_settled_epochs_from_audit,
-    record_cycle_audit,
+    record_cycle_audit as _audit_record_cycle_audit,
 )
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot.settlement import settle_from_round_data
@@ -37,7 +37,7 @@ from time import sleep as sleep_seconds
 
 
 @dataclass(slots=True)
-class _ClosedState:
+class RuntimeState:
     strategy_pipeline: StrategyPipeline | None = None
     claim_scan_initialized: bool = False
     simulated_bankroll_bnb: float | None = None
@@ -156,7 +156,7 @@ def _ensure_parent_dir(path: str) -> None:
     ensure_parent_dir(path)
 
 
-def _append_jsonl(path: str, record: dict[str, object]) -> None:
+def append_jsonl(path: str, record: dict[str, object]) -> None:
     _ensure_parent_dir(path)
     with open(path, "a") as f:
         f.write(json.dumps(record, separators=(",", ":"), sort_keys=True))
@@ -389,7 +389,7 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
             epoch=None,
             updated_ts=int(time.time()),
         )
-    wallet_bnb = _fetch_wallet_balance_bnb_with_retries(
+    wallet_bnb = fetch_wallet_balance_bnb_with_retries(
         cfg=cfg,
         reason="dry_wallet_bootstrap",
     )
@@ -402,7 +402,7 @@ def _resolve_initial_dry_bankroll_state(cfg: RuntimeConfig) -> _DryBankrollState
     )
 
 
-def _fetch_wallet_balance_bnb_with_retries(
+def fetch_wallet_balance_bnb_with_retries(
     *,
     cfg: RuntimeConfig,
     reason: str,
@@ -436,8 +436,8 @@ def _append_dry_settled_epoch(path: str, epoch: int) -> None:
         f.write("\n")
 
 
-def _dry_record_bet(
-    closed: _ClosedState,
+def dry_record_bet(
+    closed: RuntimeState,
     *,
     epoch: int,
     side: str,
@@ -463,7 +463,7 @@ def _dry_record_bet(
         "bankroll_after_bet_bnb": bankroll_after_bet_bnb,
     }
     closed.dry_bets_by_epoch[epoch] = rec
-    _append_jsonl(_paths.DRY_PENDING_BETS_PATH, rec)
+    append_jsonl(_paths.DRY_PENDING_BETS_PATH, rec)
     _save_dry_bankroll_state(
         _paths.DRY_BANKROLL_STATE_PATH,
         bankroll_bnb=bankroll_after_bet_bnb,
@@ -473,9 +473,9 @@ def _dry_record_bet(
     )
 
 
-def _record_cycle_audit(
+def record_cycle_audit(
     cfg: RuntimeConfig,
-    closed: _ClosedState,
+    closed: RuntimeState,
     *,
     current_epoch: int,
     locked_epoch: int,
@@ -511,7 +511,7 @@ def _record_cycle_audit(
         _paths.DRY_CYCLE_AUDIT_PATH if cfg.dry
         else _paths.LIVE_CYCLE_AUDIT_PATH
     )
-    record_cycle_audit(
+    _audit_record_cycle_audit(
         closed,
         cycle_audit_path=cycle_audit_path,
         current_epoch=current_epoch,
@@ -541,7 +541,7 @@ def _record_cycle_audit(
     )
 
 
-def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None:
+def dry_settle_available_bets(cfg: RuntimeConfig, closed: RuntimeState) -> None:
     if not cfg.dry:
         return
     if closed.simulated_bankroll_bnb is None:
@@ -720,7 +720,7 @@ def _dry_settle_available_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None
         )
 
 
-def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
+def init_runtime_state(cfg: RuntimeConfig) -> RuntimeState:
     """Initialize live/dry runtime state. No disk sync -- pure RPC + OKX."""
     info("START", "Core setup: strategy=momentum_gate mode=rpc_only")
 
@@ -728,7 +728,7 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
     # No warmup rounds needed: OKX gate fetches live at decision time.
     strategy_pipeline.bootstrap_from_closed_rounds(rounds=[])
 
-    closed = _ClosedState(strategy_pipeline=strategy_pipeline)
+    closed = RuntimeState(strategy_pipeline=strategy_pipeline)
 
     if cfg.dry:
         fresh = cfg.dry_fresh_start

@@ -191,6 +191,8 @@ fallback.
 ## Architecture
 
 See [docs/architecture.html](docs/architecture.html) for the visual diagram.
+Code names used throughout comments (Era 12b, F0, Bundle 5 v2, Candidate C,
+off350, ...) are indexed in [docs/glossary.md](docs/glossary.md).
 
 ### Per-round runtime loop
 

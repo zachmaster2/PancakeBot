@@ -28,63 +28,13 @@ from pancakebot.strategy.momentum_gate import (
 from pancakebot.types import Round
 
 
-# Mapping from skip_reason → keys that MUST be present in skip_context.
-# Construction of a SKIP decision with one of these reasons but missing
-# (or empty) skip_context raises InvariantError. The engine consumer
-# trusts the data — no isinstance / None-fallback guards downstream.
-_SKIP_CONTEXT_SCHEMA: Mapping[str, frozenset[str]] = {
-    "risk_drawdown_breaker_fired": frozenset({"drawdown_pct", "threshold_pct"}),
-    "risk_cooldown_active": frozenset({"rounds_remaining"}),
-    "pool_below_minimum": frozenset({"pool_bnb", "min_pool_bnb_at_cutoff"}),
-}
-
-
-@dataclass(frozen=True, slots=True)
-class StrategyPipelineDecision:
-    """Normalized open-round strategy pipeline decision (momentum-only variant).
-
-    Slim post-2026-04-26 schema: removed dead fields ``selected_strategy``,
-    ``expected_profit_bnb``, ``selector_score_bnb``, ``p_bull``, and the
-    six ``controller_*`` carryovers from the prior multi-strategy
-    architecture. None of those were read in any decision path or written
-    to a meaningful CSV column.
-
-    ``skip_context`` carries per-reason structured payload that the engine
-    consumes to compose operator-facing SKIP narratives (added 2026-05-18
-    Phase B v2 T3-B). For SKIP decisions whose ``skip_reason`` is in
-    ``_SKIP_CONTEXT_SCHEMA``, ``skip_context`` is REQUIRED and validated
-    in ``__post_init__`` — the engine consumer reads keys directly and
-    will raise loudly on any drift. For BET decisions and SKIPs whose
-    wording doesn't need extra numbers (e.g. ``gate_no_signal``), it's
-    None.
-
-    Required-context reasons (and their keys):
-      - ``risk_drawdown_breaker_fired`` → {"drawdown_pct", "threshold_pct"}
-      - ``risk_cooldown_active`` → {"rounds_remaining"}
-      - ``pool_below_minimum`` → {"pool_bnb", "min_pool_bnb_at_cutoff"}
-    """
-
-    action: str
-    bet_side: str | None
-    bet_size_bnb: float
-    skip_reason: str | None
-    skip_context: Mapping[str, object] | None = None
-
-    def __post_init__(self) -> None:
-        required_keys = _SKIP_CONTEXT_SCHEMA.get(self.skip_reason or "")
-        if required_keys is None:
-            return
-        if self.skip_context is None:
-            raise InvariantError(
-                f"skip_reason={self.skip_reason!r} requires skip_context "
-                f"with keys {sorted(required_keys)}; got None"
-            )
-        missing = required_keys - set(self.skip_context.keys())
-        if missing:
-            raise InvariantError(
-                f"skip_reason={self.skip_reason!r} skip_context missing keys: "
-                f"{sorted(missing)}"
-            )
+# The decision schema + skip_context validation rules are strategy-invariant
+# and live at the seam (strategy/base.py); re-exported here because the
+# engine, audit, and tests historically import them from this module.
+from pancakebot.strategy.base import (  # noqa: F401  (re-export)
+    _SKIP_CONTEXT_SCHEMA,
+    StrategyPipelineDecision,
+)
 
 
 def _compute_bet_size(
@@ -180,6 +130,17 @@ class MomentumOnlyPipeline:
         self._cfg = config
         self._strategy = strategy_config
         self._gate = gate
+        # The gate-config / strategy-config duality (see class docstring) is
+        # a real trap: live computes from `config`, backtest from
+        # `strategy_config.gate`. Fail fast at construction if the
+        # overlapping fields ever drift apart.
+        if (
+            tuple(config.mtf_lookbacks) != tuple(strategy_config.gate.mtf_lookbacks)
+            or config.mtf_min_return_threshold
+            != strategy_config.gate.mtf_min_return_threshold
+            or int(config.kline_cutoff_seconds) != int(kline_cutoff_seconds)
+        ):
+            raise InvariantError("gate_config_strategy_config_mismatch")
         self._cutoff_seconds = int(kline_cutoff_seconds)
         self._pool_cutoff_seconds = int(pool_cutoff_seconds)
         self._min_bet_amount_bnb = float(min_bet_amount_bnb)

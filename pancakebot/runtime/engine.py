@@ -22,13 +22,13 @@ from pancakebot.util import format_bankroll
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot import paths
 from pancakebot.runtime.dry import (
-    _ClosedState,
-    _append_jsonl,
-    _dry_record_bet,
-    _dry_settle_available_bets,
-    _fetch_wallet_balance_bnb_with_retries,
-    _init_closed_state,
-    _record_cycle_audit,
+    RuntimeState,
+    append_jsonl,
+    dry_record_bet,
+    dry_settle_available_bets,
+    fetch_wallet_balance_bnb_with_retries,
+    init_runtime_state,
+    record_cycle_audit,
 )
 from pancakebot.runtime.live import (
     DRY_CHANNEL,
@@ -336,7 +336,7 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
     _log_runtime_timing_summary(cfg)
     _assert_critical_path_timing_sane(cfg)
 
-    closed_state = _init_closed_state(cfg)
+    closed_state = init_runtime_state(cfg)
 
     # Bundle 5 v2 (2026-05-14): no application-level NTP bootstrap. The
     # bot trusts the OS clock (chrony-disciplined on the VM; see the
@@ -352,9 +352,9 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
             raise InvariantError("dry_bankroll_uninitialized")
         bankroll_bnb = closed_state.simulated_bankroll_bnb
         # PersistedBankrollTracker for dry mode is already wired by
-        # _init_closed_state (after bankroll resolution). No-op here.
+        # init_runtime_state (after bankroll resolution). No-op here.
     else:
-        bankroll_bnb = _fetch_wallet_balance_bnb_with_retries(
+        bankroll_bnb = fetch_wallet_balance_bnb_with_retries(
             cfg=cfg,
             reason="live_wallet_bootstrap",
         )
@@ -407,14 +407,14 @@ def _mono_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
-def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
+def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
     closed.iteration_count += 1
 
     # Alignment + cutoff anchoring can be noisy around epoch shifts. Ensure we only
     # take an action using a coherent epoch snapshot.
     while True:
         # Step 1: Epoch alignment handshake (shift-aware) with retries.
-        locked_round, _open_round, current_epoch, _open_rd = _epoch_handshake(cfg)
+        locked_round, _open_round, current_epoch = _epoch_handshake(cfg)
         locked_epoch = locked_round.epoch
 
         # Track last_seen_epoch (process-health telemetry; NOT wired into
@@ -466,7 +466,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 except TransientRpcError as e:
                     warn("ALERT", f"claim scan failed: rpc_transient err={e}")
 
-            _dry_settle_available_bets(cfg, closed)
+            dry_settle_available_bets(cfg, closed)
             closed.claim_scan_initialized = True
 
         # Step 3: Update strategy pipeline with the latest known settled epoch.
@@ -542,11 +542,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # ramp_1/ramp_2 removed, the final poll became the single poll
         # below).
 
-        # -- Bankroll wake --
-        # Refreshes wallet balance so risk gates + decide_open_round
-        # see fresh truth. Live mode does a BSC RPC call (~50-200ms
-        # p99); dry mode reads in-memory simulated bankroll (sub-ms).
-        # OKX session warmup wake (lock - 7000ms by default). Refreshes
+        # -- OKX warmup wake --
+        # (The wallet-balance refresh happens later, at the preflight
+        # wake.) OKX session warmup (lock - 7000ms by default). Refreshes
         # the OkxClient's HTTPS connection pool so the per-round kline
         # fetch doesn't pay a TLS handshake cost out of the critical
         # path. Without this, a long idle window (e.g. consecutive
@@ -589,11 +587,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 # Last-known tracker value for audit snapshot; 0.0 if unwired.
                 last_known_bankroll = 0.0
                 if closed.strategy_pipeline is not None:
-                    # noinspection PyProtectedMember
-                    _tracker = closed.strategy_pipeline._bankroll_tracker
+                    # Optional-attribute probe per strategy/base.py: a
+                    # pipeline without _bankroll_tracker degrades to 0.0.
+                    _tracker = getattr(
+                        closed.strategy_pipeline, "_bankroll_tracker", None)
                     if _tracker is not None:
                         last_known_bankroll = _tracker.current_bankroll()
-                _record_cycle_audit(
+                record_cycle_audit(
                     cfg,
                     closed,
                     current_epoch=current_epoch,
@@ -691,7 +691,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # -- Anchor poll + critical-path wake (Bundle 5 v2, 2026-05-14) --
         #
         # Strategy:
-        # 1. Sleep to lock - ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS (= lock - 1300ms).
+        # 1. Sleep to lock - ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS (= lock - 1500ms).
         # 2. Fire ONE eth_getBlockByNumber('latest') with a 200ms timeout.
         # 3. If response decodes to a valid BEP-520 anchor:
         #    - Compute dynamic wake (predecessor.milli_ts - 557ms)
@@ -752,7 +752,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     + _tc.POOL_READ_TIME_MS
                 )
                 # The dynamic wake lands AFTER the anchor poll response: the
-                # anchor fires at lock - ANCHOR_POLL_OFFSET (1300ms) and returns
+                # anchor fires at lock - ANCHOR_POLL_OFFSET (1500ms) and returns
                 # in ~30-60ms RTT, while the dynamic target is typically
                 # lock - ~880-930ms. _sleep_until_ts honors the resulting
                 # ~350-420ms gap (it sleeps until any target still in the
@@ -801,7 +801,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             ready, ready_reason = cfg.rpc_poller.is_pool_ready(current_epoch)
             if not ready:
                 skip_reason = f"pool_not_ready_{ready_reason}"
-                _record_cycle_audit(
+                record_cycle_audit(
                     cfg,
                     closed,
                     current_epoch=current_epoch,
@@ -940,7 +940,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
             if reason == "":
                 raise InvariantError("policy_skip_missing_reason")
 
-            _record_cycle_audit(
+            record_cycle_audit(
                 cfg,
                 closed,
                 current_epoch=current_epoch,
@@ -1046,7 +1046,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # unlikely to mine in time and would revert (gas burn).
         #
         # Bundle 5 v2 (2026-05-14): two-track deadline driven by the
-        # per-round anchor poll fired earlier at lock - 1300ms.
+        # per-round anchor poll fired earlier at lock - 1500ms.
         #
         #   1. Dynamic deadline (preferred, anchor poll succeeded):
         #      predict the predecessor block's milli_ts from the fresh
@@ -1107,7 +1107,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 f"Skipped epoch {current_epoch}: too late to submit bet "
                 f"({late_ms}ms past safe submit time)",
             )
-            _record_cycle_audit(
+            record_cycle_audit(
                 cfg,
                 closed,
                 current_epoch=current_epoch,
@@ -1174,7 +1174,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     f"Skipped epoch {current_epoch}: send caches not ready "
                     f"({cfg.contract.send_cache_summary()})",
                 )
-                _record_cycle_audit(
+                record_cycle_audit(
                     cfg,
                     closed,
                     current_epoch=current_epoch,
@@ -1226,7 +1226,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     "SKIP",
                     f"Skipped epoch {current_epoch}: gas cap breached ({gas_err})",
                 )
-                _record_cycle_audit(
+                record_cycle_audit(
                     cfg,
                     closed,
                     current_epoch=current_epoch,
@@ -1335,7 +1335,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                     else None
                 ),
             }
-            _append_jsonl("var/live/latency.jsonl", latency_record)
+            append_jsonl("var/live/latency.jsonl", latency_record)
             # Receipt classification → exactly ONE post-receipt alert.
             #   CONFIRMED  : status=1, before lock (bet registered)
             #   LATE       : status=0, at/after lock (PCS late-lock revert)
@@ -1425,7 +1425,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                 f"fetch_fire={t_features_start_offset_ms:.0f}ms vs "
                 f"computed={kline_fire_offset_before_lock_ms}ms before lock)",
             )
-            _dry_record_bet(
+            dry_record_bet(
                 closed,
                 epoch=current_epoch,
                 side=bet_side,
@@ -1457,7 +1457,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         # live and dry both emit it. Previously this lived only inside the dry
         # branch, leaving live cycle_audit.csv with zero BET rows (the bankroll
         # pair is mode-selected above: live=projected, dry=post-debit sim).
-        _record_cycle_audit(
+        record_cycle_audit(
             cfg,
             closed,
             current_epoch=current_epoch,
@@ -1496,12 +1496,10 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         return
 
 
-def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
+def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int]:
     """RPC-only epoch alignment.
 
-    Returns (locked_round_stub, open_round_stub, current_epoch, open_rd)
-    where open_rd is the raw RoundData for the open epoch (reusable for
-    pool amounts and lock_ts, avoiding duplicate RPC calls).
+    Returns (locked_round_stub, open_round_stub, current_epoch).
     """
     for idx, delay_seconds in enumerate([0] + list(RETRY_BACKOFF_SECONDS)):
         if delay_seconds > 0:
@@ -1563,12 +1561,12 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int, object]:
             failed=False,
             bets=(),
         )
-        return locked_round, open_round, current_epoch, open_rd
+        return locked_round, open_round, current_epoch
 
     raise InvariantError("epoch_handshake_exhausted")
 
 
-def _current_bankroll_estimate(closed: _ClosedState) -> float:
+def _current_bankroll_estimate(closed: RuntimeState) -> float:
     """Best-effort current bankroll for the settled-alert "new bankroll"
     display. Reads the pipeline's bankroll tracker if wired; falls back to
     0.0 (the alert's delta is the load-bearing number — absolute is display
@@ -1585,7 +1583,7 @@ def _current_bankroll_estimate(closed: _ClosedState) -> float:
     return 0.0
 
 
-def _reconcile_live_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None:
+def _reconcile_live_bets(cfg: RuntimeConfig, closed: RuntimeState) -> None:
     """Reconcile open live bets against on-chain RoundData at settle-time.
     Fires the LOSS alert only (Option B); WIN/REFUND alerts fire from the
     claim-scan path at claim-tx-confirm. Reads a FRESH wallet balance for
@@ -1617,7 +1615,7 @@ def _reconcile_live_bets(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         warn("ALERT", f"bet ledger reconcile failed: {e}")
 
 
-def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int) -> None:
+def _sleep_and_claim(cfg: RuntimeConfig, closed: RuntimeState, claim_epoch: int) -> None:
     # Bounded local retry around ``contract.close_ts`` — the only RPC call
     # in this function with real budget before the claim wake. Mirrors the
     # pattern in ``_epoch_handshake``. Exhaust → InvariantError → bot crashes
@@ -1641,7 +1639,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
     _sleep_until_ts(claim_ts, reason="wait_for_claim", epoch=claim_epoch)
 
     # Epoch handshake to refresh round state (both modes).
-    locked_round2, _open_round2, current_epoch2, _open_rd2 = _epoch_handshake(cfg)
+    locked_round2, _open_round2, current_epoch2 = _epoch_handshake(cfg)
 
     if not cfg.dry:
         # Reconcile FIRST so the ledger carries SETTLED_WON/SETTLED_REFUND
@@ -1672,7 +1670,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
             warn("ALERT", f"claim scan failed: rpc_transient err={e}")
 
     # Dry: settle simulated bets against oracle price.
-    _dry_settle_available_bets(cfg, closed)
+    dry_settle_available_bets(cfg, closed)
 
 
 # Divergence tolerance (ms) between the ACTUAL fetch-fire offset and the
