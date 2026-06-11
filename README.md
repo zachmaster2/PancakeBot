@@ -51,6 +51,7 @@ pancakebot/
     app.py                               # Mode dispatch
 
     strategy/                            # Signal + sizing
+        base.py                          # StrategyPipeline Protocol (the seam) + decision schema
         momentum_gate.py                 # OKX kline fetch + BTC multi-TF signal
         momentum_pipeline.py             # Signal -> sizing -> filters -> decision
 
