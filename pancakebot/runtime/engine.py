@@ -407,6 +407,86 @@ def _mono_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
+
+@dataclass(frozen=True, slots=True)
+class _RoundSkipCtx:
+    """Per-round audit fields shared verbatim by every terminal-SKIP exit
+    of ``_run_one_iteration`` (frozen once the round identity is fixed).
+
+    ``wake_mode`` / ``kline_fire_offset_before_lock_ms`` are deliberately
+    NOT here: they start empty and are assigned at anchor-poll resolution,
+    so each SKIP site passes the then-current values explicitly.
+    """
+    current_epoch: int
+    locked_epoch: int
+    lock_ts: int
+    cutoff_ts: int
+    bnbusd_price: float
+    open_round: Round | None
+    gate: object | None
+
+
+def _skip_round(
+    cfg: RuntimeConfig,
+    closed: RuntimeState,
+    ctx: _RoundSkipCtx,
+    *,
+    skip_reason: str,
+    decision_stage: str,
+    bankroll_bnb: float | None,
+    wake_mode: str,
+    kline_fire_offset_before_lock_ms: int | None,
+    log_level: str | None = None,
+    log_line: str | None = None,
+    decision: object | None = None,
+    decision_latency_ms: float | None = None,
+    pool_bull_bnb: float = 0.0,
+    pool_bear_bnb: float = 0.0,
+    with_fetch_ms: bool = False,
+) -> None:
+    """Terminal-SKIP bookkeeping: the cycle-audit row, plus the operator
+    SKIP line when the wording needs no site-local branching (pass
+    ``log_line=None`` to keep logging at the call site). Owns the
+    always-identical audit kwargs so the cycle_audit schema cannot drift
+    across the six exit sites; site-specific wording, side effects, and
+    the trailing ``_sleep_and_claim`` + ``return`` stay at the call site.
+    """
+    fetch_ms_kwargs: dict[str, object] = {}
+    if with_fetch_ms:
+        fetch_ms_kwargs = {
+            "btc_fetch_ms": _kline_timing_get(ctx.gate, "btc_ms"),
+            "eth_fetch_ms": _kline_timing_get(ctx.gate, "eth_ms"),
+            "sol_fetch_ms": _kline_timing_get(ctx.gate, "sol_ms"),
+        }
+    record_cycle_audit(
+        cfg,
+        closed,
+        current_epoch=ctx.current_epoch,
+        locked_epoch=ctx.locked_epoch,
+        lock_ts=ctx.lock_ts,
+        cutoff_ts=ctx.cutoff_ts,
+        locked_price_bnbusd=ctx.bnbusd_price,
+        action="SKIP",
+        decision_stage=decision_stage,
+        open_round=ctx.open_round,
+        bankroll_before_action_bnb=bankroll_bnb,
+        bankroll_after_action_bnb=bankroll_bnb,
+        decision=decision,
+        skip_reason=skip_reason,
+        decision_latency_ms=decision_latency_ms,
+        pool_bull_bnb=pool_bull_bnb,
+        pool_bear_bnb=pool_bear_bnb,
+        wake_mode=wake_mode,
+        kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+        btc_fetch_result=_kline_result_get(ctx.gate, "btc"),
+        eth_fetch_result=_kline_result_get(ctx.gate, "eth"),
+        sol_fetch_result=_kline_result_get(ctx.gate, "sol"),
+        **fetch_ms_kwargs,
+    )
+    if log_line is not None:
+        (warn if log_level == "warn" else info)("SKIP", log_line)
+
+
 def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
     closed.iteration_count += 1
 
@@ -511,6 +591,18 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
         wake_mode: str = ""
         kline_fire_offset_before_lock_ms: int | None = None
 
+        # Frozen audit context for the terminal-SKIP exits (see _skip_round):
+        # the fields every exit records identically.
+        skip_ctx = _RoundSkipCtx(
+            current_epoch=current_epoch,
+            locked_epoch=locked_epoch,
+            lock_ts=lock_ts_t,
+            cutoff_ts=cutoff_ts_t,
+            bnbusd_price=bnbusd_price,
+            open_round=open_round,
+            gate=gate,
+        )
+
         # If we missed the previous epoch's cutoff and are now targeting a
         # newer epoch, the previously-locked epoch (which just closed) may
         # become claimable before the next cutoff. In that case, we must
@@ -593,31 +685,20 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
                         closed.strategy_pipeline, "_bankroll_tracker", None)
                     if _tracker is not None:
                         last_known_bankroll = _tracker.current_bankroll()
-                record_cycle_audit(
-                    cfg,
-                    closed,
-                    current_epoch=current_epoch,
-                    locked_epoch=locked_epoch,
-                    lock_ts=lock_ts_t,
-                    cutoff_ts=cutoff_ts_t,
-                    locked_price_bnbusd=bnbusd_price,
-                    action="SKIP",
-                    decision_stage="pipeline",
-                    open_round=open_round,
-                    bankroll_before_action_bnb=last_known_bankroll,
-                    bankroll_after_action_bnb=last_known_bankroll,
-                    skip_reason="risk_bankroll_stale",
-                    wake_mode=wake_mode,
-                    kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
-                    btc_fetch_result=_kline_result_get(gate, "btc"),
-                    eth_fetch_result=_kline_result_get(gate, "eth"),
-                    sol_fetch_result=_kline_result_get(gate, "sol"),
-                )
                 # Per T3-A spec: short message, no err detail (the
                 # underlying exception class is captured in cycle_audit
                 # via skip_reason="risk_bankroll_stale"; the operator
                 # line just needs the actionable signal).
-                warn("SKIP", f"Skipped epoch {current_epoch}: bankroll stale")
+                _skip_round(
+                    cfg, closed, skip_ctx,
+                    skip_reason="risk_bankroll_stale",
+                    decision_stage="pipeline",
+                    bankroll_bnb=last_known_bankroll,
+                    wake_mode=wake_mode,
+                    kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                    log_level="warn",
+                    log_line=f"Skipped epoch {current_epoch}: bankroll stale",
+                )
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
             # Forward freshest bankroll to tracker (live only; dry records
@@ -801,25 +882,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
             ready, ready_reason = cfg.rpc_poller.is_pool_ready(current_epoch)
             if not ready:
                 skip_reason = f"pool_not_ready_{ready_reason}"
-                record_cycle_audit(
-                    cfg,
-                    closed,
-                    current_epoch=current_epoch,
-                    locked_epoch=locked_epoch,
-                    lock_ts=lock_ts_t,
-                    cutoff_ts=cutoff_ts_t,
-                    locked_price_bnbusd=bnbusd_price,
-                    action="SKIP",
-                    decision_stage="pipeline",
-                    open_round=open_round,
-                    bankroll_before_action_bnb=bankroll_bnb,
-                    bankroll_after_action_bnb=bankroll_bnb,
+                _skip_round(
+                    cfg, closed, skip_ctx,
                     skip_reason=skip_reason,
+                    decision_stage="pipeline",
+                    bankroll_bnb=bankroll_bnb,
                     wake_mode=wake_mode,
                     kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
-                    btc_fetch_result=_kline_result_get(gate, "btc"),
-                    eth_fetch_result=_kline_result_get(gate, "eth"),
-                    sol_fetch_result=_kline_result_get(gate, "sol"),
                 )
                 # skip_reason is "pool_not_ready_cold_start_in_progress"
                 # or "pool_not_ready_catchup_infeasible_for_round";
@@ -940,32 +1009,18 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
             if reason == "":
                 raise InvariantError("policy_skip_missing_reason")
 
-            record_cycle_audit(
-                cfg,
-                closed,
-                current_epoch=current_epoch,
-                locked_epoch=locked_epoch,
-                lock_ts=lock_ts_t,
-                cutoff_ts=cutoff_ts_t,
-                locked_price_bnbusd=bnbusd_price,
-                action="SKIP",
-                decision_stage="pipeline",
-                open_round=open_round,
-                bankroll_before_action_bnb=bankroll_bnb,
-                bankroll_after_action_bnb=bankroll_bnb,
-                decision=decision,
+            _skip_round(
+                cfg, closed, skip_ctx,
                 skip_reason=reason,
+                decision_stage="pipeline",
+                bankroll_bnb=bankroll_bnb,
+                wake_mode=wake_mode,
+                kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                decision=decision,
                 decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
                 pool_bull_bnb=pool_bull_bnb,
                 pool_bear_bnb=pool_bear_bnb,
-                btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
-                eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
-                sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
-                wake_mode=wake_mode,
-                kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
-                btc_fetch_result=_kline_result_get(gate, "btc"),
-                eth_fetch_result=_kline_result_get(gate, "eth"),
-                sol_fetch_result=_kline_result_get(gate, "sol"),
+                with_fetch_ms=True,
             )
             # T3-A: reason-routed SKIP with custom wording per reason.
             # In-scope reasons get bespoke prose; out-of-scope reasons
@@ -1107,32 +1162,18 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
                 f"Skipped epoch {current_epoch}: too late to submit bet "
                 f"({late_ms}ms past safe submit time)",
             )
-            record_cycle_audit(
-                cfg,
-                closed,
-                current_epoch=current_epoch,
-                locked_epoch=locked_epoch,
-                lock_ts=lock_ts_t,
-                cutoff_ts=cutoff_ts_t,
-                locked_price_bnbusd=bnbusd_price,
-                action="SKIP",
-                decision_stage="timing_guard",
-                open_round=open_round,
-                bankroll_before_action_bnb=bankroll_bnb,
-                bankroll_after_action_bnb=bankroll_bnb,
-                decision=decision,
+            _skip_round(
+                cfg, closed, skip_ctx,
                 skip_reason="too_close_to_lock_for_bet",
+                decision_stage="timing_guard",
+                bankroll_bnb=bankroll_bnb,
+                wake_mode=wake_mode,
+                kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                decision=decision,
                 decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
                 pool_bull_bnb=pool_bull_bnb,
                 pool_bear_bnb=pool_bear_bnb,
-                btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
-                eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
-                sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
-                wake_mode=wake_mode,
-                kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
-                btc_fetch_result=_kline_result_get(gate, "btc"),
-                eth_fetch_result=_kline_result_get(gate, "eth"),
-                sol_fetch_result=_kline_result_get(gate, "sol"),
+                with_fetch_ms=True,
             )
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
             return
@@ -1174,32 +1215,18 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
                     f"Skipped epoch {current_epoch}: send caches not ready "
                     f"({cfg.contract.send_cache_summary()})",
                 )
-                record_cycle_audit(
-                    cfg,
-                    closed,
-                    current_epoch=current_epoch,
-                    locked_epoch=locked_epoch,
-                    lock_ts=lock_ts_t,
-                    cutoff_ts=cutoff_ts_t,
-                    locked_price_bnbusd=bnbusd_price,
-                    action="SKIP",
-                    decision_stage="send_cache_check",
-                    open_round=open_round,
-                    bankroll_before_action_bnb=bankroll_bnb,
-                    bankroll_after_action_bnb=bankroll_bnb,
-                    decision=decision,
+                _skip_round(
+                    cfg, closed, skip_ctx,
                     skip_reason="risk_send_cache_unready",
+                    decision_stage="send_cache_check",
+                    bankroll_bnb=bankroll_bnb,
+                    wake_mode=wake_mode,
+                    kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                    decision=decision,
                     decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
                     pool_bull_bnb=pool_bull_bnb,
                     pool_bear_bnb=pool_bear_bnb,
-                    btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
-                    eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
-                    sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
-                    wake_mode=wake_mode,
-                    kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
-                    btc_fetch_result=_kline_result_get(gate, "btc"),
-                    eth_fetch_result=_kline_result_get(gate, "eth"),
-                    sol_fetch_result=_kline_result_get(gate, "sol"),
+                    with_fetch_ms=True,
                 )
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
@@ -1226,32 +1253,18 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
                     "SKIP",
                     f"Skipped epoch {current_epoch}: gas cap breached ({gas_err})",
                 )
-                record_cycle_audit(
-                    cfg,
-                    closed,
-                    current_epoch=current_epoch,
-                    locked_epoch=locked_epoch,
-                    lock_ts=lock_ts_t,
-                    cutoff_ts=cutoff_ts_t,
-                    locked_price_bnbusd=bnbusd_price,
-                    action="SKIP",
-                    decision_stage="gas_cap_check",
-                    open_round=open_round,
-                    bankroll_before_action_bnb=bankroll_bnb,
-                    bankroll_after_action_bnb=bankroll_bnb,
-                    decision=decision,
+                _skip_round(
+                    cfg, closed, skip_ctx,
                     skip_reason="gas_cap_breached",
+                    decision_stage="gas_cap_check",
+                    bankroll_bnb=bankroll_bnb,
+                    wake_mode=wake_mode,
+                    kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
+                    decision=decision,
                     decision_latency_ms=t_decision_ready_ms - t_features_start_ms,
                     pool_bull_bnb=pool_bull_bnb,
                     pool_bear_bnb=pool_bear_bnb,
-                    btc_fetch_ms=_kline_timing_get(gate, "btc_ms"),
-                    eth_fetch_ms=_kline_timing_get(gate, "eth_ms"),
-                    sol_fetch_ms=_kline_timing_get(gate, "sol_ms"),
-                    wake_mode=wake_mode,
-                    kline_fire_offset_before_lock_ms=kline_fire_offset_before_lock_ms,
-                    btc_fetch_result=_kline_result_get(gate, "btc"),
-                    eth_fetch_result=_kline_result_get(gate, "eth"),
-                    sol_fetch_result=_kline_result_get(gate, "sol"),
+                    with_fetch_ms=True,
                 )
                 _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=locked_epoch)
                 return
