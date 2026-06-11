@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pancakebot.config import StrategyConfig
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.chain.prediction_contract import Web3PredictionContract
-from pancakebot.strategy.momentum_gate import MomentumGate
+from pancakebot.strategy.momentum_gate import MomentumGate, MomentumGateConfig
 from pancakebot.chain.rpc_poller import RpcPoller
 
 
@@ -16,14 +16,14 @@ class RuntimeConfig:
     # Closed rounds store (JSONL; used by backtest only; None in live/dry)
     round_store: ClosedRoundsStore | None
 
-    # Momentum strategy config (always present; MomentumGateConfig)
-    momentum_gate_config: object
+    # Momentum strategy config (always present)
+    momentum_gate_config: MomentumGateConfig
 
     # Momentum gate (OKX 1s live client; None in backtest mode)
     momentum_gate: MomentumGate | None
 
-    # On-chain / identity (backtest passes a stub; dry/live use real contract)
-    contract: Web3PredictionContract
+    # On-chain / identity (None in backtest; dry/live use the real contract)
+    contract: Web3PredictionContract | None
     wallet_address: str
 
     # Feature cutoff
@@ -108,7 +108,7 @@ class RuntimeConfig:
     # No-archive: delete (don't archive) existing dry state on --fresh
     dry_no_archive: bool
 
-    # Strategy config (10 knobs; loaded from config.toml [strategy.*] sections)
+    # Strategy config (loaded from config.toml [strategy.*] sections)
     strategy: StrategyConfig
 
     # RPC poller: periodic + engine-driven single getLogs polls of

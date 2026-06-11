@@ -269,10 +269,9 @@ BSC_BET_SUBMIT_ONE_WAY_MS: int = 75
 # Replaces the WSS-subscription pool watcher with deterministic RPC
 # polling. WSS arrival timing is no longer relevant on the decision path;
 # the pool aggregate is built from periodic + single polls (eth_getLogs
-# range queries since Era 12). See
-# var/design/rpc_polling_architecture_2026_05_07.md for the full
-# architecture and var/incident_reports/2026_05_07_rpc_polling_spike_results.md
-# for the empirical provenance.
+# range queries since Era 12). See pancakebot/chain/rpc_poller.py's module
+# docstring for the architecture (the 2026-05-07 design/spike notes were
+# archived offline with var/).
 
 # Per-batch p99 round-trip time, indexed by batch size — the RECEIPTS-ERA
 # RTT model, retained ONLY as the conservative cost model in config.py's

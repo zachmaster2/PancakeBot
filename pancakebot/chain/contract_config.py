@@ -11,7 +11,7 @@ class Web3ContractConfig:
     """Minimal on-chain contract configuration.
 
     Required fields:
-      - rpc_url: selected by RpcPool (failover list is hardcoded elsewhere)
+      - rpc_url: selected by chain.rpc_chooser.choose_rpc_url (failover list in constants.py)
       - abi_json_path: path to ABI JSON file (must be a JSON list)
       - private_key: wallet private key (from env)
     """

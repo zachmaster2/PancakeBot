@@ -1,4 +1,10 @@
-"""Cursor-based claim scan: walks user rounds, batches claimable/refundable epochs, and submits claim txs."""
+"""Cursor-based claim scan + the bot-owned Discord alert senders.
+
+Claim path: walks user rounds, batches claimable/refundable epochs, and
+submits claim txs. Alert path: ``AlertChannel`` (LIVE/DRY) and the
+``send_*_alert`` family used by engine.py for bet-lifecycle alerts in BOTH
+modes (distinct from ops/notifications.py, the systemd lifecycle executor).
+"""
 from __future__ import annotations
 
 import os

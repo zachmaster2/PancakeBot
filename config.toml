@@ -84,6 +84,8 @@ min_signal_strength = 0.00015
 base_pool_fraction = 0.02
 
 [strategy.tier2_sizing]
+# NOTE: "tier2" is a historical section name — these are CROSS-REGIME
+# sizing knobs (they apply to the BTC-primary path too).
 # Symmetric weight applied to BOTH ETH and SOL signal strengths in the
 # BTC-primary confirmation boost AND the regime-2 effective-strength
 # composition. Collapsed from former separate eth_sizing_weight /

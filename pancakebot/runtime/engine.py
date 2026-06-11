@@ -417,8 +417,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         locked_round, _open_round, current_epoch, _open_rd = _epoch_handshake(cfg)
         locked_epoch = locked_round.epoch
 
-        # Track last_seen_epoch so the crash handler can point at the epoch
-        # the bot was on.
+        # Track last_seen_epoch (process-health telemetry; NOT wired into
+        # crash.json — run.py writes last_epoch=None).
         closed.last_seen_epoch = current_epoch
 
         # Sync round-phase state into rpc_poller immediately after handshake.
@@ -456,7 +456,7 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
                         cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
                         locked_epoch=locked_epoch,
                         current_epoch=current_epoch,
-                        now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
+                        now_ts=int(_utc_now()),  # OS-clock UTC (chrony-disciplined; see module clock-sync note); compared to chain-anchored close timestamps
                         buffer_seconds=cfg.buffer_seconds,
                         page_size=100,
                         gas_limit=GAS_LIMIT_CLAIM,
@@ -525,8 +525,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         prev_close_ts = locked_round.lock_at  # = close_at(prev_locked_epoch)
         claim_ts = prev_close_ts + cfg.buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS
         # claim_ts and cutoff_ts_t are both chain-anchored true UTC; compare
-        # against NTP-corrected _utc_now() so a drifted local clock doesn't
-        # make us miss the wake-for-claim window.
+        # against _utc_now() (OS-clock UTC, chrony-disciplined — see the module
+        # clock-sync note) so we don't miss the wake-for-claim window.
         if _utc_now() < claim_ts < cutoff_ts_t:
             _sleep_and_claim(cfg=cfg, closed=closed, claim_epoch=prev_locked_epoch)
             return
@@ -1061,8 +1061,8 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: _ClosedState) -> None:
         #      derivation).
         #
         # lock_ts_t is chain-anchored true UTC; comparisons use
-        # ``_utc_now() * 1000`` (skew-corrected ms) so a skewed local
-        # clock doesn't make the bot fire early.
+        # ``_utc_now() * 1000`` (OS-clock UTC ms, chrony-disciplined) so the
+        # bot doesn't fire early.
         lock_ms = int(lock_ts_t * 1000)
         if round_anchor is not None:
             predecessor_ms = predict_predecessor_milli_ts(
@@ -1661,7 +1661,7 @@ def _sleep_and_claim(cfg: RuntimeConfig, closed: _ClosedState, claim_epoch: int)
                 cursor_path=paths.LIVE_CLAIM_CURSOR_PATH,
                 locked_epoch=locked_round2.epoch,
                 current_epoch=current_epoch2,
-                now_ts=int(_utc_now()),  # skew-corrected: claim_scan_cursor compares to chain-anchored close timestamps
+                now_ts=int(_utc_now()),  # OS-clock UTC (chrony-disciplined; see module clock-sync note); compared to chain-anchored close timestamps
                 buffer_seconds=cfg.buffer_seconds,
                 page_size=100,
                 gas_limit=GAS_LIMIT_CLAIM,

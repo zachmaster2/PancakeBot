@@ -1,4 +1,10 @@
-"""Dry-mode state: simulated bankroll, pending bets, settlement, archiving of prior runs."""
+"""Shared dry+live runtime state and the pipeline factory for BOTH modes.
+
+Despite the module name, ``_ClosedState`` is the engine's per-process state
+object in live mode too, and ``_build_momentum_pipeline`` is the only
+runtime pipeline factory. The dry-only parts are the simulated bankroll,
+dry-bet settlement, and archiving of prior dry runs.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ from pancakebot.runtime.audit import (
 )
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot.settlement import settle_from_round_data
+from pancakebot.strategy.base import StrategyPipeline
 from pancakebot.strategy.momentum_pipeline import MomentumOnlyPipeline
 from pancakebot.types import Round
 from time import sleep as sleep_seconds
@@ -31,15 +38,16 @@ from time import sleep as sleep_seconds
 
 @dataclass(slots=True)
 class _ClosedState:
-    strategy_pipeline: MomentumOnlyPipeline | None = None
+    strategy_pipeline: StrategyPipeline | None = None
     claim_scan_initialized: bool = False
     simulated_bankroll_bnb: float | None = None
     dry_bets_by_epoch: dict[int, dict[str, object]] = field(default_factory=dict)
     dry_settled_epochs: set[int] = field(default_factory=set)
     # Process-health: incremented at top of each _run_one_iteration;
     # ``last_seen_epoch`` is the most-recent current_epoch the loop has
-    # observed. Used by the crash handler to pinpoint where the bot
-    # "was" at failure.
+    # observed. NOTE: not currently wired into crash.json — run.py's crash
+    # handler writes last_epoch=None (the epoch is recoverable from the
+    # runtime.log tail).
     iteration_count: int = 0
     last_seen_epoch: int | None = None
     # D3: tracks whether the bot is currently in a drawdown cooldown, so the
@@ -773,9 +781,8 @@ def _init_closed_state(cfg: RuntimeConfig) -> _ClosedState:
 
 
 def _build_momentum_pipeline(*, cfg: RuntimeConfig) -> MomentumOnlyPipeline:
-    """Build momentum-only strategy pipeline."""
-    from pancakebot.strategy.momentum_gate import MomentumGateConfig
-    gate_config: MomentumGateConfig = cfg.momentum_gate_config  # type: ignore[assignment]
+    """Build momentum-only strategy pipeline (shared by dry AND live)."""
+    gate_config = cfg.momentum_gate_config
     return MomentumOnlyPipeline(
         config=gate_config,
         strategy_config=cfg.strategy,

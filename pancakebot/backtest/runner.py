@@ -56,7 +56,7 @@ def _safe_rate(num: int, den: int) -> float:
 
 
 def _load_all_rounds(runtime_cfg, *, include_failed: bool = False) -> list[Round]:
-    """Load closed rounds from round_store (JSONL) or market_data_store (SQLite).
+    """Load closed rounds from the round_store (JSONL).
 
     `include_failed=False` (default) excludes on-chain-failed rounds from the
     returned list. Backtests call with the default to match live betting
@@ -66,10 +66,7 @@ def _load_all_rounds(runtime_cfg, *, include_failed: bool = False) -> list[Round
     Callers needing the full raw set (e.g. sync-integrity checks, recovery
     tools) pass `include_failed=True`.
     """
-    market_data_store = getattr(runtime_cfg, "market_data_store", None)
-    if market_data_store is not None and hasattr(market_data_store, "iter_closed_rounds"):
-        rounds = list(market_data_store.iter_closed_rounds())
-    elif runtime_cfg.round_store is not None:
+    if runtime_cfg.round_store is not None:
         rounds = list(runtime_cfg.round_store.iter_closed_rounds())
     else:
         raise InvariantError("backtest_no_round_store_available")
@@ -259,8 +256,7 @@ def run_backtest(
 
     # Build momentum pipeline (no live gate -- backtest uses cached 1s klines).
     from pancakebot.bankroll_tracker import InMemoryBankrollTracker
-    from pancakebot.strategy.momentum_gate import MomentumGateConfig
-    gate_config: MomentumGateConfig = runtime_cfg.momentum_gate_config  # type: ignore[assignment]
+    gate_config = runtime_cfg.momentum_gate_config
     bankroll_tracker = InMemoryBankrollTracker(
         initial_bankroll=initial_bankroll_bnb,
         drawdown_peak_window_days=runtime_cfg.strategy.risk.drawdown_peak_window_days,

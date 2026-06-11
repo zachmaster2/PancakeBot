@@ -191,7 +191,7 @@ class Web3PredictionContract:
       - treasury fee divisor (bps)
 
     Configuration:
-      - rpc_url selected by RpcPool
+      - rpc_url selected by chain.rpc_chooser.choose_rpc_url
       - abi_json_path from config.toml
       - private_key from .env
     """

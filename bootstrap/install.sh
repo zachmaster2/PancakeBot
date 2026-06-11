@@ -71,6 +71,13 @@ else
 fi
 
 log "STEP 5/6: systemd units (tracked files; left DISABLED)"
+# The tracked units hardcode /root/pancakebot (WorkingDirectory + ExecStart
+# venv path). Installing them from a clone elsewhere would produce units
+# that fail at first start — refuse loudly instead.
+if [ "$REPO_ROOT" != "/root/pancakebot" ]; then
+    echo "[install] FATAL: units hardcode /root/pancakebot but repo is at $REPO_ROOT — clone there (or edit the unit files first)."
+    exit 1
+fi
 # Phase 3c-2 (systemd-direct): the units are TRACKED at
 # bootstrap/linux/systemd/ and installed verbatim — systemd itself is the
 # supervisor (no Python supervisor layer). Re-copying on every run keeps
