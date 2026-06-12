@@ -24,6 +24,11 @@ retention is ~3 months; a longer gap becomes unfillable (the monitor then
 reports a non-contiguous tape and T3 cells shrink gracefully via the
 segment guard rather than computing biased windows).
 
+Never run two monitors (or a monitor and a capture script) concurrently:
+tape appends are not locked, and interleaved writers can tear a line.
+Duplicate trades from overlapping runs are harmless (deduped by tradeId
+at load), torn lines are not.
+
 Output: `var/strategy_review/monitor_runs/<YYYY-MM-DD>/findings.json` +
 `summary.txt`. The console digest ends with `VERDICT: quiet` or
 `VERDICT: TRIPPED: ...`.
