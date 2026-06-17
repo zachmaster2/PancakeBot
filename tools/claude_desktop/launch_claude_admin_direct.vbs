@@ -35,6 +35,18 @@
 '                     Closes the gap where Claude dies mid-session and the AtLogon
 '                     trigger never re-fires (long-lived logged-in session).
 '   /keepalivecheck - dry-run the keepalive decision (no launch).
+'
+' QueryPackage race hardening (2026-06-17) -- after a Windows-update reboot the
+' AtLogon ClaudeLaunchElevated task and the ~5-min ClaudeKeepalive task can
+' co-launch within milliseconds of each other. Both elevated copies share %TEMP%
+' and previously raced on a single scratch file (\claude_pkg_query.txt). The
+' loser raised a fatal WSH dialog "Permission denied 800A0046" at the
+' unguarded fs.DeleteFile call. Fix: (a) per-invocation random nonce in the
+' scratch filename eliminates the collision at root, (b) every file I/O in
+' QueryPackage is now guarded by On Error Resume Next -- matching the
+' On-Error discipline of every other helper -- so any residual transient
+' degrades to a quiet no-op (Quit 2 via Len(installLocation)=0) instead of a
+' modal dialog the operator may not be there to dismiss.
 
 Option Explicit
 
@@ -128,22 +140,47 @@ WScript.Quit 5
 
 ' InstallLocation + Status in ONE hidden PowerShell call (no flash). Output:
 ' "<InstallLocation>|<Status>" (paths can't contain '|'). Fills args ByRef.
+' All file I/O is On-Error-guarded (see 2026-06-17 race note in the header).
 Sub QueryPackage(ByRef loc, ByRef status)
     loc = "" : status = ""
-    Dim tempPath, ps, cmd, ts, raw, parts
-    tempPath = wsh.ExpandEnvironmentStrings("%TEMP%") & "\claude_pkg_query.txt"
+    Dim tempPath, ps, cmd, ts, raw, parts, nonce
+    ' Per-invocation random nonce so concurrent elevated invocations (AtLogon
+    ' vs Keepalive at boot) never collide on the scratch file.
+    Randomize
+    nonce = CStr(Int(Rnd() * 1000000000)) & "_" & CStr(Int(Timer * 1000) Mod 1000000)
+    tempPath = wsh.ExpandEnvironmentStrings("%TEMP%") & "\claude_pkg_query_" & nonce & ".txt"
+
+    On Error Resume Next
     If fs.FileExists(tempPath) Then fs.DeleteFile tempPath
+    Err.Clear
+    On Error GoTo 0
+
     ps = "$p=Get-AppxPackage | ?{$_.PackageFamilyName -eq '" & PACKAGE_FAMILY_NAME & _
          "'} | Select-Object -First 1; if($p){'{0}|{1}' -f $p.InstallLocation,$p.Status}"
     cmd = "cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -Command """ & _
           ps & """ > """ & tempPath & """ 2>&1"
+
+    On Error Resume Next
     wsh.Run cmd, 0, True
-    If Not fs.FileExists(tempPath) Then Exit Sub
+    If Not fs.FileExists(tempPath) Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Sub
+    End If
     Set ts = fs.OpenTextFile(tempPath, 1)
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        On Error Resume Next : fs.DeleteFile tempPath : Err.Clear : On Error GoTo 0
+        Exit Sub
+    End If
     raw = ts.ReadAll()
     ts.Close
-    fs.DeleteFile tempPath
-    raw = Trim(Replace(Replace(raw, vbCr, ""), vbLf, ""))
+    fs.DeleteFile tempPath        ' best-effort: %TEMP% cleanup tolerates failure
+    Err.Clear
+    On Error GoTo 0
+
+    raw = Trim(Replace(Replace(raw & "", vbCr, ""), vbLf, ""))
     If Len(raw) = 0 Then Exit Sub
     parts = Split(raw, "|")
     loc = parts(0)
