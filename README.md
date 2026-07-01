@@ -138,24 +138,22 @@ ALERTs (the poller retries). For a fast end-to-end check, set
 VM (`.venv/bin/python -m pytest`) after checkout, before restarting the
 unit. The suite includes the canonical-hash bit-identity test.
 
-### Deploying (push-to-deploy, 2026-06-10)
+### Deploying (git pull from GitHub, 2026-06-30)
 
-The VM hosts a bare repo (`/srv/pancakebot.git`) whose `post-receive`
-hook checks `master` out into `/root/pancakebot` atomically (tracked
-copy + one-time setup recipe: `bootstrap/linux/git_post_receive.sh`).
-Per deploy:
+Source of truth is **GitHub** (`github.com/zachmaster2/PancakeBot`). The VM
+is a plain clone at `/root/pancakebot`. Per deploy: push to GitHub from any
+dev clone, then pull on the VM and restart manually when greenlit:
 
 ```
-git push vm master          # hook prints "deployed <sha> -> /root/pancakebot"
-# code only — restart manually when greenlit:
-ssh root@<vm> systemctl restart pancakebot-live
+# dev box:
+git push github master
+# VM:
+ssh root@<vm> "cd /root/pancakebot && git pull && systemctl restart pancakebot-live"
 ```
 
-The dev clone is the sole canonical history (no public remote) — keep
-periodic offline backups: `git bundle create <path>.bundle --all`.
-Untracked VM files (`var/`, `.env`, `.venv`) are never touched by the
-checkout. `git status` works on the VM via the `/root/pancakebot/.git`
-gitdir pointer.
+Untracked VM files (`var/`, `.env`, `.venv`) are never touched by a pull.
+Keep periodic offline backups too: `git bundle create <path>.bundle --all`.
+(The old VM-bare-repo push-to-deploy hook was retired 2026-06-30.)
 
 ### Clock-sync prerequisite (dry + live modes)
 

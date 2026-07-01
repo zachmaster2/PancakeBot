@@ -24,8 +24,13 @@ bootstrap/
     systemd/           tracked units: pancakebot-{live,dry}.service +
                        pancakebot-notify@.service (cp'd by install.sh STEP 5)
     install_python313.sh  pyenv build of 3.13 (additive; system py untouched)
-    git_post_receive.sh   push-to-deploy hook (tracked copy + setup recipe)
 ```
+
+**Source of truth = GitHub** (`github.com/zachmaster2/PancakeBot`). The VM
+is a plain `git clone` of that remote; deploys are `git pull`. Any machine
+with the repo cloned + push access can be a dev source (push to GitHub;
+the VM pulls). The old VM-bare-repo push-to-deploy hook was retired
+2026-06-30.
 
 ## Prerequisites
 
@@ -58,12 +63,12 @@ set -a; . /etc/pancakebot/alerts.env; set +a
 ## Install (AlmaLinux 9.x)
 
 ```bash
-# Fresh-VM bring-up order (the dev clone is the only canonical history —
-# there is no public remote to clone from):
-#   1. on the VM: create the bare repo + post-receive hook per
-#      bootstrap/linux/git_post_receive.sh (incl. mkdir /root/pancakebot)
-#   2. on the dev box: git remote add vm ssh://root@<vm>/srv/pancakebot.git
-#      && git push vm master   (checks the tree out into /root/pancakebot)
+# Fresh-VM bring-up: clone from GitHub into /root/pancakebot (the units
+# hardcode that path). Needs a read-only GitHub deploy key on the VM
+# (ssh-keygen -t ed25519, add the .pub as a deploy key on the repo) OR an
+# HTTPS clone with a PAT. See the new-VM install checklist for the exact
+# deploy-key steps.
+git clone git@github.com:zachmaster2/PancakeBot.git /root/pancakebot
 cd /root/pancakebot
 # create repo-root .env with BSC_WALLET_PRIVATE_KEY + THE_GRAPH_API_KEY
 # first (STEP 3's config check blocks without it — see Prerequisites)
@@ -84,9 +89,10 @@ drop-in (`/etc/chrony.d/pancakebot.conf`) bounding clock-step detection to
 
 ## Deploys after install
 
-`git push vm master` from the dev clone (see README.md "Deploying") — the
-VM's bare-repo hook checks master out into `/root/pancakebot`; restart the
-unit manually when greenlit.
+Push to GitHub from any dev clone, then on the VM: `git -C /root/pancakebot
+pull` and restart the unit manually when greenlit (`systemctl restart
+pancakebot-{live,dry}`). The weekly monitor (research/weekly_monitor_state_machine.py)
+can also pull + evaluate + toggle the bot on a schedule.
 
 ## Validate
 

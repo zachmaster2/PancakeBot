@@ -30,7 +30,8 @@ _SH_SCRIPTS = [
     _BOOT / "install.sh",
     _BOOT / "uninstall.sh",
     _BOOT / "linux" / "install_python313.sh",
-    _BOOT / "linux" / "git_post_receive.sh",
+    # git_post_receive.sh retired 2026-06-30: deploy is now git-clone/pull from
+    # GitHub (github.com/zachmaster2/PancakeBot), not a VM bare-repo push hook.
 ]
 _PS1_SCRIPTS = [
     _TOOLS / "setup_autologon.ps1",

@@ -81,7 +81,7 @@ fi
 # Phase 3c-2 (systemd-direct): the units are TRACKED at
 # bootstrap/linux/systemd/ and installed verbatim — systemd itself is the
 # supervisor (no Python supervisor layer). Re-copying on every run keeps
-# /etc in sync with the repo (push-to-deploy updates the repo copies; rerun
+# /etc in sync with the repo (a `git pull` updates the repo copies; rerun
 # this script — or cp + daemon-reload manually — to roll units forward).
 for unit in pancakebot-live.service pancakebot-dry.service pancakebot-notify@.service; do
     cp "$HERE/linux/systemd/$unit" "/etc/systemd/system/$unit"
