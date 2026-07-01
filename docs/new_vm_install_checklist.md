@@ -98,6 +98,40 @@ live when the weekly monitor's positive trigger clears the **strict**
 after a confirmed edge. As of 2026-06-30 the recent signal was RULED OUT
 (noise), so the correct state is DISABLED.
 
+## Go-live validation ladder (user-decided 2026-06-30)
+
+The bot goes live per the loose Option-A trigger, but via an incremental
+ladder that validates the execution path with trivial money before scaling.
+**No separate sizing config is needed** — the `min_bet_only` knob in `[live]`
+is the purpose-built mechanism (it clamps every on-chain bet to the contract
+minimum, ~0.001 BNB; verified at engine.py:1200, live-only, strategy logic
+unaffected). Current committed default is `min_bet_only = true`.
+
+**Step A — dry, ~3–4h (≥40–50 rounds).**
+```bash
+systemctl start pancakebot-dry
+journalctl -u pancakebot-dry -f
+```
+Confirm: no crashes, no ALERT storms, normal SKIP patterns, on-schedule
+timing, telemetry populates. Any anomaly → stop + investigate. Clean → Step B.
+
+**Step B — live at contract-min (`min_bet_only = true`, the default).**
+```bash
+systemctl start pancakebot-live      # Conflicts= stops dry automatically
+journalctl -u pancakebot-live -f
+```
+Every bet submits at ~0.001 BNB. Watch until **≥1 bet is confirmed on-chain**:
+verify the bet TX on BSCScan, the bankroll ledger updates, settlement records
+the outcome, and a claim TX fires on a win — the full gate→sign→broadcast→
+confirm→settle→claim path. Any anomaly (LATE, gas-cap breach, POOL UNCOVERED,
+ANCHOR STALE, balance drift) → stop + investigate.
+
+**Step C — normal sizing (0.01–0.1 BNB).** After ≥1 clean full round at Step B:
+flip `min_bet_only = false` in `config.toml` (the `max_bet_bnb_*` = 0.1 ceiling
+and `min_bet_threshold_bnb` = 0.01 floor are already committed). Commit + push,
+`git pull` on the VM, `systemctl restart pancakebot-live`. The weekly monitor
+then becomes the recurring evaluator (+ protective auto-disable).
+
 ## After install — weekly monitor
 ```bash
 # dry (report only, touches nothing):
