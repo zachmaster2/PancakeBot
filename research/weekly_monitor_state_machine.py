@@ -6,21 +6,20 @@ state machine:
 
   * AUTO-DISABLE (protect capital) is fully autonomous — the negative
     trigger stops+disables the live unit with `--apply` alone.
-  * AUTO-ENABLE (risk capital) is gated: the positive trigger must clear
-    the MULTIPLE-COMPARISON-CORRECTED bar (not just raw p), AND the run
-    must be explicitly `--arm`ed, AND `--apply` given. Rationale: the
-    2026-06-30 gauntlet showed the loose raw-p<0.10 trigger fires on the
-    exact noise it ruled out (Šidák 0.54). Automating protection is safe;
-    automating real-money entry on an uncorrected p-value is not.
+  * AUTO-ENABLE (2026-07-09 user decision): the positive trigger acts
+    under `--apply` alone — raw p<0.10 on the trailing-1-week window,
+    single test, no multiple-comparison gate. If the bot is enabled but
+    breaker-suspended, the positive trigger instead writes the cooldown
+    override flag that the pipeline consumes to release the suspension.
 
 Default is DRY-RUN: it computes + reports the decision and writes the
-artifact but touches NOTHING. Pass `--apply` to let it act on systemd,
-`--arm` to additionally permit an enable.
+artifact but touches NOTHING. Pass `--apply` to let it act (systemd
+enable/disable + override-flag writes).
 
 Steps each run:
   1. sync (`run.py --sync`) unless --no-sync
   2. canonical gate flat-stake bet stream (risk-free) + trailing 2w/1w windows
-  3. standard backtest (risk breaker OFF) on the 2w window @5BNB -> gas-inclusive PnL
+  3. standard backtest (risk breaker OFF) on the 1w window @5BNB -> gas-inclusive PnL
   4. positive/negative trigger evaluation (+ Šidák correction, + consecutive-weak counter)
   5. read live bot state (systemctl), decide action, act iff permitted
   6. Discord alert (state change or weekly summary) + artifact + persistent state
@@ -29,14 +28,20 @@ Idempotent: one artifact dir per ISO week; a second run in the same week
 re-computes but does not double-advance the consecutive-weak counter or
 re-fire a state change already recorded this week.
 
-Triggers (pinned):
-  POSITIVE (loose, per dispatch):   WR > BREAKEVEN(0.55) AND raw p_upper < 0.10
-                                    AND n_fires >= 20 AND standard-backtest
-                                    net PnL (after gas) > 0, on the 2w window.
-  POSITIVE ENABLE-GATE (strict):    additionally Šidák-adjusted p < 0.05 over
-                                    the windows examined this run.
-  NEGATIVE:  latest-100-fire WR < 0.45  OR  3 consecutive weekly runs with
-             2w p_upper > 0.5.
+Triggers (pinned; 2026-07-09 redesign — 1-WEEK window only, per user decision):
+  POSITIVE:  on the trailing-1w window: WR > BREAKEVEN(0.55) AND raw
+             p_upper < 0.10 (single test) AND n_fires >= 10 AND the
+             standard risk-off backtest net PnL (after gas) > 0.
+             Action when bot DISABLED: enable + start (under --apply).
+             Action when bot ENABLED and breaker-suspended: write the
+             cooldown override flag (var/live/cooldown_override.json),
+             which the pipeline consumes to release the suspension
+             immediately (ignoring extend-while-bleeding).
+  NEGATIVE:  trailing-1w WR < 0.45  OR  3 consecutive weekly runs weak
+             (weak = 1w p_upper > 0.5, or insufficient fires n < 10).
+             Action: disable + stop entirely.
+  The 2w window + latest-100 WR + Šidák are still computed and reported
+  (informational only — they no longer gate actions).
 
 Artifacts: var/strategy_review/weekly_monitors/<YYYY-MM-DD>/{decision.json},
 persistent state var/strategy_review/weekly_monitors/state.json.
@@ -73,12 +78,11 @@ STATE_PATH = ROOT / "state.json"
 LIVE_UNIT = "pancakebot-live"
 CUTOFF, LOOKBACKS, FEE = 2, (3, 7, 15), 0.03
 BREAKEVEN_WR = 0.55
-POS_RAW_P = 0.10          # loose positive-trigger p bar
-POS_ENABLE_SIDAK_P = 0.05  # strict enable-gate (corrected)
-POS_MIN_FIRES = 20
-NEG_WR_100 = 0.45
+POS_RAW_P = 0.10           # raw permutation p_upper, single test (user decision)
+POS_MIN_FIRES = 10         # 2026-07-09: halved window (2w->1w) -> halved floor
+NEG_WR_1W = 0.45           # trailing-1w WR below this -> disable
 NEG_CONSECUTIVE_WEAK = 3
-NEG_WEAK_P = 0.5
+NEG_WEAK_P = 0.5           # weak week: 1w p_upper above this (or n < POS_MIN_FIRES)
 N_PERM = 10_000
 SEED = 20260630
 
@@ -257,7 +261,6 @@ def save_state(st: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="actually act on systemd (else dry-run)")
-    ap.add_argument("--arm", action="store_true", help="permit an AUTO-ENABLE (still needs strict gate)")
     ap.add_argument("--no-sync", action="store_true", help="skip run.py --sync")
     ap.add_argument("--iso-week", type=str, default=None, help="override week key (testing)")
     args = ap.parse_args()
@@ -281,72 +284,99 @@ def main() -> int:
         return [b for b in bets if b["lock"] >= cut]
 
     w2, w1 = window(14), window(7)
-    e2 = (min(b["epoch"] for b in w2), max(b["epoch"] for b in w2)) if w2 else (0, 0)
+    e1 = (min(b["epoch"] for b in w1), max(b["epoch"] for b in w1)) if w1 else (0, 0)
     p2, p1 = perm(w2), perm(w1)
 
-    print("--- risk-off standard backtest (2w @5BNB) ---", flush=True)
-    bt = risk_off_backtest(e2[0], e2[1], out_dir, bankroll=5.0) if w2 else {}
+    print("--- risk-off standard backtest (1w @5BNB) ---", flush=True)
+    bt = risk_off_backtest(e1[0], e1[1], out_dir, bankroll=5.0) if w1 else {}
 
     latest100 = bets[-100:]
     wr100 = float(np.mean([b["win"] for b in latest100])) if len(latest100) >= 50 else None
 
-    # ---- trigger evaluation ----
-    n_windows_examined = 2
+    # ---- trigger evaluation (2026-07-09: 1-WEEK window governs) ----
+    # Šidák over the two computed windows is still REPORTED (informational);
+    # the positive trigger is the raw single-test p per the user's decision.
     raw_best_p = min([p for p in (p2.get("p_upper"), p1.get("p_upper")) if p is not None],
                      default=1.0)
-    sidak_p = 1 - (1 - raw_best_p) ** n_windows_examined
+    sidak_p = 1 - (1 - raw_best_p) ** 2
 
-    pos_loose = bool(
-        not p2.get("insufficient") and p2.get("wr", 0) > BREAKEVEN_WR
-        and p2.get("p_upper", 1) < POS_RAW_P and p2.get("n", 0) >= POS_MIN_FIRES
+    pos_trigger = bool(
+        not p1.get("insufficient") and p1.get("wr", 0) > BREAKEVEN_WR
+        and p1.get("p_upper", 1) < POS_RAW_P and p1.get("n", 0) >= POS_MIN_FIRES
         and bt.get("net_pnl_bnb", -1) > 0)
-    pos_strict_gate = bool(pos_loose and sidak_p < POS_ENABLE_SIDAK_P)
 
-    weak_this_week = bool(p2.get("p_upper", 0) is not None and p2.get("p_upper", 0) > NEG_WEAK_P)
+    # weak week: 1w p_upper above the bar, or not enough fires to know.
+    weak_this_week = bool(
+        p1.get("insufficient")
+        or (p1.get("p_upper") is not None and p1["p_upper"] > NEG_WEAK_P))
     # advance the consecutive-weak counter only once per week
     consec = st.get("consecutive_weak", 0)
     if not same_week_rerun:
         consec = consec + 1 if weak_this_week else 0
-    neg_trigger = bool((wr100 is not None and wr100 < NEG_WR_100)
-                       or consec >= NEG_CONSECUTIVE_WEAK)
+    neg_wr_leg = bool(
+        not p1.get("insufficient") and p1.get("wr") is not None
+        and p1["wr"] < NEG_WR_1W)
+    neg_trigger = bool(neg_wr_leg or consec >= NEG_CONSECUTIVE_WEAK)
 
     state = read_bot_state()
+    pause_path = REPO / "var" / "live" / "pause_state.json"
+    in_cooldown = False
+    try:
+        if pause_path.exists():
+            in_cooldown = bool(json.loads(
+                pause_path.read_text(encoding="utf-8")).get("paused", False))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        in_cooldown = False
 
     # ---- decide action ----
     action, reason, acted = "none", "", ""
     if neg_trigger and state["is_enabled"]:
         action = "disable"
-        reason = (f"NEGATIVE: latest100 WR={wr100} (<{NEG_WR_100}) "
+        reason = (f"NEGATIVE: 1w WR={p1.get('wr')} (<{NEG_WR_1W}: {neg_wr_leg}) "
                   f"or consecutive_weak={consec}>={NEG_CONSECUTIVE_WEAK}")
         if args.apply:
             acted = do_disable()
-    elif pos_loose and not state["is_enabled"]:
-        if pos_strict_gate and args.arm and args.apply:
-            action = "enable"
-            reason = f"POSITIVE passed strict gate (Šidák {sidak_p:.3f}<{POS_ENABLE_SIDAK_P}) + armed"
+    elif pos_trigger and not state["is_enabled"]:
+        action = "enable"
+        reason = (f"POSITIVE (1w): WR={p1.get('wr')}>{BREAKEVEN_WR}, "
+                  f"p={p1.get('p_upper')}<{POS_RAW_P}, n={p1.get('n')}>="
+                  f"{POS_MIN_FIRES}, btPnL={bt.get('net_pnl_bnb')}>0")
+        if args.apply:
             acted = do_enable()
         else:
-            action = "enable_BLOCKED"
-            blockers = []
-            if not pos_strict_gate:
-                blockers.append(f"strict gate NOT met (Šidák {sidak_p:.3f} >= {POS_ENABLE_SIDAK_P})")
-            if not args.arm:
-                blockers.append("not --arm'ed")
-            if not args.apply:
-                blockers.append("dry-run (no --apply)")
-            reason = ("POSITIVE loose trigger met but ENABLE withheld: "
-                      + "; ".join(blockers))
+            action = "enable_DRYRUN"
+    elif pos_trigger and state["is_enabled"] and in_cooldown:
+        # Bot is enabled but breaker-suspended: release via the override
+        # flag, which the pipeline consumes on its next paused round
+        # (ignores extend-while-bleeding by design).
+        action = "cooldown_override"
+        reason = "POSITIVE (1w) while breaker-suspended -> override flag"
+        if args.apply:
+            flag = REPO / "var" / "live" / "cooldown_override.json"
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text(json.dumps(dict(
+                ts=time.time(), week=week,
+                reason=reason,
+                window_1w=dict(wr=p1.get("wr"), p_upper=p1.get("p_upper"),
+                               n=p1.get("n")),
+            ), indent=2), encoding="utf-8")
+            acted = f"wrote {flag}"
+        else:
+            action = "cooldown_override_DRYRUN"
 
     decision = dict(
         week=week, run_at_utc=time.strftime("%Y-%m-%d %H:%M", time.gmtime()),
         data_newest_lock=time.strftime("%Y-%m-%d %H:%M", time.gmtime(max_lock)),
-        window_2w=dict(epochs=list(e2), **p2, backtest=bt),
-        window_1w=p1, latest100_wr=wr100,
-        triggers=dict(positive_loose=pos_loose, positive_strict_gate=pos_strict_gate,
-                      negative=neg_trigger, raw_best_p=round(raw_best_p, 5),
-                      sidak_p=round(sidak_p, 5), consecutive_weak=consec),
-        bot_state=state, action=action, reason=reason, acted=acted,
-        applied=args.apply, armed=args.arm)
+        window_1w=dict(epochs=list(e1), **p1, backtest=bt),
+        window_2w=p2, latest100_wr=wr100,
+        triggers=dict(positive=pos_trigger, negative=neg_trigger,
+                      neg_wr_leg=neg_wr_leg, weak_this_week=weak_this_week,
+                      raw_best_p=round(raw_best_p, 5),
+                      sidak_p_informational=round(sidak_p, 5),
+                      consecutive_weak=consec),
+        bot_state=state, in_cooldown=in_cooldown,
+        action=action, reason=reason, acted=acted,
+        applied=args.apply)
     (out_dir / "decision.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
 
     # ---- persist state (once per week) ----
@@ -355,23 +385,24 @@ def main() -> int:
         st["last_week"] = week
         st["last_action"] = action
         st.setdefault("history", []).append(
-            dict(week=week, action=action, wr_2w=p2.get("wr"), p_2w=p2.get("p_upper"),
+            dict(week=week, action=action, wr_1w=p1.get("wr"), p_1w=p1.get("p_upper"),
                  sidak=round(sidak_p, 4)))
         save_state(st)
 
     # ---- alert ----
     head = f"[weekly-monitor {week}] action={action}"
-    body = (f"2w: n={p2.get('n')} WR={p2.get('wr')} p={p2.get('p_upper')} "
-            f"Šidák={sidak_p:.3f} btPnL={bt.get('net_pnl_bnb')}; "
-            f"neg={neg_trigger} consec_weak={consec}; bot enabled={state.get('is_enabled')}")
-    if action in ("enable", "disable"):
+    body = (f"1w: n={p1.get('n')} WR={p1.get('wr')} p={p1.get('p_upper')} "
+            f"btPnL={bt.get('net_pnl_bnb')}; 2w(info): WR={p2.get('wr')} "
+            f"p={p2.get('p_upper')}; neg={neg_trigger} consec_weak={consec}; "
+            f"enabled={state.get('is_enabled')} in_cooldown={in_cooldown}")
+    if action in ("enable", "disable", "cooldown_override"):
         discord(f"⚠️ {head} — STATE CHANGED\n{reason}\n{acted}\n{body}")
     else:
         discord(f"{head}\n{reason or 'neutral / no-op'}\n{body}")
 
     print("\n=== WEEKLY MONITOR DECISION ===")
     print(head); print(reason or "neutral / no-op"); print(body)
-    print(f"(applied={args.apply} armed={args.arm})")
+    print(f"(applied={args.apply})")
     print(f"artifacts -> {out_dir}")
     return 0
 

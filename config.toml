@@ -117,7 +117,24 @@ min_bet_threshold_bnb = 0.01
 max_bet_fraction_of_bankroll = 0.05        # bet <= 5% of current bankroll
 min_bankroll_bnb_to_bet = 0.20                # pause all bets while bankroll < this
 max_drawdown_fraction_from_peak = 0.15     # 1.0 = disabled; fires in normal regimes
-cooldown_rounds = 72                   # 6 hours at 5-min rounds
+cooldown_rounds = 288                  # ~1 day at 5-min rounds (2026-07-09 redesign; was 72/~6h)
+# Composite cooldown state machine (2026-07-09). While the breaker has betting
+# suspended, the pipeline still evaluates the gate every round and records the
+# bets it WOULD have made into a persisted shadow ledger (sized off the
+# hypothetical bankroll, same filters/caps as real bets, settled against
+# realized pools + gas). At each cooldown expiry the suspension is EXTENDED by
+# another cooldown_rounds unless the shadow shows genuine recovery:
+#   n shadow fires >= shadow_min_fires_to_release
+#   AND cumulative shadow PnL >= 0
+#   AND hypothetical bankroll > hypothetical rolling-7d peak * shadow_recovery_peak_fraction
+# On release the tracker's peak baseline is RESEEDED to the current bankroll
+# (otherwise the unchanged real drawdown would re-fire the breaker instantly).
+# The weekly monitor can also release the suspension via an override flag file
+# (var/<mode>/cooldown_override.json) when its positive trigger fires.
+extend_while_bleeding = true           # false = legacy fixed-length cooldown
+monitor_override_enabled = true        # false = ignore the monitor's override flag
+shadow_min_fires_to_release = 3        # fewer shadow fires than this at expiry -> extend
+shadow_recovery_peak_fraction = 0.85   # hypo bankroll must exceed hypo peak * this
 drawdown_peak_window_days = 7                        # rolling window for peak calculation
 drawdown_peak_mode = "rolling_7d"      # peak-tracking semantics; alt: "absolute_ratchet" (monotonic since-launch peak)
 # Absolute per-bet BNB caps (formerly under btc_primary.sizing / eth_sol_fallback.sizing).

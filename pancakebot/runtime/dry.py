@@ -723,6 +723,17 @@ def dry_settle_available_bets(cfg: RuntimeConfig, closed: RuntimeState) -> None:
 def init_runtime_state(cfg: RuntimeConfig) -> RuntimeState:
     """Initialize live/dry runtime state. No disk sync -- pure RPC + OKX."""
     info("START", "Core setup: strategy=momentum_gate mode=rpc_only")
+    _rk = cfg.strategy.risk
+    info(
+        "START",
+        f"risk config: cooldown_rounds={_rk.cooldown_rounds} "
+        f"extend_while_bleeding={_rk.extend_while_bleeding} "
+        f"monitor_override_enabled={_rk.monitor_override_enabled} "
+        f"shadow_min_fires={_rk.shadow_min_fires_to_release} "
+        f"shadow_recovery_frac={_rk.shadow_recovery_peak_fraction} "
+        f"dd_breaker={_rk.max_drawdown_fraction_from_peak} "
+        f"peak_mode={_rk.drawdown_peak_mode}",
+    )
 
     strategy_pipeline = _build_momentum_pipeline(cfg=cfg)
     # No warmup rounds needed: OKX gate fetches live at decision time.
