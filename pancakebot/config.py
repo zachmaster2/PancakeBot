@@ -191,6 +191,21 @@ class RiskConfig:
       window misses.
     - max_bet_bnb_btc_primary: absolute BNB cap for BTC primary bets.
     - max_bet_bnb_eth_sol_fallback: absolute BNB cap for regime-2 ETH+SOL bets.
+    - extend_while_bleeding: composite cooldown state machine (2026-07-09).
+      While paused, the pipeline shadow-evaluates the gate each round and at
+      cooldown expiry EXTENDS the suspension by another ``cooldown_rounds``
+      unless the shadow ledger shows recovery (see the two shadow_* knobs
+      and ShadowLedger.release_ok). Code default False preserves the legacy
+      fixed-length cooldown for existing research reproductions; the
+      deployed config.toml turns it on.
+    - monitor_override_enabled: honor the weekly monitor's override flag
+      file (cooldown_override.json in the tracker's persist dir), which
+      releases a suspension immediately. Code default False (same
+      reproduction rationale); deployed config.toml turns it on.
+    - shadow_min_fires_to_release: at cooldown expiry, fewer shadow fires
+      than this since suspension start -> extend (insufficient evidence).
+    - shadow_recovery_peak_fraction: release also requires hypothetical
+      bankroll > hypothetical rolling-7d peak * this fraction.
     """
     max_bet_fraction_of_bankroll: float
     min_bankroll_bnb_to_bet: float
@@ -200,6 +215,10 @@ class RiskConfig:
     max_bet_bnb_btc_primary: float
     max_bet_bnb_eth_sol_fallback: float
     drawdown_peak_mode: str = "rolling_7d"
+    extend_while_bleeding: bool = False
+    monitor_override_enabled: bool = False
+    shadow_min_fires_to_release: int = 3
+    shadow_recovery_peak_fraction: float = 0.85
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +294,10 @@ class StrategyConfig:
             raise InvariantError("strategy_risk_max_bet_bnb_btc_primary_must_be_positive")
         if rk.max_bet_bnb_eth_sol_fallback <= 0.0:
             raise InvariantError("strategy_risk_max_bet_bnb_eth_sol_fallback_must_be_positive")
+        if rk.shadow_min_fires_to_release < 0:
+            raise InvariantError("strategy_risk_shadow_min_fires_to_release_must_be_non_negative")
+        if not (0.0 < rk.shadow_recovery_peak_fraction <= 1.0):
+            raise InvariantError("strategy_risk_shadow_recovery_peak_fraction_out_of_range")
 
 
 # Default strategy values — match the module-level constants they replaced in
@@ -587,6 +610,20 @@ def load_strategy_config(cfg_toml: dict[str, Any]) -> StrategyConfig:
             drawdown_peak_mode=_opt_str(
                 risk_sec, "drawdown_peak_mode", d.risk.drawdown_peak_mode,
             ),
+            extend_while_bleeding=_opt_bool(
+                risk_sec, "extend_while_bleeding", d.risk.extend_while_bleeding,
+            ),
+            monitor_override_enabled=_opt_bool(
+                risk_sec, "monitor_override_enabled", d.risk.monitor_override_enabled,
+            ),
+            shadow_min_fires_to_release=_opt_int(
+                risk_sec, "shadow_min_fires_to_release",
+                d.risk.shadow_min_fires_to_release,
+            ),
+            shadow_recovery_peak_fraction=_opt_float(
+                risk_sec, "shadow_recovery_peak_fraction",
+                d.risk.shadow_recovery_peak_fraction,
+            ),
         ),
     )
     cfg.validate()
@@ -667,6 +704,10 @@ _CONFIG_SCHEMA: dict[str, set[str]] = {
         "max_bet_bnb_btc_primary",
         "max_bet_bnb_eth_sol_fallback",
         "drawdown_peak_mode",
+        "extend_while_bleeding",
+        "monitor_override_enabled",
+        "shadow_min_fires_to_release",
+        "shadow_recovery_peak_fraction",
     },
 }
 

@@ -12,12 +12,17 @@ were extracted into config in the 2026-04-26 lean&clean refactor.
 
 from __future__ import annotations
 
+import json
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from pancakebot.bankroll_tracker import BankrollTracker
 from pancakebot.config import StrategyConfig
-from pancakebot.constants import BNB_WEI
+from pancakebot.constants import BNB_WEI, MAX_GAS_COST_BET_BNB
+from pancakebot.log import info
+from pancakebot.strategy.shadow_ledger import ShadowLedger
 from pancakebot.util import InvariantError
 from pancakebot.strategy.momentum_gate import (
     MomentumGate,
@@ -159,6 +164,12 @@ class MomentumOnlyPipeline:
         # max_bet_fraction_of_bankroll cap. Callers record settlements via
         # pipeline.record_settlement(bankroll, start_at).
         self._bankroll_tracker: BankrollTracker | None = bankroll_tracker
+        # Composite cooldown state (2026-07-09): shadow ledger + monitor
+        # override flag live next to the tracker's state files (in-memory
+        # when the tracker has no persist_dir; absent when no tracker).
+        self._shadow: ShadowLedger | None = None
+        self._override_path: Path | None = None
+        self._wire_cooldown_state()
 
     # ------------------------------------------------------------------
     # Required interface: strategy.base.StrategyPipeline
@@ -189,11 +200,24 @@ class MomentumOnlyPipeline:
         self._sol_klines_by_epoch = dict(sol_klines_by_epoch)
 
     def settle_closed_rounds(self, *, rounds: list[Round]) -> None:
-        """Track the last settled epoch (no ML state to update)."""
+        """Track the last settled epoch + settle any pending shadow bets."""
         for r in sorted(rounds, key=lambda x: int(x.epoch)):
             epoch = int(r.epoch)
             if self._last_settled_epoch is None or epoch > int(self._last_settled_epoch):
                 self._last_settled_epoch = epoch
+            if self._shadow is not None and self._shadow.active:
+                pnl = self._shadow.settle_round(
+                    round_t=r,
+                    treasury_fee_fraction=self._treasury_fee_fraction,
+                    bet_gas_bnb=MAX_GAS_COST_BET_BNB,
+                )
+                if pnl is not None:
+                    info(
+                        "SHADOW",
+                        f"shadow bet settled epoch={epoch} pnl={pnl:+.4f} "
+                        f"cum={self._shadow.cum_pnl:+.4f} "
+                        f"hypo={self._shadow.hypo_bankroll():.4f}",
+                    )
 
     def bootstrap_from_closed_rounds(self, *, rounds: list[Round]) -> None:
         """Set last_settled_epoch from the warmup batch. No ML state."""
@@ -217,6 +241,22 @@ class MomentumOnlyPipeline:
         balance or persisted dry state). Pass None to disable risk checks.
         """
         self._bankroll_tracker = tracker
+        self._wire_cooldown_state()
+
+    def _wire_cooldown_state(self) -> None:
+        """(Re)derive shadow-ledger + override-flag paths from the tracker."""
+        tracker = self._bankroll_tracker
+        if tracker is None:
+            self._shadow = None
+            self._override_path = None
+            return
+        pd = tracker.persist_dir
+        self._shadow = ShadowLedger(
+            path=(pd / "shadow_state.json") if pd is not None else None,
+        )
+        self._override_path = (
+            (pd / "cooldown_override.json") if pd is not None else None
+        )
 
     # ------------------------------------------------------------------
     # Core decision
@@ -242,22 +282,82 @@ class MomentumOnlyPipeline:
         if self._bankroll_tracker is not None:
             risk = self._strategy.risk
             start_at = int(round_t.start_at)
-            # Check 1: cooldown paused. Tick the counter on every paused round
-            # observed by the pipeline so the cooldown actually winds down.
+            # Check 1: cooldown paused. Composite state machine (2026-07-09):
+            #  - monitor override flag (if enabled) releases immediately;
+            #  - otherwise tick the counter; while winding down, SHADOW-
+            #    evaluate the gate (record what we WOULD have bet);
+            #  - at expiry (tick reaches 0), release only if the shadow shows
+            #    recovery, else EXTEND by another cooldown_rounds.
+            # Every release path reseeds the peak baseline — the real
+            # bankroll did not recover during the suspension, so without the
+            # reseed Check 3 would re-fire the breaker on the next round.
+            # With extend_while_bleeding=False this reduces exactly to the
+            # legacy fixed-length cooldown.
             if self._bankroll_tracker.is_paused(start_at):
-                self._bankroll_tracker.tick_cooldown()
-                # cooldown_remaining is read AFTER tick_cooldown, so it
-                # reflects the rounds remaining INCLUDING the next round
-                # the bot will observe (not counting the current skipped
-                # round itself).
-                return self._skip(
-                    "risk_cooldown_active",
-                    skip_context={
-                        "rounds_remaining": int(
-                            self._bankroll_tracker.cooldown_remaining()
-                        ),
-                    },
-                )
+                if risk.monitor_override_enabled and self._consume_override_flag():
+                    self._release_suspension(start_at, reason="monitor_override")
+                    # fall through to the normal decision flow below
+                else:
+                    self._bankroll_tracker.tick_cooldown()
+                    # cooldown_remaining is read AFTER tick_cooldown, so it
+                    # reflects the rounds remaining INCLUDING the next round
+                    # the bot will observe (not counting the current skipped
+                    # round itself).
+                    remaining = int(self._bankroll_tracker.cooldown_remaining())
+                    use_shadow = (
+                        risk.extend_while_bleeding and self._shadow is not None
+                    )
+                    # Transition guard: a suspension inherited from BEFORE the
+                    # shadow machinery (shadow never started) expires under
+                    # LEGACY semantics — plain skip; the next round's Check 3
+                    # re-fires the breaker under the NEW rules and starts the
+                    # shadow. Without this, release_ok() on an empty ledger
+                    # would extend the inherited suspension indefinitely.
+                    if remaining <= 0 and use_shadow and self._shadow.active:
+                        ok, why = self._shadow.release_ok(
+                            min_fires=risk.shadow_min_fires_to_release,
+                            recovery_frac=risk.shadow_recovery_peak_fraction,
+                            as_of_start_at=start_at,
+                        )
+                        if ok:
+                            self._release_suspension(
+                                start_at, reason=f"shadow_recovery ({why})",
+                            )
+                            # fall through to the normal decision flow below
+                        else:
+                            self._bankroll_tracker.set_paused(
+                                risk.cooldown_rounds, start_at,
+                            )
+                            self._shadow.extend()
+                            info(
+                                "SHADOW",
+                                f"cooldown EXTENDED +{risk.cooldown_rounds} "
+                                f"rounds: {why}",
+                            )
+                            return self._skip(
+                                "risk_cooldown_active",
+                                skip_context={
+                                    "rounds_remaining": int(
+                                        self._bankroll_tracker.cooldown_remaining()
+                                    ),
+                                    "extended": True,
+                                    "extend_reason": why,
+                                    **self._shadow.stats(),
+                                },
+                            )
+                    else:
+                        if use_shadow and self._shadow.active:
+                            self._shadow_evaluate(
+                                round_t=round_t,
+                                pool_bull_bnb=pool_bull_bnb,
+                                pool_bear_bnb=pool_bear_bnb,
+                                lock_at=lock_at,
+                                cutoff_ts_ms=int(cutoff_ts_ms),
+                            )
+                        ctx: dict[str, object] = {"rounds_remaining": remaining}
+                        if use_shadow and self._shadow.active:
+                            ctx.update(self._shadow.stats())
+                        return self._skip("risk_cooldown_active", skip_context=ctx)
             # Check 2: bankroll below minimum -- skip without firing cooldown.
             current = self._bankroll_tracker.current_bankroll()
             if current < risk.min_bankroll_bnb_to_bet:
@@ -268,6 +368,8 @@ class MomentumOnlyPipeline:
                 dd_frac = (peak - current) / peak
                 if dd_frac >= risk.max_drawdown_fraction_from_peak:
                     self._bankroll_tracker.set_paused(risk.cooldown_rounds, start_at)
+                    if risk.extend_while_bleeding and self._shadow is not None:
+                        self._shadow.start(bankroll=current, start_at=start_at)
                     return self._skip(
                         "risk_drawdown_breaker_fired",
                         skip_context={
@@ -297,6 +399,69 @@ class MomentumOnlyPipeline:
         pool_total = pool_bull_bnb + pool_bear_bnb
 
         # Determine signal source: primary (BTC) or regime-2 (ETH+SOL)
+        signal_dir, effective_strength, is_regime2 = self._select_signal(
+            result, pool_total,
+        )
+
+        if signal_dir is None:
+            # Propagate the gate's specific skip reason if it set one
+            # (e.g. ``kline_fetch_transient_failure`` when ETH/SOL fetch
+            # returned ``got_15_expected_16`` and the regime-2 fallback
+            # couldn't fire either). Falling through to ``gate_no_signal``
+            # silently rebrands transient kline failures and hides
+            # data-availability issues from the cycle_audit.
+            return self._skip(result.skip_reason or "gate_no_signal")
+
+        # Pool filter: skip if visible pool is too small (dilution kills edge).
+        if pool_total < self._strategy.pool_filter.min_pool_bnb_at_cutoff:
+            return self._skip(
+                "pool_below_minimum",
+                skip_context={
+                    "pool_bnb": float(pool_total),
+                    "min_pool_bnb_at_cutoff": float(
+                        self._strategy.pool_filter.min_pool_bnb_at_cutoff
+                    ),
+                },
+            )
+
+        our_side = pool_bull_bnb if signal_dir == "Bull" else pool_bear_bnb
+
+        # Payout floor: skip if payout on our side is too low.
+        if our_side > 0 and pool_total > 0:
+            payout = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
+            if payout < self._strategy.pool_filter.min_payout_multiple_at_cutoff:
+                return self._skip("payout_below_floor")
+
+        # Bankroll for the bankroll cap kwarg (None when no tracker -> cap disabled).
+        br_current = (
+            self._bankroll_tracker.current_bankroll()
+            if self._bankroll_tracker is not None else None
+        )
+        bet_size = self._size_bet(
+            effective_strength=effective_strength,
+            is_regime2=is_regime2,
+            pool_total=pool_total,
+            our_side=our_side,
+            bankroll=br_current,
+        )
+
+        if bet_size < self._min_bet_amount_bnb:
+            return self._skip("bet_size_below_min")
+
+        return self._bet(side=str(signal_dir), size_bnb=float(bet_size))
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _select_signal(
+        self, result: MomentumGateResult, pool_total: float,
+    ) -> tuple[str | None, float, bool]:
+        """Signal selection + admission: (direction, strength, is_regime2).
+
+        Shared by the real decision path and the shadow evaluation so the
+        counterfactual uses exactly the live selection logic.
+        """
         signal_dir = None
         effective_strength = 0.0
         is_regime2 = False
@@ -333,47 +498,25 @@ class MomentumOnlyPipeline:
                     )
                     is_regime2 = True
 
-        if signal_dir is None:
-            # Propagate the gate's specific skip reason if it set one
-            # (e.g. ``kline_fetch_transient_failure`` when ETH/SOL fetch
-            # returned ``got_15_expected_16`` and the regime-2 fallback
-            # couldn't fire either). Falling through to ``gate_no_signal``
-            # silently rebrands transient kline failures and hides
-            # data-availability issues from the cycle_audit.
-            return self._skip(result.skip_reason or "gate_no_signal")
+        return signal_dir, effective_strength, is_regime2
 
-        # Pool filter: skip if visible pool is too small (dilution kills edge).
-        if pool_total < self._strategy.pool_filter.min_pool_bnb_at_cutoff:
-            return self._skip(
-                "pool_below_minimum",
-                skip_context={
-                    "pool_bnb": float(pool_total),
-                    "min_pool_bnb_at_cutoff": float(
-                        self._strategy.pool_filter.min_pool_bnb_at_cutoff
-                    ),
-                },
-            )
-
-        our_side = pool_bull_bnb if signal_dir == "Bull" else pool_bear_bnb
-
-        # Payout floor: skip if payout on our side is too low.
-        if our_side > 0 and pool_total > 0:
-            payout = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
-            if payout < self._strategy.pool_filter.min_payout_multiple_at_cutoff:
-                return self._skip("payout_below_floor")
-
-        # Bankroll for the bankroll cap kwarg (None when no tracker -> cap disabled).
-        br_current = (
-            self._bankroll_tracker.current_bankroll()
-            if self._bankroll_tracker is not None else None
-        )
+    def _size_bet(
+        self,
+        *,
+        effective_strength: float,
+        is_regime2: bool,
+        pool_total: float,
+        our_side: float,
+        bankroll: float | None,
+    ) -> float:
+        """Per-regime _compute_bet_size call (shared real/shadow sizing)."""
         br_cap_frac = self._strategy.risk.max_bet_fraction_of_bankroll
         bt_sz = self._strategy.btc_primary.sizing
         t2 = self._strategy.tier2_sizing
 
         if is_regime2:
             es_sizing = self._strategy.eth_sol_fallback.sizing
-            bet_size = _compute_bet_size(
+            return _compute_bet_size(
                 signal_strength=effective_strength,
                 pool_bnb=pool_total,
                 our_side_bnb=our_side,
@@ -383,32 +526,115 @@ class MomentumOnlyPipeline:
                 max_pool_fraction=bt_sz.max_pool_fraction,
                 treasury_fee_fraction=self._treasury_fee_fraction,
                 min_bet_threshold_bnb=t2.min_bet_threshold_bnb,
-                current_bankroll=br_current,
+                current_bankroll=bankroll,
                 max_bet_fraction_of_bankroll=br_cap_frac,
             )
+        return _compute_bet_size(
+            signal_strength=effective_strength,
+            pool_bnb=pool_total,
+            our_side_bnb=our_side,
+            base_frac=bt_sz.base_pool_fraction,
+            cap_bnb=self._strategy.risk.max_bet_bnb_btc_primary,
+            pool_fraction_slope=bt_sz.pool_fraction_slope,
+            max_pool_fraction=bt_sz.max_pool_fraction,
+            treasury_fee_fraction=self._treasury_fee_fraction,
+            min_bet_threshold_bnb=t2.min_bet_threshold_bnb,
+            current_bankroll=bankroll,
+            max_bet_fraction_of_bankroll=br_cap_frac,
+        )
+
+    def _shadow_evaluate(
+        self,
+        *,
+        round_t: Round,
+        pool_bull_bnb: float,
+        pool_bear_bnb: float,
+        lock_at: int,
+        cutoff_ts_ms: int,
+    ) -> None:
+        """Record what the strategy WOULD bet this round (suspension active).
+
+        Mirrors the real decision path exactly — same gate, same filters,
+        same sizing — except sized off the HYPOTHETICAL bankroll and
+        recorded into the shadow ledger instead of being submitted. A gate
+        exception propagates exactly as it would when unpaused (same
+        failure semantics; no extra resilience scaffolding).
+        """
+        if self._shadow is None or not self._shadow.active:
+            return
+        if self._gate is not None:
+            result = self._gate.evaluate(lock_at_ms=lock_at * 1000)
         else:
-            bet_size = _compute_bet_size(
-                signal_strength=effective_strength,
-                pool_bnb=pool_total,
-                our_side_bnb=our_side,
-                base_frac=bt_sz.base_pool_fraction,
-                cap_bnb=self._strategy.risk.max_bet_bnb_btc_primary,
-                pool_fraction_slope=bt_sz.pool_fraction_slope,
-                max_pool_fraction=bt_sz.max_pool_fraction,
-                treasury_fee_fraction=self._treasury_fee_fraction,
-                min_bet_threshold_bnb=t2.min_bet_threshold_bnb,
-                current_bankroll=br_current,
-                max_bet_fraction_of_bankroll=br_cap_frac,
+            result = self._evaluate_from_cache(
+                epoch=int(round_t.epoch), cutoff_ts_ms=cutoff_ts_ms,
             )
+            if pool_bull_bnb <= 0.0 and pool_bear_bnb <= 0.0 and round_t.bets:
+                pool_cutoff_ts = lock_at - self._pool_cutoff_seconds
+                pool_bull_bnb, pool_bear_bnb = _pools_from_bets(
+                    round_t, pool_cutoff_ts,
+                )
+        pool_total = pool_bull_bnb + pool_bear_bnb
 
+        signal_dir, effective_strength, is_regime2 = self._select_signal(
+            result, pool_total,
+        )
+        if signal_dir is None:
+            return
+        if pool_total < self._strategy.pool_filter.min_pool_bnb_at_cutoff:
+            return
+        our_side = pool_bull_bnb if signal_dir == "Bull" else pool_bear_bnb
+        if our_side > 0 and pool_total > 0:
+            payout = pool_total * (1.0 - self._treasury_fee_fraction) / our_side
+            if payout < self._strategy.pool_filter.min_payout_multiple_at_cutoff:
+                return
+        bet_size = self._size_bet(
+            effective_strength=effective_strength,
+            is_regime2=is_regime2,
+            pool_total=pool_total,
+            our_side=our_side,
+            bankroll=self._shadow.hypo_bankroll(),
+        )
         if bet_size < self._min_bet_amount_bnb:
-            return self._skip("bet_size_below_min")
+            return
+        self._shadow.record_fire(
+            epoch=int(round_t.epoch), side=str(signal_dir),
+            size_bnb=float(bet_size),
+        )
+        info(
+            "SHADOW",
+            f"shadow fire epoch={int(round_t.epoch)} side={signal_dir} "
+            f"size={bet_size:.4f} (suspension active)",
+        )
 
-        return self._bet(side=str(signal_dir), size_bnb=float(bet_size))
+    def _consume_override_flag(self) -> bool:
+        """Consume the monitor's override flag; True iff present and fresh."""
+        p = self._override_path
+        if p is None or not p.exists():
+            return False
+        fresh = False
+        try:
+            doc = json.loads(p.read_text(encoding="utf-8"))
+            ts = float(doc.get("ts", 0.0))
+            # Weekly cadence + slack: a flag older than 8 days is stale
+            # (e.g. left behind while the bot was stopped) and is discarded.
+            fresh = (time.time() - ts) <= 8 * 86400
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            fresh = False
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return fresh
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def _release_suspension(self, start_at: int, *, reason: str) -> None:
+        """End the suspension: unpause, reseed peak baseline, clear shadow."""
+        assert self._bankroll_tracker is not None
+        self._bankroll_tracker.set_paused(0, start_at)
+        self._bankroll_tracker.reset_peak_baseline(start_at)
+        stats = self._shadow.stats() if self._shadow is not None else {}
+        if self._shadow is not None:
+            self._shadow.clear()
+        info("SHADOW", f"cooldown RELEASED: {reason} {stats}")
 
     def _evaluate_from_cache(
         self,

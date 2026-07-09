@@ -75,6 +75,28 @@ class BankrollTracker(ABC):
     def cooldown_remaining(self) -> int:
         """Return the number of cooldown rounds remaining (0 when not paused)."""
 
+    @abstractmethod
+    def reset_peak_baseline(self, start_at: int) -> None:
+        """Collapse peak history to the CURRENT bankroll (suspension release).
+
+        Composite cooldown state machine (2026-07-09): when a suspension is
+        released (shadow recovery or monitor override) the real bankroll has
+        not recovered — without collapsing the peak history the
+        drawdown-from-peak check would re-fire the breaker on the very next
+        round, making release a no-op. Reseeding accepts the current
+        bankroll as the new baseline (both rolling-window and
+        absolute-ratchet semantics restart from it).
+        """
+
+    @property
+    def persist_dir(self) -> Path | None:
+        """Directory holding this tracker's state files (None = in-memory).
+
+        The pipeline derives sibling state paths from it (shadow ledger,
+        monitor override flag) so all cooldown state lives together.
+        """
+        return None
+
 
 class InMemoryBankrollTracker(BankrollTracker):
     """Backtest-mode tracker. No disk I/O. Bootstraps with ``initial_bankroll``.
@@ -216,6 +238,17 @@ class InMemoryBankrollTracker(BankrollTracker):
     def cooldown_remaining(self) -> int:
         return self._cooldown
 
+    def reset_peak_baseline(self, start_at: int) -> None:
+        current = self.current_bankroll()
+        self._entries.clear()
+        self._entries.append(_Entry(
+            start_at=int(start_at), bankroll=float(current), event="peak_reseed",
+        ))
+        self._seeded = True
+        # Release means "accept the current level as the new baseline" under
+        # BOTH peak modes: the absolute ratchet restarts from here too.
+        self._absolute_peak = float(current)
+
 
 class PersistedBankrollTracker(InMemoryBankrollTracker):
     """Dry/live-mode tracker. Persists change-events to JSONL + pause state to JSON.
@@ -254,11 +287,18 @@ class PersistedBankrollTracker(InMemoryBankrollTracker):
                     if not line:
                         continue
                     obj = json.loads(line)
-                    self._entries.append(_Entry(
+                    entry = _Entry(
                         start_at=int(obj["start_at"]),
                         bankroll=float(obj["bankroll"]),
                         event=str(obj.get("event", "settlement")),
-                    ))
+                    )
+                    if entry.event == "peak_reseed":
+                        # Reseed barrier (suspension release): history before
+                        # this point must not re-enter the peak window on
+                        # restart — the release collapsed the baseline.
+                        self._entries.clear()
+                        self._absolute_peak = entry.bankroll
+                    self._entries.append(entry)
                 if self._entries:
                     self._seeded = True
                     self._prune()
@@ -313,6 +353,17 @@ class PersistedBankrollTracker(InMemoryBankrollTracker):
     def set_paused(self, cooldown_rounds: int, triggered_at: int) -> None:
         super().set_paused(cooldown_rounds, triggered_at)
         self._persist_pause_state()
+
+    def reset_peak_baseline(self, start_at: int) -> None:
+        super().reset_peak_baseline(start_at)
+        # The 'peak_reseed' entry doubles as the load barrier (see
+        # _load_from_disk): everything before it in the history file is
+        # ignored on restart.
+        self._append_history(self._entries[-1])
+
+    @property
+    def persist_dir(self) -> Path | None:
+        return self._history_path.parent
 
     def tick_cooldown(self) -> None:
         was_paused = self._cooldown > 0
