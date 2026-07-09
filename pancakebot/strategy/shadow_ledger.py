@@ -153,7 +153,11 @@ class ShadowLedger:
         # live bot 5x on 2026-07-09.
         if round_t.position is None and not round_t.failed:
             return None
-        bet = self.pending.pop(epoch)
+        # Settle BEFORE mutating any ledger state: if the settle math raises
+        # (malformed round data, corrupt pending entry), the bet must remain
+        # pending in memory AND on disk so a retry is clean — pop-then-raise
+        # was the crash-loop-with-poisoned-state pattern (2026-07-09 review).
+        bet = self.pending[epoch]
         outcome = settle_bet_against_closed_round(
             bet_bnb=float(bet["size_bnb"]),
             bet_side=str(bet["side"]),
@@ -161,6 +165,7 @@ class ShadowLedger:
             treasury_fee_fraction=treasury_fee_fraction,
         )
         pnl = float(outcome.credit_bnb) - float(bet["size_bnb"]) - float(bet_gas_bnb)
+        self.pending.pop(epoch)
         self.cum_pnl += pnl
         self.n_settled += 1
         if outcome.outcome == "win":
