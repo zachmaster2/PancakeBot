@@ -53,7 +53,7 @@ from pancakebot.chain.rpc_poller import (
 )
 from pancakebot import timing_constants as _tc
 from pancakebot.runtime.regime_telemetry import RollingP99Monitor
-from pancakebot.types import Round
+from pancakebot.types import Bet, Round
 from time import sleep as sleep_seconds
 
 # Padding for RPC alignment near chain transition boundaries. Used for:
@@ -75,6 +75,92 @@ _RPC_ALIGNMENT_PADDING_SECONDS = 5
 # OKX kline fetch RTT against OKX_KLINE_FETCH_RTT_P99_MS — a stale-LOW
 # constant silently lets the dynamic-wake walk-back fire too late.
 # Telemetry only; reset for tests via _reset_regime_monitors().
+def build_shadow_settlement_round(rd, *, now_ts: int, buffer_seconds: int) -> Round | None:
+    """Build a SETTLEABLE Round from on-chain rounds() data (shadow feed).
+
+    Pure function (unit-testable without RPC). Returns None when the round
+    is not yet final — the pending shadow bet stays in the ledger and is
+    retried next cycle. Three outcomes:
+
+      - oracle_called: winner from lockPrice vs closePrice (equal -> "House",
+        both sides lose — matches contract semantics), final pools carried
+        as a synthetic two-Bet pair (settlement derives pools from bets).
+      - never oracle-called and well past close (10x buffer): the round was
+        cancelled on-chain -> failed=True (settlement refunds the stake,
+        matching the contract's refundable path).
+      - otherwise: None (not final yet).
+    """
+    if rd.oracle_called:
+        if rd.close_price_usd > rd.lock_price_usd:
+            position = "Bull"
+        elif rd.close_price_usd < rd.lock_price_usd:
+            position = "Bear"
+        else:
+            position = "House"
+        failed = False
+    elif rd.close_ts > 0 and now_ts > rd.close_ts + 10 * buffer_seconds:
+        position = None
+        failed = True
+    else:
+        return None
+    # Only sides with a positive amount: a zero-amount Bet would raise
+    # bet_amount_wei_nonpositive inside settlement's pool computation
+    # (review blocker, 2026-07-09). A missing side simply yields a 0 pool;
+    # the impact-aware settlement math handles one-sided rounds correctly
+    # (panel-verified: reproduces the contract's real one-sided payouts).
+    bets = tuple(
+        Bet(wallet_address=f"0xshadow-{side.lower()}", amount_wei=amount,
+            position=side, created_at=int(rd.start_ts))
+        for side, amount in (
+            ("Bull", int(rd.bull_amount_wei)),
+            ("Bear", int(rd.bear_amount_wei)),
+        )
+        if amount > 0
+    )
+    return Round(
+        epoch=int(rd.epoch), start_at=int(rd.start_ts), lock_at=int(rd.lock_ts),
+        lock_price=float(rd.lock_price_usd), close_price=float(rd.close_price_usd),
+        position=position, failed=failed, bets=bets,
+    )
+
+
+def fetch_pending_shadow_rounds(
+    *,
+    contract,
+    pipeline,
+    locked_epoch: int,
+    now_ts: int,
+    buffer_seconds: int,
+    max_fetches: int = 2,
+) -> list[Round]:
+    """Shadow settlement feed (2026-07-09): real Rounds for pending epochs.
+
+    Pending shadow bets need REAL outcomes (winner + final pools) — the
+    engine's routine settle path only carries epoch-tracking stubs, which
+    the shadow ledger ignores. Fetch on-chain rounds() for pending epochs
+    (authoritative: oracle prices, final pool amounts, oracleCalled
+    finality), bounded per cycle; unfetchable epochs simply stay pending
+    and retry next round. Runs on the round-transition path, minutes from
+    the critical path — not latency-sensitive. Extracted module-level so
+    the wiring is unit-testable with a fake contract (review major,
+    2026-07-09: untested engine wiring is how the stub crash shipped).
+    """
+    out: list[Round] = []
+    pending = getattr(pipeline, "pending_shadow_epochs", ())
+    for ep in [e for e in pending if e <= locked_epoch - 1][:max_fetches]:
+        try:
+            rd = contract.round_data(int(ep))
+        except TransientRpcError as e:
+            warn("ALERT", f"shadow settle fetch failed epoch={ep}: {e}")
+            continue
+        sr = build_shadow_settlement_round(
+            rd, now_ts=now_ts, buffer_seconds=buffer_seconds,
+        )
+        if sr is not None:
+            out.append(sr)
+    return out
+
+
 def _build_okx_kline_rtt_monitor() -> RollingP99Monitor:
     return RollingP99Monitor(
         name="okx_kline_rtt_p99",
@@ -560,7 +646,15 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
                 lock_price=None, close_price=None,
                 position=None, failed=False, bets=(),
             )
-            closed.strategy_pipeline.settle_closed_rounds(rounds=[_settled_stub])
+            _settle_batch: list[Round] = [_settled_stub]
+            _settle_batch.extend(fetch_pending_shadow_rounds(
+                contract=cfg.contract,
+                pipeline=closed.strategy_pipeline,
+                locked_epoch=locked_epoch,
+                now_ts=int(_utc_now()),
+                buffer_seconds=int(cfg.buffer_seconds),
+            ))
+            closed.strategy_pipeline.settle_closed_rounds(rounds=_settle_batch)
 
         # Step 4: lock_ts from the handshake (immutable on-chain value).
         if _open_round.lock_at is None:

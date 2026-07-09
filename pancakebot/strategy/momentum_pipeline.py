@@ -243,6 +243,15 @@ class MomentumOnlyPipeline:
         self._bankroll_tracker = tracker
         self._wire_cooldown_state()
 
+    @property
+    def pending_shadow_epochs(self) -> tuple[int, ...]:
+        """Epochs with unsettled shadow bets (engine fetches real round data
+        for these so they can settle — the routine settle path only carries
+        epoch-tracking stubs)."""
+        if self._shadow is None or not self._shadow.active:
+            return ()
+        return tuple(sorted(self._shadow.pending.keys()))
+
     def _wire_cooldown_state(self) -> None:
         """(Re)derive shadow-ledger + override-flag paths from the tracker."""
         tracker = self._bankroll_tracker

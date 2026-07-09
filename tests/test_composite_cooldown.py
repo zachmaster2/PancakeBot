@@ -280,6 +280,221 @@ def test_shadow_persistence_roundtrip(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Shadow settlement feed (engine round_data -> settleable Round)
+# ---------------------------------------------------------------------------
+
+def _round_data(**kw):
+    from pancakebot.chain.prediction_contract import RoundData
+    base = dict(epoch=700, start_ts=1_790_000_000, lock_ts=1_790_000_300,
+                close_ts=1_790_000_600, lock_price_usd=600.0,
+                close_price_usd=601.0, bull_amount_wei=int(4.0 * BNB_WEI),
+                bear_amount_wei=int(6.0 * BNB_WEI), oracle_called=True)
+    base.update(kw)
+    return RoundData(**base)
+
+
+def test_build_settlement_round_winner_derivation():
+    from pancakebot.runtime.engine import build_shadow_settlement_round
+    now = 1_790_001_000
+    assert build_shadow_settlement_round(
+        _round_data(close_price_usd=601.0), now_ts=now, buffer_seconds=30,
+    ).position == "Bull"
+    assert build_shadow_settlement_round(
+        _round_data(close_price_usd=599.0), now_ts=now, buffer_seconds=30,
+    ).position == "Bear"
+    house = build_shadow_settlement_round(
+        _round_data(close_price_usd=600.0), now_ts=now, buffer_seconds=30,
+    )
+    assert house.position == "House" and house.failed is False
+
+
+def test_build_settlement_round_not_final_and_cancelled():
+    from pancakebot.runtime.engine import build_shadow_settlement_round
+    # Not oracle-called, shortly after close -> not final yet (retry later).
+    assert build_shadow_settlement_round(
+        _round_data(oracle_called=False),
+        now_ts=1_790_000_700, buffer_seconds=30,
+    ) is None
+    # Not oracle-called, WAY past close (>10x buffer) -> cancelled/refund.
+    cancelled = build_shadow_settlement_round(
+        _round_data(oracle_called=False),
+        now_ts=1_790_000_600 + 301, buffer_seconds=30,
+    )
+    assert cancelled is not None and cancelled.failed is True
+    assert cancelled.position is None
+
+
+def test_shadow_settles_against_built_round_exact_math():
+    """End-to-end: pending shadow bet settles against the engine-built Round
+    with pools carried from on-chain amounts (impact-aware math)."""
+    from pancakebot.runtime.engine import build_shadow_settlement_round
+    sl = ShadowLedger(path=None)
+    sl.start(bankroll=1.889, start_at=1_790_000_000)
+    sl.record_fire(epoch=700, side="Bear", size_bnb=0.0945)
+
+    built = build_shadow_settlement_round(
+        _round_data(close_price_usd=599.0),   # Bear wins
+        now_ts=1_790_001_000, buffer_seconds=30,
+    )
+    pnl = sl.settle_round(
+        round_t=built, treasury_fee_fraction=_FEE,
+        bet_gas_bnb=MAX_GAS_COST_BET_BNB,
+    )
+    # pools 4 bull / 6 bear + our 0.0945 bear;
+    # credit = 0.0945 * (10.0945*0.97/6.0945) - claim_gas
+    expected_credit = 0.0945 * (10.0945 * (1 - _FEE) / 6.0945) - MAX_GAS_COST_CLAIM_BNB
+    assert pnl == pytest.approx(expected_credit - 0.0945 - MAX_GAS_COST_BET_BNB, abs=1e-9)
+    assert sl.n_settled == 1 and sl.n_wins == 1
+
+    # Cancelled round -> refund semantics (stake back minus gas).
+    sl.record_fire(epoch=701, side="Bull", size_bnb=0.05)
+    cancelled = build_shadow_settlement_round(
+        _round_data(epoch=701, oracle_called=False),
+        now_ts=1_790_000_600 + 400, buffer_seconds=30,
+    )
+    pnl2 = sl.settle_round(
+        round_t=cancelled, treasury_fee_fraction=_FEE,
+        bet_gas_bnb=MAX_GAS_COST_BET_BNB,
+    )
+    assert pnl2 == pytest.approx(
+        (0.05 - MAX_GAS_COST_CLAIM_BNB) - 0.05 - MAX_GAS_COST_BET_BNB, abs=1e-9)
+
+
+def test_build_settlement_round_one_sided_pool_no_zero_bets():
+    """Review BLOCKER (2026-07-09): a zero on-chain side must not produce a
+    zero-amount synthetic Bet (settlement raises bet_amount_wei_nonpositive
+    on those). One-sided rounds settle via the impact-aware math."""
+    from pancakebot.runtime.engine import build_shadow_settlement_round
+    built = build_shadow_settlement_round(
+        _round_data(bear_amount_wei=0, close_price_usd=599.0),  # Bear wins
+        now_ts=1_790_001_000, buffer_seconds=30,
+    )
+    assert len(built.bets) == 1 and built.bets[0].position == "Bull"
+
+    # Shadow bet on the EMPTY winning side: we'd have been the entire
+    # winning pool -> payout = (bull + our stake) * (1-fee) / our stake.
+    sl = ShadowLedger(path=None)
+    sl.start(bankroll=2.0, start_at=1_790_000_000)
+    sl.record_fire(epoch=700, side="Bear", size_bnb=0.0945)
+    pnl = sl.settle_round(
+        round_t=built, treasury_fee_fraction=_FEE,
+        bet_gas_bnb=MAX_GAS_COST_BET_BNB,
+    )
+    expected_credit = 0.0945 * ((4.0 + 0.0945) * (1 - _FEE) / 0.0945) - MAX_GAS_COST_CLAIM_BNB
+    assert pnl == pytest.approx(
+        expected_credit - 0.0945 - MAX_GAS_COST_BET_BNB, abs=1e-9)
+    # House win with a zero side settles as a plain loss (no crash).
+    sl.record_fire(epoch=701, side="Bull", size_bnb=0.05)
+    house = build_shadow_settlement_round(
+        _round_data(epoch=701, bull_amount_wei=0, close_price_usd=600.0),
+        now_ts=1_790_001_000, buffer_seconds=30,
+    )
+    pnl2 = sl.settle_round(
+        round_t=house, treasury_fee_fraction=_FEE,
+        bet_gas_bnb=MAX_GAS_COST_BET_BNB,
+    )
+    assert pnl2 == pytest.approx(-0.05 - MAX_GAS_COST_BET_BNB, abs=1e-12)
+
+
+def test_settle_round_atomic_on_settle_failure():
+    """Review MAJOR: a raise inside the settle math must leave the pending
+    bet intact in memory AND on disk (settle-then-pop ordering)."""
+    from pancakebot.util import InvariantError as IE
+    sl = ShadowLedger(path=None)
+    sl.start(bankroll=2.0, start_at=1_790_000_000)
+    sl.record_fire(epoch=750, side="Bear", size_bnb=0.05)
+    # A Round that passes the settleability guard but fails settle math
+    # (position set, but a zero-amount bet in the pool list).
+    bad = Round(
+        epoch=750, start_at=1_790_000_000, lock_at=1_790_000_300,
+        lock_price=600.0, close_price=599.0, position="Bear", failed=False,
+        bets=(Bet(wallet_address="0x0", amount_wei=0, position="Bull",
+                  created_at=1_790_000_010),),
+    )
+    with pytest.raises(IE):
+        sl.settle_round(round_t=bad, treasury_fee_fraction=_FEE,
+                        bet_gas_bnb=MAX_GAS_COST_BET_BNB)
+    assert 750 in sl.pending, "failed settle must not consume the bet"
+    assert sl.n_settled == 0 and sl.cum_pnl == 0.0
+
+
+class _FakeContract:
+    """round_data stand-in for the engine wiring tests."""
+
+    def __init__(self, data: dict, fail_epochs: set | None = None):
+        self.data = data
+        self.fail_epochs = fail_epochs or set()
+        self.calls: list[int] = []
+
+    def round_data(self, epoch: int):
+        self.calls.append(int(epoch))
+        if epoch in self.fail_epochs:
+            from pancakebot.util import TransientRpcError
+            raise TransientRpcError(f"fake rpc fail epoch={epoch}")
+        return self.data[int(epoch)]
+
+
+def test_engine_wiring_fetch_pending_shadow_rounds():
+    """Review MAJOR: drive the REAL engine wiring (filter, bound, RPC-fail
+    continue) with a fake contract + a real pipeline holding pending bets."""
+    from pancakebot.runtime.engine import fetch_pending_shadow_rounds
+    gate = MagicMock()
+    gate.evaluate.return_value = _firing_gate_result()
+    sc = _strategy({"cooldown_rounds": 10, "extend_while_bleeding": True})
+    tracker = InMemoryBankrollTracker(initial_bankroll=2.3, drawdown_peak_window_days=7)
+    pipe = _pipeline(gate, sc, tracker)
+    t0 = 1_790_000_000
+    _drive_to_breaker(pipe, tracker, t0)
+    # Three shadow fires -> three pending epochs.
+    for i, ep in enumerate((900, 901, 902)):
+        pipe.decide_open_round(
+            round_t=_open_round(ep, t0 + (3 + i) * _ROUND_SECONDS),
+            pool_bull_bnb=5.0, pool_bear_bnb=5.0,
+        )
+    assert pipe.pending_shadow_epochs == (900, 901, 902)
+
+    contract = _FakeContract(
+        data={ep: _round_data(epoch=ep, close_price_usd=599.0)
+              for ep in (900, 901, 902)},
+        fail_epochs={900},
+    )
+    # locked_epoch=902 -> only epochs <= 901 fetchable; 902 excluded.
+    rounds = fetch_pending_shadow_rounds(
+        contract=contract, pipeline=pipe, locked_epoch=902,
+        now_ts=t0 + 10 * _ROUND_SECONDS, buffer_seconds=30,
+    )
+    assert contract.calls == [900, 901], "filter + [:2] bound + order"
+    assert [r.epoch for r in rounds] == [901], "RPC-fail epoch skipped"
+
+    # Settle through the pipeline: 901 drains; 900 (failed fetch) and 902
+    # (not yet closed) stay pending.
+    stub = Round(epoch=901, start_at=0, lock_at=None, lock_price=None,
+                 close_price=None, position=None, failed=False, bets=())
+    pipe.settle_closed_rounds(rounds=[stub] + rounds)
+    assert pipe.pending_shadow_epochs == (900, 902)
+
+
+def test_pending_shadow_epochs_property():
+    gate = MagicMock()
+    gate.evaluate.return_value = _firing_gate_result()
+    sc = _strategy({"cooldown_rounds": 5, "extend_while_bleeding": True})
+    tracker = InMemoryBankrollTracker(initial_bankroll=2.3, drawdown_peak_window_days=7)
+    pipe = _pipeline(gate, sc, tracker)
+    assert pipe.pending_shadow_epochs == ()
+    t0 = 1_790_000_000
+    _drive_to_breaker(pipe, tracker, t0)
+    pipe.decide_open_round(
+        round_t=_open_round(801, t0 + 3 * _ROUND_SECONDS),
+        pool_bull_bnb=5.0, pool_bear_bnb=5.0,
+    )
+    assert pipe.pending_shadow_epochs == (801,)
+    # Settle via a real round -> pending drains.
+    pipe.settle_closed_rounds(rounds=[
+        _closed_round(801, winner="Bull", start_at=t0 + 3 * _ROUND_SECONDS)])
+    assert pipe.pending_shadow_epochs == ()
+
+
+# ---------------------------------------------------------------------------
 # Tracker reseed units
 # ---------------------------------------------------------------------------
 
