@@ -144,9 +144,16 @@ class ShadowLedger:
         if not self.active:
             return None
         epoch = int(round_t.epoch)
-        bet = self.pending.pop(epoch, None)
-        if bet is None:
+        if epoch not in self.pending:
             return None
+        # Settleability guard: the live engine passes epoch-tracking STUB
+        # rounds (position=None, bets=()) through settle_closed_rounds; a
+        # stub is not an outcome. Leave the bet pending (do NOT pop) until a
+        # real closed round arrives — popping-then-raising here crashed the
+        # live bot 5x on 2026-07-09.
+        if round_t.position is None and not round_t.failed:
+            return None
+        bet = self.pending.pop(epoch)
         outcome = settle_bet_against_closed_round(
             bet_bnb=float(bet["size_bnb"]),
             bet_side=str(bet["side"]),
