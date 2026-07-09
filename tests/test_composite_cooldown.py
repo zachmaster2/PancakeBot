@@ -156,6 +156,32 @@ def test_shadow_settle_win_and_loss_math():
     ) is None
 
 
+def test_shadow_settle_ignores_engine_stub_rounds():
+    """The live engine passes epoch-tracking STUBS (position=None, bets=())
+    to settle_closed_rounds. A stub must neither crash nor consume the
+    pending bet — regression for the 2026-07-09 live crash (5 restarts,
+    InvariantError settle_round_not_closed)."""
+    sl = ShadowLedger(path=None)
+    sl.start(bankroll=2.0, start_at=1_790_000_000)
+    sl.record_fire(epoch=600, side="Bear", size_bnb=0.09)
+
+    stub = Round(epoch=600, start_at=0, lock_at=None, lock_price=None,
+                 close_price=None, position=None, failed=False, bets=())
+    assert sl.settle_round(
+        round_t=stub, treasury_fee_fraction=_FEE,
+        bet_gas_bnb=MAX_GAS_COST_BET_BNB,
+    ) is None
+    assert 600 in sl.pending, "stub must not consume the pending bet"
+
+    # The real closed round settles it normally afterwards.
+    pnl = sl.settle_round(
+        round_t=_closed_round(600, winner="Bear"),
+        treasury_fee_fraction=_FEE, bet_gas_bnb=MAX_GAS_COST_BET_BNB,
+    )
+    assert pnl is not None and pnl > 0
+    assert sl.n_settled == 1
+
+
 def test_shadow_release_decision_table():
     t0 = 1_790_000_000
     sl = ShadowLedger(path=None)
