@@ -24,12 +24,21 @@ enable/disable + override-flag writes).
 Unattended-safety (2026-07-17/18 hardening):
   * evidence gate: positive actions require BOTH a clean sync exit AND
     fresh data (newest lock <= 36h old — a stalled indexer can exit 0
-    without advancing the stores). Blind weeks (either check failing)
+    without advancing the stores). Blind runs (either check failing)
     block enable/release, freeze the weekly counters, and alert loudly;
     the protective disable may still act on last-synced data.
-  * blindness escalation: after 3 consecutive blind weeks with the bot
-    enabled or running, the monitor disables it — never bet for months
-    while the evaluator cannot see performance.
+  * daily retries (2026-07-18): a blind applied run writes an atomic
+    retry_pending marker; cron fires DAILY and the wrapper runs Mon-Sat
+    only while a marker exists. A recovered retry is keyed to the MISSED
+    Sunday (Sundays are the last ISO day — calendar keying would steal
+    the next Sunday's state advance), runs the full evaluation (triggers
+    included), clears the marker, and reports "recovered after N failed
+    attempts". Blind retries alert one line each. The next Sunday
+    supersedes any unresolved marker.
+  * blindness escalation: sync_fail_streak counts FULLY-blind ISO weeks
+    (Sunday + every retry failed); at 3 — counting the currently-blind
+    attempt — with the bot enabled or running, the monitor disables it.
+    Never bet for months while the evaluator cannot see performance.
   * systemctl not answering blocks ALL actions with a ❌ alert (a
     failed `is-enabled` read must not masquerade as "already safe").
   * enable failure removes the just-written override flag (no 8-day
@@ -324,6 +333,72 @@ def _iso_week_key(day: str) -> str:
     return f"{y}-W{w:02d}"
 
 
+RETRY_MARKER_PATH = ROOT / "retry_pending.json"
+
+
+def _load_retry_marker(path: Path | None = None) -> dict | None:
+    """Read the pending-retry marker; a corrupt or malformed marker is
+    deleted and treated as absent (garbage must not wedge the daily gate)."""
+    p = path if path is not None else RETRY_MARKER_PATH
+    if not p.exists():
+        return None
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            raise ValueError("marker not a dict")
+        _date_key(str(doc["sunday_key"]))
+        doc["attempts"] = int(doc.get("attempts", 1))
+        return doc
+    except (OSError, ValueError, TypeError, KeyError,
+            json.JSONDecodeError, argparse.ArgumentTypeError):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return None
+
+
+def _write_retry_marker(*, sunday_key: str, attempts: int, reason: str,
+                        path: Path | None = None) -> None:
+    """Atomic (tmp+rename): the wrapper's daily existence check and a
+    concurrent manual run must never see a torn marker."""
+    p = path if path is not None else RETRY_MARKER_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(dict(
+        ts=time.time(), sunday_key=sunday_key, attempts=int(attempts),
+        reason=reason), indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _clear_retry_marker(path: Path | None = None) -> None:
+    p = path if path is not None else RETRY_MARKER_PATH
+    try:
+        p.unlink()
+    except OSError:
+        pass
+
+
+def _resolve_run_context(week: str, marker: dict | None) -> tuple[str, bool, bool]:
+    """Return (effective_week, retry_mode, completed_blind_week).
+
+    Mon-Sat with a pending marker = makeup attempt for that blind Sunday.
+    The run is keyed to the MISSED Sunday: Sundays are the LAST ISO day,
+    so the retry days after a blind Sunday fall in the NEXT ISO week —
+    keying a recovery by calendar date would consume the FOLLOWING
+    Sunday's once-per-ISO-week state advance. A Sunday run that finds a
+    marker from a previous Sunday means that whole week stayed blind
+    (Sunday + every retry failed): report it, supersede the marker.
+    """
+    import datetime as _dt
+    dow = _dt.date.fromisoformat(week).isoweekday()
+    if marker is None:
+        return week, False, False
+    if dow == 7:
+        return week, False, str(marker.get("sunday_key")) != week
+    return str(marker["sunday_key"]), True, False
+
+
 def write_override_flag(*, week: str, reason: str, p1: dict) -> Path:
     """Write the cooldown-override flag the pipeline consumes on its next
     paused round (fresh <= 8 days; `_consume_override_flag`). Atomic
@@ -351,6 +426,13 @@ def _main() -> int:
     args = ap.parse_args()
 
     week = args.iso_week or time.strftime("%Y-%m-%d", time.gmtime())
+    marker = _load_retry_marker()
+    week, retry_mode, completed_blind_week = _resolve_run_context(week, marker)
+    attempts_so_far = int(marker["attempts"]) if retry_mode else 0
+    if args.apply and marker is not None and not retry_mode:
+        # Sunday supersedes any pending retry (same-day rerun or a fully
+        # blind previous week — completed_blind_week reports the latter).
+        _clear_retry_marker()
     out_dir = ROOT / week
     out_dir.mkdir(parents=True, exist_ok=True)
     st = load_state()
@@ -391,18 +473,33 @@ def _main() -> int:
               f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(max_lock))}Z "
               "— positive actions blocked", flush=True)
 
-    # Blindness streak: consecutive sync-attempted weeks without fresh
-    # evidence. Persisted immediately (the weekly advance below is
-    # deliberately frozen on blind weeks, so this needs its own write) and
-    # escalated to a protective disable at SYNC_FAIL_DISABLE_STREAK — an
-    # enabled bot must not keep betting for months while the monitor is
-    # blind to how it is doing.
+    # Blindness streak: consecutive FULLY-blind ISO weeks (Sunday + every
+    # daily retry failed — detected by the next Sunday superseding an
+    # unresolved marker). Any fresh evidence resets it. Persisted
+    # immediately (the weekly advance below is deliberately frozen on
+    # blind runs, so this needs its own write); the disable check adds
+    # the currently-blind attempt so escalation timing matches the old
+    # per-Sunday counting.
     streak = int(st.get("sync_fail_streak", 0))
-    if not args.no_sync:
-        streak = 0 if evidence_ok else streak + 1
-        if streak != int(st.get("sync_fail_streak", 0)):
+    if args.apply and not args.no_sync:
+        new_streak = 0 if evidence_ok else (
+            streak + 1 if completed_blind_week else streak)
+        if new_streak != streak:
+            streak = new_streak
             st["sync_fail_streak"] = streak
             save_state(st)
+
+    # Retry marker lifecycle: a blind applied run (Sunday OR retry day)
+    # arms/extends daily retries; fresh evidence on a retry clears them.
+    # Dry runs never touch the marker.
+    if args.apply and not args.no_sync:
+        if evidence_ok:
+            if retry_mode:
+                _clear_retry_marker()
+        else:
+            _write_retry_marker(
+                sunday_key=week, attempts=attempts_so_far + 1,
+                reason="sync_failed" if not sync_ok else "data_stale")
 
     def window(days):
         cut = max_lock - days * 86400
@@ -467,9 +564,13 @@ def _main() -> int:
         # week — do not let a wedged systemd read as "already safe".
         action = "systemctl_UNAVAILABLE"
         reason = f"systemctl did not respond ({state['active']}) — no action possible"
-    elif streak >= SYNC_FAIL_DISABLE_STREAK and (state["is_enabled"] or state["is_running"]):
-        reason = (f"FLYING BLIND: {streak} consecutive weeks without fresh "
-                  "evidence — protective disable")
+    elif (streak + (0 if evidence_ok else 1)) >= SYNC_FAIL_DISABLE_STREAK \
+            and (state["is_enabled"] or state["is_running"]):
+        # streak counts COMPLETED fully-blind weeks; the current blind
+        # attempt adds one so the 3rd consecutive blind week disables on
+        # its Sunday, not a week later.
+        reason = (f"FLYING BLIND: {streak} completed blind weeks + current "
+                  "blind attempt — protective disable")
         if args.apply:
             action = "disable"
             acted = do_disable()
@@ -558,6 +659,8 @@ def _main() -> int:
                       consecutive_weak=consec),
         bot_state=state, in_cooldown=in_cooldown, sync_ok=sync_ok,
         data_fresh=data_fresh, sync_fail_streak=streak,
+        retry_mode=retry_mode, retry_attempts=attempts_so_far,
+        completed_blind_week=completed_blind_week,
         action=action, reason=reason, acted=acted,
         applied=args.apply)
     (out_dir / "decision.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
@@ -575,15 +678,29 @@ def _main() -> int:
 
     # ---- alert (fires on EVERY completed run — the dead-man's switch) ----
     head = f"[weekly-monitor {week}] action={action}"
+    if not args.apply:
+        head = f"[DRY RUN] {head}"
+    if retry_mode and evidence_ok:
+        head += f" — recovered after {attempts_so_far} failed attempt(s)"
     if not evidence_ok:
         what = "SYNC FAILED" if not sync_ok else "DATA STALE"
-        head = f"⚠️ {what} — stale-data evaluation; retrying next week\n{head}"
+        head = (f"⚠️ {what} — stale-data evaluation; will retry daily "
+                f"until Sunday\n{head}")
+    if completed_blind_week:
+        head += "\n(previous week ended fully blind — Sunday and every retry failed)"
     body = (f"1w: n={p1.get('n')} WR={p1.get('wr')} p={p1.get('p_upper')} "
             f"btPnL={bt.get('net_pnl_bnb')}; 2w(info): WR={p2.get('wr')} "
             f"p={p2.get('p_upper')}; neg={neg_trigger} consec_weak={consec} "
             f"blind_streak={streak}; enabled={state.get('is_enabled')} "
             f"running={state.get('is_running')} in_cooldown={in_cooldown}")
-    if action in ("enable", "disable", "cooldown_override", "restart_dead_unit"):
+    if retry_mode and not evidence_ok and action == "none":
+        # Daily retry still blind, nothing actionable: one line, no spam.
+        delivered = discord(
+            f"⚠️ [weekly-monitor retry] week {week} still blind (attempt "
+            f"{attempts_so_far + 1}: "
+            f"{'sync failed' if not sync_ok else 'data stale'}) — retrying "
+            "daily; next full run Sunday")
+    elif action in ("enable", "disable", "cooldown_override", "restart_dead_unit"):
         delivered = discord(f"⚠️ {head} — STATE CHANGED\n{reason}\n{acted}\n{body}")
     elif action.endswith("_FAILED") or action == "systemctl_UNAVAILABLE":
         delivered = discord(f"❌ {head} — ACTION FAILED / DEGRADED\n{reason}\n{acted}\n{body}")

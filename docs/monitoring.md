@@ -29,8 +29,17 @@ install needs (cronie first: minimal AlmaLinux images may lack it):
 ```bash
 dnf install -y cronie && systemctl enable --now crond
 ( crontab -l 2>/dev/null | grep -v run_weekly_monitor ; \
-  echo '0 6 * * 0 /root/pancakebot/bootstrap/linux/run_weekly_monitor.sh >/dev/null 2>&1' ) | crontab -
+  echo '0 6 * * * /root/pancakebot/bootstrap/linux/run_weekly_monitor.sh >/dev/null 2>&1' ) | crontab -
 ```
+
+The cron fires **daily**; the wrapper gates the work: Sundays run in full,
+Mon–Sat are silent no-ops unless a `retry_pending` marker exists — a blind
+Sunday (sync failure or stale data) arms daily makeup attempts until one
+recovers or the next Sunday supersedes it. A recovered attempt is keyed to
+the missed Sunday (Sundays are the last ISO day, so calendar keying would
+consume the following week's state advance), runs the full evaluation —
+triggers included, any day of the week — and reports "recovered after N
+failed attempts".
 
 The crontab line deliberately carries no logfile redirect: cron's shell
 opens redirects before the command runs, so a redirect into the gitignored
@@ -68,13 +77,15 @@ that either it is working or they would know. Concretely:
   CRASHED / STOPPED / SUPPRESSED_FAST_CRASHLOOP — additionally fire via
   `pancakebot-notify@` on the live-alerts webhook (live-validated
   2026-07-09/12).
-* **Blind weeks self-heal, and blindness cannot persist silently**: a
-  failed/hung sync or stale data (newest lock > 36 h — a stalled indexer
-  can "succeed" without new data) blocks that week's positive actions,
-  alerts loudly, freezes the weekly counters, and retries next Sunday.
-  Data stores are append-only; a missed week back-fills automatically.
-  After 3 consecutive blind weeks with the bot enabled, the monitor
-  disables it — it never bets for months unevaluated.
+* **Blind Sundays retry daily and cannot persist silently**: a failed/hung
+  sync or stale data (newest lock > 36 h — a stalled indexer can "succeed"
+  without new data) blocks positive actions, alerts loudly, and arms daily
+  makeup attempts (one-line ⚠️ per failed day — the spam is itself a
+  heartbeat). A week counts as blind only if Sunday AND every retry
+  through Saturday failed. Data stores are append-only; recovery
+  back-fills automatically. After 3 consecutive fully-blind weeks with
+  the bot enabled, the monitor disables it — it never bets for months
+  unevaluated.
 * **Unit-state drift heals weekly**: an enabled-but-dead unit is restarted
   (⚠️ alert); a running-but-disabled unit is covered by the disable path.
   To deliberately stop the bot, DISABLE it — that is the operator signal

@@ -103,9 +103,12 @@ only for the go-live validation ladder below.
 ```bash
 dnf install -y cronie && systemctl enable --now crond   # minimal images may lack it
 ( crontab -l 2>/dev/null | grep -v run_weekly_monitor ; \
-  echo '0 6 * * 0 /root/pancakebot/bootstrap/linux/run_weekly_monitor.sh >/dev/null 2>&1' ) | crontab -
+  echo '0 6 * * * /root/pancakebot/bootstrap/linux/run_weekly_monitor.sh >/dev/null 2>&1' ) | crontab -
 crontab -l   # verify
 ```
+Daily cron, weekly work: the wrapper runs Sundays in full and Mon–Sat only
+while a blind Sunday's `retry_pending` marker exists (daily makeup
+attempts; see docs/monitoring.md).
 No logfile redirect in the crontab line — the wrapper owns its logging
 (see docs/monitoring.md, which also covers triggers, alert semantics, and
 the walk-away contract). End-to-end smoke test any day:
