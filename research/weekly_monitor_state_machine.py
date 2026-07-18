@@ -6,15 +6,43 @@ state machine:
 
   * AUTO-DISABLE (protect capital) is fully autonomous — the negative
     trigger stops+disables the live unit with `--apply` alone.
-  * AUTO-ENABLE (2026-07-09 user decision): the positive trigger acts
-    under `--apply` alone — raw p<0.10 on the trailing-1-week window,
-    single test, no multiple-comparison gate. If the bot is enabled but
-    breaker-suspended, the positive trigger instead writes the cooldown
-    override flag that the pipeline consumes to release the suspension.
+  * AUTO-ENABLE (2026-07-09 user decision, re-affirmed 2026-07-17): the
+    positive trigger acts under `--apply` alone — raw p<0.10 on the
+    trailing-1-week window, single test, no multiple-comparison gate.
+    When the bot is DISABLED and its persisted pause state shows an
+    active suspension, enabling ALSO writes the cooldown override flag
+    first, so the restarted bot releases on its very first paused round
+    (one-shot re-enable; without the flag it would boot into the stale
+    suspension and need a second consecutive positive Sunday). If the
+    bot is enabled but breaker-suspended, the positive trigger writes
+    the override flag alone.
 
 Default is DRY-RUN: it computes + reports the decision and writes the
 artifact but touches NOTHING. Pass `--apply` to let it act (systemd
 enable/disable + override-flag writes).
+
+Unattended-safety (2026-07-17/18 hardening):
+  * evidence gate: positive actions require BOTH a clean sync exit AND
+    fresh data (newest lock <= 36h old — a stalled indexer can exit 0
+    without advancing the stores). Blind weeks (either check failing)
+    block enable/release, freeze the weekly counters, and alert loudly;
+    the protective disable may still act on last-synced data.
+  * blindness escalation: after 3 consecutive blind weeks with the bot
+    enabled or running, the monitor disables it — never bet for months
+    while the evaluator cannot see performance.
+  * systemctl not answering blocks ALL actions with a ❌ alert (a
+    failed `is-enabled` read must not masquerade as "already safe").
+  * enable failure removes the just-written override flag (no 8-day
+    release grenade for a later manual `systemctl start` to consume)
+    and alerts ❌; an enabled-but-dead unit is restarted weekly with a
+    ⚠️ alert (operators who want it stopped must DISABLE it).
+  * dry runs (no --apply) never advance weekly state and never touch
+    systemd — pure previews. State advances at most once per ISO week.
+  * every completed run VERIFIES Discord delivery (HTTP < 400, retry);
+    undelivered -> rc=3 so the cron wrapper curls a fallback. Any crash
+    Discords a ❌ CRASHED alert with the traceback tail and exits
+    nonzero. A Sunday with NO message therefore means the box, cron, or
+    webhook itself is dead — nothing else fails silently.
 
 Steps each run:
   1. sync (`run.py --sync`) unless --no-sync
@@ -24,9 +52,9 @@ Steps each run:
   5. read live bot state (systemctl), decide action, act iff permitted
   6. Discord alert (state change or weekly summary) + artifact + persistent state
 
-Idempotent: one artifact dir per ISO week; a second run in the same week
-re-computes but does not double-advance the consecutive-weak counter or
-re-fire a state change already recorded this week.
+Idempotent: artifact dirs are per-day, but weekly STATE advances once per
+ISO week — a re-run any day of the same ISO week re-computes and re-reports
+without double-advancing the consecutive-weak counter.
 
 Triggers (pinned; 2026-07-09 redesign — 1-WEEK window only, per user decision):
   POSITIVE:  on the trailing-1w window: WR > BREAKEVEN(0.55) AND raw
@@ -161,6 +189,12 @@ def perm(bets, n_iter=N_PERM, seed=SEED):
 # standard backtest (risk breaker OFF) on a window -> gas-inclusive net PnL
 # --------------------------------------------------------------------------
 
+BACKTEST_TIMEOUT_S = 1800   # a hung backtest must not eat the weekly slot
+SYNC_TIMEOUT_S = 3600       # observed healthy sync ~14 min; 60 min = hung
+FRESH_MAX_AGE_S = 36 * 3600  # newest lock older than this = stale evidence
+SYNC_FAIL_DISABLE_STREAK = 3  # blind weeks in a row before protective disable
+
+
 def risk_off_backtest(epoch_start: int, epoch_end: int, out_dir: Path,
                       bankroll: float = 5.0) -> dict:
     section = None
@@ -187,8 +221,12 @@ def risk_off_backtest(epoch_start: int, epoch_end: int, out_dir: Path,
         lines.append(line)
     cfg = out_dir / "risk_off_config.toml"
     cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    r = subprocess.run([sys.executable, str(REPO / "run.py"), "--backtest",
-                        "--config", str(cfg)], cwd=REPO, capture_output=True, text=True)
+    try:
+        r = subprocess.run([sys.executable, str(REPO / "run.py"), "--backtest",
+                            "--config", str(cfg)], cwd=REPO, capture_output=True,
+                           text=True, timeout=BACKTEST_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return dict(error=f"backtest timed out after {BACKTEST_TIMEOUT_S}s")
     if r.returncode != 0:
         return dict(error=r.stderr[-800:])
     summ = json.loads((REPO / "var" / "backtest" / "summary.json").read_text(encoding="utf-8"))
@@ -216,9 +254,9 @@ def read_bot_state() -> dict:
                 is_running=(ac == "active"), is_enabled=(en == "enabled"))
 
 
-def do_enable() -> str:
+def do_enable() -> tuple[bool, str]:
     rc, out = _systemctl("enable", "--now", LIVE_UNIT)
-    return f"enable --now rc={rc}: {out}"
+    return rc == 0, f"enable --now rc={rc}: {out}"
 
 
 def do_disable() -> str:
@@ -231,15 +269,24 @@ def do_disable() -> str:
 # Discord (best-effort)
 # --------------------------------------------------------------------------
 
-def discord(msg: str) -> None:
+def discord(msg: str) -> bool:
+    """Post + VERIFY delivery (HTTP < 400). Returns False on any failure so
+    the caller can exit nonzero and the cron wrapper can fire its own
+    fallback — an undelivered weekly alert must never look like success."""
     url = os.environ.get("PANCAKEBOT_GENERAL_DISCORD_WEBHOOK_URL", "")
     if not url:
-        return
-    try:
-        import requests
-        requests.post(url, json={"content": msg[:1900]}, timeout=10)
-    except Exception:
-        pass
+        return False
+    for attempt in (1, 2):
+        try:
+            import requests
+            r = requests.post(url, json={"content": msg[:1900]}, timeout=10)
+            if r.status_code < 400:
+                return True
+        except Exception:
+            pass
+        if attempt == 1:
+            time.sleep(5)
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -257,27 +304,105 @@ def save_state(st: dict) -> None:
     STATE_PATH.write_text(json.dumps(st, indent=2), encoding="utf-8")
 
 
+def _date_key(s: str) -> str:
+    """argparse validator: the week key is a YYYY-MM-DD date (despite the
+    legacy --iso-week flag name), fed to _iso_week_key for idempotency."""
+    import datetime as _dt
+    try:
+        _dt.date.fromisoformat(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {s!r}")
+    return s
+
+
+def _iso_week_key(day: str) -> str:
+    """'2026-07-19' -> '2026-W29'. Same-week idempotency compares ISO weeks
+    (a mid-week manual re-run must not double-advance the weak counter, per
+    the module docstring; the raw date comparison only caught same-DAY)."""
+    import datetime as _dt
+    y, w, _ = _dt.date.fromisoformat(day).isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def write_override_flag(*, week: str, reason: str, p1: dict) -> Path:
+    """Write the cooldown-override flag the pipeline consumes on its next
+    paused round (fresh <= 8 days; `_consume_override_flag`). Atomic
+    tmp+rename: the running bot's reader DELETES the flag on a parse error,
+    so a torn write would silently discard the release."""
+    flag = REPO / "var" / "live" / "cooldown_override.json"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    tmp = flag.with_suffix(flag.suffix + ".tmp")
+    tmp.write_text(json.dumps(dict(
+        ts=time.time(), week=week, reason=reason,
+        window_1w=dict(wr=p1.get("wr"), p_upper=p1.get("p_upper"),
+                       n=p1.get("n")),
+    ), indent=2), encoding="utf-8")
+    tmp.replace(flag)
+    return flag
+
+
 # --------------------------------------------------------------------------
-def main() -> int:
+def _main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="actually act on systemd (else dry-run)")
     ap.add_argument("--no-sync", action="store_true", help="skip run.py --sync")
-    ap.add_argument("--iso-week", type=str, default=None, help="override week key (testing)")
+    ap.add_argument("--iso-week", type=_date_key, default=None,
+                    help="override the week key with a YYYY-MM-DD date (testing)")
     args = ap.parse_args()
 
     week = args.iso_week or time.strftime("%Y-%m-%d", time.gmtime())
     out_dir = ROOT / week
     out_dir.mkdir(parents=True, exist_ok=True)
     st = load_state()
-    same_week_rerun = (st.get("last_week") == week)
+    last_week = st.get("last_week")
+    same_week_rerun = (
+        last_week is not None
+        and _iso_week_key(last_week) == _iso_week_key(week))
 
+    sync_ok = True
     if not args.no_sync:
         print("--- sync ---", flush=True)
-        subprocess.run([sys.executable, str(REPO / "run.py"), "--sync"], cwd=REPO)
+        try:
+            r = subprocess.run([sys.executable, str(REPO / "run.py"), "--sync"],
+                               cwd=REPO, timeout=SYNC_TIMEOUT_S)
+            sync_ok = (r.returncode == 0)
+        except subprocess.TimeoutExpired:
+            sync_ok = False
+        if not sync_ok:
+            print("!!! sync FAILED — evaluating on last-synced data; "
+                  "positive actions blocked this week", flush=True)
 
     print("--- canonical bet stream ---", flush=True)
     bets = build_canonical_bets()
+    if not bets:
+        # Unusable stores (empty/corrupt). Raise -> the crash handler
+        # Discords it; silence is never an outcome.
+        raise RuntimeError("canonical bet stream is EMPTY — data stores unusable")
     max_lock = max(b["lock"] for b in bets)
+
+    # Evidence gate (2026-07-18): a zero exit from sync is not enough — a
+    # stalled indexer can exit 0 without advancing the stores, and --no-sync
+    # skips it entirely. Positive actions additionally require the newest
+    # lock to be recent, else this week's "evidence" is last week's data.
+    data_fresh = (time.time() - max_lock) <= FRESH_MAX_AGE_S
+    evidence_ok = sync_ok and data_fresh
+    if not data_fresh:
+        print("!!! data STALE: newest lock "
+              f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(max_lock))}Z "
+              "— positive actions blocked", flush=True)
+
+    # Blindness streak: consecutive sync-attempted weeks without fresh
+    # evidence. Persisted immediately (the weekly advance below is
+    # deliberately frozen on blind weeks, so this needs its own write) and
+    # escalated to a protective disable at SYNC_FAIL_DISABLE_STREAK — an
+    # enabled bot must not keep betting for months while the monitor is
+    # blind to how it is doing.
+    streak = int(st.get("sync_fail_streak", 0))
+    if not args.no_sync:
+        streak = 0 if evidence_ok else streak + 1
+        if streak != int(st.get("sync_fail_streak", 0)):
+            st["sync_fail_streak"] = streak
+            save_state(st)
 
     def window(days):
         cut = max_lock - days * 86400
@@ -309,9 +434,12 @@ def main() -> int:
     weak_this_week = bool(
         p1.get("insufficient")
         or (p1.get("p_upper") is not None and p1["p_upper"] > NEG_WEAK_P))
-    # advance the consecutive-weak counter only once per week
+    # advance the consecutive-weak counter only once per week, and never on
+    # a blind week (stale data says nothing about THIS week; the stored
+    # value still feeds the negative trigger below). Persistence is
+    # additionally gated on --apply — dry runs preview, never advance.
     consec = st.get("consecutive_weak", 0)
-    if not same_week_rerun:
+    if not same_week_rerun and evidence_ok:
         consec = consec + 1 if weak_this_week else 0
     neg_wr_leg = bool(
         not p1.get("insufficient") and p1.get("wr") is not None
@@ -329,40 +457,94 @@ def main() -> int:
         in_cooldown = False
 
     # ---- decide action ----
+    # Fail-safe asymmetry on blind weeks (failed sync / stale data): the
+    # protective disable may act on last-synced data, but a positive
+    # trigger on stale evidence must never enable/release.
     action, reason, acted = "none", "", ""
-    if neg_trigger and state["is_enabled"]:
-        action = "disable"
+    if not state["available"]:
+        # systemctl itself did not answer: NO action is trustworthy (a
+        # "disabled" read here is just the error string). Scream, act next
+        # week — do not let a wedged systemd read as "already safe".
+        action = "systemctl_UNAVAILABLE"
+        reason = f"systemctl did not respond ({state['active']}) — no action possible"
+    elif streak >= SYNC_FAIL_DISABLE_STREAK and (state["is_enabled"] or state["is_running"]):
+        reason = (f"FLYING BLIND: {streak} consecutive weeks without fresh "
+                  "evidence — protective disable")
+        if args.apply:
+            action = "disable"
+            acted = do_disable()
+        else:
+            action = "disable_DRYRUN"
+    elif neg_trigger and (state["is_enabled"] or state["is_running"]):
+        # is_running covers a running-but-disabled unit (manual start
+        # without enable): do_disable() stops it either way.
         reason = (f"NEGATIVE: 1w WR={p1.get('wr')} (<{NEG_WR_1W}: {neg_wr_leg}) "
                   f"or consecutive_weak={consec}>={NEG_CONSECUTIVE_WEAK}")
         if args.apply:
+            action = "disable"
             acted = do_disable()
+        else:
+            action = "disable_DRYRUN"
     elif pos_trigger and not state["is_enabled"]:
-        action = "enable"
         reason = (f"POSITIVE (1w): WR={p1.get('wr')}>{BREAKEVEN_WR}, "
                   f"p={p1.get('p_upper')}<{POS_RAW_P}, n={p1.get('n')}>="
                   f"{POS_MIN_FIRES}, btPnL={bt.get('net_pnl_bnb')}>0")
-        if args.apply:
-            acted = do_enable()
+        if not evidence_ok:
+            action = "enable_BLOCKED_stale_evidence"
+            reason += " — sync failed or data stale; refusing to enable"
+        elif args.apply:
+            action = "enable"
+            # One-shot re-enable (2026-07-17): if the bot went down mid-
+            # suspension, write the override flag BEFORE starting it so the
+            # first paused round releases (unpause + peak reseed + shadow
+            # clear) instead of resuming a months-stale `bleeding` ledger
+            # that would extend until a second positive Sunday.
+            flag = None
+            if in_cooldown:
+                flag = write_override_flag(week=week, reason=reason, p1=p1)
+                acted = f"wrote {flag}; "
+            ok, msg = do_enable()
+            acted += msg
+            if not ok:
+                # A failed enable must not leave an 8-day release grenade:
+                # any later manual `systemctl start` would consume the flag
+                # and bet without an enable decision.
+                action = "enable_FAILED"
+                if flag is not None:
+                    try:
+                        flag.unlink()
+                        acted += " (override flag removed)"
+                    except OSError:
+                        acted += " (override flag REMOVAL FAILED — delete var/live/cooldown_override.json manually)"
         else:
             action = "enable_DRYRUN"
     elif pos_trigger and state["is_enabled"] and in_cooldown:
         # Bot is enabled but breaker-suspended: release via the override
         # flag, which the pipeline consumes on its next paused round
         # (ignores extend-while-bleeding by design).
-        action = "cooldown_override"
         reason = "POSITIVE (1w) while breaker-suspended -> override flag"
-        if args.apply:
-            flag = REPO / "var" / "live" / "cooldown_override.json"
-            flag.parent.mkdir(parents=True, exist_ok=True)
-            flag.write_text(json.dumps(dict(
-                ts=time.time(), week=week,
-                reason=reason,
-                window_1w=dict(wr=p1.get("wr"), p_upper=p1.get("p_upper"),
-                               n=p1.get("n")),
-            ), indent=2), encoding="utf-8")
-            acted = f"wrote {flag}"
+        if not evidence_ok:
+            action = "cooldown_override_BLOCKED_stale_evidence"
+            reason += " — sync failed or data stale; refusing to release"
+        elif args.apply:
+            action = "cooldown_override"
+            acted = f"wrote {write_override_flag(week=week, reason=reason, p1=p1)}"
         else:
             action = "cooldown_override_DRYRUN"
+    elif state["is_enabled"] and not state["is_running"]:
+        # Reconcile enabled-but-dead (start-limit-hit residue, manual stop
+        # without disable): weekly restart + alert — otherwise a dead bot
+        # reads as healthy in every summary for months. Operators who WANT
+        # it stopped must disable it (that is what enabled means here).
+        reason = "unit enabled but not running — starting it"
+        if args.apply:
+            action = "restart_dead_unit"
+            rc, out = _systemctl("start", LIVE_UNIT)
+            acted = f"start rc={rc}: {out}"
+            if rc != 0:
+                action = "restart_dead_unit_FAILED"
+        else:
+            action = "restart_dead_unit_DRYRUN"
 
     decision = dict(
         week=week, run_at_utc=time.strftime("%Y-%m-%d %H:%M", time.gmtime()),
@@ -374,13 +556,15 @@ def main() -> int:
                       raw_best_p=round(raw_best_p, 5),
                       sidak_p_informational=round(sidak_p, 5),
                       consecutive_weak=consec),
-        bot_state=state, in_cooldown=in_cooldown,
+        bot_state=state, in_cooldown=in_cooldown, sync_ok=sync_ok,
+        data_fresh=data_fresh, sync_fail_streak=streak,
         action=action, reason=reason, acted=acted,
         applied=args.apply)
     (out_dir / "decision.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
 
-    # ---- persist state (once per week) ----
-    if not same_week_rerun:
+    # ---- persist state (once per ISO week; only real, fresh, applied
+    # runs count — dry runs preview without advancing, blind weeks retry) --
+    if args.apply and evidence_ok and not same_week_rerun:
         st["consecutive_weak"] = consec
         st["last_week"] = week
         st["last_action"] = action
@@ -389,22 +573,50 @@ def main() -> int:
                  sidak=round(sidak_p, 4)))
         save_state(st)
 
-    # ---- alert ----
+    # ---- alert (fires on EVERY completed run — the dead-man's switch) ----
     head = f"[weekly-monitor {week}] action={action}"
+    if not evidence_ok:
+        what = "SYNC FAILED" if not sync_ok else "DATA STALE"
+        head = f"⚠️ {what} — stale-data evaluation; retrying next week\n{head}"
     body = (f"1w: n={p1.get('n')} WR={p1.get('wr')} p={p1.get('p_upper')} "
             f"btPnL={bt.get('net_pnl_bnb')}; 2w(info): WR={p2.get('wr')} "
-            f"p={p2.get('p_upper')}; neg={neg_trigger} consec_weak={consec}; "
-            f"enabled={state.get('is_enabled')} in_cooldown={in_cooldown}")
-    if action in ("enable", "disable", "cooldown_override"):
-        discord(f"⚠️ {head} — STATE CHANGED\n{reason}\n{acted}\n{body}")
+            f"p={p2.get('p_upper')}; neg={neg_trigger} consec_weak={consec} "
+            f"blind_streak={streak}; enabled={state.get('is_enabled')} "
+            f"running={state.get('is_running')} in_cooldown={in_cooldown}")
+    if action in ("enable", "disable", "cooldown_override", "restart_dead_unit"):
+        delivered = discord(f"⚠️ {head} — STATE CHANGED\n{reason}\n{acted}\n{body}")
+    elif action.endswith("_FAILED") or action == "systemctl_UNAVAILABLE":
+        delivered = discord(f"❌ {head} — ACTION FAILED / DEGRADED\n{reason}\n{acted}\n{body}")
     else:
-        discord(f"{head}\n{reason or 'neutral / no-op'}\n{body}")
+        delivered = discord(f"{head}\n{reason or 'neutral / no-op'}\n{body}")
 
     print("\n=== WEEKLY MONITOR DECISION ===")
     print(head); print(reason or "neutral / no-op"); print(body)
     print(f"(applied={args.apply})")
     print(f"artifacts -> {out_dir}")
+    if not delivered:
+        # Evaluation completed but the alert did not land: exit 3 so the
+        # wrapper attempts its curl fallback; if Discord itself is down,
+        # cron.log carries the explanation and next week retries.
+        print("!!! Discord delivery FAILED (rc=3)", file=sys.stderr)
+        return 3
     return 0
+
+
+def main() -> int:
+    """Crash containment: any unhandled exception still produces a Discord
+    alert (the walk-away contract: a silent Sunday can only mean the box,
+    cron, or webhook is dead — never a swallowed error)."""
+    try:
+        return _main()
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        discord("❌ [weekly-monitor] CRASHED mid-run — an action may already "
+                "have been taken (check the decision artifact + systemctl "
+                f"state); will retry next Sunday\n```{tb[-1200:]}```")
+        return 1
 
 
 if __name__ == "__main__":

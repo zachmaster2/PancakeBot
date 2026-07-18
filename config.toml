@@ -139,8 +139,8 @@ drawdown_peak_window_days = 7                        # rolling window for peak c
 drawdown_peak_mode = "rolling_7d"      # peak-tracking semantics; alt: "absolute_ratchet" (monotonic since-launch peak)
 # Absolute per-bet BNB caps (formerly under btc_primary.sizing / eth_sol_fallback.sizing).
 # 2026-06-30 new-VM deploy: capped to 0.1 BNB (small-stake live-validation
-# ceiling; min floor is min_bet_threshold_bnb=0.01). Real 0.01-0.1 sizing is
-# gated by min_bet_only in [live] (still true = contract-min ~0.001 until the
-# operator flips it after min-bet live validation).
+# ceiling; min floor is min_bet_threshold_bnb=0.01). Whether real 0.01-0.1
+# sizing applies is gated by min_bet_only in [live] (see its comment; a new
+# VM bring-up sets it true for the ladder's min-bet step, then restores false).
 max_bet_bnb_btc_primary = 0.1          # hard cap on BTC primary stake (deploy: 0.1)
 max_bet_bnb_eth_sol_fallback = 0.1     # hard cap on ETH+SOL regime-2 stake (deploy: 0.1)
