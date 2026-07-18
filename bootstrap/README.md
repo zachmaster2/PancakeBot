@@ -24,6 +24,9 @@ bootstrap/
     systemd/           tracked units: pancakebot-{live,dry}.service +
                        pancakebot-notify@.service (cp'd by install.sh STEP 5)
     install_python313.sh  pyenv build of 3.13 (additive; system py untouched)
+    run_weekly_monitor.sh weekly-monitor cron wrapper (flock, log cap,
+                       curl failure fallback; crontab recipe in
+                       docs/new_vm_install_checklist.md step 13)
 ```
 
 **Source of truth = GitHub** (`github.com/zachmaster2/PancakeBot`). The VM
@@ -91,8 +94,11 @@ drop-in (`/etc/chrony.d/pancakebot.conf`) bounding clock-step detection to
 
 Push to GitHub from any dev clone, then on the VM: `git -C /root/pancakebot
 pull` and restart the unit manually when greenlit (`systemctl restart
-pancakebot-{live,dry}`). The weekly monitor (research/weekly_monitor_state_machine.py)
-can also pull + evaluate + toggle the bot on a schedule.
+pancakebot-{live,dry}`). Deploys are always manual pulls — the weekly
+monitor cron (`linux/run_weekly_monitor.sh`, installed per
+docs/new_vm_install_checklist.md step 13) evaluates + toggles the bot but
+never pulls code; an unattended VM runs the last deliberately deployed
+commit. Triggers + alert contract: docs/monitoring.md.
 
 ## Validate
 

@@ -74,8 +74,10 @@ Installs python3.13 + venv + systemd units (DISABLED) + chrony drop-in.
 .venv/bin/python bootstrap/common/config_check.py
 ```
 (config.toml + .env + webhook presence; no mutation.) Confirm the deploy
-sizing: `max_bet_bnb_*` = 0.1 ceiling, `min_bet_only = true` (contract-min
-~0.001 BNB bets until you deliberately flip it after min-bet live validation).
+sizing: `max_bet_bnb_*` = 0.1 ceiling. NOTE the committed `min_bet_only`
+default is `false` (real 0.01–0.1 sizing, flipped 2026-07-01 after the
+first ladder run) — for a NEW VM bring-up set it to `true` locally before
+Step B of the ladder and restore `false` at Step C.
 
 ## 10. Sync data  **[impl]**
 ```bash
@@ -92,11 +94,32 @@ Confirm normal round cadence + no ALERTs (VM-tuned 250ms RPC timeouts are
 fine on a real datacenter link). Then `systemctl stop pancakebot-dry`.
 
 ## 12. Live stays DISABLED  **[by design]**
-Do **NOT** `systemctl enable pancakebot-live` at install. The bot only goes
-live when the weekly monitor's positive trigger clears the **strict**
-(Šidák-corrected) gate AND is explicitly armed, or you enable it by hand
-after a confirmed edge. As of 2026-06-30 the recent signal was RULED OUT
-(noise), so the correct state is DISABLED.
+Do **NOT** `systemctl enable pancakebot-live` at install. The weekly
+monitor (step 13) is the sole authority: its positive trigger auto-enables
+under `--apply`, its negative trigger auto-disables. Manual enabling is
+only for the go-live validation ladder below.
+
+## 13. Weekly monitor cron  **[impl]**
+```bash
+dnf install -y cronie && systemctl enable --now crond   # minimal images may lack it
+( crontab -l 2>/dev/null | grep -v run_weekly_monitor ; \
+  echo '0 6 * * 0 /root/pancakebot/bootstrap/linux/run_weekly_monitor.sh >/dev/null 2>&1' ) | crontab -
+crontab -l   # verify
+```
+No logfile redirect in the crontab line — the wrapper owns its logging
+(see docs/monitoring.md, which also covers triggers, alert semantics, and
+the walk-away contract). End-to-end smoke test any day:
+`bash bootstrap/linux/run_weekly_monitor.sh --dry` (full compute +
+Discord message, zero mutation).
+
+## 14. Unattended security updates  **[impl]**
+```bash
+dnf install -y dnf-automatic
+sed -i 's/^upgrade_type.*/upgrade_type = security/; s/^apply_updates.*/apply_updates = yes/' /etc/dnf/automatic.conf
+systemctl enable --now dnf-automatic.timer
+```
+Security-only, applies in place, `reboot = never` (the shipped default —
+leave it) — the running bot and the pyenv-built python are unaffected.
 
 ## Go-live validation ladder (user-decided 2026-06-30)
 
@@ -104,8 +127,9 @@ The bot goes live per the loose Option-A trigger, but via an incremental
 ladder that validates the execution path with trivial money before scaling.
 **No separate sizing config is needed** — the `min_bet_only` knob in `[live]`
 is the purpose-built mechanism (it clamps every on-chain bet to the contract
-minimum, ~0.001 BNB; verified at engine.py:1200, live-only, strategy logic
-unaffected). Current committed default is `min_bet_only = true`.
+minimum, ~0.001 BNB; live-only, strategy logic unaffected). The committed
+default is `min_bet_only = false` (real sizing) — set it `true` locally for
+Steps A–B of a fresh bring-up.
 
 **Step A — dry, ~3–4h (≥40–50 rounds).**
 ```bash
@@ -115,7 +139,7 @@ journalctl -u pancakebot-dry -f
 Confirm: no crashes, no ALERT storms, normal SKIP patterns, on-schedule
 timing, telemetry populates. Any anomaly → stop + investigate. Clean → Step B.
 
-**Step B — live at contract-min (`min_bet_only = true`, the default).**
+**Step B — live at contract-min (set `min_bet_only = true` locally first; see step 9).**
 ```bash
 systemctl start pancakebot-live      # Conflicts= stops dry automatically
 journalctl -u pancakebot-live -f
@@ -127,19 +151,13 @@ confirm→settle→claim path. Any anomaly (LATE, gas-cap breach, POOL UNCOVERED
 ANCHOR STALE, balance drift) → stop + investigate.
 
 **Step C — normal sizing (0.01–0.1 BNB).** After ≥1 clean full round at Step B:
-flip `min_bet_only = false` in `config.toml` (the `max_bet_bnb_*` = 0.1 ceiling
-and `min_bet_threshold_bnb` = 0.01 floor are already committed). Commit + push,
-`git pull` on the VM, `systemctl restart pancakebot-live`. The weekly monitor
-then becomes the recurring evaluator (+ protective auto-disable).
+restore `min_bet_only = false` (the committed default; the `max_bet_bnb_*` =
+0.1 ceiling and `min_bet_threshold_bnb` = 0.01 floor are already committed),
+`systemctl restart pancakebot-live`. The weekly monitor then becomes the
+recurring evaluator (autonomous enable AND disable).
 
 ## After install — weekly monitor
-```bash
-# dry (report only, touches nothing):
-.venv/bin/python research/weekly_monitor_state_machine.py
-# live actions (auto-disable allowed; auto-enable still needs --arm + strict gate):
-.venv/bin/python research/weekly_monitor_state_machine.py --apply
-```
-Schedule via systemd timer or cron (weekly). It syncs, evaluates the 2w/1w
-windows, and toggles the live unit under the fail-safe rules
-(auto-disable autonomous; auto-enable gated on corrected significance +
-`--arm`).
+Installed as cron in step 13; both directions are autonomous under
+`--apply` (negative → disable, positive → enable + release). Manual dry
+runs (`.venv/bin/python research/weekly_monitor_state_machine.py`, no
+`--apply`) report without acting and never double-advance weekly state.
