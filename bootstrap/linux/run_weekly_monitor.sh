@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # Weekly monitor cron wrapper — the only thing the VM's crontab calls:
 #
-#   0 6 * * 0  /root/pancakebot/bootstrap/linux/run_weekly_monitor.sh >/dev/null 2>&1
+#   0 6 * * *  /root/pancakebot/bootstrap/linux/run_weekly_monitor.sh >/dev/null 2>&1
+#
+# DAILY cron, weekly work: Sundays run in full; Mon-Sat are no-ops UNLESS
+# a retry_pending marker exists (written by a blind applied run — sync
+# failure or stale data), in which case the day is a full makeup attempt
+# for the blind Sunday. Recovery clears the marker; the next Sunday
+# supersedes it. A failed Sunday thus costs at most one day of blindness
+# per recovery opportunity, not a full week.
 #
 # The crontab line carries NO logfile redirect on purpose: cron's shell
 # opens redirects BEFORE the command runs, so a redirect into the
@@ -70,6 +77,16 @@ else
 fi
 
 echo "=== $(date -u +%FT%TZ) weekly monitor run ($*) ==="
+
+# Daily-cron gate: Mon-Sat only run while a retry is pending. `--dry`
+# (manual smoke) always runs. Sunday (dow 7) always runs.
+if [ "${1:-}" != "--dry" ]; then
+    dow=$(date -u +%u)
+    if [ "$dow" != "7" ] && [ ! -f "$LOGDIR/retry_pending.json" ]; then
+        echo "no-op (dow=$dow, no retry pending)"
+        exit 0
+    fi
+fi
 
 # Overlap guard: a hung previous run must not interleave with this one
 # (the monitor has its own sync/backtest timeouts, so a held lock means
