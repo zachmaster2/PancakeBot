@@ -23,8 +23,10 @@ enable/disable + override-flag writes).
 
 Unattended-safety (2026-07-17/18 hardening):
   * evidence gate: positive actions require BOTH a clean sync exit AND
-    fresh data (newest lock <= 36h old — a stalled indexer can exit 0
-    without advancing the stores). Blind runs (either check failing)
+    fresh data (newest closed ROUND <= 36h old — a stalled indexer can
+    exit 0 without advancing the stores; the newest FIRE is deliberately
+    not the yardstick, it lags days in normal signal droughts). Blind
+    runs (either check failing)
     block enable/release, freeze the weekly counters, and alert loudly;
     the protective disable may still act on last-synced data.
   * daily retries (2026-07-18): a blind applied run writes an atomic
@@ -129,9 +131,15 @@ SEED = 20260630
 # --------------------------------------------------------------------------
 
 def build_canonical_bets():
+    """Return (bets, newest_round_lock). Freshness must be judged from the
+    newest closed ROUND in the store — the newest FIRE can lag days behind
+    during normal signal droughts (~1-2% fire rate) and tripped the
+    2026-07-19 Sunday run as a false DATA STALE."""
     rounds = [r for r in ipr._load_all_rounds(use_extended_data=False)
               if r.position in ("Bull", "Bear")]
     rounds.sort(key=lambda r: r.epoch)
+    newest_round_lock = max(
+        (int(r.lock_at) for r in rounds if r.lock_at is not None), default=0)
     max_lb = max(LOOKBACKS)
     sliced = {}
     for sym, path in (("btc", ipr._BTC_KLINES_PATH), ("eth", ipr._ETH_KLINES_PATH),
@@ -173,7 +181,7 @@ def build_canonical_bets():
                          outcome_bull=outcome_bull, payout_bull=tot * (1 - FEE) / fb,
                          payout_bear=tot * (1 - FEE) / fbe, win=win,
                          pnl=(pay - 1.0) if win else -1.0))
-    return bets
+    return bets, newest_round_lock
 
 
 def perm(bets, n_iter=N_PERM, seed=SEED):
@@ -200,7 +208,7 @@ def perm(bets, n_iter=N_PERM, seed=SEED):
 
 BACKTEST_TIMEOUT_S = 1800   # a hung backtest must not eat the weekly slot
 SYNC_TIMEOUT_S = 3600       # observed healthy sync ~14 min; 60 min = hung
-FRESH_MAX_AGE_S = 36 * 3600  # newest lock older than this = stale evidence
+FRESH_MAX_AGE_S = 36 * 3600  # newest closed ROUND older than this = stale
 SYNC_FAIL_DISABLE_STREAK = 3  # blind weeks in a row before protective disable
 
 
@@ -455,22 +463,24 @@ def _main() -> int:
                   "positive actions blocked this week", flush=True)
 
     print("--- canonical bet stream ---", flush=True)
-    bets = build_canonical_bets()
+    bets, newest_round_lock = build_canonical_bets()
     if not bets:
         # Unusable stores (empty/corrupt). Raise -> the crash handler
         # Discords it; silence is never an outcome.
         raise RuntimeError("canonical bet stream is EMPTY — data stores unusable")
     max_lock = max(b["lock"] for b in bets)
 
-    # Evidence gate (2026-07-18): a zero exit from sync is not enough — a
-    # stalled indexer can exit 0 without advancing the stores, and --no-sync
-    # skips it entirely. Positive actions additionally require the newest
-    # lock to be recent, else this week's "evidence" is last week's data.
-    data_fresh = (time.time() - max_lock) <= FRESH_MAX_AGE_S
+    # Evidence gate (2026-07-18, fixed 2026-07-19): a zero exit from sync
+    # is not enough — a stalled indexer can exit 0 without advancing the
+    # stores, and --no-sync skips it entirely. Freshness is judged from the
+    # newest closed ROUND in the store; the newest FIRE (max_lock, which
+    # keys the evaluation windows) lags days behind in normal signal
+    # droughts and must not trip this gate.
+    data_fresh = (time.time() - newest_round_lock) <= FRESH_MAX_AGE_S
     evidence_ok = sync_ok and data_fresh
     if not data_fresh:
-        print("!!! data STALE: newest lock "
-              f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(max_lock))}Z "
+        print("!!! data STALE: newest closed round lock "
+              f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(newest_round_lock))}Z "
               "— positive actions blocked", flush=True)
 
     # Blindness streak: consecutive FULLY-blind ISO weeks (Sunday + every
@@ -649,7 +659,9 @@ def _main() -> int:
 
     decision = dict(
         week=week, run_at_utc=time.strftime("%Y-%m-%d %H:%M", time.gmtime()),
-        data_newest_lock=time.strftime("%Y-%m-%d %H:%M", time.gmtime(max_lock)),
+        data_newest_lock=time.strftime(
+            "%Y-%m-%d %H:%M", time.gmtime(newest_round_lock)),
+        newest_fire_lock=time.strftime("%Y-%m-%d %H:%M", time.gmtime(max_lock)),
         window_1w=dict(epochs=list(e1), **p1, backtest=bt),
         window_2w=p2, latest100_wr=wr100,
         triggers=dict(positive=pos_trigger, negative=neg_trigger,

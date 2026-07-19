@@ -78,8 +78,10 @@ that either it is working or they would know. Concretely:
   `pancakebot-notify@` on the live-alerts webhook (live-validated
   2026-07-09/12).
 * **Blind Sundays retry daily and cannot persist silently**: a failed/hung
-  sync or stale data (newest lock > 36 h — a stalled indexer can "succeed"
-  without new data) blocks positive actions, alerts loudly, and arms daily
+  sync or stale data (newest closed **round** > 36 h — a stalled indexer
+  can "succeed" without new data; the newest *fire* is not the yardstick,
+  it lags days in normal droughts) blocks positive actions, alerts loudly,
+  and arms daily
   makeup attempts (one-line ⚠️ per failed day — the spam is itself a
   heartbeat). A week counts as blind only if Sunday AND every retry
   through Saturday failed. Data stores are append-only; recovery
