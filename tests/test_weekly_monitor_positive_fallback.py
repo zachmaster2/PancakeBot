@@ -12,6 +12,9 @@ re-runs recompute the booking from the prior-week baseline — overwrite,
 never freeze or double-advance).
 """
 import importlib.util
+import json
+import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -75,15 +78,37 @@ def test_backtest_error_or_missing_fails_pnl_leg():
 
 def test_sufficient_1w_evaluates_1w_stats_not_2w():
     # A weak-but-evaluable 1w week must not borrow the strong 2w stats.
-    spent = wm.positive_window(WEAK_1W, GOOD_2W)
-    assert spent == "1w"
+    tw = wm.positive_window(WEAK_1W, GOOD_2W)
+    assert tw == "1w"
+    assert wm.spent_stats(tw, WEAK_1W, GOOD_2W) is WEAK_1W
     assert wm.evaluate_positive(WEAK_1W, BT_POS) is False
 
 
 def test_both_insufficient_cannot_fire():
-    # _main hands the (insufficient) 1w stats to the evaluator on "none";
-    # the not-insufficient leg keeps the trigger off.
-    assert wm.evaluate_positive(INSUF_1W, BT_POS) is False
+    tw = wm.positive_window(INSUF_1W, INSUF_2W)
+    assert tw == "none"
+    # contract: with no spendable window the evaluator is handed the 1w
+    # stats (insufficient) — the 2w stats are never bound to any leg
+    handed = wm.spent_stats(tw, INSUF_1W, INSUF_2W)
+    assert handed is INSUF_1W
+    assert wm.evaluate_positive(handed, BT_POS) is False
+
+
+def test_negative_wr_leg_follows_spent_window():
+    # The reviewer's starved-1w regime: 2w evaluable at WR=0.40 with
+    # 0.10 < p_upper <= 0.5 — not weak, but the WR floor must still bite.
+    losing_2w = dict(n=19, wr=0.40, obs_mean_pnl=-0.12, null_mean=0.0,
+                     p_upper=0.30)
+    assert wm.weak_week("2w_fallback", losing_2w) is False
+    assert wm.negative_wr_leg("2w_fallback", losing_2w) is True
+    # healthy spent windows do not trip it
+    assert wm.negative_wr_leg("2w_fallback", GOOD_2W) is False
+    assert wm.negative_wr_leg("1w", GOOD_1W) is False
+    assert wm.negative_wr_leg("1w", dict(GOOD_1W, wr=0.40)) is True
+    # strict inequality at the floor
+    assert wm.negative_wr_leg("1w", dict(GOOD_1W, wr=wm.NEG_WR_FLOOR)) is False
+    # no spendable window: the leg is unevaluable (weak-booking covers it)
+    assert wm.negative_wr_leg("none", INSUF_1W) is False
 
 
 def test_boundary_values_do_not_fire():
@@ -172,3 +197,131 @@ def test_booking_migration_default_covers_2026_08_16_state():
     # land consecutive_weak back at 0.
     st = {"consecutive_weak": 1}
     assert wm.book_weak_week(st, same_week_rerun=True, weak=False) == (0, 0)
+
+
+# ---- backtest window-identity guard ----------------------------------------
+
+def test_backtest_summary_window_mismatch_is_error(tmp_path, monkeypatch):
+    import types
+    repo = tmp_path / "repo"
+    (repo / "var" / "backtest").mkdir(parents=True)
+    (repo / "config.toml").write_text(
+        "[backtest]\ninitial_bankroll_bnb = 5.0\n# epoch_start = 0\n"
+        "# epoch_end = 0\n\n[strategy.risk]\n"
+        "max_drawdown_fraction_from_peak = 0.15\n"
+        "min_bankroll_bnb_to_bet = 0.5\ncooldown_rounds = 3\n",
+        encoding="utf-8")
+    monkeypatch.setattr(wm, "REPO", repo)
+    monkeypatch.setattr(wm, "subprocess", types.SimpleNamespace(
+        run=lambda *a, **k: types.SimpleNamespace(returncode=0, stderr=""),
+        TimeoutExpired=Exception))
+    (repo / "var" / "backtest" / "summary.json").write_text(json.dumps(dict(
+        first_epoch=100, last_epoch=118, net_pnl_bnb=0.41, num_bets=19,
+        win_rate=0.6842)), encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    assert wm.risk_off_backtest(100, 118, out) == dict(
+        net_pnl_bnb=0.41, num_bets=19, win_rate=0.6842,
+        gas_per_bet=wm.MAX_GAS_COST_BET_BNB)
+    # a summary left behind by another window's run must never stand in —
+    # the mismatch fails the PnL leg
+    stale = wm.risk_off_backtest(200, 250, out)
+    assert "window mismatch" in stale["error"]
+    assert wm.evaluate_positive(GOOD_2W, stale) is False
+
+
+# ---- end-to-end: fallback enable path through _main ------------------------
+
+def test_fallback_enable_path_end_to_end(tmp_path, monkeypatch):
+    """1w starved + strong 2w drives _main end-to-end: window selection ->
+    spent stats/backtest binding -> enable action + override flag ->
+    booking overwrite. The seeded state mimics the real 2026-08-16 Sunday
+    run (weak-booked consec=1, pre-baseline schema), so this also pins the
+    directed same-week re-run recomputing the booking 1 -> 0."""
+    root = tmp_path / "weekly_monitors"
+    repo = tmp_path / "repo"
+    (repo / "var" / "live").mkdir(parents=True)
+    (repo / "var" / "live" / "pause_state.json").write_text(
+        json.dumps({"paused": True}), encoding="utf-8")
+    root.mkdir(parents=True)
+    (root / "state.json").write_text(json.dumps(dict(
+        consecutive_weak=1, last_week="2026-08-16", last_action="none",
+        history=[dict(week="2026-08-16", action="none", wr_1w=None,
+                      p_1w=None, sidak=0.0563)])), encoding="utf-8")
+    monkeypatch.setattr(wm, "ROOT", root)
+    monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
+    monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
+    monkeypatch.setattr(wm, "REPO", repo)
+
+    now = time.time()
+    newest_fire = int(now - 3600)
+    bets = [dict(epoch=100 + i, lock=int(newest_fire - (8 + i * 0.4) * 86400),
+                 win=True) for i in range(13)]
+    bets += [dict(epoch=113 + i, lock=int(newest_fire - (5 - i) * 86400),
+                  win=True) for i in range(6)]
+    monkeypatch.setattr(wm, "build_canonical_bets",
+                        lambda: (bets, int(now - 1800)))
+
+    def fake_perm(w, n_iter=None, seed=None):
+        if len(w) < wm.POS_MIN_FIRES:
+            return dict(n=len(w), insufficient=True)
+        return dict(n=len(w), wr=0.6842, obs_mean_pnl=0.2442,
+                    null_mean=0.0, p_upper=0.0285)
+    monkeypatch.setattr(wm, "perm", fake_perm)
+
+    bt_calls = []
+
+    def fake_bt(epoch_start, epoch_end, out_dir, bankroll=5.0,
+                cfg_name="risk_off_config.toml"):
+        bt_calls.append((epoch_start, epoch_end, cfg_name))
+        if cfg_name == "risk_off_config_2w.toml":
+            return dict(net_pnl_bnb=0.41, num_bets=19, win_rate=0.6842,
+                        gas_per_bet=0.0006)
+        return dict(net_pnl_bnb=0.2693, num_bets=6, win_rate=0.8333,
+                    gas_per_bet=0.0006)
+    monkeypatch.setattr(wm, "risk_off_backtest", fake_bt)
+
+    monkeypatch.setattr(wm, "read_bot_state", lambda: dict(
+        available=True, active="inactive", enabled="disabled",
+        is_running=False, is_enabled=False))
+    monkeypatch.setattr(wm, "do_enable",
+                        lambda: (True, "enable --now rc=0: ok"))
+    messages = []
+    monkeypatch.setattr(wm, "discord",
+                        lambda msg: (messages.append(msg), True)[1])
+    monkeypatch.setattr(sys, "argv", [
+        "wm", "--apply", "--no-sync", "--iso-week", "2026-08-16"])
+
+    assert wm._main() == 0
+
+    decision = json.loads(
+        (root / "2026-08-16" / "decision.json").read_text(encoding="utf-8"))
+    assert decision["action"] == "enable"
+    assert decision["triggers"]["positive"] is True
+    assert decision["triggers"]["trigger_window"] == "2w_fallback"
+    assert decision["triggers"]["negative"] is False
+    assert decision["triggers"]["weak_this_week"] is False
+    assert decision["triggers"]["consecutive_weak"] == 0
+    assert decision["window_2w"]["backtest"]["net_pnl_bnb"] == 0.41
+
+    # binding: 1w backtest over the 1w fires, then the REAL 2w run
+    assert bt_calls == [(113, 118, "risk_off_config.toml"),
+                        (100, 118, "risk_off_config_2w.toml")]
+
+    st = json.loads((root / "state.json").read_text(encoding="utf-8"))
+    assert st["consecutive_weak"] == 0            # retroactive 1 -> 0
+    assert st["consecutive_weak_baseline"] == 0
+    assert st["last_week"] == "2026-08-16"
+    assert len(st["history"]) == 1                # replaced, not appended
+    assert st["history"][0]["action"] == "enable"
+    assert st["history"][0]["trigger_window"] == "2w_fallback"
+
+    flag = json.loads((repo / "var" / "live" / "cooldown_override.json")
+                      .read_text(encoding="utf-8"))
+    assert flag["trigger_window"] == "2w_fallback"
+    assert flag["window"]["wr"] == 0.6842
+
+    assert len(messages) == 1
+    assert "STATE CHANGED" in messages[0]
+    assert "1w: n=6<10 insufficient" in messages[0]
+    assert "2w(fallback SPENT)" in messages[0]

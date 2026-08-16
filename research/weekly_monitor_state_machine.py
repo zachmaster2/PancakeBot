@@ -89,12 +89,16 @@ decisions):
              cooldown override flag (var/live/cooldown_override.json),
              which the pipeline consumes to release the suspension
              immediately (ignoring extend-while-bleeding).
-  NEGATIVE:  WR leg on the trailing-1w window: WR < 0.45.  OR  3
-             consecutive weekly runs weak — weak is judged on the SPENT
-             positive window: an evaluable spent window with p_upper >
-             0.5, or both windows starved (n < 10 fires even across 14
-             days = a genuine fire collapse). A 1w-starved week with a
-             strong 2w window is NOT weak.
+  NEGATIVE:  WR leg on the SPENT positive window (the same window the
+             positive legs read — a starved-1w regime must not make the
+             WR floor unreachable while the 2w window shows a losing
+             edge): spent WR < 0.45 -> disable. With no spendable window
+             the WR leg is unevaluable; weak-booking covers total
+             starvation.  OR  3 consecutive weekly runs weak — weak is
+             judged on the SPENT positive window: an evaluable spent
+             window with p_upper > 0.5, or both windows starved (n < 10
+             fires even across 14 days = a genuine fire collapse). A
+             1w-starved week with a strong 2w window is NOT weak.
              Action: disable + stop entirely.
   The 2w permutation stats + latest-100 WR + Šidák are computed and
   reported every week; the 2w risk-off backtest runs only when the
@@ -138,7 +142,7 @@ CUTOFF, LOOKBACKS, FEE = 2, (3, 7, 15), 0.03
 BREAKEVEN_WR = 0.55
 POS_RAW_P = 0.10           # raw permutation p_upper, single test (user decision)
 POS_MIN_FIRES = 10         # per-WINDOW information floor; 1w starved -> positive falls back to 2w
-NEG_WR_1W = 0.45           # trailing-1w WR below this -> disable
+NEG_WR_FLOOR = 0.45        # spent-window WR below this -> disable
 NEG_CONSECUTIVE_WEAK = 3
 NEG_WEAK_P = 0.5           # weak week: SPENT-window p_upper above this (or both windows starved)
 N_PERM = 10_000
@@ -233,6 +237,24 @@ def positive_window(p1: dict, p2: dict) -> str:
     if not p2.get("insufficient"):
         return "2w_fallback"
     return "none"
+
+
+def spent_stats(trigger_window: str, p1: dict, p2: dict) -> dict:
+    """The permutation stats handed to the trigger legs: the 2w stats
+    only when the fallback is spent; '1w' and 'none' both read the 1w
+    stats (for 'none' they are insufficient, keeping every leg off)."""
+    return p2 if trigger_window == "2w_fallback" else p1
+
+
+def negative_wr_leg(trigger_window: str, stats: dict) -> bool:
+    """The disable WR leg reads the SPENT window, same source as the
+    positive legs — a starved-1w regime must not make the WR floor
+    unreachable while the 2w window shows a losing edge. With no
+    spendable window ('none') the leg is unevaluable; weak-booking
+    covers total starvation."""
+    return bool(trigger_window != "none"
+                and stats.get("wr") is not None
+                and stats["wr"] < NEG_WR_FLOOR)
 
 
 def evaluate_positive(stats: dict, bt: dict) -> bool:
@@ -339,6 +361,19 @@ def risk_off_backtest(epoch_start: int, epoch_end: int, out_dir: Path,
     if r.returncode != 0:
         return dict(error=r.stderr[-800:])
     summ = json.loads((REPO / "var" / "backtest" / "summary.json").read_text(encoding="utf-8"))
+    # Window-identity guard: summary.json is a SHARED artifact and this
+    # helper runs once per window — a summary whose boundary rounds don't
+    # match the requested range is another window's result (or a config
+    # substitution that failed to apply) and must fail the PnL leg, never
+    # silently stand in. Equality is exact: the requested boundaries are
+    # canonical fire epochs, i.e. non-failed closed rounds in the same
+    # store the backtest loads, so they are always its boundary sim rounds.
+    if (summ.get("first_epoch") != epoch_start
+            or summ.get("last_epoch") != epoch_end):
+        return dict(error=(
+            f"backtest summary window mismatch: requested "
+            f"[{epoch_start}..{epoch_end}], summary "
+            f"[{summ.get('first_epoch')}..{summ.get('last_epoch')}]"))
     return dict(net_pnl_bnb=summ["net_pnl_bnb"], num_bets=summ["num_bets"],
                 win_rate=summ["win_rate"], gas_per_bet=MAX_GAS_COST_BET_BNB)
 
@@ -628,7 +663,7 @@ def _main() -> int:
         print("--- risk-off standard backtest (2w fallback @5BNB) ---", flush=True)
         bt2 = risk_off_backtest(e2[0], e2[1], out_dir, bankroll=5.0,
                                 cfg_name="risk_off_config_2w.toml")
-    pos_stats = p2 if trigger_window == "2w_fallback" else p1
+    pos_stats = spent_stats(trigger_window, p1, p2)
     pos_bt = bt2 if trigger_window == "2w_fallback" else bt
 
     latest100 = bets[-100:]
@@ -656,9 +691,7 @@ def _main() -> int:
     if evidence_ok:
         baseline, consec = book_weak_week(
             st, same_week_rerun=same_week_rerun, weak=weak_this_week)
-    neg_wr_leg = bool(
-        not p1.get("insufficient") and p1.get("wr") is not None
-        and p1["wr"] < NEG_WR_1W)
+    neg_wr_leg = negative_wr_leg(trigger_window, pos_stats)
     neg_trigger = bool(neg_wr_leg or consec >= NEG_CONSECUTIVE_WEAK)
 
     state = read_bot_state()
@@ -697,9 +730,11 @@ def _main() -> int:
     elif neg_trigger and (state["is_enabled"] or state["is_running"]):
         # is_running covers a running-but-disabled unit (manual start
         # without enable): do_disable() stops it either way.
-        reason = (f"NEGATIVE: {_window_desc('1w', p1)} (WR<{NEG_WR_1W}: "
-                  f"{neg_wr_leg}) or consecutive_weak={consec}>="
-                  f"{NEG_CONSECUTIVE_WEAK}")
+        neg_desc = (_window_desc("2w(fallback SPENT)", p2)
+                    if trigger_window == "2w_fallback"
+                    else _window_desc("1w", p1))
+        reason = (f"NEGATIVE: {neg_desc} (WR<{NEG_WR_FLOOR}: {neg_wr_leg}) "
+                  f"or consecutive_weak={consec}>={NEG_CONSECUTIVE_WEAK}")
         if args.apply:
             action = "disable"
             acted = do_disable()

@@ -13,7 +13,7 @@ strategy is demonstrably working again. No manual arming step exists
 | trigger | condition (canonical windows) | action |
 |---|---|---|
 | POSITIVE | evaluated on exactly ONE window — the trailing 1-week window when it has n ≥ 10 fires, else falling back to the trailing 2-week window (the fires floor is an information floor, not a time floor; both windows starved → cannot fire). The spent window must pass all four legs: WR > 0.55 AND raw permutation p_upper < 0.10 AND n ≥ 10 AND risk-off backtest net PnL (gas-inclusive, run over that same window) > 0 | bot disabled → **enable + start** (writing the cooldown-override flag first if the bot went down mid-suspension, so it releases on its first paused round). bot enabled but breaker-suspended → **write the override flag** (release). |
-| NEGATIVE | WR < 0.45 on the trailing 1-week window, OR 3 consecutive weak weeks — weak is judged on the spent positive window: its p_upper > 0.5, or both windows starved (n < 10 fires even across 2 weeks). A 1-week-starved week with a strong 2-week window is NOT weak | **stop + disable** entirely. |
+| NEGATIVE | WR leg on the spent positive window (same window the positive legs read): WR < 0.45 (unevaluable when both windows starve — weak-booking covers that), OR 3 consecutive weak weeks — weak is judged on the spent window: its p_upper > 0.5, or both windows starved (n < 10 fires even across 2 weeks). A 1-week-starved week with a strong 2-week window is NOT weak | **stop + disable** entirely. |
 
 The latest-100 WR and Šidák-corrected p are computed and reported but do
 not gate actions; the 2-week permutation stats are always reported and
