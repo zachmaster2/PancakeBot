@@ -48,7 +48,9 @@ Unattended-safety (2026-07-17/18 hardening):
     and alerts ❌; an enabled-but-dead unit is restarted weekly with a
     ⚠️ alert (operators who want it stopped must DISABLE it).
   * dry runs (no --apply) never advance weekly state and never touch
-    systemd — pure previews. State advances at most once per ISO week.
+    systemd — pure previews. Weekly state is booked per ISO week; an
+    applied same-week re-run overwrites that week's booking (recomputed
+    from the prior-week baseline), never double-advancing it.
   * every completed run VERIFIES Discord delivery (HTTP < 400, retry);
     undelivered -> rc=3 so the cron wrapper curls a fallback. Any crash
     Discords a ❌ CRASHED alert with the traceback tail and exits
@@ -64,9 +66,11 @@ Steps each run:
   5. read live bot state (systemctl), decide action, act iff permitted
   6. Discord alert (state change or weekly summary) + artifact + persistent state
 
-Idempotent: artifact dirs are per-day, but weekly STATE advances once per
-ISO week — a re-run any day of the same ISO week re-computes and re-reports
-without double-advancing the consecutive-weak counter.
+Idempotent: artifact dirs are per-day; weekly STATE books once per ISO
+week — a same-ISO-week re-run recomputes the week's weak booking from the
+persisted prior-week baseline and OVERWRITES it (plus the week's history
+entry): corrected code can fix the current week's booking, and nothing
+ever double-advances the counter.
 
 Triggers (pinned; 2026-07-09 redesign + 2026-08-16 fallback, per user
 decisions):
@@ -85,9 +89,12 @@ decisions):
              cooldown override flag (var/live/cooldown_override.json),
              which the pipeline consumes to release the suspension
              immediately (ignoring extend-while-bleeding).
-  NEGATIVE:  always judged on the trailing-1w window: WR < 0.45  OR  3
-             consecutive weekly runs weak (weak = 1w p_upper > 0.5, or
-             insufficient fires n < 10). The 2w fallback never feeds it.
+  NEGATIVE:  WR leg on the trailing-1w window: WR < 0.45.  OR  3
+             consecutive weekly runs weak — weak is judged on the SPENT
+             positive window: an evaluable spent window with p_upper >
+             0.5, or both windows starved (n < 10 fires even across 14
+             days = a genuine fire collapse). A 1w-starved week with a
+             strong 2w window is NOT weak.
              Action: disable + stop entirely.
   The 2w permutation stats + latest-100 WR + Šidák are computed and
   reported every week; the 2w risk-off backtest runs only when the
@@ -133,7 +140,7 @@ POS_RAW_P = 0.10           # raw permutation p_upper, single test (user decision
 POS_MIN_FIRES = 10         # per-WINDOW information floor; 1w starved -> positive falls back to 2w
 NEG_WR_1W = 0.45           # trailing-1w WR below this -> disable
 NEG_CONSECUTIVE_WEAK = 3
-NEG_WEAK_P = 0.5           # weak week: 1w p_upper above this (or n < POS_MIN_FIRES)
+NEG_WEAK_P = 0.5           # weak week: SPENT-window p_upper above this (or both windows starved)
 N_PERM = 10_000
 SEED = 20260630
 
@@ -237,6 +244,38 @@ def evaluate_positive(stats: dict, bt: dict) -> bool:
         and stats.get("p_upper", 1) < POS_RAW_P
         and stats.get("n", 0) >= POS_MIN_FIRES
         and bt.get("net_pnl_bnb", -1) > 0)
+
+
+def weak_week(trigger_window: str, stats: dict) -> bool:
+    """Weak is judged on the SPENT positive window: an evaluable spent
+    window whose p_upper exceeds NEG_WEAK_P, or no spendable window at
+    all ('none' — not even the 2w window produced POS_MIN_FIRES fires, a
+    fortnight-wide fire collapse with zero statistical evidence to defend
+    betting on). A 1w-starved week with a strong 2w window is NOT weak.
+    `stats` is the spent window's perm stats (ignored for 'none')."""
+    if trigger_window == "none":
+        return True
+    return bool(stats.get("p_upper") is not None
+                and stats["p_upper"] > NEG_WEAK_P)
+
+
+def book_weak_week(st: dict, *, same_week_rerun: bool, weak: bool) -> tuple[int, int]:
+    """Return (baseline, consec) for this ISO week's weak booking.
+
+    First run of the week: baseline = last week's persisted counter,
+    advance from it. Same-ISO-week re-run: RECOMPUTE from the persisted
+    baseline — overwrite semantics, so a re-run under corrected code can
+    fix the week's booking, and nothing ever double-advances. The
+    baseline fallback for state files that predate the key assumes the
+    last booking was weak (stored-1); a not-weak booking stores 0 either
+    way, so the fallback can only over-forgive, never over-count."""
+    stored = int(st.get("consecutive_weak", 0))
+    if same_week_rerun:
+        baseline = int(st.get("consecutive_weak_baseline",
+                              max(stored - 1, 0)))
+    else:
+        baseline = stored
+    return baseline, (baseline + 1 if weak else 0)
 
 
 def _window_desc(tag: str, stats: dict, bt: dict | None = None) -> str:
@@ -604,17 +643,19 @@ def _main() -> int:
 
     pos_trigger = evaluate_positive(pos_stats, pos_bt)
 
-    # weak week: 1w p_upper above the bar, or not enough fires to know.
-    weak_this_week = bool(
-        p1.get("insufficient")
-        or (p1.get("p_upper") is not None and p1["p_upper"] > NEG_WEAK_P))
-    # advance the consecutive-weak counter only once per week, and never on
-    # a blind week (stale data says nothing about THIS week; the stored
-    # value still feeds the negative trigger below). Persistence is
-    # additionally gated on --apply — dry runs preview, never advance.
-    consec = st.get("consecutive_weak", 0)
-    if not same_week_rerun and evidence_ok:
-        consec = consec + 1 if weak_this_week else 0
+    # weak week: judged on the SPENT positive window (see weak_week).
+    weak_this_week = weak_week(trigger_window, pos_stats)
+    # Book the week: first run of the ISO week advances from last week's
+    # counter; a same-week re-run RECOMPUTES from the persisted baseline
+    # (overwrite — never freeze, never double-advance). Blind weeks keep
+    # the stored value untouched (stale data says nothing about THIS
+    # week; it still feeds the negative trigger below). Persistence is
+    # additionally gated on --apply — dry runs preview, never persist.
+    consec = int(st.get("consecutive_weak", 0))
+    baseline = consec
+    if evidence_ok:
+        baseline, consec = book_weak_week(
+            st, same_week_rerun=same_week_rerun, weak=weak_this_week)
     neg_wr_leg = bool(
         not p1.get("insufficient") and p1.get("wr") is not None
         and p1["wr"] < NEG_WR_1W)
@@ -752,15 +793,23 @@ def _main() -> int:
         applied=args.apply)
     (out_dir / "decision.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
 
-    # ---- persist state (once per ISO week; only real, fresh, applied
-    # runs count — dry runs preview without advancing, blind weeks retry) --
-    if args.apply and evidence_ok and not same_week_rerun:
+    # ---- persist state (booked once per ISO week; only real, fresh,
+    # applied runs count — dry runs preview without persisting, blind
+    # weeks retry). A same-week applied re-run OVERWRITES the week's
+    # booking and history entry (recomputed from the baseline above). ----
+    if args.apply and evidence_ok:
         st["consecutive_weak"] = consec
+        st["consecutive_weak_baseline"] = baseline
         st["last_week"] = week
         st["last_action"] = action
-        st.setdefault("history", []).append(
-            dict(week=week, action=action, wr_1w=p1.get("wr"), p_1w=p1.get("p_upper"),
-                 trigger_window=trigger_window, sidak=round(sidak_p, 4)))
+        hist = st.setdefault("history", [])
+        entry = dict(week=week, action=action, wr_1w=p1.get("wr"),
+                     p_1w=p1.get("p_upper"), trigger_window=trigger_window,
+                     sidak=round(sidak_p, 4))
+        if same_week_rerun and hist and hist[-1].get("week") == last_week:
+            hist[-1] = entry
+        else:
+            hist.append(entry)
         save_state(st)
 
     # ---- alert (fires on EVERY completed run — the dead-man's switch) ----
@@ -780,7 +829,7 @@ def _main() -> int:
     else:
         w2_desc = _window_desc("2w(info)", p2)
     body = (f"{_window_desc('1w', p1, bt)}; {w2_desc}; "
-            f"neg={neg_trigger} consec_weak={consec} "
+            f"neg={neg_trigger} weak={weak_this_week} consec_weak={consec} "
             f"blind_streak={streak}; enabled={state.get('is_enabled')} "
             f"running={state.get('is_running')} in_cooldown={in_cooldown}")
     if retry_mode and not evidence_ok and action == "none":
