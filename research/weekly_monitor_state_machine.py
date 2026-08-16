@@ -58,7 +58,8 @@ Unattended-safety (2026-07-17/18 hardening):
 Steps each run:
   1. sync (`run.py --sync`) unless --no-sync
   2. canonical gate flat-stake bet stream (risk-free) + trailing 2w/1w windows
-  3. standard backtest (risk breaker OFF) on the 1w window @5BNB -> gas-inclusive PnL
+  3. standard backtest (risk breaker OFF) @5BNB -> gas-inclusive net PnL on
+     the 1w window (+ the 2w window iff the positive fallback engages)
   4. positive/negative trigger evaluation (+ Šidák correction, + consecutive-weak counter)
   5. read live bot state (systemctl), decide action, act iff permitted
   6. Discord alert (state change or weekly summary) + artifact + persistent state
@@ -67,20 +68,31 @@ Idempotent: artifact dirs are per-day, but weekly STATE advances once per
 ISO week — a re-run any day of the same ISO week re-computes and re-reports
 without double-advancing the consecutive-weak counter.
 
-Triggers (pinned; 2026-07-09 redesign — 1-WEEK window only, per user decision):
-  POSITIVE:  on the trailing-1w window: WR > BREAKEVEN(0.55) AND raw
-             p_upper < 0.10 (single test) AND n_fires >= 10 AND the
-             standard risk-off backtest net PnL (after gas) > 0.
+Triggers (pinned; 2026-07-09 redesign + 2026-08-16 fallback, per user
+decisions):
+  POSITIVE:  evaluated on exactly ONE window — the trailing-1w window
+             when it clears the n_fires >= 10 information floor, else
+             falling back to the trailing-2w window (the floor is an
+             information floor, not a time floor: a starved 1w week must
+             not mask a strong fortnight). The SPENT window must pass
+             all four legs: WR > BREAKEVEN(0.55) AND raw p_upper < 0.10
+             (single test) AND n_fires >= 10 AND the standard risk-off
+             backtest net PnL (after gas) > 0, with the backtest run
+             over that same window — never rescaled from the other one.
+             Both windows starved -> the positive trigger cannot fire.
              Action when bot DISABLED: enable + start (under --apply).
              Action when bot ENABLED and breaker-suspended: write the
              cooldown override flag (var/live/cooldown_override.json),
              which the pipeline consumes to release the suspension
              immediately (ignoring extend-while-bleeding).
-  NEGATIVE:  trailing-1w WR < 0.45  OR  3 consecutive weekly runs weak
-             (weak = 1w p_upper > 0.5, or insufficient fires n < 10).
+  NEGATIVE:  always judged on the trailing-1w window: WR < 0.45  OR  3
+             consecutive weekly runs weak (weak = 1w p_upper > 0.5, or
+             insufficient fires n < 10). The 2w fallback never feeds it.
              Action: disable + stop entirely.
-  The 2w window + latest-100 WR + Šidák are still computed and reported
-  (informational only — they no longer gate actions).
+  The 2w permutation stats + latest-100 WR + Šidák are computed and
+  reported every week; the 2w risk-off backtest runs only when the
+  fallback is engaged. decision.json records the spent window as
+  triggers.trigger_window ("1w" | "2w_fallback" | "none").
 
 Artifacts: var/strategy_review/weekly_monitors/<YYYY-MM-DD>/{decision.json},
 persistent state var/strategy_review/weekly_monitors/state.json.
@@ -118,7 +130,7 @@ LIVE_UNIT = "pancakebot-live"
 CUTOFF, LOOKBACKS, FEE = 2, (3, 7, 15), 0.03
 BREAKEVEN_WR = 0.55
 POS_RAW_P = 0.10           # raw permutation p_upper, single test (user decision)
-POS_MIN_FIRES = 10         # 2026-07-09: halved window (2w->1w) -> halved floor
+POS_MIN_FIRES = 10         # per-WINDOW information floor; 1w starved -> positive falls back to 2w
 NEG_WR_1W = 0.45           # trailing-1w WR below this -> disable
 NEG_CONSECUTIVE_WEAK = 3
 NEG_WEAK_P = 0.5           # weak week: 1w p_upper above this (or n < POS_MIN_FIRES)
@@ -202,6 +214,46 @@ def perm(bets, n_iter=N_PERM, seed=SEED):
                 p_upper=round(float((null >= obs).mean()), 5))
 
 
+def positive_window(p1: dict, p2: dict) -> str:
+    """Select the window the POSITIVE trigger spends: '1w' when it clears
+    the POS_MIN_FIRES information floor, else '2w_fallback' when the 2w
+    window clears it (the floor is an information floor, not a time floor
+    — a starved 1w week must not mask a strong fortnight), else 'none'
+    (both windows starved: the positive trigger cannot fire). The
+    NEGATIVE trigger never consults this — it is 1w-only."""
+    if not p1.get("insufficient"):
+        return "1w"
+    if not p2.get("insufficient"):
+        return "2w_fallback"
+    return "none"
+
+
+def evaluate_positive(stats: dict, bt: dict) -> bool:
+    """The four positive legs, applied to the SPENT window's permutation
+    stats and the risk-off backtest run over that SAME window. A missing
+    or errored backtest (no net_pnl_bnb key) fails the PnL leg."""
+    return bool(
+        not stats.get("insufficient") and stats.get("wr", 0) > BREAKEVEN_WR
+        and stats.get("p_upper", 1) < POS_RAW_P
+        and stats.get("n", 0) >= POS_MIN_FIRES
+        and bt.get("net_pnl_bnb", -1) > 0)
+
+
+def _window_desc(tag: str, stats: dict, bt: dict | None = None) -> str:
+    """One window, one clause: 'tag: n=.. WR=.. p=..' when evaluable, or
+    'tag: n=..<10 insufficient' when starved — a starved window must read
+    as starved, never as 'WR=None p=None'. Appends btPnL when a backtest
+    dict is provided (and non-empty)."""
+    if stats.get("insufficient"):
+        s = f"{tag}: n={stats.get('n')}<{POS_MIN_FIRES} insufficient"
+    else:
+        s = (f"{tag}: n={stats.get('n')} WR={stats.get('wr')} "
+             f"p={stats.get('p_upper')}")
+    if bt:
+        s += f" btPnL={bt.get('net_pnl_bnb')}"
+    return s
+
+
 # --------------------------------------------------------------------------
 # standard backtest (risk breaker OFF) on a window -> gas-inclusive net PnL
 # --------------------------------------------------------------------------
@@ -213,7 +265,8 @@ SYNC_FAIL_DISABLE_STREAK = 3  # blind weeks in a row before protective disable
 
 
 def risk_off_backtest(epoch_start: int, epoch_end: int, out_dir: Path,
-                      bankroll: float = 5.0) -> dict:
+                      bankroll: float = 5.0,
+                      cfg_name: str = "risk_off_config.toml") -> dict:
     section = None
     lines = []
     for raw in (REPO / "config.toml").read_text(encoding="utf-8").splitlines():
@@ -236,7 +289,7 @@ def risk_off_backtest(epoch_start: int, epoch_end: int, out_dir: Path,
             elif s.startswith("cooldown_rounds"):
                 line = "cooldown_rounds = 0"
         lines.append(line)
-    cfg = out_dir / "risk_off_config.toml"
+    cfg = out_dir / cfg_name
     cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
     try:
         r = subprocess.run([sys.executable, str(REPO / "run.py"), "--backtest",
@@ -407,18 +460,22 @@ def _resolve_run_context(week: str, marker: dict | None) -> tuple[str, bool, boo
     return str(marker["sunday_key"]), True, False
 
 
-def write_override_flag(*, week: str, reason: str, p1: dict) -> Path:
+def write_override_flag(*, week: str, reason: str, stats: dict,
+                        trigger_window: str) -> Path:
     """Write the cooldown-override flag the pipeline consumes on its next
     paused round (fresh <= 8 days; `_consume_override_flag`). Atomic
     tmp+rename: the running bot's reader DELETES the flag on a parse error,
-    so a torn write would silently discard the release."""
+    so a torn write would silently discard the release. The window block is
+    forensic only — the pipeline reader checks nothing but ts freshness —
+    and records the SPENT positive window's legs."""
     flag = REPO / "var" / "live" / "cooldown_override.json"
     flag.parent.mkdir(parents=True, exist_ok=True)
     tmp = flag.with_suffix(flag.suffix + ".tmp")
     tmp.write_text(json.dumps(dict(
         ts=time.time(), week=week, reason=reason,
-        window_1w=dict(wr=p1.get("wr"), p_upper=p1.get("p_upper"),
-                       n=p1.get("n")),
+        trigger_window=trigger_window,
+        window=dict(wr=stats.get("wr"), p_upper=stats.get("p_upper"),
+                    n=stats.get("n")),
     ), indent=2), encoding="utf-8")
     tmp.replace(flag)
     return flag
@@ -517,25 +574,35 @@ def _main() -> int:
 
     w2, w1 = window(14), window(7)
     e1 = (min(b["epoch"] for b in w1), max(b["epoch"] for b in w1)) if w1 else (0, 0)
+    e2 = (min(b["epoch"] for b in w2), max(b["epoch"] for b in w2)) if w2 else (0, 0)
     p2, p1 = perm(w2), perm(w1)
 
     print("--- risk-off standard backtest (1w @5BNB) ---", flush=True)
     bt = risk_off_backtest(e1[0], e1[1], out_dir, bankroll=5.0) if w1 else {}
 
+    # Positive-trigger window selection: the 2w risk-off backtest is REAL
+    # and runs only when the fallback is engaged (1w starved, 2w evaluable)
+    # — the PnL leg is never rescaled from the 1w run or simulated.
+    trigger_window = positive_window(p1, p2)
+    bt2 = {}
+    if trigger_window == "2w_fallback":
+        print("--- risk-off standard backtest (2w fallback @5BNB) ---", flush=True)
+        bt2 = risk_off_backtest(e2[0], e2[1], out_dir, bankroll=5.0,
+                                cfg_name="risk_off_config_2w.toml")
+    pos_stats = p2 if trigger_window == "2w_fallback" else p1
+    pos_bt = bt2 if trigger_window == "2w_fallback" else bt
+
     latest100 = bets[-100:]
     wr100 = float(np.mean([b["win"] for b in latest100])) if len(latest100) >= 50 else None
 
-    # ---- trigger evaluation (2026-07-09: 1-WEEK window governs) ----
+    # ---- trigger evaluation (positive on the spent window; negative 1w) ----
     # Šidák over the two computed windows is still REPORTED (informational);
     # the positive trigger is the raw single-test p per the user's decision.
     raw_best_p = min([p for p in (p2.get("p_upper"), p1.get("p_upper")) if p is not None],
                      default=1.0)
     sidak_p = 1 - (1 - raw_best_p) ** 2
 
-    pos_trigger = bool(
-        not p1.get("insufficient") and p1.get("wr", 0) > BREAKEVEN_WR
-        and p1.get("p_upper", 1) < POS_RAW_P and p1.get("n", 0) >= POS_MIN_FIRES
-        and bt.get("net_pnl_bnb", -1) > 0)
+    pos_trigger = evaluate_positive(pos_stats, pos_bt)
 
     # weak week: 1w p_upper above the bar, or not enough fires to know.
     weak_this_week = bool(
@@ -589,17 +656,19 @@ def _main() -> int:
     elif neg_trigger and (state["is_enabled"] or state["is_running"]):
         # is_running covers a running-but-disabled unit (manual start
         # without enable): do_disable() stops it either way.
-        reason = (f"NEGATIVE: 1w WR={p1.get('wr')} (<{NEG_WR_1W}: {neg_wr_leg}) "
-                  f"or consecutive_weak={consec}>={NEG_CONSECUTIVE_WEAK}")
+        reason = (f"NEGATIVE: {_window_desc('1w', p1)} (WR<{NEG_WR_1W}: "
+                  f"{neg_wr_leg}) or consecutive_weak={consec}>="
+                  f"{NEG_CONSECUTIVE_WEAK}")
         if args.apply:
             action = "disable"
             acted = do_disable()
         else:
             action = "disable_DRYRUN"
     elif pos_trigger and not state["is_enabled"]:
-        reason = (f"POSITIVE (1w): WR={p1.get('wr')}>{BREAKEVEN_WR}, "
-                  f"p={p1.get('p_upper')}<{POS_RAW_P}, n={p1.get('n')}>="
-                  f"{POS_MIN_FIRES}, btPnL={bt.get('net_pnl_bnb')}>0")
+        reason = (f"POSITIVE ({trigger_window}): WR={pos_stats.get('wr')}>"
+                  f"{BREAKEVEN_WR}, p={pos_stats.get('p_upper')}<{POS_RAW_P}, "
+                  f"n={pos_stats.get('n')}>={POS_MIN_FIRES}, "
+                  f"btPnL={pos_bt.get('net_pnl_bnb')}>0")
         if not evidence_ok:
             action = "enable_BLOCKED_stale_evidence"
             reason += " — sync failed or data stale; refusing to enable"
@@ -612,7 +681,9 @@ def _main() -> int:
             # that would extend until a second positive Sunday.
             flag = None
             if in_cooldown:
-                flag = write_override_flag(week=week, reason=reason, p1=p1)
+                flag = write_override_flag(week=week, reason=reason,
+                                           stats=pos_stats,
+                                           trigger_window=trigger_window)
                 acted = f"wrote {flag}; "
             ok, msg = do_enable()
             acted += msg
@@ -633,13 +704,16 @@ def _main() -> int:
         # Bot is enabled but breaker-suspended: release via the override
         # flag, which the pipeline consumes on its next paused round
         # (ignores extend-while-bleeding by design).
-        reason = "POSITIVE (1w) while breaker-suspended -> override flag"
+        reason = f"POSITIVE ({trigger_window}) while breaker-suspended -> override flag"
         if not evidence_ok:
             action = "cooldown_override_BLOCKED_stale_evidence"
             reason += " — sync failed or data stale; refusing to release"
         elif args.apply:
             action = "cooldown_override"
-            acted = f"wrote {write_override_flag(week=week, reason=reason, p1=p1)}"
+            flag = write_override_flag(week=week, reason=reason,
+                                       stats=pos_stats,
+                                       trigger_window=trigger_window)
+            acted = f"wrote {flag}"
         else:
             action = "cooldown_override_DRYRUN"
     elif state["is_enabled"] and not state["is_running"]:
@@ -663,8 +737,9 @@ def _main() -> int:
             "%Y-%m-%d %H:%M", time.gmtime(newest_round_lock)),
         newest_fire_lock=time.strftime("%Y-%m-%d %H:%M", time.gmtime(max_lock)),
         window_1w=dict(epochs=list(e1), **p1, backtest=bt),
-        window_2w=p2, latest100_wr=wr100,
-        triggers=dict(positive=pos_trigger, negative=neg_trigger,
+        window_2w=dict(epochs=list(e2), **p2, backtest=bt2), latest100_wr=wr100,
+        triggers=dict(positive=pos_trigger, trigger_window=trigger_window,
+                      negative=neg_trigger,
                       neg_wr_leg=neg_wr_leg, weak_this_week=weak_this_week,
                       raw_best_p=round(raw_best_p, 5),
                       sidak_p_informational=round(sidak_p, 5),
@@ -685,7 +760,7 @@ def _main() -> int:
         st["last_action"] = action
         st.setdefault("history", []).append(
             dict(week=week, action=action, wr_1w=p1.get("wr"), p_1w=p1.get("p_upper"),
-                 sidak=round(sidak_p, 4)))
+                 trigger_window=trigger_window, sidak=round(sidak_p, 4)))
         save_state(st)
 
     # ---- alert (fires on EVERY completed run — the dead-man's switch) ----
@@ -700,9 +775,12 @@ def _main() -> int:
                 f"until Sunday\n{head}")
     if completed_blind_week:
         head += "\n(previous week ended fully blind — Sunday and every retry failed)"
-    body = (f"1w: n={p1.get('n')} WR={p1.get('wr')} p={p1.get('p_upper')} "
-            f"btPnL={bt.get('net_pnl_bnb')}; 2w(info): WR={p2.get('wr')} "
-            f"p={p2.get('p_upper')}; neg={neg_trigger} consec_weak={consec} "
+    if trigger_window == "2w_fallback":
+        w2_desc = _window_desc("2w(fallback SPENT)", p2, bt2)
+    else:
+        w2_desc = _window_desc("2w(info)", p2)
+    body = (f"{_window_desc('1w', p1, bt)}; {w2_desc}; "
+            f"neg={neg_trigger} consec_weak={consec} "
             f"blind_streak={streak}; enabled={state.get('is_enabled')} "
             f"running={state.get('is_running')} in_cooldown={in_cooldown}")
     if retry_mode and not evidence_ok and action == "none":
