@@ -5,8 +5,11 @@ for the 2w fallback (2026-08-16 user decision): `positive_window` (which
 window the positive trigger spends — the POS_MIN_FIRES floor is an
 information floor, not a time floor), `evaluate_positive` (the four legs
 applied to the spent window's stats + that window's REAL risk-off
-backtest), and `_window_desc` (a starved window must render as
-insufficient, never as 'WR=None p=None').
+backtest), `_window_desc` (a starved window must render as insufficient,
+never as 'WR=None p=None'), `weak_week` (weak is judged on the spent
+window; both-starved counts weak), and `book_weak_week` (same-ISO-week
+re-runs recompute the booking from the prior-week baseline — overwrite,
+never freeze or double-advance).
 """
 import importlib.util
 from pathlib import Path
@@ -120,3 +123,52 @@ def test_fallback_spent_label_carries_2w_legs():
 
 def test_empty_backtest_dict_appends_nothing():
     assert wm._window_desc("1w", INSUF_1W, {}) == "1w: n=6<10 insufficient"
+
+
+# ---- spent-window weak semantics ------------------------------------------
+
+def test_spent_2w_strong_is_not_weak():
+    # The 2026-08-16 shape: 1w starved, 2w spent with p=0.0285 -> NOT weak.
+    assert wm.weak_week("2w_fallback", GOOD_2W) is False
+
+
+def test_spent_2w_weak_p_books_weak():
+    assert wm.weak_week("2w_fallback", dict(GOOD_2W, p_upper=0.61)) is True
+
+
+def test_both_starved_books_weak():
+    assert wm.weak_week("none", INSUF_1W) is True
+
+
+def test_sufficient_1w_weak_semantics_unchanged():
+    assert wm.weak_week("1w", WEAK_1W) is True       # p=0.61 > 0.5
+    assert wm.weak_week("1w", GOOD_1W) is False      # p=0.041
+    # bar is a strict inequality
+    assert wm.weak_week("1w", dict(GOOD_1W, p_upper=wm.NEG_WEAK_P)) is False
+
+
+# ---- weekly booking (baseline overwrite semantics) ------------------------
+
+def test_booking_first_run_advances_and_resets():
+    assert wm.book_weak_week({"consecutive_weak": 1},
+                             same_week_rerun=False, weak=True) == (1, 2)
+    assert wm.book_weak_week({"consecutive_weak": 2},
+                             same_week_rerun=False, weak=False) == (2, 0)
+
+
+def test_booking_same_week_rerun_recomputes_from_baseline():
+    st = {"consecutive_weak": 1, "consecutive_weak_baseline": 0}
+    assert wm.book_weak_week(st, same_week_rerun=True, weak=False) == (0, 0)
+    # re-running a weak week must not double-advance
+    assert wm.book_weak_week(st, same_week_rerun=True, weak=True) == (0, 1)
+    st2 = {"consecutive_weak": 3, "consecutive_weak_baseline": 2}
+    assert wm.book_weak_week(st2, same_week_rerun=True, weak=False) == (2, 0)
+
+
+def test_booking_migration_default_covers_2026_08_16_state():
+    # The one real pre-baseline state file: Sunday 2026-08-16 booked weak
+    # under 1w-only semantics (consec 0->1, no baseline key persisted).
+    # The directed same-week re-run (2w spent, p=0.0285 -> not weak) must
+    # land consecutive_weak back at 0.
+    st = {"consecutive_weak": 1}
+    assert wm.book_weak_week(st, same_week_rerun=True, weak=False) == (0, 0)
