@@ -458,6 +458,9 @@ class RpcPoller:
         # the cursor clamp) and by _poll_now (if RTT degrades mid-round).
         # Reset on epoch advance.
         self._catchup_infeasible_for_round: bool = False
+        # Last F0 coverage shortfall in blocks (None when covered).
+        # Read-only diagnostic for the pool-gate alarm's alert body.
+        self._last_pool_blocks_short: int | None = None
 
         # ``(needed_ms, available_ms)`` from the most recent catchup
         # feasibility check that returned True (= infeasible). Reset
@@ -734,8 +737,12 @@ class RpcPoller:
         # ALERT outside the lock; expected ~once/round (the engine calls
         # is_pool_ready once at the decision). See _pool_coverage_shortfall_locked.
         if shortfall is None:
+            with self._lock:
+                self._last_pool_blocks_short = None
             return True, ""
         cursor_ms, cutoff_ms, blocks_short = shortfall
+        with self._lock:
+            self._last_pool_blocks_short = int(blocks_short)
         warn(
             "ALERT",
             f"POOL UNCOVERED epoch={epoch}: getLogs endpoint lagged the "
@@ -744,6 +751,14 @@ class RpcPoller:
             f"to avoid sizing the bet on an incomplete pool (F0 guarantee).",
         )
         return False, "pool_uncovered"
+
+    @property
+    def last_pool_blocks_short(self) -> int | None:
+        """Blocks by which the cursor trailed the pool-cutoff block at the
+        last ``is_pool_ready`` call, or None if coverage was complete.
+        Diagnostic only — nothing gates on it."""
+        with self._lock:
+            return self._last_pool_blocks_short
 
     def _pool_coverage_shortfall_locked(self) -> tuple[int, int, int] | None:
         """F0 pool-coverage check (call holding ``self._lock``).

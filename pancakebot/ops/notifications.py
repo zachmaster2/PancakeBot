@@ -59,6 +59,11 @@ _CHANNEL_BY_KIND: dict[str, str] = {
     "MODE_TRANSITION": "live",  # Live started, Dry was stopped
     "MODE_TRANSITION_REFUSED": "dry",  # Dry refused, Live is up
     "SERVICE_CRASHED": "general",
+    # Pool-gate alarm (raised in-process by the runtime, not by the
+    # systemd notifier): the bot is up and enabled but has been unable
+    # to trade for a run of rounds. Mode channel, alongside CRASHED/DOWN.
+    "POOL_GATE_BLOCKED": "mode",
+    "POOL_GATE_RECOVERED": "mode",
 }
 
 # Severity tag per kind. ASCII-only, monospace-friendly. Replaces the
@@ -78,6 +83,8 @@ _SEVERITY_BY_KIND: dict[str, str] = {
     "REBOOTED": "INFO",
     "RECOVERY_AFTER_CRASH": "INFO",
     "MODE_TRANSITION": "INFO",
+    "POOL_GATE_BLOCKED": "CRIT",
+    "POOL_GATE_RECOVERED": "INFO",
 }
 
 
@@ -241,6 +248,22 @@ def build_message(
         if isinstance(spawn_err, str) and spawn_err:
             lines.append(f"spawn_error: `{spawn_err}`")
         lines.append("note: service failed to spawn a bot child; manual intervention required")
+    elif kind in ("POOL_GATE_BLOCKED", "POOL_GATE_RECOVERED"):
+        # Structured kv rendering ordered for phone triage: how bad, how
+        # long, why, how far behind, where coverage last held. The same
+        # field set also arrives on the `detail` line.
+        for k in ("consecutive", "recovered_after", "blocked_for", "reason",
+                  "blocks_short", "getlogs_p99_ms", "last_ok_epoch", "epoch"):
+            if k in fields:
+                lines.append(f"{k}: `{fields[k]}`")
+        if kind == "POOL_GATE_BLOCKED":
+            lines.append(
+                "note: bot is UP and ENABLED but cannot place bets — pool "
+                "coverage unavailable. No capital at risk; it resumes "
+                "automatically when coverage returns."
+            )
+        else:
+            lines.append("note: pool coverage restored; betting resumed.")
 
     return "\n".join(lines)
 

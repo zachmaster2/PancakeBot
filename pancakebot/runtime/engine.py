@@ -20,6 +20,8 @@ from pancakebot.util import GasPriceCapBreachedError, InvariantError, TransientR
 from pancakebot.log import info, warn
 from pancakebot.util import format_bankroll
 from pancakebot.runtime.config import RuntimeConfig
+from pancakebot.runtime.pool_gate_alarm import KIND_BLOCKED, PoolGateAlarm
+from pancakebot.ops.notifications import notify
 from pancakebot import paths
 from pancakebot.runtime.dry import (
     RuntimeState,
@@ -178,6 +180,54 @@ def _reset_regime_monitors() -> None:
     """Test hook: rebuild the module-level monitors with empty windows."""
     global _OKX_KLINE_RTT_MONITOR
     _OKX_KLINE_RTT_MONITOR = _build_okx_kline_rtt_monitor()
+
+
+# Consecutive pool-gate-blocked alarm: the "up and enabled but unable to
+# trade" detector. Module-level like the regime monitors above — the round
+# loop is a function chain with no per-run object to hang state on.
+_POOL_GATE_ALARM = PoolGateAlarm()
+
+
+def _reset_pool_gate_alarm() -> None:
+    """Test hook: drop the accumulated blocked-round streak."""
+    global _POOL_GATE_ALARM
+    _POOL_GATE_ALARM = PoolGateAlarm()
+
+
+def _dispatch_pool_gate_alarm(
+    cfg: RuntimeConfig, *, ready: bool, reason: str, epoch: int,
+) -> None:
+    """Fold one round's readiness verdict into the alarm and dispatch any
+    resulting Discord alert.
+
+    Alert-and-CONTINUE by design: never raises, never skips a round, never
+    touches systemd. The bot cannot trade while the pool gate is blocked,
+    so stopping it would gain nothing and would forfeit the automatic
+    recovery that happens the moment coverage returns. Every failure here
+    is swallowed — the bet path must not break because an alert could not
+    be built or delivered.
+    """
+    try:
+        blocks_short = None
+        if cfg.rpc_poller is not None:
+            blocks_short = cfg.rpc_poller.last_pool_blocks_short
+        event = _POOL_GATE_ALARM.record(
+            ready=ready, reason=reason, epoch=int(epoch),
+            now=_utc_now(), blocks_short=blocks_short,
+        )
+        if event is None:
+            return
+        if event.kind == KIND_BLOCKED:
+            warn("ALERT", f"POOL GATE BLOCKED {event.detail}")
+        else:
+            info("ALERT", f"POOL GATE RECOVERED {event.detail}")
+        outcome = notify(
+            mode=("dry" if cfg.dry else "live"),
+            kind=event.kind, fields=event.fields, detail=event.detail,
+        )
+        info("ALERT", f"{event.kind} discord={outcome}")
+    except Exception as e:  # noqa: BLE001 — alerting must never break betting
+        warn("ALERT", f"pool gate alarm dispatch failed: {type(e).__name__}: {e}")
 
 
 # -- Clock sync ---------------------------------------------------------------
@@ -974,6 +1024,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
             # bankroll_bnb was already resolved at the preflight wake;
             # reuse for audit on the skip path.
             ready, ready_reason = cfg.rpc_poller.is_pool_ready(current_epoch)
+            # Streak alarm BEFORE the skip branch: a ready round must reset
+            # the counter even when the strategy gate then declines to fire
+            # (a no-BET streak is meaningless at a ~0.3% fire rate).
+            _dispatch_pool_gate_alarm(
+                cfg, ready=ready, reason=ready_reason, epoch=current_epoch,
+            )
             if not ready:
                 skip_reason = f"pool_not_ready_{ready_reason}"
                 _skip_round(
