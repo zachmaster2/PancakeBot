@@ -325,3 +325,89 @@ def test_fallback_enable_path_end_to_end(tmp_path, monkeypatch):
     assert "STATE CHANGED" in messages[0]
     assert "1w: n=6<10 insufficient" in messages[0]
     assert "2w(fallback SPENT)" in messages[0]
+
+# ---- fire-stream (frozen window) evidence gate ----------------------------
+
+def test_fire_freshness_boundary():
+    now = 1_787_000_000.0
+    bound = wm.FIRE_STALE_MAX_AGE_S
+    assert wm.fire_evidence_fresh(int(now - bound + 1), now) is True
+    assert wm.fire_evidence_fresh(int(now - bound), now) is True
+    assert wm.fire_evidence_fresh(int(now - bound - 1), now) is False
+
+
+def test_fire_freshness_tolerates_a_real_thin_week():
+    """The largest inter-fire gap in the 10 weeks to 2026-08-14 was 117.5h
+    and p99 was 57.0h; a normal quiet stretch must NOT be called frozen."""
+    now = 1_787_000_000.0
+    for gap_h in (2.0, 17.5, 24.1, 57.0, 95.0):
+        assert wm.fire_evidence_fresh(int(now - gap_h * 3600), now) is True, gap_h
+    # the one 117.5h outlier does trip it — accepted, ~1.3% of Sundays
+    assert wm.fire_evidence_fresh(int(now - 117.5 * 3600), now) is False
+
+
+def test_fire_freshness_catches_the_2026_08_17_outage():
+    """Fires froze 2026-08-14 18:06Z; the next Sunday run is 2026-08-23."""
+    import datetime as _dt
+    frozen = _dt.datetime(2026, 8, 14, 18, 6, tzinfo=_dt.timezone.utc).timestamp()
+    sunday = _dt.datetime(2026, 8, 23, 6, 0, tzinfo=_dt.timezone.utc).timestamp()
+    assert wm.fire_evidence_fresh(int(frozen), sunday) is False
+    assert (sunday - frozen) / 3600 > 2 * (wm.FIRE_STALE_MAX_AGE_S / 3600)
+
+
+def test_frozen_window_blocks_enable_end_to_end(tmp_path, monkeypatch):
+    """The money path: a qualifying window whose fires are 9 days old must
+    NOT enable the bot, and must say so in the artifact and the alert."""
+    root = tmp_path / "weekly_monitors"
+    repo = tmp_path / "repo"
+    (repo / "var" / "live").mkdir(parents=True)
+    root.mkdir(parents=True)
+    (root / "state.json").write_text(json.dumps(dict(
+        consecutive_weak=0, last_week=None, last_action=None, history=[])),
+        encoding="utf-8")
+    monkeypatch.setattr(wm, "ROOT", root)
+    monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
+    monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
+    monkeypatch.setattr(wm, "REPO", repo)
+
+    now = time.time()
+    frozen_fire = int(now - 9 * 86400)          # fires stopped 9 days ago
+    bets = [dict(epoch=100 + i, lock=int(frozen_fire - (13 - i) * 0.4 * 86400),
+                 win=True) for i in range(13)]
+    bets += [dict(epoch=113 + i, lock=int(frozen_fire - (5 - i) * 3600),
+                  win=True) for i in range(6)]
+    # ROUND stream stays fresh — exactly the condition --sync keeps green
+    monkeypatch.setattr(wm, "build_canonical_bets",
+                        lambda: (bets, int(now - 1800)))
+    monkeypatch.setattr(wm, "perm", lambda w, n_iter=None, seed=None: (
+        dict(n=len(w), insufficient=True) if len(w) < wm.POS_MIN_FIRES
+        else dict(n=len(w), wr=0.6842, obs_mean_pnl=0.2442, null_mean=0.0,
+                  p_upper=0.0285)))
+    monkeypatch.setattr(wm, "risk_off_backtest",
+                        lambda *a, **k: dict(net_pnl_bnb=0.41, num_bets=19,
+                                             win_rate=0.6842, gas_per_bet=0.0006))
+    monkeypatch.setattr(wm, "read_bot_state", lambda: dict(
+        available=True, active="inactive", enabled="disabled",
+        is_running=False, is_enabled=False))
+    monkeypatch.setattr(wm, "do_enable", lambda: (_ for _ in ()).throw(
+        AssertionError("do_enable must not be called on a frozen window")))
+    messages = []
+    monkeypatch.setattr(wm, "discord",
+                        lambda msg: (messages.append(msg), True)[1])
+    monkeypatch.setattr(sys, "argv", [
+        "wm", "--apply", "--no-sync", "--iso-week", "2026-08-23"])
+
+    assert wm._main() == 0
+    decision = json.loads(
+        (root / "2026-08-23" / "decision.json").read_text(encoding="utf-8"))
+    assert decision["triggers"]["positive"] is True    # stats still qualify
+    assert decision["action"] == "enable_BLOCKED_frozen_window"
+    assert decision["fire_fresh"] is False
+    assert decision["data_fresh"] is True              # rounds ARE fresh
+    assert decision["newest_fire_age_h"] > 200
+    assert not (repo / "var" / "live" / "cooldown_override.json").exists()
+    assert "FROZEN WINDOW" in messages[0]
+    assert "placed no bet since" in messages[0]
+    # state still books the week (this is not a blind week)
+    st = json.loads((root / "state.json").read_text(encoding="utf-8"))
+    assert st["last_action"] == "enable_BLOCKED_frozen_window"
