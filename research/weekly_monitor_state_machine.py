@@ -103,6 +103,12 @@ decisions):
              reported loudly and may not be spent on any POSITIVE action.
              It is NOT a disable trigger and never blocks the protective
              disable — see fire_evidence_fresh.
+             LIMITATION (queued follow-up): this is a POINT check on the
+             newest fire, so one recovery bet un-freezes an otherwise
+             all-stale window. Until a density leg lands, every window's
+             fresh/stale composition is reported (decision.json
+             window_*.fire_composition and the Discord body) so a mixed
+             window cannot be misread as a live one.
   NEGATIVE:  WR leg on the SPENT positive window (the same window the
              positive legs read — a starved-1w regime must not make the
              WR floor unreachable while the 2w window shows a losing
@@ -253,6 +259,41 @@ def fire_evidence_fresh(newest_fire_lock: int, now: float) -> bool:
     return (now - float(newest_fire_lock)) <= FIRE_STALE_MAX_AGE_S
 
 
+def window_fire_composition(window: list, now: float) -> dict:
+    """How much of a window's evidence is RECENT, not merely present.
+
+    ``fire_evidence_fresh`` is a POINT check on the newest fire, so a
+    single recovery bet un-freezes an otherwise all-stale window: 18 fires
+    aged 9-13 days plus one fire 2h old passes the gate. This does not
+    change that decision (a density leg is the queued follow-up); it makes
+    the composition VISIBLE so a mixed window cannot be read as a live one.
+    """
+    n = len(window)
+    fresh = sum(1 for b in window
+                if (now - b["lock"]) <= FIRE_STALE_MAX_AGE_S)
+    d7 = sum(1 for b in window if (now - b["lock"]) <= 7 * 86400)
+    oldest_h = ((now - min(b["lock"] for b in window)) / 3600.0) if window else None
+    return dict(
+        n=n, fresh_within_bound=fresh, in_last_7d=d7,
+        stale=n - fresh,
+        oldest_fire_age_h=round(oldest_h, 1) if oldest_h is not None else None,
+    )
+
+
+def fire_gap_p99_h(bets: list, now: float, lookback_days: int = 70) -> float | None:
+    """Trailing p99 inter-fire gap in hours, same definition as the one
+    FIRE_STALE_MAX_AGE_S was derived from. Reported every week so the
+    threshold's shrinking margin is visible as the fire rate falls."""
+    locks = sorted(int(b["lock"]) for b in bets)
+    cut = now - lookback_days * 86400
+    gaps = [(locks[i + 1] - locks[i]) / 3600.0
+            for i in range(len(locks) - 1) if locks[i] > cut]
+    if len(gaps) < 20:
+        return None
+    gaps.sort()
+    return round(gaps[min(len(gaps) - 1, int(0.99 * len(gaps)))], 1)
+
+
 def positive_window(p1: dict, p2: dict) -> str:
     """Select the window the POSITIVE trigger spends: '1w' when it clears
     the POS_MIN_FIRES information floor, else '2w_fallback' when the 2w
@@ -328,7 +369,8 @@ def book_weak_week(st: dict, *, same_week_rerun: bool, weak: bool) -> tuple[int,
     return baseline, (baseline + 1 if weak else 0)
 
 
-def _window_desc(tag: str, stats: dict, bt: dict | None = None) -> str:
+def _window_desc(tag: str, stats: dict, bt: dict | None = None,
+                 comp: dict | None = None) -> str:
     """One window, one clause: 'tag: n=.. WR=.. p=..' when evaluable, or
     'tag: n=..<10 insufficient' when starved — a starved window must read
     as starved, never as 'WR=None p=None'. Appends btPnL when a backtest
@@ -340,6 +382,12 @@ def _window_desc(tag: str, stats: dict, bt: dict | None = None) -> str:
              f"p={stats.get('p_upper')}")
     if bt:
         s += f" btPnL={bt.get('net_pnl_bnb')}"
+    if comp:
+        # Composition always shown: a window can pass the point-in-time
+        # freshness gate while being almost entirely pre-outage evidence.
+        s += (f" [fresh {comp['fresh_within_bound']}/{comp['n']}"
+              f" last7d={comp['in_last_7d']}"
+              f" oldest={comp['oldest_fire_age_h']}h]")
     return s
 
 
@@ -358,13 +406,33 @@ FRESH_MAX_AGE_S = 36 * 3600  # newest closed ROUND older than this = stale
 # no bets at all (the 2026-08-17 pool outage: rounds fresh, fires frozen
 # since 08-14, monitor would have reported healthy stats and action=none).
 #
-# Derived from the fire stream itself, 10 weeks to 2026-08-14, n=272
-# inter-fire gaps: p50 2.0h, p90 17.5h, p95 24.1h, p99 57.0h, max 117.5h.
-# Gaps exceeding 96h: 1 of 272 (0.37%); time-weighted (the quantity that
-# matters, since a Sunday samples wall-clock, not gaps) only the single
-# 117.5h gap exceeds, contributing ~21.5h of 1,680h = ~1.3% of Sundays.
-# 96h also keeps the newest fire inside the 1-week window's own span, so a
-# window flagged stale genuinely covers less than half the reported week.
+# Derived from the fire stream itself. REPRODUCIBLE DEFINITION: fires are
+# the `lock` timestamps of build_canonical_bets() (non-failed closed rounds
+# the canonical gate would have BET, both pools > 0); gaps are between
+# consecutive fires; the sample is every gap whose EARLIER endpoint is
+# strictly newer than (newest_fire - 70d), with newest_fire = 2026-08-14
+# 18:06Z. On that definition n=272: p50 2.0h, p90 17.5h, p95 24.1h,
+# p99 57.0h, max 117.5h. (A re-computation using a different window edge
+# got n=304 / p50 1.5 / p90 16.1 / p95 23.0 / p99 56.7 — the max, the
+# exceedance count and the time-weighted figure below were identical, so
+# the choice below is insensitive to the edge; state the edge when
+# re-deriving.)
+#
+# WHY 96h SPECIFICALLY: it is the LARGEST bound that still catches the
+# worst drought ever observed. Time-weighted exceedance (the quantity that
+# matters, since a Sunday samples wall-clock rather than gaps):
+#     48h -> 7.79%   72h -> 3.86%   96h -> ~1.3%   120h -> 0.00%
+# 120h flags nothing at all — it would have missed the 117.5h event, i.e.
+# it is not a gate. 96h keeps that event inside the net while paying only
+# ~1.3% of Sundays, and keeps the newest fire inside the 1-week window's
+# own span.
+#
+# EROSION WATCH: this bound is absolute, so a falling fire rate eats the
+# margin. At the current (halved) rate the trailing p99 gap is already
+# ~91.1h against this 96h bound; another halving pushes legitimate quiet
+# weeks through it. decision.json therefore records fire_gap_p99_h beside
+# the threshold every week so the erosion is visible before it bites.
+#
 # A RELATIVE threshold (k x trailing mean gap) was rejected deliberately:
 # it inflates as the fire rate collapses, so it goes quiet exactly during
 # a slow strangulation - the same blind-spot class as a gate that cannot
@@ -708,6 +776,12 @@ def _main() -> int:
         return [b for b in bets if b["lock"] >= cut]
 
     w2, w1 = window(14), window(7)
+    # Composition of each window's evidence (see window_fire_composition):
+    # reported always, so a window that passes the point-in-time freshness
+    # gate on one recent fire cannot be misread as a live window.
+    comp1 = window_fire_composition(w1, time.time())
+    comp2 = window_fire_composition(w2, time.time())
+    gap_p99_h = fire_gap_p99_h(bets, time.time())
     e1 = (min(b["epoch"] for b in w1), max(b["epoch"] for b in w1)) if w1 else (0, 0)
     e2 = (min(b["epoch"] for b in w2), max(b["epoch"] for b in w2)) if w2 else (0, 0)
     p2, p1 = perm(w2), perm(w1)
@@ -881,8 +955,10 @@ def _main() -> int:
         data_newest_lock=time.strftime(
             "%Y-%m-%d %H:%M", time.gmtime(newest_round_lock)),
         newest_fire_lock=time.strftime("%Y-%m-%d %H:%M", time.gmtime(max_lock)),
-        window_1w=dict(epochs=list(e1), **p1, backtest=bt),
-        window_2w=dict(epochs=list(e2), **p2, backtest=bt2), latest100_wr=wr100,
+        window_1w=dict(epochs=list(e1), **p1, backtest=bt,
+                       fire_composition=comp1),
+        window_2w=dict(epochs=list(e2), **p2, backtest=bt2,
+                       fire_composition=comp2), latest100_wr=wr100,
         triggers=dict(positive=pos_trigger, trigger_window=trigger_window,
                       negative=neg_trigger,
                       neg_wr_leg=neg_wr_leg, weak_this_week=weak_this_week,
@@ -893,6 +969,7 @@ def _main() -> int:
         data_fresh=data_fresh, fire_fresh=fire_fresh,
         newest_fire_age_h=round(fire_age_h, 1),
         fire_stale_max_age_h=FIRE_STALE_MAX_AGE_S // 3600,
+        fire_gap_p99_h=gap_p99_h,
         sync_fail_streak=streak,
         retry_mode=retry_mode, retry_attempts=attempts_so_far,
         completed_blind_week=completed_blind_week,
@@ -941,11 +1018,12 @@ def _main() -> int:
     if completed_blind_week:
         head += "\n(previous week ended fully blind — Sunday and every retry failed)"
     if trigger_window == "2w_fallback":
-        w2_desc = _window_desc("2w(fallback SPENT)", p2, bt2)
+        w2_desc = _window_desc("2w(fallback SPENT)", p2, bt2, comp2)
     else:
-        w2_desc = _window_desc("2w(info)", p2)
-    body = (f"{_window_desc('1w', p1, bt)}; {w2_desc}; "
-            f"fire_age={fire_age_h:.1f}h fresh={fire_fresh}; "
+        w2_desc = _window_desc("2w(info)", p2, None, comp2)
+    body = (f"{_window_desc('1w', p1, bt, comp1)}; {w2_desc}; "
+            f"fire_age={fire_age_h:.1f}h fresh={fire_fresh} "
+            f"gap_p99={gap_p99_h}h/{FIRE_STALE_MAX_AGE_S // 3600}h; "
             f"neg={neg_trigger} weak={weak_this_week} consec_weak={consec} "
             f"blind_streak={streak}; enabled={state.get('is_enabled')} "
             f"running={state.get('is_running')} in_cooldown={in_cooldown}")
