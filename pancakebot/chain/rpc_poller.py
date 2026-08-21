@@ -67,10 +67,16 @@ Public interface mirrors ``PoolEventWatcher`` where feasible
 (``get_pool``, ``set_round_phase``, ``connected``, ``current_endpoint``,
 ``is_pool_ready``) so the engine call sites are minimally affected.
 
-Persistent HTTP/1.1 connections via ``urllib3.PoolManager`` mean the
-endpoint's TLS handshake amortizes across the bot's lifetime — after
-warmup, every call (including the parallel block-ts fan-out) reuses
-already-open sockets.
+Persistent HTTP/1.1 connections via ``urllib3.PoolManager``: a socket's
+TLS handshake is paid by whichever call opens it, then amortized
+organically across that socket's later reuse (including the parallel
+block-ts fan-out). There is NO warm-up step and NO connection-freshness
+policy on this read path — unlike the OKX client's per-round pool
+warmup or the write path's per-round TLS warm, nothing here primes,
+recycles or ages out a connection; sockets live until the pool or the
+peer drops one. Whether that is optimal is UNMEASURED here: a
+2026-08-21 probe found reconnect-per-call strictly WORSE than reuse, so
+no recycling is implemented, but the question is open, not settled.
 """
 from __future__ import annotations
 
