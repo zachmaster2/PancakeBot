@@ -513,6 +513,7 @@ class RpcPoller:
         # bound rather than dropped — see ``getlogs_p99_ms``.
         self._getlogs_latency_ms: deque[float] = deque(maxlen=200)
         self._getlogs_censored: int = 0
+        self._getlogs_errors: int = 0
 
         # ``(needed_ms, available_ms)`` from the most recent catchup
         # feasibility check that returned True (= infeasible). Reset
@@ -627,6 +628,7 @@ class RpcPoller:
                 "current_endpoint": RPC_BLOXROUTE_ENDPOINT,
                 "getlogs_endpoint": RPC_GETLOGS_ENDPOINT,
                 "getlogs_censored_samples": self._getlogs_censored,
+                "getlogs_errors": self._getlogs_errors,
                 "poll_count": self._poll_count,
                 "last_poll_at": self._last_poll_at,
                 "last_poll_rtt_ms": self._last_poll_rtt_ms,
@@ -913,6 +915,7 @@ class RpcPoller:
         self._periodic_thread.start()
         info("START",
              f"RPC poller started endpoint={RPC_BLOXROUTE_ENDPOINT} "
+             f"getlogs_endpoint={RPC_GETLOGS_ENDPOINT} "
              f"periodic={self._periodic_poll_interval_s}s "
              f"getlogs_chunk={_GETLOGS_CHUNK_BLOCKS} "
              f"wall_caps={_tc.RPC_POLL_WALL_CAP_SINGLE_MS}/"
@@ -1066,6 +1069,27 @@ class RpcPoller:
     # Round-aware cursor clamp + catch-up feasibility check
     # ------------------------------------------------------------------
 
+    def _log_getlogs_health(self) -> None:
+        """One structured line per round on the getLogs read path.
+
+        Cadence is the epoch advance (~5 min): frequent enough to see a
+        degradation build, rare enough to stay readable. Emitted even when
+        healthy, because "no news" was exactly the failure mode of the
+        2026-08-17 outage — the p99 here is the number that would have
+        named the cause on day one. Includes censored timeouts (see
+        ``getlogs_p99_ms``), so a p99 at the bound reads as ">=".
+        """
+        p99 = self.getlogs_p99_ms
+        with self._lock:
+            censored, errors = self._getlogs_censored, self._getlogs_errors
+            samples = len(self._getlogs_latency_ms)
+        info(
+            "POLL",
+            f"getlogs health: p99={'>=' + str(p99) + 'ms' if p99 is not None else 'n/a'} "
+            f"samples={samples} censored={censored} errors={errors} "
+            f"host={RPC_GETLOGS_ENDPOINT}",
+        )
+
     def _on_epoch_advance(self, *, lock_at: int, current_epoch: int) -> None:
         """Atomic round transition + catch-up feasibility check.
 
@@ -1139,6 +1163,8 @@ class RpcPoller:
             ]
             for bn in stale_bns:
                 del self._block_ts[bn]
+
+        self._log_getlogs_health()
 
         if rs_block is None:
             warn("ALERT",
@@ -2148,6 +2174,8 @@ class RpcPoller:
                     # RPC-level rejection is not a latency observation at
                     # all, so only attempts that actually consumed the
                     # budget are recorded, censored at the bound.
+                    with self._lock:
+                        self._getlogs_errors += 1
                     elapsed_ms = (time.monotonic() - t_attempt) * 1000.0
                     if elapsed_ms >= timeout_ms * 0.9:
                         self._record_getlogs_latency(
