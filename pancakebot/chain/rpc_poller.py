@@ -1083,9 +1083,17 @@ class RpcPoller:
         with self._lock:
             censored, errors = self._getlogs_censored, self._getlogs_errors
             samples = len(self._getlogs_latency_ms)
+        # ">=" ONLY when at least one sample is a censored timeout. With
+        # censored=0 the p99 is an exact measurement, and an unconditional
+        # ">=" makes a bound indistinguishable from a measurement — which
+        # is the whole point of reporting it.
+        if p99 is None:
+            p99_txt = "n/a"
+        else:
+            p99_txt = f"{'>=' if censored else ''}{p99}ms"
         info(
             "POLL",
-            f"getlogs health: p99={'>=' + str(p99) + 'ms' if p99 is not None else 'n/a'} "
+            f"getlogs health: p99={p99_txt} "
             f"samples={samples} censored={censored} errors={errors} "
             f"host={RPC_GETLOGS_ENDPOINT}",
         )
