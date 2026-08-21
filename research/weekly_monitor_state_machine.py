@@ -24,11 +24,19 @@ enable/disable + override-flag writes).
 Unattended-safety (2026-07-17/18 hardening):
   * evidence gate: positive actions require BOTH a clean sync exit AND
     fresh data (newest closed ROUND <= 36h old — a stalled indexer can
-    exit 0 without advancing the stores; the newest FIRE is deliberately
-    not the yardstick, it lags days in normal signal droughts). Blind
-    runs (either check failing)
-    block enable/release, freeze the weekly counters, and alert loudly;
-    the protective disable may still act on last-synced data.
+    exit 0 without advancing the stores). ROUND freshness is the yardstick
+    here because the round stream is dense; the sparse FIRE stream lags
+    days in normal droughts and would false-trip it. Blind runs (either
+    check failing) block enable/release, freeze the weekly counters, and
+    alert loudly; the protective disable may still act on last-synced
+    data.
+  * frozen-window gate (2026-08-21): the fire stream has its OWN, separate
+    staleness bound (FIRE_STALE_MAX_AGE_S) because the evaluation windows
+    are keyed to the newest FIRE — a bot that stops betting freezes them
+    while --sync keeps the ROUND stream fresh, so the run above would
+    report healthy stats for a week it never traded in. A frozen window
+    blocks POSITIVE actions and is reported loudly, but never freezes
+    counters, never arms retries, and is never itself a disable trigger.
   * daily retries (2026-07-18): a blind applied run writes an atomic
     retry_pending marker; cron fires DAILY and the wrapper runs Mon-Sat
     only while a marker exists. A recovered retry is keyed to the MISSED
@@ -89,6 +97,12 @@ decisions):
              cooldown override flag (var/live/cooldown_override.json),
              which the pipeline consumes to release the suspension
              immediately (ignoring extend-while-bleeding).
+  EVIDENCE:  the windows are keyed to the newest FIRE, so a bot that stops
+             betting freezes them. A newest fire older than
+             FIRE_STALE_MAX_AGE_S makes the window FROZEN evidence: it is
+             reported loudly and may not be spent on any POSITIVE action.
+             It is NOT a disable trigger and never blocks the protective
+             disable — see fire_evidence_fresh.
   NEGATIVE:  WR leg on the SPENT positive window (the same window the
              positive legs read — a starved-1w regime must not make the
              WR floor unreachable while the 2w window shows a losing
@@ -225,6 +239,20 @@ def perm(bets, n_iter=N_PERM, seed=SEED):
                 p_upper=round(float((null >= obs).mean()), 5))
 
 
+def fire_evidence_fresh(newest_fire_lock: int, now: float) -> bool:
+    """True when the newest FIRE is recent enough for its window to count
+    as live evidence (see FIRE_STALE_MAX_AGE_S).
+
+    Gates POSITIVE actions only. A stale fire stream never blocks the
+    protective disable: if the last evidence we have says the strategy is
+    losing, a drought must not rescue the bot from being switched off.
+    Nor is staleness itself a disable trigger - a genuinely quiet week is
+    legitimate, the bot self-heals from infrastructure faults, and the
+    runtime pool-gate alarm is what pages for "up but unable to trade".
+    """
+    return (now - float(newest_fire_lock)) <= FIRE_STALE_MAX_AGE_S
+
+
 def positive_window(p1: dict, p2: dict) -> str:
     """Select the window the POSITIVE trigger spends: '1w' when it clears
     the POS_MIN_FIRES information floor, else '2w_fallback' when the 2w
@@ -322,6 +350,26 @@ def _window_desc(tag: str, stats: dict, bt: dict | None = None) -> str:
 BACKTEST_TIMEOUT_S = 1800   # a hung backtest must not eat the weekly slot
 SYNC_TIMEOUT_S = 3600       # observed healthy sync ~14 min; 60 min = hung
 FRESH_MAX_AGE_S = 36 * 3600  # newest closed ROUND older than this = stale
+
+# Newest FIRE older than this -> the evaluation windows are FROZEN: they
+# re-score bets that already happened and describe a week the bot did not
+# trade in. Distinct from FRESH_MAX_AGE_S above, which watches the dense
+# ROUND stream and is refreshed by every --sync even while the bot places
+# no bets at all (the 2026-08-17 pool outage: rounds fresh, fires frozen
+# since 08-14, monitor would have reported healthy stats and action=none).
+#
+# Derived from the fire stream itself, 10 weeks to 2026-08-14, n=272
+# inter-fire gaps: p50 2.0h, p90 17.5h, p95 24.1h, p99 57.0h, max 117.5h.
+# Gaps exceeding 96h: 1 of 272 (0.37%); time-weighted (the quantity that
+# matters, since a Sunday samples wall-clock, not gaps) only the single
+# 117.5h gap exceeds, contributing ~21.5h of 1,680h = ~1.3% of Sundays.
+# 96h also keeps the newest fire inside the 1-week window's own span, so a
+# window flagged stale genuinely covers less than half the reported week.
+# A RELATIVE threshold (k x trailing mean gap) was rejected deliberately:
+# it inflates as the fire rate collapses, so it goes quiet exactly during
+# a slow strangulation - the same blind-spot class as a gate that cannot
+# fire when it matters most.
+FIRE_STALE_MAX_AGE_S = 96 * 3600
 SYNC_FAIL_DISABLE_STREAK = 3  # blind weeks in a row before protective disable
 
 
@@ -609,6 +657,19 @@ def _main() -> int:
     # droughts and must not trip this gate.
     data_fresh = (time.time() - newest_round_lock) <= FRESH_MAX_AGE_S
     evidence_ok = sync_ok and data_fresh
+    # Fire-stream freshness is a SEPARATE gate, deliberately NOT folded into
+    # evidence_ok: a quiet week is not a sync failure, so it must not freeze
+    # the weekly counters or arm the daily retry machinery. It gates the
+    # POSITIVE actions only (see fire_evidence_fresh).
+    fire_age_h = (time.time() - max_lock) / 3600.0
+    fire_fresh = fire_evidence_fresh(max_lock, time.time())
+    positive_evidence_ok = evidence_ok and fire_fresh
+    if not fire_fresh:
+        print(f"!!! fire stream STALE: newest fire "
+              f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(max_lock))}Z "
+              f"({fire_age_h:.1f}h > {FIRE_STALE_MAX_AGE_S / 3600:.0f}h) — the "
+              "evaluation windows are FROZEN; positive actions blocked",
+              flush=True)
     if not data_fresh:
         print("!!! data STALE: newest closed round lock "
               f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(newest_round_lock))}Z "
@@ -745,9 +806,13 @@ def _main() -> int:
                   f"{BREAKEVEN_WR}, p={pos_stats.get('p_upper')}<{POS_RAW_P}, "
                   f"n={pos_stats.get('n')}>={POS_MIN_FIRES}, "
                   f"btPnL={pos_bt.get('net_pnl_bnb')}>0")
-        if not evidence_ok:
-            action = "enable_BLOCKED_stale_evidence"
-            reason += " — sync failed or data stale; refusing to enable"
+        if not positive_evidence_ok:
+            action = ("enable_BLOCKED_stale_evidence" if not evidence_ok
+                      else "enable_BLOCKED_frozen_window")
+            reason += (" — sync failed or data stale; refusing to enable"
+                       if not evidence_ok else
+                       f" — newest fire {fire_age_h:.1f}h old: this window is "
+                       "FROZEN evidence, not this week's; refusing to enable")
         elif args.apply:
             action = "enable"
             # One-shot re-enable (2026-07-17): if the bot went down mid-
@@ -781,9 +846,13 @@ def _main() -> int:
         # flag, which the pipeline consumes on its next paused round
         # (ignores extend-while-bleeding by design).
         reason = f"POSITIVE ({trigger_window}) while breaker-suspended -> override flag"
-        if not evidence_ok:
-            action = "cooldown_override_BLOCKED_stale_evidence"
-            reason += " — sync failed or data stale; refusing to release"
+        if not positive_evidence_ok:
+            action = ("cooldown_override_BLOCKED_stale_evidence" if not evidence_ok
+                      else "cooldown_override_BLOCKED_frozen_window")
+            reason += (" — sync failed or data stale; refusing to release"
+                       if not evidence_ok else
+                       f" — newest fire {fire_age_h:.1f}h old: this window is "
+                       "FROZEN evidence, not this week's; refusing to release")
         elif args.apply:
             action = "cooldown_override"
             flag = write_override_flag(week=week, reason=reason,
@@ -821,7 +890,10 @@ def _main() -> int:
                       sidak_p_informational=round(sidak_p, 5),
                       consecutive_weak=consec),
         bot_state=state, in_cooldown=in_cooldown, sync_ok=sync_ok,
-        data_fresh=data_fresh, sync_fail_streak=streak,
+        data_fresh=data_fresh, fire_fresh=fire_fresh,
+        newest_fire_age_h=round(fire_age_h, 1),
+        fire_stale_max_age_h=FIRE_STALE_MAX_AGE_S // 3600,
+        sync_fail_streak=streak,
         retry_mode=retry_mode, retry_attempts=attempts_so_far,
         completed_blind_week=completed_blind_week,
         action=action, reason=reason, acted=acted,
@@ -857,6 +929,15 @@ def _main() -> int:
         what = "SYNC FAILED" if not sync_ok else "DATA STALE"
         head = (f"⚠️ {what} — stale-data evaluation; will retry daily "
                 f"until Sunday\n{head}")
+    if not fire_fresh:
+        # Loudest banner available: the numbers below describe bets that
+        # already happened, not the week being reported on.
+        head = (f"⚠️ FROZEN WINDOW — newest fire is {fire_age_h:.1f}h old "
+                f"(> {FIRE_STALE_MAX_AGE_S // 3600}h): the stats below re-score "
+                f"PAST bets and say nothing about this week. Positive actions "
+                f"blocked; the bot has placed no bet since "
+                f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(max_lock))}Z.\n"
+                f"{head}")
     if completed_blind_week:
         head += "\n(previous week ended fully blind — Sunday and every retry failed)"
     if trigger_window == "2w_fallback":
@@ -864,6 +945,7 @@ def _main() -> int:
     else:
         w2_desc = _window_desc("2w(info)", p2)
     body = (f"{_window_desc('1w', p1, bt)}; {w2_desc}; "
+            f"fire_age={fire_age_h:.1f}h fresh={fire_fresh}; "
             f"neg={neg_trigger} weak={weak_this_week} consec_weak={consec} "
             f"blind_streak={streak}; enabled={state.get('is_enabled')} "
             f"running={state.get('is_running')} in_cooldown={in_cooldown}")
