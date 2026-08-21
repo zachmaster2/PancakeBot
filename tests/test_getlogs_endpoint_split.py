@@ -127,3 +127,44 @@ def test_alarm_payload_carries_the_censored_p99():
                   blocks_short=655, getlogs_p99_ms=250)
     assert ev.fields["getlogs_p99_ms"] == ">=250"
     assert "getlogs_p99_ms=>=250" in ev.detail
+
+# ---- periodic health line (observability) ---------------------------------
+
+def test_stats_exposes_error_counter():
+    p = RpcPoller(interval_seconds=300)
+    assert p.stats["getlogs_errors"] == 0
+
+
+def test_health_line_reports_host_and_censored_p99(monkeypatch):
+    """Emitted once per round even when healthy: silence was the failure
+    mode of the 2026-08-17 outage."""
+    import pancakebot.chain.rpc_poller as mod
+    p = RpcPoller(interval_seconds=300)
+    lines = []
+    monkeypatch.setattr(mod, "info", lambda *a, **k: lines.append(a))
+
+    p._log_getlogs_health()
+    assert lines and lines[-1][0] == "POLL"
+    assert "p99=n/a" in lines[-1][1]              # below the sample floor
+    assert RPC_GETLOGS_ENDPOINT in lines[-1][1]
+
+    for _ in range(30):
+        p._record_getlogs_latency(float(_GETLOGS_TIMEOUT_MS), censored=True)
+    p._log_getlogs_health()
+    # censored samples must surface as a lower bound, never as a flat number
+    assert ">=%dms" % _GETLOGS_TIMEOUT_MS in lines[-1][1]
+    assert "censored=30" in lines[-1][1]
+
+
+def test_transport_counts_every_getlogs_error_not_just_timeouts(monkeypatch):
+    p = RpcPoller(interval_seconds=300)
+
+    def fast_boom(url, body, *, timeout_seconds):
+        raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(p, "_rpc_post", fast_boom)
+    with pytest.raises(ConnectionRefusedError):
+        p._bloxroute_call("eth_getLogs", [{}], timeout_ms=20, attempts=1)
+    # a fast rejection is not a LATENCY sample, but it IS an error
+    assert p.stats["getlogs_censored_samples"] == 0
+    assert p.stats["getlogs_errors"] == 1
