@@ -417,3 +417,98 @@ def test_frozen_window_blocks_enable_end_to_end(tmp_path, monkeypatch):
     # state still books the week (this is not a blind week)
     st = json.loads((root / "state.json").read_text(encoding="utf-8"))
     assert st["last_action"] == "enable_BLOCKED_frozen_window"
+
+# ---- spent-window fire composition (point-check visibility) ---------------
+
+def _w(now, ages_h):
+    return [dict(epoch=1000 + i, lock=int(now - a * 3600), win=True)
+            for i, a in enumerate(ages_h)]
+
+
+def test_composition_counts_fresh_and_stale():
+    now = 1_787_000_000.0
+    comp = wm.window_fire_composition(_w(now, [1, 50, 95, 97, 300]), now)
+    assert comp["n"] == 5
+    assert comp["fresh_within_bound"] == 3       # <= 96h
+    assert comp["stale"] == 2
+    assert comp["in_last_7d"] == 4               # <= 168h
+    assert comp["oldest_fire_age_h"] == 300.0
+
+
+def test_one_recovery_fire_passes_the_gate_but_composition_shows_it():
+    """The reviewer's finding: 18 fires aged 9.6-13d plus ONE 2h-old fire
+    passes the point-in-time freshness gate. That decision is unchanged in
+    this pass (a density leg is the queued follow-up) — but the mixture
+    must be VISIBLE, never readable as a live window."""
+    now = 1_787_000_000.0
+    ages = [2.0] + [h * 24.0 for h in (9.6, 10, 10.4, 10.8, 11.2, 11.6, 12,
+                                       12.2, 12.4, 12.6, 12.8, 13, 13, 13,
+                                       13, 13, 13, 13)]
+    window = _w(now, ages)
+    newest = max(b["lock"] for b in window)
+    assert wm.fire_evidence_fresh(newest, now) is True      # gate passes
+    comp = wm.window_fire_composition(window, now)
+    assert comp["n"] == 19 and comp["fresh_within_bound"] == 1
+    assert comp["in_last_7d"] == 1
+    rendered = wm._window_desc("2w(fallback SPENT)", GOOD_2W, BT_POS, comp)
+    assert "[fresh 1/19 last7d=1" in rendered
+
+
+def test_gap_p99_needs_samples_and_tracks_erosion():
+    now = 1_787_000_000.0
+    assert wm.fire_gap_p99_h(_w(now, [1, 2, 3]), now) is None
+    # 40 fires 2h apart, then one 90h drought -> p99 sits at the drought
+    ages = [90.0 + 2 * i for i in range(40)] + [0.0]
+    p99 = wm.fire_gap_p99_h(_w(now, ages), now)
+    assert p99 is not None and p99 >= 89.0
+
+
+def test_mixed_window_composition_reaches_decision_and_discord(tmp_path, monkeypatch):
+    """End-to-end shape of Sunday 2026-08-23: a 2w window straddling the
+    outage. The run may still act, but the artifact and the alert must both
+    carry the fresh/stale split."""
+    root = tmp_path / "weekly_monitors"
+    repo = tmp_path / "repo"
+    (repo / "var" / "live").mkdir(parents=True)
+    root.mkdir(parents=True)
+    (root / "state.json").write_text(json.dumps(dict(
+        consecutive_weak=0, last_week=None, last_action=None, history=[])),
+        encoding="utf-8")
+    monkeypatch.setattr(wm, "ROOT", root)
+    monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
+    monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
+    monkeypatch.setattr(wm, "REPO", repo)
+
+    now = time.time()
+    pre = int(now - 9 * 86400)
+    bets = [dict(epoch=100 + i, lock=int(pre - (13 - i) * 0.3 * 86400), win=True)
+            for i in range(18)]
+    bets.append(dict(epoch=200, lock=int(now - 2 * 3600), win=True))
+    monkeypatch.setattr(wm, "build_canonical_bets",
+                        lambda: (bets, int(now - 1800)))
+    monkeypatch.setattr(wm, "perm", lambda w, n_iter=None, seed=None: (
+        dict(n=len(w), insufficient=True) if len(w) < wm.POS_MIN_FIRES
+        else dict(n=len(w), wr=0.6842, obs_mean_pnl=0.2442, null_mean=0.0,
+                  p_upper=0.0285)))
+    monkeypatch.setattr(wm, "risk_off_backtest",
+                        lambda *a, **k: dict(net_pnl_bnb=0.41, num_bets=19,
+                                             win_rate=0.6842, gas_per_bet=0.0006))
+    monkeypatch.setattr(wm, "read_bot_state", lambda: dict(
+        available=True, active="active", enabled="enabled",
+        is_running=True, is_enabled=True))
+    messages = []
+    monkeypatch.setattr(wm, "discord",
+                        lambda msg: (messages.append(msg), True)[1])
+    monkeypatch.setattr(sys, "argv", [
+        "wm", "--apply", "--no-sync", "--iso-week", "2026-08-23"])
+
+    assert wm._main() == 0
+    d = json.loads((root / "2026-08-23" / "decision.json").read_text(encoding="utf-8"))
+    # the point-check gate passes on the single recent fire...
+    assert d["fire_fresh"] is True
+    # ...and the composition makes the mixture impossible to miss
+    comp2 = d["window_2w"]["fire_composition"]
+    assert comp2["n"] >= 18 and comp2["fresh_within_bound"] == 1
+    assert comp2["oldest_fire_age_h"] > 200
+    assert "fresh 1/" in messages[0]
+    assert d["fire_gap_p99_h"] is None or d["fire_gap_p99_h"] > 0
