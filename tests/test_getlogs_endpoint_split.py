@@ -148,6 +148,15 @@ def test_health_line_reports_host_and_censored_p99(monkeypatch):
     assert "p99=n/a" in lines[-1][1]              # below the sample floor
     assert RPC_GETLOGS_ENDPOINT in lines[-1][1]
 
+    # an UNcensored p99 is an exact measurement: no ">=" prefix, or a bound
+    # becomes indistinguishable from a measurement
+    for _ in range(25):
+        p._record_getlogs_latency(20.0, censored=False)
+    p._log_getlogs_health()
+    assert "p99=20ms" in lines[-1][1]
+    assert ">=" not in lines[-1][1]
+    assert "censored=0" in lines[-1][1]
+
     for _ in range(30):
         p._record_getlogs_latency(float(_GETLOGS_TIMEOUT_MS), censored=True)
     p._log_getlogs_health()
