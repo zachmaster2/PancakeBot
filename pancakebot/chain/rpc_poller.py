@@ -20,6 +20,18 @@ docstring is the canonical architecture reference; the 2026-05-07 design +
 WSS-spike notes lived in var/ and were archived offline — the spike showed
 cross-subscription event ordering is NOT preserved on public WSS endpoints,
 which is what motivated deterministic getLogs polling.)
+Era 13 (2026-08-21): the single-source property above is BROKEN, on
+purpose, for ONE method. bloXroute's log-index path regressed on
+2026-08-17 — a one-block, fully-filtered ``eth_getLogs`` measured 2,865ms
+against 11ms on publicnode for the identical request, while
+``eth_blockNumber`` (4ms), ``eth_getBlockByNumber`` (5ms) and ``eth_call``
+(4ms) stayed healthy on the same connection in the same session. The
+degradation is per-METHOD, not per-host, so the fix is too: ``eth_getLogs``
+goes to ``RPC_GETLOGS_ENDPOINT`` and every other read stays on bloXroute
+(see ``_ENDPOINT_BY_METHOD``). The cross-node skew Era 12b avoided is
+accepted here because the alternative measured 1,077 consecutive skipped
+rounds and four days of no trading; F0 remains the node-independent
+backstop, and it is what caught that outage every round.)
 
 The poller has three trigger paths:
 
@@ -66,6 +78,7 @@ import concurrent.futures
 import json
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -113,6 +126,27 @@ _BET_BEAR_TOPIC = "0x0d8c1fe3e67ab767116a81f122b83c2557a8c2564019cb7c4f83de1aeb1
 # second read source would add cross-node skew, not availability.
 RPC_BLOXROUTE_ENDPOINT: str = "https://bsc.rpc.blxrbdn.com"
 
+# eth_getLogs ONLY (Era 13 — see the module docstring for the measurement).
+# Every other read method stays on bloXroute, which serves them in
+# single-digit ms. Constraint on this host: it serves RECENT blocks only
+# (deeper history returns "Archive requests require a personal token"),
+# which suits this poller exactly — the cursor is structurally bounded to
+# at most one round behind head by the per-round forward jump in
+# ``_on_epoch_advance``, and ranges are capped at _GETLOGS_CHUNK_BLOCKS,
+# so every query lands within ~6 minutes of the tip.
+RPC_GETLOGS_ENDPOINT: str = "https://bsc-rpc.publicnode.com"
+
+# THE routing table: read it to see which host serves which method, and
+# the docstring above for why the split exists at all.
+_ENDPOINT_BY_METHOD: dict[str, str] = {
+    "eth_getLogs": RPC_GETLOGS_ENDPOINT,
+}
+
+
+def _endpoint_for(method: str) -> str:
+    """Host that serves ``method``; bloXroute unless routed away above."""
+    return _ENDPOINT_BY_METHOD.get(method, RPC_BLOXROUTE_ENDPOINT)
+
 # Max blocks per eth_getLogs range. Sized to cover every fetch path in ONE
 # call: steady ~8s poll (~18 blocks), engine single poll (~18), and cold-start
 # catch-up (<= 667 = one 5-min round). Backlogs above this loop in chunks.
@@ -127,7 +161,14 @@ _GETLOGS_FETCH_RTT_P99_MS: int = 250
 # (VM measurements above). A timeout is a FAIL-FAST bound, not a budget: a
 # healthy call returns in p50 ~20-30ms; a call that hits one of these is
 # treated as failed and retried (or surfaced) instead of hanging the poll.
-_GETLOGS_TIMEOUT_MS: int = 600       # > soak max 492ms
+# Re-derived 2026-08-21 for RPC_GETLOGS_ENDPOINT on the VM (the previous
+# 600ms was sized for bloXroute's "> soak max 492ms"). Soak on the new
+# host, same filter: 18-block ranges n=120 p50=17 p95=35 p99=41 max=51ms;
+# 660-block ranges n=30 p50=41 p95=61 p99=103 max=103ms. 250ms is ~2.4x
+# the worst observation, and — unlike 600ms — it lets a SECOND attempt
+# start inside the 950ms single-poll cap (250 + 25 backoff + 250 = 525ms),
+# restoring the in-call retry that the old value silently disabled.
+_GETLOGS_TIMEOUT_MS: int = 250       # > soak max 103ms on the getLogs host
 _BLX_HEAD_TIMEOUT_MS: int = 250      # eth_blockNumber, > ~3.6x p99 69ms
 _BLX_HEADER_TIMEOUT_MS: int = 250    # getBlockByNumber(latest), > ~3.5x p99 71ms
 _BLX_BLOCK_TS_TIMEOUT_MS: int = 250  # getBlockByNumber(bn), > ~5.9x p99 42ms
@@ -461,6 +502,11 @@ class RpcPoller:
         # Last F0 coverage shortfall in blocks (None when covered).
         # Read-only diagnostic for the pool-gate alarm's alert body.
         self._last_pool_blocks_short: int | None = None
+        # Observed eth_getLogs wallclock, DIAGNOSTIC ONLY (nothing gates on
+        # it). Timeouts are recorded as censored observations at the timeout
+        # bound rather than dropped — see ``getlogs_p99_ms``.
+        self._getlogs_latency_ms: deque[float] = deque(maxlen=200)
+        self._getlogs_censored: int = 0
 
         # ``(needed_ms, available_ms)`` from the most recent catchup
         # feasibility check that returned True (= infeasible). Reset
@@ -533,11 +579,48 @@ class RpcPoller:
         return RPC_BLOXROUTE_ENDPOINT
 
     @property
+    def getlogs_endpoint(self) -> str:
+        return RPC_GETLOGS_ENDPOINT
+
+    def _record_getlogs_latency(self, ms: float, *, censored: bool) -> None:
+        with self._lock:
+            self._getlogs_latency_ms.append(float(ms))
+            if censored:
+                self._getlogs_censored += 1
+
+    @property
+    def getlogs_p99_ms(self) -> int | None:
+        """Observed ``eth_getLogs`` wallclock p99 in ms, or None before
+        enough samples.
+
+        TIMEOUTS COUNT, at the timeout bound. A timeout is an observation
+        that the call took AT LEAST ``_GETLOGS_TIMEOUT_MS``, not an absent
+        sample: averaging only successes would make this metric revert to
+        the healthy-path number exactly when every call is failing, which
+        is the one moment it has to be believed. (The 2026-08-17 outage
+        timed out on 100% of calls; a success-only p99 would have had zero
+        samples and reported nothing wrong.) Because timeouts are censored
+        at the bound, a p99 pinned AT the timeout means "at least this
+        slow" — the true latency is higher.
+
+        DIAGNOSTIC ONLY: no skip, gate, or budget reads this. Feasibility
+        (INFEAS) keeps its static cost model deliberately — a predictive
+        skip keyed on live latency would skip rounds F0 would have passed.
+        """
+        with self._lock:
+            samples = sorted(self._getlogs_latency_ms)
+        if len(samples) < 20:
+            return None
+        return int(samples[min(len(samples) - 1, int(0.99 * len(samples)))])
+
+    @property
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "connected": self._connected,
                 "current_endpoint": RPC_BLOXROUTE_ENDPOINT,
+                "getlogs_endpoint": RPC_GETLOGS_ENDPOINT,
+                "getlogs_censored_samples": self._getlogs_censored,
                 "poll_count": self._poll_count,
                 "last_poll_at": self._last_poll_at,
                 "last_poll_rtt_ms": self._last_poll_rtt_ms,
@@ -2038,16 +2121,32 @@ class RpcPoller:
                 raise InvariantError(
                     f"poll_wall_cap_exceeded:{method}:attempt_{i + 1}_not_started"
                 )
+            t_attempt = time.monotonic()
             try:
                 resp_bytes = self._rpc_post(
-                    RPC_BLOXROUTE_ENDPOINT, body,
+                    _endpoint_for(method), body,
                     timeout_seconds=timeout_ms / 1000.0,
                 )
+                if method == "eth_getLogs":
+                    self._record_getlogs_latency(
+                        (time.monotonic() - t_attempt) * 1000.0, censored=False,
+                    )
                 payload = json.loads(resp_bytes)
                 if "error" in payload:
                     raise InvariantError(f"rpc_error:{method}:{payload['error']}")
                 return payload.get("result")
             except Exception as e:  # noqa: BLE001
+                if method == "eth_getLogs":
+                    # A timeout is an observation of ">= timeout", not a
+                    # missing sample (see ``getlogs_p99_ms``). A fast
+                    # RPC-level rejection is not a latency observation at
+                    # all, so only attempts that actually consumed the
+                    # budget are recorded, censored at the bound.
+                    elapsed_ms = (time.monotonic() - t_attempt) * 1000.0
+                    if elapsed_ms >= timeout_ms * 0.9:
+                        self._record_getlogs_latency(
+                            max(elapsed_ms, float(timeout_ms)), censored=True,
+                        )
                 last_error = e
         assert last_error is not None  # attempts >= 1 guaranteed by callers
         raise last_error

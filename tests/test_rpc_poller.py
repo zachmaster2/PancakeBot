@@ -2320,8 +2320,9 @@ def _far_abort_at() -> float:
 
 def test_fetch_and_process_logs_queries_getlogs_endpoint(monkeypatch):
     """_fetch_and_process_logs POSTs a single eth_getLogs range query to
-    RPC_BLOXROUTE_ENDPOINT, filtered by contract address + Bet topic0, and
-    feeds the result to _process_bet_logs."""
+    RPC_GETLOGS_ENDPOINT (Era 13: getLogs is the one method routed off
+    bloXroute), filtered by contract address + Bet topic0, and feeds the
+    result to _process_bet_logs."""
     import json as _json
     import pancakebot.chain.rpc_poller as mod
     p = _make_poller()
@@ -2339,7 +2340,7 @@ def test_fetch_and_process_logs_queries_getlogs_endpoint(monkeypatch):
     )
     p._fetch_and_process_logs(100, 117, attempts=1, abort_at=_far_abort_at())
 
-    assert captured["url"] == mod.RPC_BLOXROUTE_ENDPOINT
+    assert captured["url"] == mod.RPC_GETLOGS_ENDPOINT
     req = captured["req"]
     assert req["method"] == "eth_getLogs"
     flt = req["params"][0]

@@ -209,11 +209,16 @@ def _dispatch_pool_gate_alarm(
     """
     try:
         blocks_short = None
+        getlogs_p99_ms = None
         if cfg.rpc_poller is not None:
             blocks_short = cfg.rpc_poller.last_pool_blocks_short
+            # Diagnostic only: names the CAUSE (endpoint latency) beside
+            # the symptom (blocks short) in the alert body.
+            getlogs_p99_ms = getattr(cfg.rpc_poller, "getlogs_p99_ms", None)
         event = _POOL_GATE_ALARM.record(
             ready=ready, reason=reason, epoch=int(epoch),
             now=_utc_now(), blocks_short=blocks_short,
+            getlogs_p99_ms=getlogs_p99_ms,
         )
         if event is None:
             return

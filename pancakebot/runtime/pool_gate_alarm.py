@@ -88,6 +88,7 @@ class PoolGateAlarm:
         self._reason_counts: dict[str, int] = {}
         self._last_ok_epoch: int | None = None
         self._last_blocks_short: int | None = None
+        self._last_getlogs_p99_ms: int | None = None
 
     @property
     def streak(self) -> int:
@@ -112,6 +113,9 @@ class PoolGateAlarm:
         }
         if self._last_blocks_short is not None:
             out["blocks_short"] = self._last_blocks_short
+        if self._last_getlogs_p99_ms is not None:
+            # Censored at the timeout bound, so ">=" is the honest reading.
+            out["getlogs_p99_ms"] = f">={self._last_getlogs_p99_ms}"
         out["last_ok_epoch"] = (
             self._last_ok_epoch if self._last_ok_epoch is not None else "none-since-start"
         )
@@ -125,6 +129,7 @@ class PoolGateAlarm:
         epoch: int,
         now: float,
         blocks_short: int | None = None,
+        getlogs_p99_ms: int | None = None,
     ) -> PoolGateEvent | None:
         """Fold one round's readiness verdict in. Returns an event to
         dispatch, or None (the overwhelmingly common case)."""
@@ -132,6 +137,7 @@ class PoolGateAlarm:
             return self._record_ready(epoch=epoch, now=now)
         return self._record_blocked(
             reason=reason, epoch=epoch, now=now, blocks_short=blocks_short,
+            getlogs_p99_ms=getlogs_p99_ms,
         )
 
     def _record_ready(self, *, epoch: int, now: float) -> PoolGateEvent | None:
@@ -147,6 +153,7 @@ class PoolGateAlarm:
         self._alerting = False
         self._reason_counts = {}
         self._last_blocks_short = None
+        self._last_getlogs_p99_ms = None
         self._last_ok_epoch = epoch
 
         if not was_alerting:
@@ -166,6 +173,7 @@ class PoolGateAlarm:
 
     def _record_blocked(
         self, *, reason: str, epoch: int, now: float, blocks_short: int | None,
+        getlogs_p99_ms: int | None = None,
     ) -> PoolGateEvent | None:
         if self._streak == 0:
             self._first_blocked_at = now
@@ -174,6 +182,8 @@ class PoolGateAlarm:
         self._reason_counts[key] = self._reason_counts.get(key, 0) + 1
         if blocks_short is not None:
             self._last_blocks_short = int(blocks_short)
+        if getlogs_p99_ms is not None:
+            self._last_getlogs_p99_ms = int(getlogs_p99_ms)
 
         if self._streak < self.threshold:
             return None
