@@ -277,7 +277,9 @@ def test_fallback_enable_path_end_to_end(tmp_path, monkeypatch):
         if cfg_name == "risk_off_config_2w.toml":
             return dict(net_pnl_bnb=0.41, num_bets=19, win_rate=0.6842,
                         gas_per_bet=0.0006)
-        return dict(net_pnl_bnb=0.2693, num_bets=6, win_rate=0.8333,
+        # NEGATIVE on purpose: the enable must be reachable ONLY through
+        # the 2w backtest, so a `pos_bt = bt` mutation cannot survive.
+        return dict(net_pnl_bnb=-0.15, num_bets=6, win_rate=0.3333,
                     gas_per_bet=0.0006)
     monkeypatch.setattr(wm, "risk_off_backtest", fake_bt)
 
@@ -303,6 +305,10 @@ def test_fallback_enable_path_end_to_end(tmp_path, monkeypatch):
     assert decision["triggers"]["weak_this_week"] is False
     assert decision["triggers"]["consecutive_weak"] == 0
     assert decision["window_2w"]["backtest"]["net_pnl_bnb"] == 0.41
+    # the 1w backtest lost money; only the 2w leg can have enabled this
+    assert decision["window_1w"]["backtest"]["net_pnl_bnb"] == -0.15
+    assert wm.evaluate_positive(
+        decision["window_2w"], decision["window_1w"]["backtest"]) is False
 
     # binding: 1w backtest over the 1w fires, then the REAL 2w run
     assert bt_calls == [(113, 118, "risk_off_config.toml"),
