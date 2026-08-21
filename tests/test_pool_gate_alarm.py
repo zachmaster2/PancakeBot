@@ -143,26 +143,80 @@ def test_format_duration(secs, want):
 
 # ---- engine wiring -------------------------------------------------------
 
-def test_engine_dispatch_alerts_and_never_raises(monkeypatch):
+FAR_FROM_LOCK = 300.0   # a fresh round: lock is ~5 minutes out
+
+
+def _cfg(dry=False, blocks_short=655):
+    return types.SimpleNamespace(
+        dry=dry,
+        rpc_poller=types.SimpleNamespace(
+            last_pool_blocks_short=blocks_short, getlogs_p99_ms=250),
+    )
+
+
+def test_recording_on_the_critical_path_sends_nothing(monkeypatch):
+    """THE guard: _note_pool_gate_outcome runs ~2.5s before lock, so it must
+    do no I/O at all. Even at the threshold the alert is only QUEUED."""
     from pancakebot.runtime import engine
 
     engine._reset_pool_gate_alarm()
     sent = []
-    monkeypatch.setattr(engine, "notify",
-                        lambda **kw: sent.append(kw) or "SENT")
-    cfg = types.SimpleNamespace(
-        dry=False,
-        rpc_poller=types.SimpleNamespace(last_pool_blocks_short=655),
-    )
+    monkeypatch.setattr(engine, "notify", lambda **kw: sent.append(kw) or "SENT")
+    cfg = _cfg()
     for i in range(DEFAULT_THRESHOLD):
-        engine._dispatch_pool_gate_alarm(
+        engine._note_pool_gate_outcome(
             cfg, ready=False, reason="pool_uncovered", epoch=500_000 + i)
-    assert len(sent) == 1
-    assert sent[0]["kind"] == KIND_BLOCKED
+    assert sent == []
+    assert len(engine._PENDING_POOL_GATE_EVENTS) == 1
+    engine._reset_pool_gate_alarm()
+
+
+def test_flush_refuses_inside_the_pre_lock_window(monkeypatch):
+    """A queued alert must never be sent close to lock, whoever calls it."""
+    from pancakebot.runtime import engine
+
+    engine._reset_pool_gate_alarm()
+    sent = []
+    monkeypatch.setattr(engine, "notify", lambda **kw: sent.append(kw) or "SENT")
+    cfg = _cfg()
+    for i in range(DEFAULT_THRESHOLD):
+        engine._note_pool_gate_outcome(
+            cfg, ready=False, reason="pool_uncovered", epoch=i)
+
+    now = 1_000_000.0
+    # every point inside the wake ladder, up to the slack margin itself
+    for slack in (0.0, 1.195, 2.5, 7.0, engine._POOL_GATE_ALERT_MIN_SLACK_S - 0.001):
+        engine._flush_pool_gate_alerts(cfg, lock_ts=now + slack, now=now)
+        assert sent == [], f"alert sent with only {slack}s to lock"
+        assert len(engine._PENDING_POOL_GATE_EVENTS) == 1  # still queued
+
+    # ...and delivered once there is ample room
+    engine._flush_pool_gate_alerts(cfg, lock_ts=now + FAR_FROM_LOCK, now=now)
+    assert len(sent) == 1 and sent[0]["kind"] == KIND_BLOCKED
+    assert engine._PENDING_POOL_GATE_EVENTS == []
+    engine._reset_pool_gate_alarm()
+
+
+def test_queued_alert_carries_the_diagnostic_fields(monkeypatch):
+    from pancakebot.runtime import engine
+
+    engine._reset_pool_gate_alarm()
+    sent = []
+    monkeypatch.setattr(engine, "notify", lambda **kw: sent.append(kw) or "SENT")
+    cfg = _cfg()
+    now = 1_000_000.0
+    for i in range(DEFAULT_THRESHOLD):
+        engine._note_pool_gate_outcome(
+            cfg, ready=False, reason="pool_uncovered", epoch=500_000 + i)
+    engine._flush_pool_gate_alerts(cfg, lock_ts=now + FAR_FROM_LOCK, now=now)
     assert sent[0]["mode"] == "live"
     assert sent[0]["fields"]["blocks_short"] == 655
+    assert sent[0]["fields"]["getlogs_p99_ms"] == ">=250"
 
-    engine._dispatch_pool_gate_alarm(cfg, ready=True, reason="", epoch=500_100)
+    # recovery is queued the same way, never sent from the critical path
+    engine._note_pool_gate_outcome(cfg, ready=True, reason="", epoch=500_100)
+    assert len(sent) == 1
+    engine._flush_pool_gate_alerts(cfg, lock_ts=now + FAR_FROM_LOCK, now=now)
     assert len(sent) == 2 and sent[1]["kind"] == KIND_RECOVERED
     engine._reset_pool_gate_alarm()
 
@@ -177,9 +231,12 @@ def test_engine_dispatch_swallows_notifier_failure(monkeypatch):
         raise RuntimeError("discord exploded")
 
     monkeypatch.setattr(engine, "notify", boom)
-    cfg = types.SimpleNamespace(
-        dry=True, rpc_poller=types.SimpleNamespace(last_pool_blocks_short=None))
+    cfg = _cfg(dry=True, blocks_short=None)
+    now = 1_000_000.0
     for i in range(DEFAULT_THRESHOLD):
-        engine._dispatch_pool_gate_alarm(
+        engine._note_pool_gate_outcome(
             cfg, ready=False, reason="pool_uncovered", epoch=i)  # must not raise
+    engine._flush_pool_gate_alerts(cfg, lock_ts=now + FAR_FROM_LOCK, now=now)
+    # the failed send is dropped, not retried forever
+    assert engine._PENDING_POOL_GATE_EVENTS == []
     engine._reset_pool_gate_alarm()

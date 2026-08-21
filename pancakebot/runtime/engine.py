@@ -189,16 +189,33 @@ _POOL_GATE_ALARM = PoolGateAlarm()
 
 
 def _reset_pool_gate_alarm() -> None:
-    """Test hook: drop the accumulated blocked-round streak."""
+    """Test hook: drop the blocked-round streak AND the pending queue."""
     global _POOL_GATE_ALARM
     _POOL_GATE_ALARM = PoolGateAlarm()
+    del _PENDING_POOL_GATE_EVENTS[:]
 
 
-def _dispatch_pool_gate_alarm(
+# Alerts produced on the critical path are QUEUED here and sent later,
+# off it. A Discord POST carries a 10s client timeout; running one in
+# the pre-lock window could delay or lose a bet, and RECOVERED is the
+# worst case of all — it fires on the very round where trading resumes.
+# Nothing here is time-critical: a 30-minute threshold tolerates a
+# one-round (~5 min) delivery delay completely.
+_PENDING_POOL_GATE_EVENTS: list = []
+
+# Minimum slack before lock for a send to be allowed to start. The wake
+# ladder begins at the OKX warmup wake (~7s before lock), so this margin
+# keeps every send strictly outside all timing-sensitive phases, with
+# room for the POST's own timeout.
+_POOL_GATE_ALERT_MIN_SLACK_S = 30.0
+
+
+def _note_pool_gate_outcome(
     cfg: RuntimeConfig, *, ready: bool, reason: str, epoch: int,
 ) -> None:
-    """Fold one round's readiness verdict into the alarm and dispatch any
-    resulting Discord alert.
+    """Fold one round's readiness verdict into the alarm and QUEUE any
+    resulting alert. Pure bookkeeping — no I/O — so it is safe on the
+    critical path; ``_flush_pool_gate_alerts`` does the sending.
 
     Alert-and-CONTINUE by design: never raises, never skips a round, never
     touches systemd. The bot cannot trade while the pool gate is blocked,
@@ -226,13 +243,39 @@ def _dispatch_pool_gate_alarm(
             warn("ALERT", f"POOL GATE BLOCKED {event.detail}")
         else:
             info("ALERT", f"POOL GATE RECOVERED {event.detail}")
-        outcome = notify(
-            mode=("dry" if cfg.dry else "live"),
-            kind=event.kind, fields=event.fields, detail=event.detail,
-        )
-        info("ALERT", f"{event.kind} discord={outcome}")
+        _PENDING_POOL_GATE_EVENTS.append(event)
     except Exception as e:  # noqa: BLE001 — alerting must never break betting
-        warn("ALERT", f"pool gate alarm dispatch failed: {type(e).__name__}: {e}")
+        warn("ALERT", f"pool gate alarm record failed: {type(e).__name__}: {e}")
+
+
+def _flush_pool_gate_alerts(
+    cfg: RuntimeConfig, *, lock_ts: float, now: float | None = None,
+) -> None:
+    """Send queued pool-gate alerts, but ONLY with ample slack to lock.
+
+    Called at the top of the round cycle, before the wake ladder starts,
+    where the next lock is minutes away. With less than
+    ``_POOL_GATE_ALERT_MIN_SLACK_S`` remaining the queue is left intact
+    and delivery waits for the next round — an alert is never worth a
+    bet. That guard is what keeps a 10s Discord POST out of the pre-lock
+    window even if a caller is added later at a worse point.
+    """
+    if not _PENDING_POOL_GATE_EVENTS:
+        return
+    now = _utc_now() if now is None else now
+    if (lock_ts - now) < _POOL_GATE_ALERT_MIN_SLACK_S:
+        return
+    events = list(_PENDING_POOL_GATE_EVENTS)
+    del _PENDING_POOL_GATE_EVENTS[:]
+    for event in events:
+        try:
+            outcome = notify(
+                mode=("dry" if cfg.dry else "live"),
+                kind=event.kind, fields=event.fields, detail=event.detail,
+            )
+            info("ALERT", f"{event.kind} discord={outcome}")
+        except Exception as e:  # noqa: BLE001 — alerting must never break betting
+            warn("ALERT", f"pool gate alert send failed: {type(e).__name__}: {e}")
 
 
 # -- Clock sync ---------------------------------------------------------------
@@ -794,6 +837,12 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
         # 2026-05-21 live crash post-mortem. Always-runs (idempotent
         # when connections are already warm). Errors swallowed inside
         # ``OkxClient.warmup``; bot bets regardless.
+        # Deliver any queued pool-gate alert HERE: the wake ladder has
+        # not started, so the next lock is minutes away. Guarded by its
+        # own slack check — it defers rather than risk the pre-lock
+        # window.
+        _flush_pool_gate_alerts(cfg, lock_ts=lock_ts_t)
+
         okx_warmup_wake_ts = lock_ts_t - cfg.okx_warmup_wakeup_offset_before_lock_ms / 1000.0
         _sleep_until_ts(
             okx_warmup_wake_ts,
@@ -1032,7 +1081,9 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
             # Streak alarm BEFORE the skip branch: a ready round must reset
             # the counter even when the strategy gate then declines to fire
             # (a no-BET streak is meaningless at a ~0.3% fire rate).
-            _dispatch_pool_gate_alarm(
+            # Record only — no I/O here. Delivery happens at the next
+            # round top, off the critical path (_flush_pool_gate_alerts).
+            _note_pool_gate_outcome(
                 cfg, ready=ready, reason=ready_reason, epoch=current_epoch,
             )
             if not ready:
