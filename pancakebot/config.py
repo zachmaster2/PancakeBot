@@ -352,8 +352,9 @@ class AppConfig:
       consumes candles closing at-or-before lock_at - this).
     - ``pool_cutoff_seconds``: data horizon for the pool aggregate (only
       bets with block_ts < lock_at - this are counted).
-    - ``max_consecutive_kline_fetch_failures``: streak counter before the bot
-      crashes with InvariantError + systemd restart.
+    - ``max_consecutive_kline_fetch_failures``: consecutive GENUINE fetch
+      failures (publish-delay tails excluded) before the engine ALERTS
+      (alert-and-continue; it does not crash or stop the bot).
 
     Derived (computed at config-load time from
     ``pancakebot/timing_constants.py``; not user-tunable):
@@ -817,10 +818,17 @@ def load_app_config(path: str) -> AppConfig:
             f"got={pool_cutoff_seconds} valid=[1..30]"
         )
 
-    # ``max_consecutive_kline_fetch_failures``: streak counter for OKX
-    # transient failures on the live decision path. After this many in a
-    # row, the gate raises InvariantError -> bot crashes -> systemd
-    # restart + Discord alert.
+    # ``max_consecutive_kline_fetch_failures``: consecutive rounds with a
+    # GENUINE kline fetch failure -- unreachable, HTTP error, or a gapped
+    # response -- before the ENGINE raises a Discord alarm and keeps
+    # running. It no longer crashes the bot.
+    #
+    # Stays at 5, its original sensitivity. OKX publish-delay tails are
+    # EXCLUDED from this streak (they are a benign condition, not a failed
+    # fetch, and are proven tail-only by okx_client before exclusion), so
+    # this counter means what it always meant and does not need to be
+    # inflated to absorb them. The publish-delay condition has its own,
+    # much higher threshold in engine.py.
     max_consecutive_kline_fetch_failures = _opt_int(
         runtime, "max_consecutive_kline_fetch_failures", 5,
     )

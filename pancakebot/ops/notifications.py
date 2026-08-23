@@ -64,6 +64,12 @@ _CHANNEL_BY_KIND: dict[str, str] = {
     # to trade for a run of rounds. Mode channel, alongside CRASHED/DOWN.
     "POOL_GATE_BLOCKED": "mode",
     "POOL_GATE_RECOVERED": "mode",
+    # Kline-gate alarm: the bot is up but cannot EVALUATE (OKX served
+    # partial candles for a run of rounds). Same channel, same shape.
+    "KLINE_GATE_BLOCKED": "mode",
+    "KLINE_GATE_RECOVERED": "mode",
+    "KLINE_FETCH_FAILING": "mode",
+    "KLINE_FETCH_RECOVERED": "mode",
 }
 
 # Severity tag per kind. ASCII-only, monospace-friendly. Replaces the
@@ -85,6 +91,10 @@ _SEVERITY_BY_KIND: dict[str, str] = {
     "MODE_TRANSITION": "INFO",
     "POOL_GATE_BLOCKED": "CRIT",
     "POOL_GATE_RECOVERED": "INFO",
+    "KLINE_GATE_BLOCKED": "CRIT",
+    "KLINE_GATE_RECOVERED": "INFO",
+    "KLINE_FETCH_FAILING": "CRIT",
+    "KLINE_FETCH_RECOVERED": "INFO",
 }
 
 
@@ -265,7 +275,9 @@ def build_message(
         if isinstance(spawn_err, str) and spawn_err:
             lines.append(f"spawn_error: `{spawn_err}`")
         lines.append("note: service failed to spawn a bot child; manual intervention required")
-    elif kind in ("POOL_GATE_BLOCKED", "POOL_GATE_RECOVERED"):
+    elif kind in ("POOL_GATE_BLOCKED", "POOL_GATE_RECOVERED",
+                  "KLINE_GATE_BLOCKED", "KLINE_GATE_RECOVERED",
+                  "KLINE_FETCH_FAILING", "KLINE_FETCH_RECOVERED"):
         # Structured kv rendering ordered for phone triage: how bad, how
         # long, why, how far behind, where coverage last held. The same
         # field set also arrives on the `detail` line.
@@ -279,6 +291,24 @@ def build_message(
                 "coverage unavailable. No capital at risk; it resumes "
                 "automatically when coverage returns."
             )
+        elif kind == "KLINE_GATE_BLOCKED":
+            lines.append(
+                "note: bot is UP and ENABLED but cannot EVALUATE — OKX "
+                "returned partial candles for every round in this run. Each "
+                "round was SKIPPED before any signal was computed, so no bet "
+                "was ever sized on incomplete data. Resumes automatically."
+            )
+        elif kind == "KLINE_GATE_RECOVERED":
+            lines.append("note: OKX publishing on time again; evaluation resumed.")
+        elif kind == "KLINE_FETCH_FAILING":
+            lines.append(
+                "note: GENUINE kline fetch failures (unreachable / HTTP error "
+                "/ gapped response) \u2014 not the benign publish delay. Rounds "
+                "are skipped, no bet is sized on partial data, but this is a "
+                "real fetch fault worth investigating."
+            )
+        elif kind == "KLINE_FETCH_RECOVERED":
+            lines.append("note: kline fetches succeeding again.")
         else:
             lines.append("note: pool coverage restored; betting resumed.")
 

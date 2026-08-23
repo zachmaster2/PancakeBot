@@ -212,6 +212,9 @@ def test_pool_cutoff_default_is_6(tmp_path):
 
 def test_max_consecutive_fetch_failures_default_is_5(tmp_path):
     cfg = load_app_config(str(_write_cfg(tmp_path)))
+    # Stays 5: it is now an ALARM threshold for GENUINE fetch failures
+    # only (publish-delay tails are excluded from the streak), so it keeps
+    # its original sensitivity instead of being inflated to absorb them.
     assert cfg.max_consecutive_kline_fetch_failures == 5
 
 

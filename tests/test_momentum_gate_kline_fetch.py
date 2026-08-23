@@ -37,8 +37,13 @@ if str(_REPO_ROOT) not in sys.path:
 from pancakebot.strategy.momentum_gate import (  # noqa: E402
     MomentumGate,
     MomentumGateConfig,
-    _MAX_CONSECUTIVE_FETCH_FAILURES,
 )
+
+# The gate counts consecutive transient failures but no longer escalates on
+# them (2026-08-23): a partial candle set is OKX's publish delay, and the
+# round is skipped either way. Escalation is the engine's alert-and-continue
+# alarm. This local constant just gives these tests a run length to drive.
+_STREAK_N = 5
 from pancakebot.util import InvariantError, TransientOkxError  # noqa: E402
 
 
@@ -344,7 +349,7 @@ def test_evaluate_all_three_transient_increments_streak_and_skips():
     )
     result = gate.evaluate(lock_at_ms=_LOCK_AT_MS)
     assert result.skip_reason == "kline_fetch_transient_failure"
-    assert gate._consecutive_fetch_failures == 1
+    assert gate.consecutive_fetch_failures == 1
     assert set(gate.last_fetch_results.keys()) == {"btc", "eth", "sol"}
     assert all(v.startswith("error:") for v in gate.last_fetch_results.values())
 
@@ -365,7 +370,7 @@ def test_streak_resets_on_successful_fetch_regardless_of_signal():
                 ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
     gate.evaluate(lock_at_ms=_LOCK_AT_MS)
-    assert gate._consecutive_fetch_failures == 1
+    assert gate.consecutive_fetch_failures == 1
 
     # Round 2: clean fetch, but flat market → gate_no_signal.
     fake_client.kline_fetch_window.side_effect = _make_router(
@@ -373,7 +378,7 @@ def test_streak_resets_on_successful_fetch_regardless_of_signal():
     )
     result = gate.evaluate(lock_at_ms=_LOCK_AT_MS + 300_000)
     assert result.skip_reason == "gate_no_signal"
-    assert gate._consecutive_fetch_failures == 0, (
+    assert gate.consecutive_fetch_failures == 0, (
         "streak must reset to 0 after a clean fetch even when signal misses"
     )
 
@@ -386,23 +391,14 @@ def test_streak_escalates_to_invariant_error_at_three_consecutive_failures():
         errors={s: TransientOkxError("net_down") for s in
                 ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
-    raised = None
-    # First _MAX_CONSECUTIVE_FETCH_FAILURES - 1 rounds skip; the Nth
-    # fires InvariantError.
-    for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
+    # A long run of transient failures must SKIP every round and NEVER
+    # raise: the bot crashed here on 2026-08-23 20:41:13 UTC on a run of 5,
+    # which bought an alert and a cold start but could not fix OKX.
+    for i in range(_STREAK_N * 3):
         result = gate.evaluate(lock_at_ms=_LOCK_AT_MS + i * 300_000)
         assert result.skip_reason == "kline_fetch_transient_failure"
-    try:
-        gate.evaluate(
-            lock_at_ms=_LOCK_AT_MS + _MAX_CONSECUTIVE_FETCH_FAILURES * 300_000,
-        )
-    except InvariantError as e:
-        raised = e
-    assert raised is not None, (
-        f"expected InvariantError after {_MAX_CONSECUTIVE_FETCH_FAILURES} consecutive transients"
-    )
-    assert "kline_fetch_failure_streak_max_reached" in str(raised)
-    assert f"streak={_MAX_CONSECUTIVE_FETCH_FAILURES}" in str(raised)
+    # ...and the streak is still counted, as telemetry for the engine alarm.
+    assert gate.consecutive_fetch_failures == _STREAK_N * 3
 
 
 def test_streak_does_not_escalate_when_a_clean_round_intervenes():
@@ -416,16 +412,16 @@ def test_streak_does_not_escalate_when_a_clean_round_intervenes():
         errors={s: TransientOkxError("net_down") for s in
                 ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
-    for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
+    for i in range(_STREAK_N - 1):
         gate.evaluate(lock_at_ms=_LOCK_AT_MS + i * 300_000)
-    assert gate._consecutive_fetch_failures == _MAX_CONSECUTIVE_FETCH_FAILURES - 1
+    assert gate.consecutive_fetch_failures == _STREAK_N - 1
 
     # Clean round resets the streak.
     fake_client.kline_fetch_window.side_effect = _make_router(
         ok_klines=_flat_klines(lock_at_ms=_LOCK_AT_MS + 9_000_000),
     )
     gate.evaluate(lock_at_ms=_LOCK_AT_MS + 9_000_000)
-    assert gate._consecutive_fetch_failures == 0
+    assert gate.consecutive_fetch_failures == 0
 
     # Second (N-1) transient rounds -- still no escalation because reset.
     fake_client.kline_fetch_window.side_effect = _make_router(
@@ -433,11 +429,11 @@ def test_streak_does_not_escalate_when_a_clean_round_intervenes():
         errors={s: TransientOkxError("net_down") for s in
                 ("BTC-USDT", "ETH-USDT", "SOL-USDT")},
     )
-    for i in range(_MAX_CONSECUTIVE_FETCH_FAILURES - 1):
+    for i in range(_STREAK_N - 1):
         result = gate.evaluate(lock_at_ms=_LOCK_AT_MS + 10_000_000 + i * 300_000)
         assert result.skip_reason == "kline_fetch_transient_failure"
     # Should be at N-1, not escalated.
-    assert gate._consecutive_fetch_failures == _MAX_CONSECUTIVE_FETCH_FAILURES - 1
+    assert gate.consecutive_fetch_failures == _STREAK_N - 1
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +479,7 @@ def test_evaluate_invariant_error_does_not_increment_streak():
         gate.evaluate(lock_at_ms=_LOCK_AT_MS)
     except InvariantError:
         pass
-    assert gate._consecutive_fetch_failures == 0
+    assert gate.consecutive_fetch_failures == 0
 
 
 # ---------------------------------------------------------------------------
