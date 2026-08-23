@@ -97,11 +97,11 @@ def _local_time_str() -> str:
     be correlatable without arithmetic.
 
     Milliseconds matter: a systemctl restart fires the stopped and started
-    hooks concurrently and their Discord POSTs land ~6ms apart, so a
-    whole-second stamp rendered them identical and the pair looked
-    simultaneous (and out of order, since Discord shows arrival order).
-    This is the NOTIFY time, not the event time — see the evt_mono_us
-    field for authoritative event ordering.
+    hooks concurrently, and their Discord POSTs land ~6ms apart, so a
+    whole-second stamp rendered the pair identical and apparently
+    simultaneous. Arrival order itself is fixed upstream — the started
+    hook waits for the stopped hook to finish (notify_lifecycle
+    .wait_for_stopped_sibling) — so this stamp is simply the notify time.
     """
     try:
         from zoneinfo import ZoneInfo
@@ -243,7 +243,7 @@ def build_message(
         lines.append(f"detail: `{detail}`")
 
     # Common context fields (best-effort).
-    for k in ("pid", "evt_mono_us", "bankroll", "iterations", "last_epoch"):
+    for k in ("pid", "bankroll", "iterations", "last_epoch"):
         if k in fields:
             lines.append(f"{k}: `{fields[k]}`")
 
@@ -258,14 +258,6 @@ def build_message(
             tb = _clip_text(tb_raw, max_lines=20, max_chars=1500)
             if tb:
                 lines.append("```\n" + tb + "\n```")
-    elif kind in ("STARTED", "STOPPED") and "evt_mono_us" in fields:
-        # A restart fires both hooks concurrently, so Discord's ordering is
-        # arrival order and can invert the real sequence. evt_mono_us is
-        # systemd's own monotonic event time: lower = earlier, always.
-        lines.append(
-            "ordering: compare `evt_mono_us` (lower = earlier); Discord "
-            "lists by arrival, which during a restart can invert these two"
-        )
     elif kind == "UNINSTRUMENTED":
         lines.append("note: legacy bot detected outside service control")
     elif kind == "SPAWN_FAILED":
