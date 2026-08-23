@@ -89,13 +89,30 @@ _SEVERITY_BY_KIND: dict[str, str] = {
 
 
 def _local_time_str() -> str:
-    """America/New_York wall time for Discord human-readability."""
+    """Notify-time stamp: local wall time to MILLISECONDS, plus UTC.
+
+    Local (America/New_York) is deliberate — these land on a phone and a
+    reader should not have to convert. UTC is appended because every log,
+    artifact and journal entry on this project is UTC, so an alert has to
+    be correlatable without arithmetic.
+
+    Milliseconds matter: a systemctl restart fires the stopped and started
+    hooks concurrently and their Discord POSTs land ~6ms apart, so a
+    whole-second stamp rendered them identical and the pair looked
+    simultaneous (and out of order, since Discord shows arrival order).
+    This is the NOTIFY time, not the event time — see the evt_mono_us
+    field for authoritative event ordering.
+    """
     try:
         from zoneinfo import ZoneInfo
         tz = ZoneInfo("America/New_York")
-        return datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+        now = datetime.datetime.now(tz)
     except Exception:
-        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now = datetime.datetime.now(datetime.timezone.utc)
+    utc = now.astimezone(datetime.timezone.utc)
+    return (f"{now.strftime('%Y-%m-%d %H:%M:%S')}.{now.microsecond // 1000:03d} "
+            f"{now.strftime('%Z')} / {utc.strftime('%H:%M:%S')}"
+            f".{utc.microsecond // 1000:03d}Z")
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +243,7 @@ def build_message(
         lines.append(f"detail: `{detail}`")
 
     # Common context fields (best-effort).
-    for k in ("pid", "bankroll", "iterations", "last_epoch"):
+    for k in ("pid", "evt_mono_us", "bankroll", "iterations", "last_epoch"):
         if k in fields:
             lines.append(f"{k}: `{fields[k]}`")
 
@@ -241,6 +258,14 @@ def build_message(
             tb = _clip_text(tb_raw, max_lines=20, max_chars=1500)
             if tb:
                 lines.append("```\n" + tb + "\n```")
+    elif kind in ("STARTED", "STOPPED") and "evt_mono_us" in fields:
+        # A restart fires both hooks concurrently, so Discord's ordering is
+        # arrival order and can invert the real sequence. evt_mono_us is
+        # systemd's own monotonic event time: lower = earlier, always.
+        lines.append(
+            "ordering: compare `evt_mono_us` (lower = earlier); Discord "
+            "lists by arrival, which during a restart can invert these two"
+        )
     elif kind == "UNINSTRUMENTED":
         lines.append("note: legacy bot detected outside service control")
     elif kind == "SPAWN_FAILED":
