@@ -144,6 +144,44 @@ def query_unit_state(
     return result, exit_status, n_restarts
 
 
+def event_order_fields(
+    unit: str, event: str, *, run_cmd: RunCmd = _run_cmd,
+) -> dict:
+    """Ordering metadata for a lifecycle alert: the unit's MainPID and the
+    monotonic timestamp of THIS event's transition.
+
+    ``started`` reads ActiveEnterTimestampMonotonic, ``stopped`` reads
+    InactiveEnterTimestampMonotonic — each is the transition the event is
+    about, so the two messages of one restart carry different, correctly
+    ordered values even though they are emitted concurrently. Best effort:
+    any failure yields an empty dict, never an exception (this runs inside
+    the alerting path, which must never raise)."""
+    try:
+        out = run_cmd([
+            "systemctl", "show", unit, "-p", "MainPID",
+            "-p", "ActiveEnterTimestampMonotonic",
+            "-p", "InactiveEnterTimestampMonotonic",
+        ])
+    except Exception:  # noqa: BLE001
+        return {}
+    parsed: dict[str, str] = {}
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        parsed[key.strip()] = value.strip()
+    key = ("ActiveEnterTimestampMonotonic" if event == "started"
+           else "InactiveEnterTimestampMonotonic")
+    fields: dict = {}
+    mono = parsed.get(key, "")
+    if mono.isdigit():
+        fields["evt_mono_us"] = int(mono)
+    pid = parsed.get("MainPID", "")
+    # Only the started hook can trust MainPID: by the time the stopped hook
+    # queries, the replacement process already owns it.
+    if event == "started" and pid.isdigit() and int(pid) > 0:
+        fields["pid"] = int(pid)
+    return fields
+
+
 def journal_tail(unit: str, *, run_cmd: RunCmd = _run_cmd) -> str:
     return run_cmd([
         "journalctl", "-u", unit, "-n", str(_JOURNAL_TAIL_LINES),
@@ -327,7 +365,10 @@ def main(
         # alerts route to the DRY channel (the router only knows live/dry,
         # and validation noise belongs with dry watchers).
         notify_mode = "dry" if mode == "test" else mode
+        order_fields = event_order_fields(unit, event, run_cmd=run_cmd)
         for kind, fields, detail in alerts:
+            if kind in ("STARTED", "STOPPED"):
+                fields = {**fields, **order_fields}
             outcome = notifications.notify(
                 mode=notify_mode, kind=kind, fields=fields, art=art, detail=detail,
             )
