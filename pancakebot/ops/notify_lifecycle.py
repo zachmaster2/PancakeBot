@@ -144,42 +144,71 @@ def query_unit_state(
     return result, exit_status, n_restarts
 
 
-def event_order_fields(
+# The started hook waits for its stopped sibling here, not with a fixed
+# sleep: a `systemctl restart` starts the two notify@ oneshots as separate
+# --no-block jobs ~44ms apart, and the stopped one does more work before
+# posting (journal tail + systemctl show), so its POST landed ~6ms LATE in
+# both measured restarts and Discord — which lists by ARRIVAL — inverted
+# the pair. Waiting on the sibling's actual unit state removes the race
+# instead of betting on a margin.
+_SIBLING_BUSY_STATES = frozenset(
+    {"activating", "active", "reloading", "deactivating"})
+_SIBLING_WAIT_TIMEOUT_S = 5.0
+_SIBLING_POLL_S = 0.05
+
+
+def wait_for_stopped_sibling(
+    unit: str, event: str, *, run_cmd: RunCmd = _run_cmd,
+    sleep=time.sleep, timeout_s: float = _SIBLING_WAIT_TIMEOUT_S,
+) -> float:
+    """Block the STARTED hook until the STOPPED hook has finished, so the
+    restart pair arrives in the right order. Returns seconds waited.
+
+    Costs nothing on a fresh start: with no preceding stop the sibling
+    instance is ``inactive`` (systemd reports that even for an instance
+    never activated), so this returns immediately. The bot is never
+    delayed either — both hooks are already detached via
+    ``systemctl start --no-block``; only this notifier process waits.
+
+    Bounded by ``timeout_s``: if the stopped hook is wedged (a Discord POST
+    can burn 10s on timeouts plus a retry), the alert goes out anyway and
+    the behaviour degrades to what it was before — out of order, never
+    lost.
+    """
+    if event != "started":
+        return 0.0
+    sibling = f"pancakebot-notify@{unit}-stopped.service"
+    waited = 0.0
+    while waited < timeout_s:
+        state = (run_cmd(["systemctl", "is-active", sibling]) or "").strip()
+        # `is-active` exits nonzero for inactive units but still prints the
+        # state; _run_cmd returns stdout regardless and "" on hard failure,
+        # which falls through as not-busy.
+        if state not in _SIBLING_BUSY_STATES:
+            return waited
+        sleep(_SIBLING_POLL_S)
+        waited += _SIBLING_POLL_S
+    return waited
+
+
+def started_pid_field(
     unit: str, event: str, *, run_cmd: RunCmd = _run_cmd,
 ) -> dict:
-    """Ordering metadata for a lifecycle alert: the unit's MainPID and the
-    monotonic timestamp of THIS event's transition.
+    """``{"pid": <MainPID>}`` for the STARTED alert, else ``{}``.
 
-    ``started`` reads ActiveEnterTimestampMonotonic, ``stopped`` reads
-    InactiveEnterTimestampMonotonic — each is the transition the event is
-    about, so the two messages of one restart carry different, correctly
-    ordered values even though they are emitted concurrently. Best effort:
-    any failure yields an empty dict, never an exception (this runs inside
-    the alerting path, which must never raise)."""
-    try:
-        out = run_cmd([
-            "systemctl", "show", unit, "-p", "MainPID",
-            "-p", "ActiveEnterTimestampMonotonic",
-            "-p", "InactiveEnterTimestampMonotonic",
-        ])
-    except Exception:  # noqa: BLE001
+    Only the started hook can trust MainPID. By the time the stopped hook
+    queries, the replacement main process already owns it and systemd has
+    cleared ExecMainExitTimestamp (measured 2026-08-21) — so the stopped
+    alert deliberately carries no pid rather than a wrong one."""
+    if event != "started":
         return {}
-    parsed: dict[str, str] = {}
+    out = run_cmd(["systemctl", "show", unit, "-p", "MainPID"]) or ""
     for line in out.splitlines():
         key, _, value = line.partition("=")
-        parsed[key.strip()] = value.strip()
-    key = ("ActiveEnterTimestampMonotonic" if event == "started"
-           else "InactiveEnterTimestampMonotonic")
-    fields: dict = {}
-    mono = parsed.get(key, "")
-    if mono.isdigit():
-        fields["evt_mono_us"] = int(mono)
-    pid = parsed.get("MainPID", "")
-    # Only the started hook can trust MainPID: by the time the stopped hook
-    # queries, the replacement process already owns it.
-    if event == "started" and pid.isdigit() and int(pid) > 0:
-        fields["pid"] = int(pid)
-    return fields
+        if key.strip() == "MainPID" and value.strip().isdigit():
+            pid = int(value.strip())
+            return {"pid": pid} if pid > 0 else {}
+    return {}
 
 
 def journal_tail(unit: str, *, run_cmd: RunCmd = _run_cmd) -> str:
@@ -365,10 +394,16 @@ def main(
         # alerts route to the DRY channel (the router only knows live/dry,
         # and validation noise belongs with dry watchers).
         notify_mode = "dry" if mode == "test" else mode
-        order_fields = event_order_fields(unit, event, run_cmd=run_cmd)
+        # Order the restart pair at the source: hold the STARTED alert
+        # until the STOPPED alert's process has exited (no-op on a fresh
+        # start). Cheap, bounded, and it leaves Discord's arrival order
+        # correct without any proof metadata in the message.
+        if alerts:
+            wait_for_stopped_sibling(unit, event, run_cmd=run_cmd)
+        pid_field = started_pid_field(unit, event, run_cmd=run_cmd)
         for kind, fields, detail in alerts:
-            if kind in ("STARTED", "STOPPED"):
-                fields = {**fields, **order_fields}
+            if kind == "STARTED":
+                fields = {**fields, **pid_field}
             outcome = notifications.notify(
                 mode=notify_mode, kind=kind, fields=fields, art=art, detail=detail,
             )
