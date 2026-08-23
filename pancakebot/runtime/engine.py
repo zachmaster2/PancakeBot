@@ -27,6 +27,7 @@ from pancakebot.runtime.pool_gate_alarm import (
     KIND_KLINE_BLOCKED,
     KIND_KLINE_RECOVERED,
     PoolGateAlarm,
+    RateWindow,
 )
 from pancakebot.ops.notifications import notify
 from pancakebot import paths
@@ -197,90 +198,191 @@ _POOL_GATE_ALARM = PoolGateAlarm()
 
 def _reset_pool_gate_alarm() -> None:
     """Test hook: drop the blocked-round streaks AND the pending queue."""
-    global _POOL_GATE_ALARM, _KLINE_GATE_ALARM, _FETCH_FAIL_ALARM
+    global _POOL_GATE_ALARM, _KLINE_GATE_ALARM, _GENUINE_RATE_ALARM
+    global _FETCH_BURST_ALARM, _PUBLISH_RATE_WINDOW, _GENUINE_RATE_WINDOW
     _POOL_GATE_ALARM = PoolGateAlarm()
     _KLINE_GATE_ALARM = None
-    _FETCH_FAIL_ALARM = None
+    _GENUINE_RATE_ALARM = None
+    _FETCH_BURST_ALARM = None
+    _PUBLISH_RATE_WINDOW = None
+    _GENUINE_RATE_WINDOW = None
     del _PENDING_POOL_GATE_EVENTS[:]
 
 
-# Publish-delay alarm: consecutive rounds the gate could not EVALUATE
-# because OKX had not yet published the newest 1s candle. Benign per round
-# but operationally important in bulk -- on 2026-08-23 it cost a third of
-# all rounds.
+# Kline health is a RATE, not a run length. At the 2026-08-23 partial-read
+# rate of 33%, any run-length threshold high enough to be quiet at a benign
+# baseline is unreachable (15-in-a-row is ~7e-8), and an interleaved
+# genuine/publish-delay sequence resets both run counters every other round
+# -- every round skipped, zero alerts. So the primary signals are trailing
+# rates; run length survives only as a fast BURST path for genuine
+# failures, where a short run really is the signal.
 #
-# THRESHOLD 15 (~75 min), derived from that day's live run-length
-# distribution -- the 33% regime, not the historical 12%. 51 runs of
-# consecutive publish-delay rounds: 29x1, 11x2, 5x3, 5x4, 1x>=5 (the last
-# truncated by the crash, so the observed max is a LOWER bound). Survival
-# P(>=4) = 6/51 = 0.118 with tail continuation ~0.5-0.55, so
-# P(run >= k) ~= (6/51) * q^(k-4) over ~51 run-starts/day gives roughly one
-# false alert per 20-43 days at k=12 (monthly noise, i.e. alert fatigue on
-# the channel we depend on) versus one per 4-12 months at k=15.
-_PUBLISH_DELAY_ALARM_THRESHOLD = 15
+# Thresholds from the measured rolling 60-round kline-skip rate (journal):
+#     Aug 20 (0.0% day):   every window 0.000
+#     Aug 21 (7.1% day):   p50 .100  p95 .150  max .150
+#     Aug 22 (11.3% day):  p50 .117  p90 .200  max .233
+#     Aug 23 (31% day):    p50 .300  p75 .367  p90 .450  max .517
+# Enter 0.30 clears Aug 22's worst window (0.233) by 29% and sits at
+# Aug 23's median, so today's regime alerts and a merely-elevated day does
+# not. Exit 0.15 is exactly the worst window observed at the 7% baseline,
+# so recovery is declared only once the rate is back to normal-day noise.
+_PUBLISH_RATE_ENTER, _PUBLISH_RATE_EXIT = 0.30, 0.15
+# Genuine failures have run at ~0 historically; a sustained 6-in-60 is
+# already worth paging.
+_GENUINE_RATE_ENTER, _GENUINE_RATE_EXIT = 0.10, 0.05
+# Window length, chosen over moving the entry bar. Today's ~31% sits right
+# on the 0.30 entry, so the question was whether that produces
+# BLOCKED->RECOVERED->BLOCKED churn. Sampling std of a windowed rate is
+# sqrt(p(1-p)/W):
+#       p=0.31:  W=60 -> 0.0597    W=120 -> 0.0422
+#       p=0.22:  W=60 -> 0.0535    W=120 -> 0.0378
+# (W=120 cuts the std by 1/sqrt(2) = 29%, not by half.)
+#
+# Churn at 31% turns out not to be the real risk: hysteresis already stops
+# it. Once BLOCKED, RECOVERED needs the window under 0.15, which is 2.68
+# std away at W=60 -- P = 0.4% per window -- and 3.79 std at W=120
+# (P = 0.008%). So the design already yields one alert and then quiet.
+#
+# The real risk is the OTHER regime. Lowering entry to 0.25 as first
+# suggested would flag 28.7% of windows in a 22% world (21.4% even at
+# W=120) -- constant alerting in a regime the anchor fix could plausibly
+# land us in. Keeping entry at 0.30 and doubling the window instead cuts
+# false entry at 22% from 6.7% to 1.7% per window, while entry at 31% is
+# untouched (56.7% -> 59.4% of windows are over the bar, so it still
+# alerts promptly).
+#
+# Warm-up is NOT worsened: first evaluation is governed by
+# _RATE_MIN_SAMPLES, which is unchanged, so the signal still goes live
+# after 30 rounds (~2.5h). The larger window only tightens the estimate
+# from there.
+_RATE_WINDOW_ROUNDS = 120         # ~10h at 12 rounds/h
+_RATE_MIN_SAMPLES = 30            # ~2.5h; avoids alarming off a cold start
 
+# Re-alert cadence differs by class ON PURPOSE. A publish-delay regime is a
+# days-long known condition: hourly would be 24 messages a day about
+# something the operator already knows, which is precisely how an alert
+# channel becomes wallpaper. Six-hourly, each carrying the CURRENT rate so
+# the message still says something new. Genuine failures are rare and
+# urgent, so they keep the hourly cadence.
+_PUBLISH_REALERT_S = 6 * 3600.0
+_GENUINE_REALERT_S = 3600.0
+
+_PUBLISH_RATE_WINDOW: RateWindow | None = None
+_GENUINE_RATE_WINDOW: RateWindow | None = None
 _KLINE_GATE_ALARM: PoolGateAlarm | None = None
-_FETCH_FAIL_ALARM: PoolGateAlarm | None = None
+_GENUINE_RATE_ALARM: PoolGateAlarm | None = None
+_FETCH_BURST_ALARM: PoolGateAlarm | None = None
 
 
-def _kline_gate_alarm(cfg: RuntimeConfig) -> PoolGateAlarm:
-    global _KLINE_GATE_ALARM
-    if _KLINE_GATE_ALARM is None:
+def _kline_rate_state(cfg: RuntimeConfig):
+    """Lazily build the two rate windows and the three alarms.
+
+    Alarms take ``threshold=1`` for the rate signals: the RateWindow has
+    already decided whether the rate is over the bar (with hysteresis), so
+    the alarm is acting as a level detector and should fire on the first
+    over-threshold round. That reuses its alert / re-alert / RECOVERED
+    cadence and its queueing with no new notification machinery.
+    """
+    global _PUBLISH_RATE_WINDOW, _GENUINE_RATE_WINDOW
+    global _KLINE_GATE_ALARM, _GENUINE_RATE_ALARM, _FETCH_BURST_ALARM
+    if _PUBLISH_RATE_WINDOW is None:
+        _PUBLISH_RATE_WINDOW = RateWindow(
+            enter_rate=_PUBLISH_RATE_ENTER, exit_rate=_PUBLISH_RATE_EXIT,
+            window=_RATE_WINDOW_ROUNDS, min_samples=_RATE_MIN_SAMPLES,
+        )
+        _GENUINE_RATE_WINDOW = RateWindow(
+            enter_rate=_GENUINE_RATE_ENTER, exit_rate=_GENUINE_RATE_EXIT,
+            window=_RATE_WINDOW_ROUNDS, min_samples=_RATE_MIN_SAMPLES,
+        )
         _KLINE_GATE_ALARM = PoolGateAlarm(
-            threshold=_PUBLISH_DELAY_ALARM_THRESHOLD,
-            kind_blocked=KIND_KLINE_BLOCKED,
-            kind_recovered=KIND_KLINE_RECOVERED,
+            threshold=1, realert_interval_s=_PUBLISH_REALERT_S,
+            kind_blocked=KIND_KLINE_BLOCKED, kind_recovered=KIND_KLINE_RECOVERED,
         )
-    return _KLINE_GATE_ALARM
-
-
-def _fetch_fail_alarm(cfg: RuntimeConfig) -> PoolGateAlarm:
-    """Genuine fetch failures, at the ORIGINAL sensitivity. Excluding
-    publish delays is what lets this threshold stay where it always was:
-    it now counts only fetches that really failed. Lazily built because
-    the threshold is operator-tunable."""
-    global _FETCH_FAIL_ALARM
-    if _FETCH_FAIL_ALARM is None:
-        _FETCH_FAIL_ALARM = PoolGateAlarm(
+        _GENUINE_RATE_ALARM = PoolGateAlarm(
+            threshold=1, realert_interval_s=_GENUINE_REALERT_S,
+            kind_blocked=KIND_FETCH_FAILING, kind_recovered=KIND_FETCH_RECOVERED,
+        )
+        _FETCH_BURST_ALARM = PoolGateAlarm(
             threshold=int(cfg.max_consecutive_kline_fetch_failures),
-            kind_blocked=KIND_FETCH_FAILING,
-            kind_recovered=KIND_FETCH_RECOVERED,
+            realert_interval_s=_GENUINE_REALERT_S,
+            kind_blocked=KIND_FETCH_FAILING, kind_recovered=KIND_FETCH_RECOVERED,
         )
-    return _FETCH_FAIL_ALARM
+    return (_PUBLISH_RATE_WINDOW, _GENUINE_RATE_WINDOW,
+            _KLINE_GATE_ALARM, _GENUINE_RATE_ALARM, _FETCH_BURST_ALARM)
 
 
 def _note_kline_gate_outcome(
     cfg: RuntimeConfig, *, transient_class: str | None, epoch: int,
 ) -> None:
-    """Fold one round's kline outcome into BOTH kline alarms and QUEUE any
-    alerts. Pure bookkeeping — no I/O — so it is safe here on the critical
-    path; delivery rides the same off-critical flush as the pool alarm.
+    """Fold one round's kline outcome into the rate windows and the burst
+    detector, and QUEUE any alerts. Pure bookkeeping — no I/O — so it is
+    safe here on the critical path; delivery rides the same off-critical
+    flush as the pool alarm.
 
-    Two conditions, deliberately separate rather than one generalised
-    counter: a publish delay is benign-but-costly and needs a high
-    threshold, a genuine fetch failure is rare-and-serious and needs a low
-    one. Conflating them would hide the second behind the first — which is
-    exactly the category error that crashed the bot on 2026-08-23.
+    The two classes stay separate throughout: a publish delay is
+    benign-but-costly and wants a high bar and a slow re-alert, a genuine
+    failure is rare-and-serious and wants a low bar and a fast one.
+    Merging them would hide the second behind the first.
     """
     try:
-        for alarm, blocked, tag in (
-            (_kline_gate_alarm(cfg), transient_class == "publish_delay",
-             "KLINE GATE"),
-            (_fetch_fail_alarm(cfg), transient_class == "fetch_failure",
-             "KLINE FETCH"),
-        ):
-            event = alarm.record(
-                ready=not blocked,
-                reason=transient_class or "ok",
-                epoch=int(epoch), now=_utc_now(),
+        pub_hit = transient_class == "publish_delay"
+        gen_hit = transient_class == "fetch_failure"
+        (pub_win, gen_win, pub_alarm,
+         gen_rate_alarm, burst_alarm) = _kline_rate_state(cfg)
+
+        # A restart blinds the publish-delay alarm until the window holds
+        # _RATE_MIN_SAMPLES rounds, and unlike the genuine class it has no
+        # burst fast path. That is acceptable and self-healing, but an
+        # operator must be able to tell "still warming" from "quiet because
+        # things are fine" -- especially given how often this bot has been
+        # restarted. Reported on the health line that already fires once
+        # per round, so no new log line is introduced.
+        if cfg.rpc_poller is not None:
+            cfg.rpc_poller.set_health_extra(
+                window_rounds=f"{pub_win.n}/{_RATE_WINDOW_ROUNDS}"
+                              f"{'' if pub_win.n >= _RATE_MIN_SAMPLES else '(warming)'}",
             )
-            if event is None:
-                continue
-            if event.kind in (KIND_KLINE_BLOCKED, KIND_FETCH_FAILING):
-                warn("ALERT", f"{tag} BLOCKED {event.detail}")
+
+        events: list = []
+        # --- rate signals: EVERY round lands in both denominators, which
+        # is what makes an interleaved sequence raise both rates instead of
+        # cancelling both streaks.
+        for win, alarm, hit, reason in (
+            (pub_win, pub_alarm, pub_hit, "publish_delay_rate"),
+            (gen_win, gen_rate_alarm, gen_hit, "fetch_failure_rate"),
+        ):
+            over = win.observe(hit)
+            if over is None:
+                continue        # window still filling
+            ev = alarm.record(
+                ready=not over, reason=reason, epoch=int(epoch),
+                now=_utc_now(),
+                extra={"signal": "rate", "rate": round(win.rate, 3),
+                       "window_rounds": win.n},
+            )
+            if ev is not None:
+                events.append(ev)
+
+        # --- burst path (genuine only): a short run really is the signal
+        # for a hard fetch outage, and it fires hours before the rate can.
+        # A publish-delay round is NEUTRAL here -- it carries no evidence
+        # about whether genuine fetches work, and feeding it as "ready"
+        # would reset this streak, reviving the mutual-reset bug one layer
+        # down.
+        burst_ready = None if pub_hit else (not gen_hit)
+        ev = burst_alarm.record(
+            ready=burst_ready, reason="fetch_failure", epoch=int(epoch),
+            now=_utc_now(), extra={"signal": "burst"},
+        )
+        if ev is not None:
+            events.append(ev)
+
+        for ev in events:
+            if ev.kind in (KIND_KLINE_BLOCKED, KIND_FETCH_FAILING):
+                warn("ALERT", f"KLINE {ev.kind} {ev.detail}")
             else:
-                info("ALERT", f"{tag} RECOVERED {event.detail}")
-            _PENDING_POOL_GATE_EVENTS.append(event)
+                info("ALERT", f"KLINE {ev.kind} {ev.detail}")
+            _PENDING_POOL_GATE_EVENTS.append(ev)
     except Exception as e:  # noqa: BLE001 — alerting must never break betting
         warn("ALERT", f"kline alarm record failed: {type(e).__name__}: {e}")
 
@@ -547,7 +649,8 @@ def _log_runtime_timing_summary(cfg: RuntimeConfig) -> None:
         f"okx_warmup_wakeup={cfg.okx_warmup_wakeup_offset_before_lock_ms}ms "
         f"preflight_wakeup={cfg.preflight_wakeup_offset_before_lock_ms}ms "
         f"single_poll_wakeup={cfg.single_poll_wakeup_offset_before_lock_ms}ms "
-        f"critical_path_wakeup={cfg.critical_path_wakeup_offset_before_lock_ms}ms "
+        f"critical_path_wakeup(static fallback)="
+        f"{cfg.critical_path_wakeup_offset_before_lock_ms}ms "
         f"bet_submit_deadline={cfg.bet_submit_deadline_offset_before_lock_ms}ms "
         f"bet_tx_receipt_timeout={cfg.bet_tx_receipt_timeout_seconds}s "
         f"claim_tx_receipt_timeout={cfg.claim_tx_receipt_timeout_seconds}s",

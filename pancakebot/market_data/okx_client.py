@@ -204,8 +204,14 @@ class _OkxErrorClass(Enum):
     INSUFFICIENT = "insufficient"  # code=0 but empty or short data — retry, then raise
 
 
+# Every kline path in this client is the 1s bar. Named once so the step
+# cannot drift between the expected-count math and the gap classifier.
+_KLINE_BAR_MS = 1000
+
+
 def _missing_position(
     data: list, oldest_open_ms: int, newest_open_ms_inclusive: int,
+    *, bar_ms: int = _KLINE_BAR_MS,
 ) -> str | None:
     """Which end of the requested window is absent from a SHORT response.
 
@@ -225,7 +231,12 @@ def _missing_position(
         return "gap_or_head"
     if not times:
         return None
-    expected = list(range(oldest_open_ms, newest_open_ms_inclusive + 1, 1000))
+    span = newest_open_ms_inclusive - oldest_open_ms
+    if bar_ms <= 0 or span % bar_ms:
+        # A window that is not a whole number of bars cannot be reasoned
+        # about here; refuse to call it benign.
+        return "gap_or_head"
+    expected = list(range(oldest_open_ms, newest_open_ms_inclusive + 1, bar_ms))
     return "tail" if times == expected[:len(times)] else "gap_or_head"
 
 
@@ -417,7 +428,9 @@ class OkxClient:
                 f"kline_fetch_window_unaligned_ms: oldest={oldest_open_ms} "
                 f"newest={newest_open_ms_inclusive} (must be 1s-aligned)"
             )
-        expected_count = (newest_open_ms_inclusive - oldest_open_ms) // 1000 + 1
+        expected_count = (
+            newest_open_ms_inclusive - oldest_open_ms
+        ) // _KLINE_BAR_MS + 1
         if expected_count > 300:
             # OKX /history-candles caps at 300 per request. Caller must
             # paginate (none of our current callers do; sync's per-round

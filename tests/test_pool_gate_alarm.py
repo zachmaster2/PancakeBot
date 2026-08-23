@@ -263,90 +263,130 @@ def test_second_instance_uses_its_own_kinds_and_threshold():
     assert rec.kind == KIND_KLINE_RECOVERED
 
 
-def test_publish_delay_run_alerts_but_never_raises():
-    """The 2026-08-23 crash shape: a long run of publish delays must alert
-    and keep running, not raise."""
+def _feed(engine, cfg, classes):
+    """Feed a sequence of transient classes; return queued events."""
+    for i, c in enumerate(classes):
+        engine._note_kline_gate_outcome(cfg, transient_class=c, epoch=i)
+    return list(engine._PENDING_POOL_GATE_EVENTS)
+
+
+def test_rate_signal_fires_at_todays_33_percent():
+    """Aug 23 ran a 31% daily rate with rolling-60 windows at p50 .300 --
+    the regime the run-length alarm was structurally blind to."""
     from pancakebot.runtime import engine
     from pancakebot.runtime.pool_gate_alarm import KIND_KLINE_BLOCKED
 
     engine._reset_pool_gate_alarm()
     cfg = _kcfg()
-    n = engine._PUBLISH_DELAY_ALARM_THRESHOLD
-    for i in range(n - 1):
-        engine._note_kline_gate_outcome(
-            cfg, transient_class="publish_delay", epoch=500_000 + i)
-    assert engine._PENDING_POOL_GATE_EVENTS == []       # silent below bar
-    engine._note_kline_gate_outcome(
-        cfg, transient_class="publish_delay", epoch=500_000 + n)
-    assert len(engine._PENDING_POOL_GATE_EVENTS) == 1
-    ev = engine._PENDING_POOL_GATE_EVENTS[0]
-    assert ev.kind == KIND_KLINE_BLOCKED
-    assert ev.fields["consecutive"] == n
-    assert ev.fields["reason"] == "publish_delay"
+    # 1 in 3 rounds is a publish delay -> rate 0.333 > enter 0.30
+    seq = [("publish_delay" if i % 3 == 0 else None) for i in range(60)]
+    events = _feed(engine, cfg, seq)
+    blocked = [e for e in events if e.kind == KIND_KLINE_BLOCKED]
+    assert blocked, "33% publish-delay rate must alert"
+    ev = blocked[0]
+    assert ev.fields["signal"] == "rate"
+    assert ev.fields["rate"] >= engine._PUBLISH_RATE_ENTER
+    assert ev.fields["window_rounds"] >= engine._RATE_MIN_SAMPLES
     engine._reset_pool_gate_alarm()
 
 
-def test_publish_delays_never_feed_the_fetch_failure_alarm():
-    """THE point of the redesign: a benign publish delay is not a fetch
-    failure, so the low-threshold failure alarm must stay silent through a
-    run far longer than its own threshold."""
+def test_rate_signal_is_quiet_at_the_measured_benign_baselines():
+    """Aug 21 (7.1%/day, worst window .150) and Aug 22 (11.3%/day, worst
+    window .233) must not alert -- entry sits above both."""
+    from pancakebot.runtime import engine
+    from pancakebot.runtime.pool_gate_alarm import KIND_KLINE_BLOCKED
+
+    for period in (7, 5):        # 1-in-7 = 14%, 1-in-5 = 20%
+        engine._reset_pool_gate_alarm()
+        seq = [("publish_delay" if i % period == 0 else None) for i in range(120)]
+        events = _feed(engine, _kcfg(), seq)
+        assert not [e for e in events if e.kind == KIND_KLINE_BLOCKED], \
+            f"1-in-{period} must stay under the bar"
+    engine._reset_pool_gate_alarm()
+
+
+def test_window_must_fill_before_any_rate_alert():
+    """A cold start must not alarm off a handful of rounds."""
+    from pancakebot.runtime import engine
+    engine._reset_pool_gate_alarm()
+    events = _feed(engine, _kcfg(),
+                   ["publish_delay"] * (engine._RATE_MIN_SAMPLES - 1))
+    assert events == []
+    engine._reset_pool_gate_alarm()
+
+
+def test_interleaved_genuine_and_tail_raises_BOTH_rates():
+    """The silence case: alternating classes left both run-length counters
+    pinned at 1 forever while every round was skipped. Rates cannot cancel
+    -- every round lands in both denominators."""
+    from pancakebot.runtime import engine
+    from pancakebot.runtime.pool_gate_alarm import (
+        KIND_FETCH_FAILING, KIND_KLINE_BLOCKED)
+
+    engine._reset_pool_gate_alarm()
+    seq = [("publish_delay" if i % 2 == 0 else "fetch_failure")
+           for i in range(60)]
+    events = _feed(engine, _kcfg(), seq)
+    kinds = {e.kind for e in events}
+    assert KIND_KLINE_BLOCKED in kinds     # publish rate 0.5
+    assert KIND_FETCH_FAILING in kinds     # genuine rate 0.5
+    engine._reset_pool_gate_alarm()
+
+
+def test_alternating_sequence_reaches_the_genuine_BURST_threshold():
+    """THE neutral-input pin. A publish-delay round carries no evidence
+    about genuine fetches, so it must neither advance nor RESET the burst
+    streak -- otherwise the mutual-reset bug returns one layer down."""
     from pancakebot.runtime import engine
     from pancakebot.runtime.pool_gate_alarm import KIND_FETCH_FAILING
 
     engine._reset_pool_gate_alarm()
     cfg = _kcfg(threshold=5)
-    for i in range(60):
-        engine._note_kline_gate_outcome(
-            cfg, transient_class="publish_delay", epoch=i)
-    kinds = [e.kind for e in engine._PENDING_POOL_GATE_EVENTS]
-    assert KIND_FETCH_FAILING not in kinds
-    assert engine._fetch_fail_alarm(cfg).streak == 0
+    # strictly alternating, and only 5 genuine rounds in total
+    seq = []
+    for _ in range(5):
+        seq += ["fetch_failure", "publish_delay"]
+    events = _feed(engine, cfg, seq)
+    burst = [e for e in events
+             if e.kind == KIND_FETCH_FAILING and e.fields.get("signal") == "burst"]
+    assert burst, "5 genuine rounds interleaved with tails must still burst"
+    assert burst[0].fields["consecutive"] == 5
     engine._reset_pool_gate_alarm()
 
 
-def test_genuine_failures_alarm_at_the_original_sensitivity():
-    """Excluding publish delays is what lets this threshold stay at 5."""
+def test_a_genuinely_healthy_round_does_reset_the_burst_streak():
+    """Neutral is not the same as healthy: a clean round still resets."""
     from pancakebot.runtime import engine
     from pancakebot.runtime.pool_gate_alarm import KIND_FETCH_FAILING
 
     engine._reset_pool_gate_alarm()
     cfg = _kcfg(threshold=5)
-    for i in range(4):
-        engine._note_kline_gate_outcome(
-            cfg, transient_class="fetch_failure", epoch=i)
-    assert engine._PENDING_POOL_GATE_EVENTS == []
-    engine._note_kline_gate_outcome(cfg, transient_class="fetch_failure", epoch=5)
-    assert [e.kind for e in engine._PENDING_POOL_GATE_EVENTS] == [KIND_FETCH_FAILING]
+    seq = ["fetch_failure"] * 4 + [None] + ["fetch_failure"] * 4
+    events = _feed(engine, cfg, seq)
+    assert not [e for e in events if e.kind == KIND_FETCH_FAILING]
     engine._reset_pool_gate_alarm()
 
 
-def test_a_healthy_round_resets_both_kline_streaks():
-    """None means the fetch worked — a BET round or a quiet gate_no_signal
-    round both land here."""
-    from pancakebot.runtime import engine
-    from pancakebot.runtime.pool_gate_alarm import KIND_KLINE_RECOVERED
-
-    engine._reset_pool_gate_alarm()
-    cfg = _kcfg(threshold=5)
-    for i in range(engine._PUBLISH_DELAY_ALARM_THRESHOLD):
-        engine._note_kline_gate_outcome(
-            cfg, transient_class="publish_delay", epoch=i)
-    engine._note_kline_gate_outcome(cfg, transient_class=None, epoch=99)
-    assert engine._PENDING_POOL_GATE_EVENTS[-1].kind == KIND_KLINE_RECOVERED
-    assert engine._kline_gate_alarm(cfg).streak == 0
-    assert engine._fetch_fail_alarm(cfg).streak == 0
-    engine._reset_pool_gate_alarm()
-
-
-def test_alarm_thresholds_are_independent():
+def test_publish_realerts_six_hourly_and_genuine_hourly():
+    """Publish delay is a days-long known condition; hourly would be 24
+    messages a day about something already known."""
     from pancakebot.runtime import engine
     engine._reset_pool_gate_alarm()
-    cfg = _kcfg(threshold=7)
-    # publish delays use the derived module constant, failures the config
-    assert engine._kline_gate_alarm(cfg).threshold == \
-        engine._PUBLISH_DELAY_ALARM_THRESHOLD
-    assert engine._fetch_fail_alarm(cfg).threshold == 7
-    assert engine._PUBLISH_DELAY_ALARM_THRESHOLD > 7
+    (_pw, _gw, pub, gen_rate, burst) = engine._kline_rate_state(_kcfg())
+    assert pub.realert_interval_s == 6 * 3600.0
+    assert gen_rate.realert_interval_s == 3600.0
+    assert burst.realert_interval_s == 3600.0
+    engine._reset_pool_gate_alarm()
+
+
+def test_rate_alarms_are_level_detectors():
+    """RateWindow owns the hysteresis, so the alarms fire on the first
+    over-threshold round."""
+    from pancakebot.runtime import engine
+    engine._reset_pool_gate_alarm()
+    (_pw, _gw, pub, gen_rate, burst) = engine._kline_rate_state(_kcfg(threshold=5))
+    assert pub.threshold == 1 and gen_rate.threshold == 1
+    assert burst.threshold == 5
     engine._reset_pool_gate_alarm()
 
 
@@ -358,4 +398,59 @@ def test_kline_note_never_raises():
                                 max_consecutive_kline_fetch_failures="nope")
     engine._note_kline_gate_outcome(
         bad, transient_class="publish_delay", epoch=1)  # must not raise
+    engine._reset_pool_gate_alarm()
+
+# ---- RateWindow ----------------------------------------------------------
+
+def test_rate_window_needs_min_samples_then_reports():
+    from pancakebot.runtime.pool_gate_alarm import RateWindow
+    w = RateWindow(enter_rate=0.30, exit_rate=0.15, window=60, min_samples=30)
+    for _ in range(29):
+        assert w.observe(True) is None
+    assert w.observe(True) is True
+    assert w.n == 30 and w.rate == 1.0
+
+
+def test_rate_window_hysteresis_does_not_flap():
+    """Enters at 0.30, and does NOT clear until the rate falls under 0.15."""
+    from pancakebot.runtime.pool_gate_alarm import RateWindow
+    w = RateWindow(enter_rate=0.30, exit_rate=0.15, window=10, min_samples=10)
+    for _ in range(10):
+        w.observe(True)
+    assert w.over is True
+    # drift down to 0.20 -- above exit, so still alerting
+    for _ in range(8):
+        w.observe(False)
+    assert 0.15 <= w.rate <= 0.25 and w.over is True
+    for _ in range(2):
+        w.observe(False)
+    assert w.rate == 0.0 and w.over is False
+
+
+def test_rate_window_rejects_inverted_or_oversized_config():
+    import pytest as _pytest
+    from pancakebot.runtime.pool_gate_alarm import RateWindow
+    with _pytest.raises(ValueError):
+        RateWindow(enter_rate=0.15, exit_rate=0.30)      # inverted
+    with _pytest.raises(ValueError):
+        RateWindow(enter_rate=0.30, exit_rate=0.15, window=10, min_samples=20)
+
+
+def test_rate_window_length_and_warmup_are_independent():
+    """W was doubled to 120 to cut sampling variance (sqrt(p(1-p)/W): at
+    p=0.22 it drops false entry over the 0.30 bar from 6.7% to 1.7% per
+    window), NOT to move the bar -- entry 0.25 would have flagged 28.7% of
+    windows in a 22% regime. Warm-up is governed by min_samples, which is
+    unchanged, so the signal still goes live after 30 rounds."""
+    from pancakebot.runtime import engine
+    assert engine._RATE_WINDOW_ROUNDS == 120
+    assert engine._RATE_MIN_SAMPLES == 30
+    assert engine._PUBLISH_RATE_ENTER == 0.30
+    assert engine._PUBLISH_RATE_EXIT == 0.15
+
+    engine._reset_pool_gate_alarm()
+    # live after min_samples even though the window holds far more
+    seq = ["publish_delay"] * engine._RATE_MIN_SAMPLES
+    events = _feed(engine, _kcfg(), seq)
+    assert events, "must alert once min_samples is reached, not at full W"
     engine._reset_pool_gate_alarm()

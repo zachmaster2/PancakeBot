@@ -177,3 +177,85 @@ def test_transport_counts_every_getlogs_error_not_just_timeouts(monkeypatch):
     # a fast rejection is not a LATENCY sample, but it IS an error
     assert p.stats["getlogs_censored_samples"] == 0
     assert p.stats["getlogs_errors"] == 1
+
+
+# ---- diagnosability: swallowed causes must survive ------------------------
+
+def test_round_start_block_failure_carries_its_cause(monkeypatch):
+    """`except Exception: return None` discarded the cause, so a timeout, an
+    HTTP error and a malformed result all read as "RPC failed" -- which is
+    why the 2026-08 header-path degradation went a week uncharacterised.
+    Fail-safe behaviour is unchanged; only the cause is added."""
+    p = RpcPoller(interval_seconds=300)
+
+    def boom(**kwargs):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(p, "_bloxroute_latest_header", boom)
+    assert p._compute_round_start_block(1_787_000_000) is None   # still None
+    assert "TimeoutError" in p._last_rs_block_error
+    assert "read timed out" in p._last_rs_block_error
+
+
+def test_round_start_block_success_clears_the_stale_cause(monkeypatch):
+    p = RpcPoller(interval_seconds=300)
+    p._last_rs_block_error = "TimeoutError: stale"
+    monkeypatch.setattr(p, "_bloxroute_latest_header",
+                        lambda **kw: (1_000_000, 1_787_000_000, None))
+    p._compute_round_start_block(1_787_000_000)
+    assert p._last_rs_block_error is None
+
+
+def test_anchor_poll_fallback_names_the_exception_type(monkeypatch):
+    """"timeout_or_transport" alone cannot separate a read timeout from a
+    connection reset from a malformed-JSON parse."""
+    p = RpcPoller(interval_seconds=300)
+    seen = []
+    monkeypatch.setattr(p, "_record_anchor_outcome",
+                        lambda **kw: seen.append(kw))
+
+    def boom(*a, **kw):
+        raise ConnectionResetError("peer reset")
+
+    monkeypatch.setattr(p, "_bloxroute_call", boom)
+    assert p.fire_anchor_poll(timeout_s=0.2) is None            # still None
+    assert seen and seen[-1]["fell_back"] is True
+    assert "ConnectionResetError" in seen[-1]["reason"]
+
+
+def test_health_line_reports_head_fetch_ok_by_default(monkeypatch):
+    import pancakebot.chain.rpc_poller as mod
+    p = RpcPoller(interval_seconds=300)
+    lines = []
+    monkeypatch.setattr(mod, "info", lambda *a, **k: lines.append(a))
+    p._log_getlogs_health()
+    assert "head_fetch=ok" in lines[-1][1]
+
+
+def test_health_line_carries_the_feasibility_head_fetch_cause(monkeypatch):
+    """The INFEAS gate fails OPEN when this fetch dies. Behaviour is
+    unchanged, but the cause must not be invisible -- and it rides the
+    existing once-per-round line, so no new log line is added."""
+    import pancakebot.chain.rpc_poller as mod
+    p = RpcPoller(interval_seconds=300)
+    lines = []
+    monkeypatch.setattr(mod, "info", lambda *a, **k: lines.append(a))
+    p._last_head_fetch_error = "ReadTimeoutError: timed out"
+    p._log_getlogs_health()
+    assert "head_fetch=ReadTimeoutError: timed out" in lines[-1][1]
+
+
+def test_health_line_surfaces_window_fill_and_warming(monkeypatch):
+    """An operator must be able to tell 'still warming after a restart'
+    from 'quiet because things are fine'."""
+    import pancakebot.chain.rpc_poller as mod
+    p = RpcPoller(interval_seconds=300)
+    lines = []
+    monkeypatch.setattr(mod, "info", lambda *a, **k: lines.append(a))
+    p.set_health_extra(window_rounds="12/120(warming)")
+    p._log_getlogs_health()
+    assert "window_rounds=12/120(warming)" in lines[-1][1]
+    p.set_health_extra(window_rounds="120/120")
+    p._log_getlogs_health()
+    assert "window_rounds=120/120" in lines[-1][1]
+    assert "warming" not in lines[-1][1]

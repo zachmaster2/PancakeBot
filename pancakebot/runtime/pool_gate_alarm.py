@@ -26,6 +26,7 @@ dependency on the poller or the notifier.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -107,6 +108,7 @@ class PoolGateAlarm:
         self._last_ok_epoch: int | None = None
         self._last_blocks_short: int | None = None
         self._last_getlogs_p99_ms: int | None = None
+        self._last_extra: dict = {}
 
     @property
     def streak(self) -> int:
@@ -137,25 +139,43 @@ class PoolGateAlarm:
         out["last_ok_epoch"] = (
             self._last_ok_epoch if self._last_ok_epoch is not None else "none-since-start"
         )
+        out.update(self._last_extra)
         return out
 
     def record(
         self,
         *,
-        ready: bool,
+        ready: bool | None,
         reason: str,
         epoch: int,
         now: float,
         blocks_short: int | None = None,
         getlogs_p99_ms: int | None = None,
+        extra: dict | None = None,
     ) -> PoolGateEvent | None:
-        """Fold one round's readiness verdict in. Returns an event to
-        dispatch, or None (the overwhelmingly common case)."""
+        """Fold one round's verdict in. Returns an event to dispatch, or
+        None (the overwhelmingly common case).
+
+        ``ready`` is THREE-state on purpose:
+          True  -> the watched thing worked; reset the streak.
+          False -> the watched thing failed; advance the streak.
+          None  -> NEUTRAL: this round carries no evidence either way, so
+                   neither advance nor reset.
+
+        The neutral case is not decoration. A publish-delay round says
+        nothing about whether genuine fetches work, so feeding it as
+        "ready" to the genuine-failure alarm would reset that streak and an
+        alternating genuine/tail sequence would sit at 1 forever while
+        every round was skipped -- the mutual-reset bug, reappearing one
+        layer down.
+        """
+        if ready is None:
+            return None
         if ready:
             return self._record_ready(epoch=epoch, now=now)
         return self._record_blocked(
             reason=reason, epoch=epoch, now=now, blocks_short=blocks_short,
-            getlogs_p99_ms=getlogs_p99_ms,
+            getlogs_p99_ms=getlogs_p99_ms, extra=extra,
         )
 
     def _record_ready(self, *, epoch: int, now: float) -> PoolGateEvent | None:
@@ -191,7 +211,7 @@ class PoolGateAlarm:
 
     def _record_blocked(
         self, *, reason: str, epoch: int, now: float, blocks_short: int | None,
-        getlogs_p99_ms: int | None = None,
+        getlogs_p99_ms: int | None = None, extra: dict | None = None,
     ) -> PoolGateEvent | None:
         if self._streak == 0:
             self._first_blocked_at = now
@@ -202,6 +222,7 @@ class PoolGateAlarm:
             self._last_blocks_short = int(blocks_short)
         if getlogs_p99_ms is not None:
             self._last_getlogs_p99_ms = int(getlogs_p99_ms)
+        self._last_extra = dict(extra) if extra else {}
 
         if self._streak < self.threshold:
             return None
@@ -216,6 +237,69 @@ class PoolGateAlarm:
             detail=_kv_line(fields),
             fields=fields,
         )
+
+
+class RateWindow:
+    """Trailing-window RATE detector with hysteresis.
+
+    Run-length alarms answer "how many in a row"; some conditions are a
+    RATE and never produce a long run. The 2026-08-23 partial-kline regime
+    is one: at a 33% per-round rate, 15-in-a-row has probability ~7e-8, so
+    a run-length alarm is silent while a third of every hour is lost. Worse,
+    an interleaved genuine/publish-delay sequence resets both run-length
+    counters every other round and produces silence forever.
+
+    A rate never resets: every round lands in the denominator, so
+    interleaving raises BOTH rates instead of cancelling both streaks.
+
+    Hysteresis (``enter_rate`` > ``exit_rate``) stops a rate hovering at the
+    bar from flapping alert/recover. ``min_samples`` avoids alarming off a
+    handful of rounds right after a restart.
+    """
+
+    def __init__(
+        self, *, enter_rate: float, exit_rate: float,
+        window: int = 60, min_samples: int = 30,
+    ) -> None:
+        if not (0.0 < exit_rate < enter_rate <= 1.0):
+            raise ValueError(
+                f"rate_window_thresholds_invalid: enter={enter_rate} "
+                f"exit={exit_rate}")
+        if min_samples > window:
+            raise ValueError(
+                f"rate_window_min_samples_gt_window: {min_samples}>{window}")
+        self.enter_rate = float(enter_rate)
+        self.exit_rate = float(exit_rate)
+        self.window = int(window)
+        self.min_samples = int(min_samples)
+        self._hits: deque[int] = deque(maxlen=self.window)
+        self._over = False
+
+    @property
+    def n(self) -> int:
+        return len(self._hits)
+
+    @property
+    def rate(self) -> float:
+        return (sum(self._hits) / len(self._hits)) if self._hits else 0.0
+
+    @property
+    def over(self) -> bool:
+        return self._over
+
+    def observe(self, hit: bool) -> bool | None:
+        """Fold one round in. Returns True/False once the window holds at
+        least ``min_samples`` rounds, else None (not enough evidence)."""
+        self._hits.append(1 if hit else 0)
+        if len(self._hits) < self.min_samples:
+            return None
+        r = self.rate
+        if self._over:
+            if r < self.exit_rate:
+                self._over = False
+        elif r >= self.enter_rate:
+            self._over = True
+        return self._over
 
 
 def _kv_line(fields: dict[str, Any]) -> str:

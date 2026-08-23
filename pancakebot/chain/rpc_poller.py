@@ -508,6 +508,15 @@ class RpcPoller:
         # Last F0 coverage shortfall in blocks (None when covered).
         # Read-only diagnostic for the pool-gate alarm's alert body.
         self._last_pool_blocks_short: int | None = None
+        # Cause of the most recent round-start-block RPC failure, kept so
+        # the epoch-advance warn can name it. Cleared on every success.
+        self._last_rs_block_error: str | None = None
+        # Cause of the most recent feasibility head-fetch failure, and
+        # a slot the engine fills with its own once-per-round facts.
+        # Both ride the existing health line -- no new log lines, so
+        # incident noise is unchanged by construction.
+        self._last_head_fetch_error: str | None = None
+        self._health_extra: dict = {}
         # Observed eth_getLogs wallclock, DIAGNOSTIC ONLY (nothing gates on
         # it). Timeouts are recorded as censored observations at the timeout
         # bound rather than dropped — see ``getlogs_p99_ms``.
@@ -681,11 +690,17 @@ class RpcPoller:
                 "eth_getBlockByNumber", ["latest", False],
                 timeout_ms=int(timeout_s * 1000), attempts=1,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             # Anchor poll timeout / transport error: fallback to static wake.
             # Per round this is silent (wake_mode="static" in cycle_audit);
             # the rolling-rate monitor surfaces a sustained-fallback regime.
-            self._record_anchor_outcome(fell_back=True, reason="timeout_or_transport")
+            # The exception TYPE rides along: "timeout_or_transport" alone
+            # cannot tell a read timeout from a connection reset from a
+            # malformed-JSON parse, and those want different responses.
+            self._record_anchor_outcome(
+                fell_back=True,
+                reason=f"timeout_or_transport:{type(e).__name__}",
+            )
             return None
         if not isinstance(block, dict):
             self._record_anchor_outcome(fell_back=True, reason="malformed_response")
@@ -1069,6 +1084,17 @@ class RpcPoller:
     # Round-aware cursor clamp + catch-up feasibility check
     # ------------------------------------------------------------------
 
+    def set_health_extra(self, **kv) -> None:
+        """Attach caller-owned facts to the once-per-round health line.
+
+        The engine knows things the poller cannot (how full the kline rate
+        window is, say). Rather than emit a second per-round line, it hands
+        them here and they render alongside the poller's own fields.
+        Observability only -- nothing reads these back.
+        """
+        with self._lock:
+            self._health_extra.update(kv)
+
     def _log_getlogs_health(self) -> None:
         """One structured line per round on the getLogs read path.
 
@@ -1083,6 +1109,8 @@ class RpcPoller:
         with self._lock:
             censored, errors = self._getlogs_censored, self._getlogs_errors
             samples = len(self._getlogs_latency_ms)
+            head_fetch = self._last_head_fetch_error or "ok"
+            extra = dict(self._health_extra)
         # ">=" ONLY when at least one sample is a censored timeout. With
         # censored=0 the p99 is an exact measurement, and an unconditional
         # ">=" makes a bound indistinguishable from a measurement — which
@@ -1095,7 +1123,9 @@ class RpcPoller:
             "POLL",
             f"getlogs health: p99={p99_txt} "
             f"samples={samples} censored={censored} errors={errors} "
-            f"host={RPC_GETLOGS_ENDPOINT}",
+            f"head_fetch={head_fetch} "
+            + "".join(f"{k}={v} " for k, v in sorted(extra.items()))
+            + f"host={RPC_GETLOGS_ENDPOINT}",
         )
 
     def _on_epoch_advance(self, *, lock_at: int, current_epoch: int) -> None:
@@ -1175,18 +1205,35 @@ class RpcPoller:
         self._log_getlogs_health()
 
         if rs_block is None:
+            with self._lock:
+                _cause = self._last_rs_block_error or "unknown"
             warn("ALERT",
-                 "epoch advance: round-start block RPC failed; cursor not "
-                 "jumped (bounded catch-up fallback — next poll crunches "
-                 "the backlog, archive bets epoch-gated)")
+                 f"epoch advance: round-start block RPC failed; cursor not "
+                 f"jumped (bounded catch-up fallback — next poll crunches "
+                 f"the backlog, archive bets epoch-gated) cause={_cause}")
 
         # Phase 3 — feasibility check: how far behind are we vs how much
         # time remains, with a single fresh head fetch.
         try:
             head = self._bloxroute_block_number(attempts=_RPC_ATTEMPTS_PERIODIC)
-        except Exception:  # noqa: BLE001
-            return  # leave _catchup_infeasible_for_round at False; next
-                    # poll/round will reassess.
+        except Exception as e:  # noqa: BLE001
+            # Behaviour unchanged: return bare, leaving
+            # _catchup_infeasible_for_round False so the next poll/round
+            # reassesses. But note what that MEANS -- the INFEAS gate has
+            # silently failed OPEN for this round. Nothing unsafe follows
+            # (F0 still catches short coverage at decision time), yet a
+            # safety gate declining to do its job invisibly is exactly the
+            # class of blindness that cost a week in 2026-08. The cause is
+            # therefore carried on the once-per-round health line rather
+            # than a new warn: zero extra log lines, no rate-limit policy
+            # to get wrong. This call is eth_blockNumber, the one bloXroute
+            # method measured consistently healthy (p50 3ms), so it should
+            # read ok on essentially every round.
+            with self._lock:
+                self._last_head_fetch_error = f"{type(e).__name__}: {e}"
+            return
+        with self._lock:
+            self._last_head_fetch_error = None
 
         with self._lock:
             cursor = self._last_polled_block_number
@@ -1265,8 +1312,18 @@ class RpcPoller:
             head_num, head_ts, head_milli = self._bloxroute_latest_header(
                 attempts=_RPC_ATTEMPTS_PERIODIC,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # Fail-safe behaviour is unchanged -- still None, still no
+            # raise. What changes is that the CAUSE survives. "round-start
+            # block RPC failed" on its own is unactionable: a timeout, an
+            # HTTP error and a malformed result read identically, which is
+            # why the 2026-08 header-path degradation went a week without
+            # being characterised.
+            with self._lock:
+                self._last_rs_block_error = f"{type(e).__name__}: {e}"
             return None
+        with self._lock:
+            self._last_rs_block_error = None
         if head_ts <= 0 or head_num <= 0:
             return None
         return self._rs_block_from_header(
