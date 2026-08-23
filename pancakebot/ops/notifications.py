@@ -281,7 +281,8 @@ def build_message(
         # Structured kv rendering ordered for phone triage: how bad, how
         # long, why, how far behind, where coverage last held. The same
         # field set also arrives on the `detail` line.
-        for k in ("consecutive", "recovered_after", "blocked_for", "reason",
+        for k in ("signal", "rate", "window_rounds", "consecutive",
+                  "recovered_after", "blocked_for", "reason",
                   "blocks_short", "getlogs_p99_ms", "last_ok_epoch", "epoch"):
             if k in fields:
                 lines.append(f"{k}: `{fields[k]}`")
