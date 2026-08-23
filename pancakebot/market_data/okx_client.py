@@ -204,6 +204,31 @@ class _OkxErrorClass(Enum):
     INSUFFICIENT = "insufficient"  # code=0 but empty or short data — retry, then raise
 
 
+def _missing_position(
+    data: list, oldest_open_ms: int, newest_open_ms_inclusive: int,
+) -> str | None:
+    """Which end of the requested window is absent from a SHORT response.
+
+    ``"tail"`` iff the returned open_times are exactly a contiguous prefix
+    of the requested range starting at ``oldest_open_ms`` -- so only the
+    newest candle(s) are missing, the publish-delay shape. Anything else
+    (a hole in the middle, a missing oldest bound, unparseable rows) is
+    ``"gap_or_head"``; ``None`` when the response carries no usable rows.
+
+    Deliberately strict: callers exclude ``"tail"`` from failure streaks,
+    so an ambiguous response must NOT be labelled benign.
+    """
+    try:
+        times = sorted(int(row[0]) for row in data
+                       if isinstance(row, (list, tuple)) and row)
+    except (TypeError, ValueError):
+        return "gap_or_head"
+    if not times:
+        return None
+    expected = list(range(oldest_open_ms, newest_open_ms_inclusive + 1, 1000))
+    return "tail" if times == expected[:len(times)] else "gap_or_head"
+
+
 def _classify_response(resp: requests.Response, expected_count: int) -> tuple[_OkxErrorClass, str]:
     """Classify an HTTP response into one of the four outcome classes."""
     status = resp.status_code
@@ -517,12 +542,24 @@ class OkxClient:
                 # here.
                 #
                 # ``received_count`` is computed for INSUFFICIENT cases so
-                # the caller can show ``received=N requested=M``. We do
-                # NOT additionally compute which boundary is missing: in
-                # practice OKX only ever shorts us at the newest end
-                # (publish-delay tail) and supporting hypothetical
-                # middle-gap / oldest-missing cases is overengineering.
+                # the caller can show ``received=N requested=M``.
+                #
+                # ``missing_position`` says WHICH end is short, and it has to
+                # be proven rather than assumed. A short response is
+                # classified INSUFFICIENT by ``_classify_response`` BEFORE
+                # the contiguity and boundary checks run (those only execute
+                # once len == expected_count), so a middle-gap response is
+                # indistinguishable from a publish-delay tail on counts
+                # alone. Callers now exclude publish-delay tails from their
+                # failure streaks, which makes that distinction load-bearing:
+                # excluding a middle gap would silently swallow real data
+                # corruption. (This reverses a 2026-06-09 decision to drop
+                # the field as "overengineering for cases that don't happen"
+                # -- as of 2026-08-23 the tail case is 33% of live rounds,
+                # so the case very much happens and the two must be told
+                # apart.)
                 received_count: int | None = None
+                missing_position: str | None = None
                 if response_received and cls == _OkxErrorClass.INSUFFICIENT:
                     try:
                         body = resp.json()
@@ -532,6 +569,9 @@ class OkxClient:
                         data = body.get("data")
                         if isinstance(data, list):
                             received_count = len(data)
+                            missing_position = _missing_position(
+                                data, oldest_open_ms, newest_open_ms_inclusive,
+                            )
                 raise TransientOkxError(
                     f"kline_fetch_exhausted: symbol={symbol} "
                     f"class={cls.value} detail={detail}",
@@ -545,6 +585,7 @@ class OkxClient:
                     rtt_ms=rtt_ms if response_received else None,
                     received_count=received_count,
                     requested_count=expected_count,
+                    missing_position=missing_position,
                 )
             base_delay = retry_policy.backoff_seconds[attempt]
             delay = base_delay * random.uniform(_RETRY_JITTER_MIN_FRACTION, _RETRY_JITTER_MAX_FRACTION)

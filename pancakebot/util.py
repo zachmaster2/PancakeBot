@@ -66,6 +66,7 @@ class TransientOkxError(Exception):
         rtt_ms: int | None = None,
         received_count: int | None = None,
         requested_count: int | None = None,
+        missing_position: str | None = None,
     ) -> None:
         super().__init__(message)
         self.error_class = error_class
@@ -73,6 +74,14 @@ class TransientOkxError(Exception):
         self.rtt_ms = rtt_ms
         self.received_count = received_count
         self.requested_count = requested_count
+        # "tail"  -> the rows returned are a contiguous prefix of the
+        #            requested window: only the NEWEST candle(s) are absent,
+        #            i.e. an OKX publish delay. Structurally benign.
+        # "gap_or_head" -> anything else missing: a hole in the middle or a
+        #            missing oldest bound. That is a data-integrity concern,
+        #            NOT a publish delay, and must never be treated as one.
+        # None    -> not applicable / could not be determined.
+        self.missing_position = missing_position
 
 
 # -- Paths ---------------------------------------------------------

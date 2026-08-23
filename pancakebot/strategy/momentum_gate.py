@@ -46,17 +46,20 @@ from pancakebot.market_data.okx_client import (
 from pancakebot.util import InvariantError, TransientOkxError
 
 
-# Streak counter limit is configured per-instance via
-# ``MomentumGateConfig.max_consecutive_kline_fetch_failures`` (threaded from
-# ``cfg.max_consecutive_kline_fetch_failures`` at config load). The constant
-# below is the canonical default + the value used by tests that don't
-# construct a custom MomentumGateConfig.
+# This gate COUNTS consecutive transient fetch failures but no longer
+# escalates on them -- see ``evaluate``. Escalation moved to the engine as
+# an alert-and-continue alarm whose threshold is
+# ``RuntimeConfig.max_consecutive_kline_fetch_failures``.
 #
-# At default max=5 with empirical per-round transient-failure rate ~12%
-# (research/p4c_canonical_loop_probe.py n=1000 at 800ms post-close):
-# P(5 consecutive transient) = 0.12^5 = 2.5e-5 -> expected crash once
-# per ~40,000 rounds = ~14 weeks at 12 rounds/h.
-_MAX_CONSECUTIVE_FETCH_FAILURES = 5
+# The old design crashed the bot at 5 in a row, justified by an empirical
+# per-round transient-failure rate of ~12% (research/
+# p4c_canonical_loop_probe.py n=1000 at 800ms post-close), giving
+# P(5 consecutive) = 0.12^5 = 2.5e-5, about one crash per 14 weeks. That
+# premise is FALSE as of 2026-08-23: the measured rate is 33% (86 partial
+# reads in 259 rounds that day, up from 3/day on 08-17), runs of four
+# occurred five times in the preceding week, and the bot duly crashed at
+# 20:41:13 UTC on a fifth. A rate this high makes the streak a measure of
+# OKX publish delay, not of anything a restart can fix.
 
 # BNB temporarily removed from the live fetch -- the strategy doesn't
 # consume BNB closes for signal computation, and the bot already has
@@ -89,7 +92,6 @@ class MomentumGateConfig:
     kline_cutoff_seconds: int
     mtf_lookbacks: tuple[int, ...]
     mtf_min_return_threshold: float
-    max_consecutive_kline_fetch_failures: int = 5
     eth_symbol: str = "ETH-USDT"
     sol_symbol: str = "SOL-USDT"
 
@@ -132,9 +134,10 @@ class MomentumGate:
       ``last_fetch_results`` at SKIP time and composes a single
       ``warn("SKIP", ...)`` line carrying the per-symbol failure detail.
       Increments ``_consecutive_fetch_failures``; reset to 0 on a fully
-      successful 3-symbol fetch.
-    - Streak >= ``MomentumGateConfig.max_consecutive_kline_fetch_failures`` →
-      escalate to ``InvariantError("kline_fetch_failure_streak_max_reached: ...")``.
+      successful 3-symbol fetch. That counter is TELEMETRY only (exposed as
+      ``consecutive_fetch_failures``) -- this class never escalates on it.
+    - Escalation lives in the engine: a run of these rounds raises the
+      KLINE_GATE_BLOCKED Discord alarm and the bot keeps running.
     """
 
     def __init__(
@@ -178,6 +181,11 @@ class MomentumGate:
         self.last_fetch_results: dict[str, str] | None = None
         # Consecutive-failure escalation state (TransientOkxError streak).
         self._consecutive_fetch_failures: int = 0
+        # Consecutive rounds shorted ONLY by an OKX publish-delay tail.
+        # Tracked separately because it is a benign condition that still
+        # costs evaluation opportunities -- the engine alarms on it.
+        self._consecutive_publish_delays: int = 0
+        self._last_transient_class: str | None = None
         # ThreadPoolExecutor lives for the gate's lifetime so we don't pay
         # thread-spawn cost every round. max_workers=3 -- one per symbol
         # (BTC + ETH + SOL). Bump to 4 if BNB is re-enabled in
@@ -185,6 +193,23 @@ class MomentumGate:
         self._executor = ThreadPoolExecutor(
             max_workers=3, thread_name_prefix="kline-fetch",
         )
+
+    @property
+    def consecutive_fetch_failures(self) -> int:
+        """Consecutive rounds with a GENUINE fetch failure (publish-delay
+        tails excluded). Diagnostic only - nothing here escalates on it."""
+        return self._consecutive_fetch_failures
+
+    @property
+    def consecutive_publish_delays(self) -> int:
+        """Consecutive rounds shorted only by an OKX publish-delay tail."""
+        return self._consecutive_publish_delays
+
+    @property
+    def last_transient_class(self) -> str | None:
+        """``"publish_delay"`` | ``"fetch_failure"`` | None for the most
+        recent evaluate() -- what the engine's alarms are fed from."""
+        return self._last_transient_class
 
     @property
     def enabled(self) -> bool:
@@ -356,19 +381,40 @@ class MomentumGate:
         # the per-symbol detail. See engine.py _run_one_iteration where
         # reason == "kline_fetch_transient_failure".
         if transient_errors:
-            self._consecutive_fetch_failures += 1
-            if self._consecutive_fetch_failures >= self._cfg.max_consecutive_kline_fetch_failures:
-                # Capture the latest detail for the fail-loud message.
-                latest_sym, latest_err = transient_errors[-1]
-                raise InvariantError(
-                    f"kline_fetch_failure_streak_max_reached: "
-                    f"streak={self._consecutive_fetch_failures} "
-                    f"max={self._cfg.max_consecutive_kline_fetch_failures} "
-                    f"latest={latest_sym}={latest_err}"
-                )
+            # A tail-only short read is an OKX PUBLISH DELAY, not a failed
+            # fetch: OKX has not emitted the newest 1s candle yet. Counting
+            # it toward a fetch-failure streak is a category error, and it
+            # is what crashed the bot on 2026-08-23 (five in a row at a 33%
+            # per-round rate). Publish delays therefore get their own
+            # counter; the fetch-failure streak keeps its original meaning
+            # AND its original sensitivity for genuinely broken fetches
+            # (unreachable, HTTP errors, middle-gap responses).
+            #
+            # Tail-only is PROVEN by okx_client (``missing_position``), not
+            # inferred from the error class -- a middle-gap response is also
+            # class=insufficient, and excluding one of those would swallow
+            # real data corruption.
+            genuine = [
+                (s, e) for s, e in transient_errors
+                if not (getattr(e, "error_class", None) == "insufficient"
+                        and getattr(e, "missing_position", None) == "tail")
+            ]
+            if genuine:
+                self._consecutive_fetch_failures += 1
+                self._consecutive_publish_delays = 0
+                self._last_transient_class = "fetch_failure"
+            else:
+                # The fetch worked as well as OKX currently allows.
+                self._consecutive_fetch_failures = 0
+                self._consecutive_publish_delays += 1
+                self._last_transient_class = "publish_delay"
+            # Either way the round is SKIPPED before any signal is computed,
+            # so no bet is ever sized on an incomplete candle set.
             return self._skip("kline_fetch_transient_failure")
 
-        # ----- All 4 fetched cleanly -- reset streak -----
+        # ----- All 4 fetched cleanly -- reset streaks -----
+        self._consecutive_publish_delays = 0
+        self._last_transient_class = None
         # Reset BEFORE signal computation so quiet-market `gate_no_signal`
         # rounds don't falsely escalate the streak. The streak measures
         # OKX-fetch health, not signal availability.

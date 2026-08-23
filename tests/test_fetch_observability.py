@@ -114,7 +114,6 @@ def _make_gate():
         kline_cutoff_seconds=2,
         mtf_lookbacks=(3, 7, 15),
         mtf_min_return_threshold=0.0001,
-        max_consecutive_kline_fetch_failures=5,
     )
     # Minimal client; we patch kline_fetch_window per test.
     client = mock.MagicMock()
@@ -495,11 +494,16 @@ def _candle_row(ts_ms: int) -> list:
 
 
 def test_okx_client_carries_received_and_requested_counts_on_insufficient():
-    """INSUFFICIENT response (got fewer rows than expected) surfaces both
-    ``received_count`` and ``requested_count`` on the raised exception.
-    Boundary position (newest vs oldest vs middle) is NOT computed --
-    OKX only ever shorts us at the tail in practice and supporting
-    hypothetical middle-gap / oldest-missing cases is overengineering.
+    """INSUFFICIENT response surfaces ``received_count``,
+    ``requested_count`` AND ``missing_position``.
+
+    ``missing_position`` was dropped in 2026-06-09 as overengineering. It
+    came back on 2026-08-23 because it became load-bearing: the gate now
+    EXCLUDES publish-delay tails from its fetch-failure streak, and a
+    short response is classified INSUFFICIENT before the contiguity check
+    ever runs -- so without this field a middle-gap response (real data
+    corruption) is indistinguishable from a benign tail and would be
+    silently excluded too.
     """
     requested_count = 16
     oldest = 1_700_000_000_000
@@ -519,8 +523,34 @@ def test_okx_client_carries_received_and_requested_counts_on_insufficient():
     assert raised is not None
     assert raised.received_count == 15
     assert raised.requested_count == 16
-    # ``missing_position`` is intentionally not a field anymore.
-    assert not hasattr(raised, "missing_position")
+    # rows are a contiguous prefix ending one short of `newest` -> tail
+    assert raised.missing_position == "tail"
+
+
+def test_okx_client_flags_a_middle_gap_as_not_a_publish_delay():
+    """A hole in the MIDDLE must never be labelled a tail: the gate would
+    exclude it from the failure streak and the corruption would go
+    unnoticed."""
+    requested_count = 16
+    oldest = 1_700_000_000_000
+    newest = oldest + (requested_count - 1) * 1000
+    # every candle except one in the interior
+    times = [oldest + i * 1000 for i in range(requested_count) if i != 7]
+    rows = [_candle_row(ts) for ts in reversed(times)]
+    client, _ = _make_okx_client_with_response({"code": "0", "data": rows})
+    raised: TransientOkxError | None = None
+    try:
+        client.kline_fetch_window(
+            symbol="BTC-USDT",
+            oldest_open_ms=oldest,
+            newest_open_ms_inclusive=newest,
+            retry_policy=RetryPolicy(max_attempts=1, backoff_seconds=()),
+        )
+    except TransientOkxError as e:
+        raised = e
+    assert raised is not None
+    assert raised.received_count == 15
+    assert raised.missing_position == "gap_or_head"
 
 
 # Phase B v2 (2026-05-18): the gate-side per-symbol kline WARN emission

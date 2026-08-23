@@ -75,9 +75,12 @@ class RuntimeConfig:
     bet_tx_receipt_timeout_seconds: int
     claim_tx_receipt_timeout_seconds: int
 
-    # User-tunable. Streak counter for OKX transient failures; bot
-    # crashes (-> systemd restart + Discord alert) after this many
-    # consecutive `kline_fetch_transient_failure` rounds.
+    # User-tunable. Consecutive GENUINE kline fetch failures (unreachable /
+    # HTTP error / gapped response; OKX publish-delay tails are excluded)
+    # before the engine raises the KLINE_FETCH_FAILING Discord alarm
+    # (alert-and-continue; it does NOT crash or stop the bot). Every such
+    # round is skipped before any signal is computed, so the streak costs
+    # evaluation opportunities, never a bet on partial data.
     max_consecutive_kline_fetch_failures: int
 
     # User-tunable. Pool cutoff: only bets with on-chain block_timestamp

@@ -20,7 +20,14 @@ from pancakebot.util import GasPriceCapBreachedError, InvariantError, TransientR
 from pancakebot.log import info, warn
 from pancakebot.util import format_bankroll
 from pancakebot.runtime.config import RuntimeConfig
-from pancakebot.runtime.pool_gate_alarm import KIND_BLOCKED, PoolGateAlarm
+from pancakebot.runtime.pool_gate_alarm import (
+    KIND_BLOCKED,
+    KIND_FETCH_FAILING,
+    KIND_FETCH_RECOVERED,
+    KIND_KLINE_BLOCKED,
+    KIND_KLINE_RECOVERED,
+    PoolGateAlarm,
+)
 from pancakebot.ops.notifications import notify
 from pancakebot import paths
 from pancakebot.runtime.dry import (
@@ -189,10 +196,93 @@ _POOL_GATE_ALARM = PoolGateAlarm()
 
 
 def _reset_pool_gate_alarm() -> None:
-    """Test hook: drop the blocked-round streak AND the pending queue."""
-    global _POOL_GATE_ALARM
+    """Test hook: drop the blocked-round streaks AND the pending queue."""
+    global _POOL_GATE_ALARM, _KLINE_GATE_ALARM, _FETCH_FAIL_ALARM
     _POOL_GATE_ALARM = PoolGateAlarm()
+    _KLINE_GATE_ALARM = None
+    _FETCH_FAIL_ALARM = None
     del _PENDING_POOL_GATE_EVENTS[:]
+
+
+# Publish-delay alarm: consecutive rounds the gate could not EVALUATE
+# because OKX had not yet published the newest 1s candle. Benign per round
+# but operationally important in bulk -- on 2026-08-23 it cost a third of
+# all rounds.
+#
+# THRESHOLD 15 (~75 min), derived from that day's live run-length
+# distribution -- the 33% regime, not the historical 12%. 51 runs of
+# consecutive publish-delay rounds: 29x1, 11x2, 5x3, 5x4, 1x>=5 (the last
+# truncated by the crash, so the observed max is a LOWER bound). Survival
+# P(>=4) = 6/51 = 0.118 with tail continuation ~0.5-0.55, so
+# P(run >= k) ~= (6/51) * q^(k-4) over ~51 run-starts/day gives roughly one
+# false alert per 20-43 days at k=12 (monthly noise, i.e. alert fatigue on
+# the channel we depend on) versus one per 4-12 months at k=15.
+_PUBLISH_DELAY_ALARM_THRESHOLD = 15
+
+_KLINE_GATE_ALARM: PoolGateAlarm | None = None
+_FETCH_FAIL_ALARM: PoolGateAlarm | None = None
+
+
+def _kline_gate_alarm(cfg: RuntimeConfig) -> PoolGateAlarm:
+    global _KLINE_GATE_ALARM
+    if _KLINE_GATE_ALARM is None:
+        _KLINE_GATE_ALARM = PoolGateAlarm(
+            threshold=_PUBLISH_DELAY_ALARM_THRESHOLD,
+            kind_blocked=KIND_KLINE_BLOCKED,
+            kind_recovered=KIND_KLINE_RECOVERED,
+        )
+    return _KLINE_GATE_ALARM
+
+
+def _fetch_fail_alarm(cfg: RuntimeConfig) -> PoolGateAlarm:
+    """Genuine fetch failures, at the ORIGINAL sensitivity. Excluding
+    publish delays is what lets this threshold stay where it always was:
+    it now counts only fetches that really failed. Lazily built because
+    the threshold is operator-tunable."""
+    global _FETCH_FAIL_ALARM
+    if _FETCH_FAIL_ALARM is None:
+        _FETCH_FAIL_ALARM = PoolGateAlarm(
+            threshold=int(cfg.max_consecutive_kline_fetch_failures),
+            kind_blocked=KIND_FETCH_FAILING,
+            kind_recovered=KIND_FETCH_RECOVERED,
+        )
+    return _FETCH_FAIL_ALARM
+
+
+def _note_kline_gate_outcome(
+    cfg: RuntimeConfig, *, transient_class: str | None, epoch: int,
+) -> None:
+    """Fold one round's kline outcome into BOTH kline alarms and QUEUE any
+    alerts. Pure bookkeeping — no I/O — so it is safe here on the critical
+    path; delivery rides the same off-critical flush as the pool alarm.
+
+    Two conditions, deliberately separate rather than one generalised
+    counter: a publish delay is benign-but-costly and needs a high
+    threshold, a genuine fetch failure is rare-and-serious and needs a low
+    one. Conflating them would hide the second behind the first — which is
+    exactly the category error that crashed the bot on 2026-08-23.
+    """
+    try:
+        for alarm, blocked, tag in (
+            (_kline_gate_alarm(cfg), transient_class == "publish_delay",
+             "KLINE GATE"),
+            (_fetch_fail_alarm(cfg), transient_class == "fetch_failure",
+             "KLINE FETCH"),
+        ):
+            event = alarm.record(
+                ready=not blocked,
+                reason=transient_class or "ok",
+                epoch=int(epoch), now=_utc_now(),
+            )
+            if event is None:
+                continue
+            if event.kind in (KIND_KLINE_BLOCKED, KIND_FETCH_FAILING):
+                warn("ALERT", f"{tag} BLOCKED {event.detail}")
+            else:
+                info("ALERT", f"{tag} RECOVERED {event.detail}")
+            _PENDING_POOL_GATE_EVENTS.append(event)
+    except Exception as e:  # noqa: BLE001 — alerting must never break betting
+        warn("ALERT", f"kline alarm record failed: {type(e).__name__}: {e}")
 
 
 # Alerts produced on the critical path are QUEUED here and sent later,
@@ -1168,6 +1258,14 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
             round_t=open_round,
             pool_bull_bnb=pool_bull_bnb,
             pool_bear_bnb=pool_bear_bnb,
+        )
+        # Record only — no I/O. Any round that reaches here got past the
+        # pool gate, so the kline fetch genuinely ran and its outcome is
+        # meaningful: a transient-fetch skip is blocked, anything else
+        # (including a BET or a quiet gate_no_signal) is healthy.
+        _note_kline_gate_outcome(
+            cfg, transient_class=getattr(gate, "last_transient_class", None),
+            epoch=current_epoch,
         )
         # `p_bull` was removed from StrategyPipelineDecision in the
         # 2026-04-26 lean&clean refactor; defensive getattr keeps the

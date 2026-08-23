@@ -240,3 +240,122 @@ def test_engine_dispatch_swallows_notifier_failure(monkeypatch):
     # the failed send is dropped, not retried forever
     assert engine._PENDING_POOL_GATE_EVENTS == []
     engine._reset_pool_gate_alarm()
+
+# ---- kline-gate alarm (second instance) -----------------------------------
+
+def _kcfg(threshold=5):
+    return types.SimpleNamespace(
+        dry=False, rpc_poller=None,
+        max_consecutive_kline_fetch_failures=threshold,
+    )
+
+
+def test_second_instance_uses_its_own_kinds_and_threshold():
+    from pancakebot.runtime.pool_gate_alarm import (
+        KIND_KLINE_BLOCKED, KIND_KLINE_RECOVERED)
+    a = PoolGateAlarm(threshold=3, kind_blocked=KIND_KLINE_BLOCKED,
+                      kind_recovered=KIND_KLINE_RECOVERED)
+    assert a.record(ready=False, reason="x", epoch=1, now=0.0) is None
+    assert a.record(ready=False, reason="x", epoch=2, now=300.0) is None
+    ev = a.record(ready=False, reason="x", epoch=3, now=600.0)
+    assert ev.kind == KIND_KLINE_BLOCKED
+    rec = a.record(ready=True, reason="", epoch=4, now=900.0)
+    assert rec.kind == KIND_KLINE_RECOVERED
+
+
+def test_publish_delay_run_alerts_but_never_raises():
+    """The 2026-08-23 crash shape: a long run of publish delays must alert
+    and keep running, not raise."""
+    from pancakebot.runtime import engine
+    from pancakebot.runtime.pool_gate_alarm import KIND_KLINE_BLOCKED
+
+    engine._reset_pool_gate_alarm()
+    cfg = _kcfg()
+    n = engine._PUBLISH_DELAY_ALARM_THRESHOLD
+    for i in range(n - 1):
+        engine._note_kline_gate_outcome(
+            cfg, transient_class="publish_delay", epoch=500_000 + i)
+    assert engine._PENDING_POOL_GATE_EVENTS == []       # silent below bar
+    engine._note_kline_gate_outcome(
+        cfg, transient_class="publish_delay", epoch=500_000 + n)
+    assert len(engine._PENDING_POOL_GATE_EVENTS) == 1
+    ev = engine._PENDING_POOL_GATE_EVENTS[0]
+    assert ev.kind == KIND_KLINE_BLOCKED
+    assert ev.fields["consecutive"] == n
+    assert ev.fields["reason"] == "publish_delay"
+    engine._reset_pool_gate_alarm()
+
+
+def test_publish_delays_never_feed_the_fetch_failure_alarm():
+    """THE point of the redesign: a benign publish delay is not a fetch
+    failure, so the low-threshold failure alarm must stay silent through a
+    run far longer than its own threshold."""
+    from pancakebot.runtime import engine
+    from pancakebot.runtime.pool_gate_alarm import KIND_FETCH_FAILING
+
+    engine._reset_pool_gate_alarm()
+    cfg = _kcfg(threshold=5)
+    for i in range(60):
+        engine._note_kline_gate_outcome(
+            cfg, transient_class="publish_delay", epoch=i)
+    kinds = [e.kind for e in engine._PENDING_POOL_GATE_EVENTS]
+    assert KIND_FETCH_FAILING not in kinds
+    assert engine._fetch_fail_alarm(cfg).streak == 0
+    engine._reset_pool_gate_alarm()
+
+
+def test_genuine_failures_alarm_at_the_original_sensitivity():
+    """Excluding publish delays is what lets this threshold stay at 5."""
+    from pancakebot.runtime import engine
+    from pancakebot.runtime.pool_gate_alarm import KIND_FETCH_FAILING
+
+    engine._reset_pool_gate_alarm()
+    cfg = _kcfg(threshold=5)
+    for i in range(4):
+        engine._note_kline_gate_outcome(
+            cfg, transient_class="fetch_failure", epoch=i)
+    assert engine._PENDING_POOL_GATE_EVENTS == []
+    engine._note_kline_gate_outcome(cfg, transient_class="fetch_failure", epoch=5)
+    assert [e.kind for e in engine._PENDING_POOL_GATE_EVENTS] == [KIND_FETCH_FAILING]
+    engine._reset_pool_gate_alarm()
+
+
+def test_a_healthy_round_resets_both_kline_streaks():
+    """None means the fetch worked — a BET round or a quiet gate_no_signal
+    round both land here."""
+    from pancakebot.runtime import engine
+    from pancakebot.runtime.pool_gate_alarm import KIND_KLINE_RECOVERED
+
+    engine._reset_pool_gate_alarm()
+    cfg = _kcfg(threshold=5)
+    for i in range(engine._PUBLISH_DELAY_ALARM_THRESHOLD):
+        engine._note_kline_gate_outcome(
+            cfg, transient_class="publish_delay", epoch=i)
+    engine._note_kline_gate_outcome(cfg, transient_class=None, epoch=99)
+    assert engine._PENDING_POOL_GATE_EVENTS[-1].kind == KIND_KLINE_RECOVERED
+    assert engine._kline_gate_alarm(cfg).streak == 0
+    assert engine._fetch_fail_alarm(cfg).streak == 0
+    engine._reset_pool_gate_alarm()
+
+
+def test_alarm_thresholds_are_independent():
+    from pancakebot.runtime import engine
+    engine._reset_pool_gate_alarm()
+    cfg = _kcfg(threshold=7)
+    # publish delays use the derived module constant, failures the config
+    assert engine._kline_gate_alarm(cfg).threshold == \
+        engine._PUBLISH_DELAY_ALARM_THRESHOLD
+    assert engine._fetch_fail_alarm(cfg).threshold == 7
+    assert engine._PUBLISH_DELAY_ALARM_THRESHOLD > 7
+    engine._reset_pool_gate_alarm()
+
+
+def test_kline_note_never_raises():
+    """Runs on the critical path; a failure here must not reach the bet."""
+    from pancakebot.runtime import engine
+    engine._reset_pool_gate_alarm()
+    bad = types.SimpleNamespace(dry=False, rpc_poller=None,
+                                max_consecutive_kline_fetch_failures="nope")
+    engine._note_kline_gate_outcome(
+        bad, transient_class="publish_delay", epoch=1)  # must not raise
+    engine._reset_pool_gate_alarm()

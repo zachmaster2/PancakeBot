@@ -106,7 +106,6 @@ def _pipeline(gate, strategy, tracker) -> MomentumOnlyPipeline:
         enabled=True, bnb_symbol="BNB-USDT", btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT", sol_symbol="SOL-USDT", kline_cutoff_seconds=2,
         mtf_lookbacks=(3, 7, 15), mtf_min_return_threshold=0.0001,
-        max_consecutive_kline_fetch_failures=5,
     )
     return MomentumOnlyPipeline(
         config=cfg, strategy_config=strategy, gate=gate,

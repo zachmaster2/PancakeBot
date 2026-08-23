@@ -61,7 +61,6 @@ def run_from_config(
         kline_cutoff_seconds=cfg.kline_cutoff_seconds,
         mtf_lookbacks=cfg.strategy.gate.mtf_lookbacks,
         mtf_min_return_threshold=cfg.strategy.gate.mtf_min_return_threshold,
-        max_consecutive_kline_fetch_failures=cfg.max_consecutive_kline_fetch_failures,
     )
 
     if backtest:

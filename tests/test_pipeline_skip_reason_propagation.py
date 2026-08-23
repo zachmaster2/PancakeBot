@@ -91,7 +91,6 @@ def _make_pipeline(gate_mock) -> MomentumOnlyPipeline:
         kline_cutoff_seconds=2,
         mtf_lookbacks=(3, 7, 15),
         mtf_min_return_threshold=0.0001,
-        max_consecutive_kline_fetch_failures=5,
     )
     return MomentumOnlyPipeline(
         config=cfg,
@@ -254,7 +253,6 @@ def _make_pipeline_with_tracker(gate_mock, tracker) -> MomentumOnlyPipeline:
         kline_cutoff_seconds=2,
         mtf_lookbacks=(3, 7, 15),
         mtf_min_return_threshold=0.0001,
-        max_consecutive_kline_fetch_failures=5,
     )
     return MomentumOnlyPipeline(
         config=cfg,

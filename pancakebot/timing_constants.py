@@ -560,3 +560,4 @@ OKX_WARMUP_WAKEUP_OFFSET_BEFORE_LOCK_MS: int = 7000
 # Source: code inspection of pool_watcher.PoolEventWatcher.get_pool.
 # Last measured: 2026-05-03 (engineering judgment)
 POOL_READ_TIME_MS: int = 5
+

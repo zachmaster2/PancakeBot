@@ -37,6 +37,15 @@ DEFAULT_REALERT_INTERVAL_S = 3600.0
 
 KIND_BLOCKED = "POOL_GATE_BLOCKED"
 KIND_RECOVERED = "POOL_GATE_RECOVERED"
+# Second instance: OKX served partial candles so the gate could not
+# evaluate. Same machine, own threshold, own kinds.
+KIND_KLINE_BLOCKED = "KLINE_GATE_BLOCKED"
+KIND_KLINE_RECOVERED = "KLINE_GATE_RECOVERED"
+# Third instance: GENUINE fetch failures (unreachable / HTTP error /
+# middle-gap response). Kept at the original sensitivity, because
+# excluding publish delays means this streak means what it always did.
+KIND_FETCH_FAILING = "KLINE_FETCH_FAILING"
+KIND_FETCH_RECOVERED = "KLINE_FETCH_RECOVERED"
 
 # The reasons ``is_pool_ready`` returns when the pool path itself is the
 # blocker. Listed for the operator-facing histogram; the counter itself
@@ -76,11 +85,20 @@ class PoolGateAlarm:
         *,
         threshold: int = DEFAULT_THRESHOLD,
         realert_interval_s: float = DEFAULT_REALERT_INTERVAL_S,
+        kind_blocked: str = KIND_BLOCKED,
+        kind_recovered: str = KIND_RECOVERED,
     ) -> None:
+        """``kind_*`` let a SECOND instance watch a different condition on
+        its own threshold and its own notification kinds. The mechanism is
+        deliberately not generalised beyond that: each condition wants an
+        independently tunable threshold, and conflating them would hide one
+        outage behind the other."""
         if threshold < 1:
             raise ValueError(f"pool_gate_alarm_threshold_invalid: {threshold}")
         self.threshold = int(threshold)
         self.realert_interval_s = float(realert_interval_s)
+        self.kind_blocked = kind_blocked
+        self.kind_recovered = kind_recovered
         self._streak = 0
         self._first_blocked_at: float | None = None
         self._last_alert_at: float | None = None
@@ -166,7 +184,7 @@ class PoolGateAlarm:
             "last_ok_epoch": prev_ok if prev_ok is not None else "none-since-start",
         }
         return PoolGateEvent(
-            kind=KIND_RECOVERED,
+            kind=self.kind_recovered,
             detail=_kv_line(fields),
             fields=fields,
         )
@@ -194,7 +212,7 @@ class PoolGateAlarm:
         self._last_alert_at = now
         fields = self._blocked_fields(epoch=epoch, now=now)
         return PoolGateEvent(
-            kind=KIND_BLOCKED,
+            kind=self.kind_blocked,
             detail=_kv_line(fields),
             fields=fields,
         )
