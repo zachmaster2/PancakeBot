@@ -156,7 +156,7 @@ def test_after_the_change_the_cap_binds_except_where_raw_is_smaller(
         regime, base_frac, fires, bankroll):
     """At any bankroll >= 1.0 the absolute cap is the operative clamp --
     but NOT universally: where the raw bet is already under 0.05 it passes
-    through unchanged. That is the 3.7% the bankroll fraction still owns."""
+    through unchanged -- those 3.7% are RAW-bound, with no clamp active."""
     for fire in fires:
         raw = _raw(base_frac, fire)
         stake = _size(base_frac, fire, cap=0.05, bankroll=bankroll)
@@ -211,8 +211,9 @@ def test_config_carries_the_new_caps_and_keeps_the_risk_floor():
     assert risk.max_bet_bnb_btc_primary == 0.05
     assert risk.max_bet_bnb_eth_sol_fallback == 0.05
     # Unchanged on purpose: the dilution optimum is absolute, the fraction
-    # is the risk control -- and it is NOT inert, it still binds below a
-    # 1.0 bankroll and on the 3.7% of rounds that size under 0.05.
+    # is the risk control -- and it is NOT inert. Below a ~1.0 bankroll it
+    # binds again; above it, raising this value would move the crossover
+    # and hand control back to it.
     assert risk.max_bet_fraction_of_bankroll == 0.05
 
 

@@ -157,9 +157,13 @@ drawdown_peak_mode = "rolling_7d"      # peak-tracking semantics; alt: "absolute
 # At the live bankroll of 1.889 BNB the OLD 0.1 absolute cap bound 0 times
 # out of 1982 -- max_bet_fraction_of_bankroll bound every round. That is why
 # observed live stakes tracked 0.05 x 1.889 = 0.0945 rather than 0.1000.
+# (Strictly: the bankroll fraction bound ~82% and the other ~18% were
+# RAW-bound -- their adaptive size was already under 0.0945. The absolute
+# cap bound in neither case.)
+#
 # After this change the ABSOLUTE cap binds 96.3% of rounds at any bankroll
-# >= 1.0, and the bankroll fraction still binds the remaining 3.7% (the raws
-# that already sit under 0.05).
+# >= 1.0. The remaining 3.7% are RAW-bound, not fraction-bound: their
+# adaptive size already sits under 0.05, so no clamp touches them.
 #
 # So the practical effect IS a near-flat 0.05 stake, but note what changed:
 # the operative clamp moves from the bankroll fraction to the absolute cap.
@@ -184,8 +188,10 @@ drawdown_peak_mode = "rolling_7d"      # peak-tracking semantics; alt: "absolute
 # cap pins us in the band and stays there. Matching today's effect via the
 # bankroll fraction would drift back out as the bankroll moves and would
 # degrade the risk control that fraction exists to provide. The fraction is
-# unchanged and remains the risk floor, still binding for the 3.7% of rounds
-# whose raw size is under 0.05 and for any bankroll below ~1.0.
+# unchanged and remains the risk floor: at any bankroll below ~1.0 it binds
+# again and scales every stake down with the bankroll. Above 1.0 it is
+# dormant but NOT dead -- raising it would raise the crossover bankroll and
+# hand control back to it.
 #
 # REPORTING CONSEQUENCE: the weekly monitor copies this file verbatim and
 # overrides only four keys, NOT max_bet_bnb_*. Every btPnL it reports
