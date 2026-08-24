@@ -1486,6 +1486,20 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
                         cooldown_rounds=_cd_rounds,
                         approx_hours=_cd_rounds * cfg.interval_seconds / 3600.0,
                     )
+            elif reason == "risk_worst_case_exposure":
+                # NOT a suspension. The round is declined because if the
+                # open position(s) lost, the breaker WOULD fire — so the
+                # new exposure is not survivable. Betting resumes by
+                # itself the moment those positions resolve.
+                _ctx = decision.skip_context
+                warn(
+                    "SKIP",
+                    f"Skipped epoch {current_epoch}: worst-case exposure "
+                    f"({_ctx['worst_case_pct']:.1f}% if the "
+                    f"{_ctx['open_stake_bnb']:.4f} BNB in flight lost, "
+                    f"threshold {_ctx['threshold_pct']:.0f}%) — declining a "
+                    f"new position, NOT suspended",
+                )
             elif reason == "risk_cooldown_active":
                 _ctx = decision.skip_context
                 closed.in_cooldown = True  # D3: stay marked until LIFTED edge
