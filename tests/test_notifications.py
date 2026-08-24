@@ -215,27 +215,50 @@ def test_every_kind_is_deliverable_within_discords_content_cap():
         _DISCORD_CONTENT_LIMIT, _SEVERITY_BY_KIND, _chunk_for_discord,
         build_message,
     )
+    # Exercised across payload shapes, not just the empty one: an
+    # empty-fields fixture cannot produce the growth this invariant exists
+    # to catch. A CRASHED alert carries a traceback tail, so the long and
+    # newline-dense cases are realistic, not hypothetical.
+    payloads = {
+        "empty": "",
+        "typical_alarm_detail": "x" * 151,
+        "long_single_line": "y" * 4096,
+        "traceback_like": chr(10).join(f"  File line {i}" for i in range(400)),
+    }
     for kind in sorted(_SEVERITY_BY_KIND):
-        msg = build_message(mode="live", kind=kind, fields={})
-        chunks = _chunk_for_discord(msg)
-        assert chunks, kind
-        for i, chunk in enumerate(chunks, 1):
-            assert len(chunk) <= _DISCORD_CONTENT_LIMIT, (
-                f"{kind} part {i}/{len(chunks)} is {len(chunk)} chars, over "
-                f"the {_DISCORD_CONTENT_LIMIT} cap — Discord will 400 it")
+        for name, detail in payloads.items():
+            msg = build_message(mode="live", kind=kind, fields={},
+                                detail=detail)
+            chunks = _chunk_for_discord(msg)
+            assert chunks, (kind, name)
+            for i, chunk in enumerate(chunks, 1):
+                assert len(chunk) <= _DISCORD_CONTENT_LIMIT, (
+                    f"{kind} [{name}] part {i}/{len(chunks)} is {len(chunk)} "
+                    f"chars, over the {_DISCORD_CONTENT_LIMIT} cap — Discord "
+                    f"will 400 it")
 
 
 def test_routine_alerts_stay_in_a_single_message():
     """Only the endpoint-move payload is allowed to span parts. If a
     routine alert starts chunking, it has grown a payload that belongs in
-    an artifact, not on a phone."""
+    an artifact, not on a phone — and adding it to this allowlist should
+    be a deliberate edit, not something that happens quietly.
+
+    Bounded at a REALISTIC detail rather than an arbitrary one: the alarm
+    path's detail runs ~151 chars and lifecycle's is short, so 400 is
+    comfortably above production without asserting something that cannot
+    hold. A 4 KB detail chunks every kind, which is the transport working,
+    not a violation — that case is covered by the deliverability test
+    above.
+    """
     from pancakebot.ops.notifications import (
         _SEVERITY_BY_KIND, _chunk_for_discord, build_message,
     )
-    multi = {k for k in _SEVERITY_BY_KIND
-             if len(_chunk_for_discord(build_message(
-                 mode="live", kind=k, fields={}))) > 1}
-    assert multi <= {"ENDPOINT_MOVE_TRIGGERED"}, multi
+    for detail in ("", "d" * 400):
+        multi = {k for k in _SEVERITY_BY_KIND
+                 if len(_chunk_for_discord(build_message(
+                     mode="live", kind=k, fields={}, detail=detail))) > 1}
+        assert multi <= {"ENDPOINT_MOVE_TRIGGERED"}, (detail[:8], multi)
 
 
 def test_chunking_splits_on_line_boundaries_and_loses_nothing():
