@@ -182,6 +182,16 @@ class ClaimSubmitResult:
     total_amount_wei: int | None = None
 
 
+# Indices into the PredictionV2 ``rounds(epoch)`` tuple:
+# (epoch, startTimestamp, lockTimestamp, closeTimestamp, ...). Exported so
+# that read-only tooling which cannot construct a Web3PredictionContract --
+# that requires the wallet private key -- reads the SAME definition instead
+# of restating ``[2]`` (see scripts/preflight_restart.py).
+ROUNDS_START_TS_IDX = 1
+ROUNDS_LOCK_TS_IDX = 2
+ROUNDS_CLOSE_TS_IDX = 3
+
+
 class Web3PredictionContract:
     """Thin Web3 wrapper for Pancake PredictionV2.
 
@@ -481,13 +491,11 @@ class Web3PredictionContract:
 
     def lock_ts(self, epoch: int) -> int:
         r = self._rpc_call(op="lock_ts", fn=lambda: self._contract.functions.rounds(int(epoch)).call())
-        # Indices stable for PredictionV2 rounds tuple:
-        # (epoch, startTimestamp, lockTimestamp, closeTimestamp, ...)
-        return int(r[2])
+        return int(r[ROUNDS_LOCK_TS_IDX])
 
     def close_ts(self, epoch: int) -> int:
         r = self._rpc_call(op="close_ts", fn=lambda: self._contract.functions.rounds(int(epoch)).call())
-        return int(r[3])
+        return int(r[ROUNDS_CLOSE_TS_IDX])
 
     def read_bet_amount(self, epoch: int, wallet: str) -> int:
         """Return the per-address bet amount (wei) registered on-chain for
