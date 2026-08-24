@@ -470,20 +470,31 @@ def _send_discord(webhook_url: str, mode: str, message: str) -> tuple[bool, str]
     except Exception as e:
         return False, f"requests_import_failed:{e}"
     chunks = _chunk_for_discord(message)
+    n = len(chunks)
     details: list[str] = []
+
+    def _failed(i: int, why: str) -> tuple[bool, str]:
+        # LEAD WITH THE PART, because a later part failing is the one
+        # failure mode that still LOOKS delivered from the phone: part 1
+        # arrives and the operator sees an alert, while the constants and
+        # caveats in part 2 never land. `notify` already returns
+        # SEND_FAILED, but the only place that is visible is this line, so
+        # it has to be greppable on its own -- a systematically failing
+        # part 2 must be obvious from the journal without correlation.
+        details.append(f"part{i}/{n}:{why}")
+        return False, (f"FAILED_AT_PART_{i}_OF_{n} delivered={i - 1}/{n} "
+                       + " ".join(details))
+
     for i, chunk in enumerate(chunks, 1):
         payload = {"content": chunk, "username": f"PancakeBot-{mode}"}
         try:
             r = requests.post(webhook_url, json=payload, timeout=10)
         except Exception as e:
-            details.append(f"part{i}:post_exception:{type(e).__name__}:{e}")
-            return False, ";".join(details)
+            return _failed(i, f"post_exception:{type(e).__name__}:{e}")
         if not (200 <= r.status_code < 300):
-            details.append(
-                f"part{i}:http_{r.status_code}:{(r.text or '')[:200]}")
-            return False, ";".join(details)
-        details.append(f"part{i}:http_{r.status_code}")
-    return True, ";".join(details)
+            return _failed(i, f"http_{r.status_code}:{(r.text or '')[:200]}")
+        details.append(f"part{i}/{n}:http_{r.status_code}")
+    return True, " ".join(details)
 
 
 # ---------------------------------------------------------------------------
