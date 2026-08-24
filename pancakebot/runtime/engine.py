@@ -1474,6 +1474,18 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
                     f"({_ctx['drawdown_pct']:.1f}% from peak, "
                     f"threshold {_ctx['threshold_pct']:.0f}%)",
                 )
+                # D3: COOLDOWN ENTERED alert on the trip edge (once per entry).
+                if not closed.in_cooldown:
+                    closed.in_cooldown = True
+                    _cd_rounds = int(cfg.strategy.risk.cooldown_rounds)
+                    send_cooldown_entered_alert(
+                        channel=(DRY_CHANNEL if cfg.dry else LIVE_CHANNEL),
+                        drawdown_pct=float(_ctx["drawdown_pct"]),
+                        threshold_pct=float(_ctx["threshold_pct"]),
+                        bankroll_bnb=bankroll_bnb,
+                        cooldown_rounds=_cd_rounds,
+                        approx_hours=_cd_rounds * cfg.interval_seconds / 3600.0,
+                    )
             elif reason == "risk_worst_case_exposure":
                 # NOT a suspension. The round is declined because if the
                 # open position(s) lost, the breaker WOULD fire — so the
@@ -1488,18 +1500,6 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
                     f"threshold {_ctx['threshold_pct']:.0f}%) — declining a "
                     f"new position, NOT suspended",
                 )
-                # D3: COOLDOWN ENTERED alert on the trip edge (once per entry).
-                if not closed.in_cooldown:
-                    closed.in_cooldown = True
-                    _cd_rounds = int(cfg.strategy.risk.cooldown_rounds)
-                    send_cooldown_entered_alert(
-                        channel=(DRY_CHANNEL if cfg.dry else LIVE_CHANNEL),
-                        drawdown_pct=float(_ctx["drawdown_pct"]),
-                        threshold_pct=float(_ctx["threshold_pct"]),
-                        bankroll_bnb=bankroll_bnb,
-                        cooldown_rounds=_cd_rounds,
-                        approx_hours=_cd_rounds * cfg.interval_seconds / 3600.0,
-                    )
             elif reason == "risk_cooldown_active":
                 _ctx = decision.skip_context
                 closed.in_cooldown = True  # D3: stay marked until LIFTED edge

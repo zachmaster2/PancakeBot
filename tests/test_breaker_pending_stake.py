@@ -190,6 +190,13 @@ def _pipeline_with(tmp_path, *, wallet, peak, open_stake):
 
     strategy = load_app_config("config.toml").strategy
     tracker = MagicMock()
+    # HERMETIC. MomentumOnlyPipeline._wire_cooldown_state does
+    # `pd = tracker.persist_dir` and then `pd / "shadow_state.json"`, so a
+    # bare MagicMock makes the ShadowLedger write real JSON into a
+    # `MagicMock/mock.persist_dir.__truediv__()/<id>` directory in the REPO
+    # ROOT -- 25 such files were committed before this was caught. Point it
+    # at tmp_path so the test writes nowhere but its own sandbox.
+    tracker.persist_dir = tmp_path
     tracker.current_bankroll.return_value = wallet
     tracker.peak_bankroll.return_value = peak
     tracker.is_paused.return_value = False
@@ -416,3 +423,135 @@ def test_a_recovering_position_releases_the_gate(tmp_path):
     d = _decide(pipe)
     assert d.skip_reason not in (
         "risk_worst_case_exposure", "risk_drawdown_breaker_fired")
+
+
+# ---- ordering invariant, named structurally ------------------------------
+
+def test_the_breaker_is_evaluated_before_the_admission_gate():
+    """LOW. The ordering is already robust behaviourally (mutating Check 4
+    above Check 3, or gating Check 3 on open_stake == 0, is caught by the
+    tests above). This names the invariant for the next reader, in the AST
+    so it survives reflow.
+
+    Check 3 MUST run first: it decides whether the account is already in
+    trouble. If Check 4 ran first, a genuinely underwater account would be
+    merely DECLINED round after round -- never suspended, no cooldown, no
+    COOLDOWN ENTERED alert. That is the silent no-bet state, arrived at
+    from the other direction.
+    """
+    import ast
+
+    from pancakebot.strategy import momentum_pipeline
+
+    src = Path(momentum_pipeline.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name == "decide_open_round"), None)
+    assert fn is not None, "decide_open_round not found"
+
+    def skip_line(reason: str) -> int:
+        lines = [n.lineno for n in ast.walk(fn)
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "_skip"
+                 and n.args and isinstance(n.args[0], ast.Constant)
+                 and n.args[0].value == reason]
+        assert lines, f"no _skip({reason!r}) call in decide_open_round"
+        return min(lines)
+
+    pause = [n.lineno for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "set_paused"]
+    assert pause, "the breaker no longer suspends"
+
+    breaker = skip_line("risk_drawdown_breaker_fired")
+    admission = skip_line("risk_worst_case_exposure")
+    assert min(pause) < admission, (
+        "the suspension path must be evaluated BEFORE the admission gate, "
+        "or an underwater account is declined forever instead of suspended")
+    assert breaker < admission, (
+        f"Check 3 (line {breaker}) must precede Check 4 (line {admission})")
+
+
+# ---- open_stake recorded alongside each sample ---------------------------
+
+def test_history_records_the_open_stake_without_touching_the_raw_balance(
+        tmp_path):
+    """LOW. `bankroll` must stay the RAW wallet balance so
+    bankroll_history.jsonl keeps reconciling against the chain; the stake
+    in flight rides alongside as an extra column, which makes each
+    sample's settled-equivalent value recomputable after the fact."""
+    import json as _json
+
+    from pancakebot.bankroll_tracker import PersistedBankrollTracker
+
+    tr = PersistedBankrollTracker(
+        path=tmp_path / "bankroll_history.jsonl", initial_bankroll=2.0,
+        drawdown_peak_window_days=7, peak_mode="rolling_7d",
+    )
+    tr.record_settlement(1.90, 1000, 0.05)
+    tr.record_settlement(1.80, 2000)            # nothing in flight
+    rows = [_json.loads(l) for l in
+            (tmp_path / "bankroll_history.jsonl").read_text(
+                encoding="utf-8").splitlines() if l.strip()]
+    settlements = [r for r in rows if r["event"] == "settlement"]
+    assert settlements[0]["bankroll"] == pytest.approx(1.90)   # RAW, unchanged
+    assert settlements[0]["open_stake"] == pytest.approx(0.05)
+    # omitted when zero: an always-present 0.0 would churn every line of a
+    # 5,900-entry history for no information
+    assert "open_stake" not in settlements[1]
+    assert settlements[1]["bankroll"] == pytest.approx(1.80)
+
+
+def test_the_recorded_stake_makes_the_settled_basis_recomputable():
+    """The point of the column: peak within one rolling window can now be
+    computed on the settled basis instead of merely bounded by inequality.
+    Residual it closes: C*s/(P*(P+s)) ~ 2.0pp with one 0.05 stake in
+    flight, ~4pp with two."""
+    P, C, s = INCIDENT_PEAK, INCIDENT_WALLET + INCIDENT_STAKE, 0.05
+    residual = C * s / (P * (P + s))
+    assert residual == pytest.approx(0.0199, abs=5e-4)
+    residual2 = C * (2 * s) / (P * (P + 2 * s))
+    assert residual2 == pytest.approx(0.0390, abs=5e-4)
+    # and it is one-directional: understating the peak understates drawdown
+    assert _dd(P, C) < _dd(P + s, C)
+
+
+def test_the_open_stake_column_survives_a_restart(tmp_path):
+    """Without this the column would be lost on every reload and the
+    settled-basis recomputation would only work within one process
+    lifetime -- useless for a 7-day rolling peak on a bot that restarts."""
+    import json as _json
+
+    from pancakebot.bankroll_tracker import PersistedBankrollTracker
+
+    hp = tmp_path / "bankroll_history.jsonl"
+    kw = dict(initial_bankroll=2.0, drawdown_peak_window_days=7,
+              peak_mode="rolling_7d")
+    tr = PersistedBankrollTracker(path=hp, **kw)
+    tr.record_settlement(1.90, 1000, 0.05)
+    del tr
+
+    reloaded = PersistedBankrollTracker(path=hp, **kw)
+    entries = [e for e in reloaded._entries if e.event == "settlement"]
+    assert entries, "history did not reload"
+    assert entries[-1].bankroll == pytest.approx(1.90)
+    assert entries[-1].open_stake == pytest.approx(0.05)
+
+
+def test_history_written_before_the_column_existed_still_loads(tmp_path):
+    """Backward compatibility: the live bankroll_history.jsonl has ~5,900
+    rows with no open_stake key. They must load as 0.0, not raise."""
+    from pancakebot.bankroll_tracker import PersistedBankrollTracker
+
+    hp = tmp_path / "bankroll_history.jsonl"
+    hp.write_text(
+        '{"start_at":1000,"bankroll":1.9,"event":"settlement"}\n'
+        '{"start_at":2000,"bankroll":1.8,"event":"settlement"}\n',
+        encoding="utf-8")
+    tr = PersistedBankrollTracker(
+        path=hp, initial_bankroll=2.0, drawdown_peak_window_days=7,
+        peak_mode="rolling_7d")
+    assert all(e.open_stake == 0.0 for e in tr._entries)
+    assert tr.current_bankroll() == pytest.approx(1.8)

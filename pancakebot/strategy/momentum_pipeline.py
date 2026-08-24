@@ -238,7 +238,10 @@ class MomentumOnlyPipeline:
         as the timestamp anchor for the rolling window.
         """
         if self._bankroll_tracker is not None:
-            self._bankroll_tracker.record_settlement(bankroll, start_at)
+            # Record what was in flight ALONGSIDE the raw balance, so this
+            # sample's settled-equivalent value stays recomputable later.
+            self._bankroll_tracker.record_settlement(
+                bankroll, start_at, self._open_stake_bnb())
 
     def set_bankroll_tracker(self, tracker: BankrollTracker | None) -> None:
         """Wire (or rewire) the bankroll tracker after pipeline construction.
