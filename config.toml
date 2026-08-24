@@ -55,7 +55,78 @@ initial_bankroll_bnb = 50.0
 # ================================================================
 
 [strategy.pool_filter]
-min_pool_bnb_at_cutoff = 1.5
+# 2026-08-24: min_pool_bnb_at_cutoff 1.5 -> 1.25.
+#
+# THE CASE FOR THIS CHANGE IS VOLUME, NOT EDGE. Read that twice before
+# using these numbers to argue anything. The rounds this admits are
+# statistically indistinguishable from EV-neutral and, on the evidence
+# available, always will be: WR 0.5708 (comparable to the already-admitted
+# set, so accuracy is not the issue) and EV/bet -0.00175 BNB at the 0.05
+# stake with a confidence interval spanning zero. "Catastrophe ruled out"
+# is NOT evidence that these rounds are good. What this buys is a faster
+# clock on learning whether the strategy works at all, for a small and
+# uncertain cost.
+#
+# Pool-filter sweep, replaying the real bet sequence through the real
+# breaker rules (15% rolling-7d, 288-round cooldown) at the deployed 0.05
+# stake against a 2.03 bankroll:
+#
+#   T      bets/wk  susp%   effective/wk   wk cost   trips
+#   1.50     25.8   11.9%       22.7       -0.0965     10
+#   1.25     36.9   10.7%       33.0       -0.1002      9
+#   1.00     51.1   29.6%       36.0       -0.1497     25
+#   0.00     82.7   66.4%       27.8       -0.1961     56
+#
+# T=1.25 buys +45% effective evidence rate for +0.004 BNB/week -- inside
+# noise -- with breaker exposure unchanged (10 trips -> 9). The EFFECTIVE
+# rate peaks around T=1.0-1.25 and then FALLS: past that the breaker
+# suspends often enough to destroy the volume the looser filter bought,
+# which is why T=0 is dominated on every axis rather than merely worse.
+#
+# Overall the volume trade is worth about 1.6x, NOT the 7x that was
+# claimed at one point and then self-corrected. Do not repeat the 7x.
+#
+# The breaker replay is OPTIMISTIC: it models the plain 288-round
+# cooldown, but extend_while_bleeding = true means a real suspension can
+# run longer than one cooldown. So the susp% column is a floor and the
+# effective/wk column is a ceiling.
+#
+# Why halving the stake made this affordable: the marginal rounds have a
+# median pool of 0.944 BNB, and dilution scales super-linearly in stake
+# as a share of pool, so their cost fell 69% when the cap went 0.1 -> 0.05.
+# This change and the stake cap are coupled; do not raise the cap back
+# without re-running this sweep.
+#
+# SCOPE, verified in source rather than assumed:
+#   * This gate is `pool_total < min_pool_bnb_at_cutoff -> skip
+#     pool_below_minimum` (momentum_pipeline, live path and shadow path).
+#     The comparison is STRICT, so a pool of exactly 1.25 is ADMITTED.
+#   * min_payout_multiple_at_cutoff below is a DIFFERENT gate on a
+#     different quantity (payout multiple on our side, not pool size in
+#     BNB). It shares the value 1.5 by coincidence and is NOT changed.
+#   * The SHADOW ledger uses the same threshold, so counterfactual fires
+#     rise at the same rate. That feeds the breaker's release test
+#     (shadow_min_fires = 3), which will now be satisfied sooner.
+#   * The code default in config.py stays 1.5. If this key were ever
+#     dropped from this file the bot would revert to the tighter filter --
+#     the safe direction, unlike min_bet_only.
+#
+# WHAT THE WEEKLY MONITOR WILL REPORT: its two numbers move differently
+# and it is easy to misread.
+#   * Trigger legs (n, WR, p_upper, weak booking) are UNCHANGED. They come
+#     from build_canonical_bets(), which calls
+#     load_strategy_config_from_dict({}) -- code defaults, never this file.
+#     So the canonical fire stream stays on the 1.5 filter.
+#   * btPnL DOES change (larger magnitude, more bets). The risk-off
+#     backtest copies this file verbatim and overrides only the bankroll,
+#     the epoch window and three risk keys -- pool_filter is not among
+#     them.
+#   * CONSEQUENCE WORTH WATCHING: the monitor's evidence stream and the
+#     live bot now disagree about which rounds are bets. The monitor will
+#     be judging a 1.5-filter bot while a 1.25-filter bot trades. That is
+#     a real divergence, not a rounding difference -- roughly +45% of
+#     fires live that the monitor never sees.
+min_pool_bnb_at_cutoff = 1.25
 min_payout_multiple_at_cutoff = 1.5
 
 [strategy.gate]
