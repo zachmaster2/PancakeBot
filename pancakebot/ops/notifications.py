@@ -99,30 +99,21 @@ _SEVERITY_BY_KIND: dict[str, str] = {
 
 
 def _local_time_str() -> str:
-    """Notify-time stamp: local wall time to MILLISECONDS, plus UTC.
+    """America/New_York wall time for Discord human-readability.
 
-    Local (America/New_York) is deliberate — these land on a phone and a
-    reader should not have to convert. UTC is appended because every log,
-    artifact and journal entry on this project is UTC, so an alert has to
-    be correlatable without arithmetic.
-
-    Milliseconds matter: a systemctl restart fires the stopped and started
-    hooks concurrently, and their Discord POSTs land ~6ms apart, so a
-    whole-second stamp rendered the pair identical and apparently
-    simultaneous. Arrival order itself is fixed upstream — the started
-    hook waits for the stopped hook to finish (notify_lifecycle
-    .wait_for_stopped_sibling) — so this stamp is simply the notify time.
+    Deliberately whole-second and local-only. A millisecond + dual-UTC
+    stamp was added to make a concurrent STOPPED/STARTED pair orderable
+    when Discord's arrival order could not be trusted; ordering is now
+    structural (the started hook waits on its stopped sibling), so the
+    precision bought nothing and cost a timestamp that wrapped onto two
+    lines on a phone. Do not re-add it without a consumer that needs it.
     """
     try:
         from zoneinfo import ZoneInfo
         tz = ZoneInfo("America/New_York")
-        now = datetime.datetime.now(tz)
+        return datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
     except Exception:
-        now = datetime.datetime.now(datetime.timezone.utc)
-    utc = now.astimezone(datetime.timezone.utc)
-    return (f"{now.strftime('%Y-%m-%d %H:%M:%S')}.{now.microsecond // 1000:03d} "
-            f"{now.strftime('%Z')} / {utc.strftime('%H:%M:%S')}"
-            f".{utc.microsecond // 1000:03d}Z")
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 # ---------------------------------------------------------------------------

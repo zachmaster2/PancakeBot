@@ -191,26 +191,6 @@ def wait_for_stopped_sibling(
     return waited
 
 
-def started_pid_field(
-    unit: str, event: str, *, run_cmd: RunCmd = _run_cmd,
-) -> dict:
-    """``{"pid": <MainPID>}`` for the STARTED alert, else ``{}``.
-
-    Only the started hook can trust MainPID. By the time the stopped hook
-    queries, the replacement main process already owns it and systemd has
-    cleared ExecMainExitTimestamp (measured 2026-08-21) — so the stopped
-    alert deliberately carries no pid rather than a wrong one."""
-    if event != "started":
-        return {}
-    out = run_cmd(["systemctl", "show", unit, "-p", "MainPID"]) or ""
-    for line in out.splitlines():
-        key, _, value = line.partition("=")
-        if key.strip() == "MainPID" and value.strip().isdigit():
-            pid = int(value.strip())
-            return {"pid": pid} if pid > 0 else {}
-    return {}
-
-
 def journal_tail(unit: str, *, run_cmd: RunCmd = _run_cmd) -> str:
     return run_cmd([
         "journalctl", "-u", unit, "-n", str(_JOURNAL_TAIL_LINES),
@@ -400,10 +380,7 @@ def main(
         # correct without any proof metadata in the message.
         if alerts:
             wait_for_stopped_sibling(unit, event, run_cmd=run_cmd)
-        pid_field = started_pid_field(unit, event, run_cmd=run_cmd)
         for kind, fields, detail in alerts:
-            if kind == "STARTED":
-                fields = {**fields, **pid_field}
             outcome = notifications.notify(
                 mode=notify_mode, kind=kind, fields=fields, art=art, detail=detail,
             )
