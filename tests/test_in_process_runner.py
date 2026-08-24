@@ -69,17 +69,52 @@ _EXPECTED_5FOLD_TOTAL_PNL = 50.4953
 _EXPECTED_HOLDOUT_PNL = 0.2282
 _EXPECTED_HOLDOUT_BETS = 9
 _EXPECTED_HOLDOUT_WINS = 6
-# 2026-05-16 rename pass: this hash was previously
-# ``9eec23adceca7fbbe44cfae5245dfc83``. It changed to
-# ``be2f746be32defb1008ef45538e92179`` because a backtest summary dict
-# key was renamed (the "round count" field; old name dropped per the
-# rename-pass audit catalog Bucket A). The bet/win/pnl VALUES in the
-# summary are bit-identical to the prior baseline — confirmed by the
-# per-fold assertions below which check bets, wins, and PnL
-# explicitly. Only a JSON key name changed, hence the new hash. If
-# THIS hash drifts again without an explicit dict-key rename, that
-# IS a real behavior change.
-_EXPECTED_5FOLD_HASH = "be2f746be32defb1008ef45538e92179"
+# ANCHOR LINEAGE. This hash covers the whole summary dict, so it moves
+# for any of THREE distinct reasons. Only the third is a red flag, and
+# an earlier version of this comment said otherwise — it claimed that a
+# drift without a dict-key rename "IS a real behavior change". That was
+# wrong, and it would have sent the next auditor hunting for a strategy
+# regression that did not exist.
+#
+#   1. A summary dict KEY was renamed. Values bit-identical.
+#   2. The DATA CORPUS changed — rounds added to or removed from the
+#      store. Per-round behaviour bit-identical; only denominators and
+#      derived rates move.
+#   3. Anything else. That is a real behaviour change: STOP.
+#
+# The per-fold assertions below are what actually discriminate. They
+# check bets, wins and PnL explicitly for all five folds and the
+# holdout, so categories 1 and 2 leave them ALL passing while category
+# 3 breaks at least one. Never re-baseline this hash on its own — only
+# ever with those assertions green and the cause identified.
+#
+# 9eec23adceca7fbbe44cfae5245dfc83
+#   -> be2f746be32defb1008ef45538e92179   2026-05-16, category 1
+#   Rename pass: the "round count" summary key was renamed (old name
+#   dropped per the rename-pass audit catalog Bucket A).
+#
+# be2f746be32defb1008ef45538e92179
+#   -> ac3fb12ab299930fa9f2a9fcac45cfbb   2026-08-24, category 2
+#   STORE REPAIR. 23 previously-missing rounds and 60 kline windows
+#   were inserted into the local and VM stores (byte-identical on both
+#   hosts). Nine of the recovered rounds fall inside fold windows and
+#   every one of them evaluates to gate_no_signal — evaluated, no
+#   signal, no bet — so the denominator grew and nothing else did:
+#
+#     f4  round_count 7298 -> 7305 (+7)   skips 6887 -> 6894 (+7)
+#         gate_no_signal 6449 -> 6456
+#         bet_rate 0.05631679912304741 -> 0.05626283367556468
+#     f5  round_count 7297 -> 7299 (+2)   skips 7060 -> 7062 (+2)
+#         gate_no_signal 6743 -> 6745
+#         bet_rate 0.032479101000411126 -> 0.03247020139745171
+#     f1, f2, f3, holdout — byte-identical summaries
+#
+#   NOT ONE bet, win, win-rate or PnL figure moved: f1 129/85/+4.2602,
+#   f2 196/120/+7.3128, f3 473/291/+20.2876, f4 411/251/+17.0644,
+#   f5 237/137/+1.5703, 5-fold total +50.4953, holdout 9/6/+0.2282 —
+#   all exactly as they were before the repair, as the assertions below
+#   still verify.
+_EXPECTED_5FOLD_HASH = "ac3fb12ab299930fa9f2a9fcac45cfbb"
 
 _RUN_LABEL = "in_process_baseline_verification"
 
