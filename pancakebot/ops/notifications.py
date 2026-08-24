@@ -346,16 +346,9 @@ def build_message(
                 "ANCHOR_POLL_TIMEOUT_MS 200 -> 114. Every derived value "
                 "sits BELOW the current one, so the move needs no "
                 "increase. KEEP the current values: tightening buys "
-                "nothing and only adds wake_mode=static risk."
-            )
-            lines.append(
-                "ALREADY VERIFIED, do not re-run: fan-out — 8 concurrent "
-                "getBlockByNumber + head + header, 18 iterations (~180 "
-                "requests), wall p50 34 / p90 53 / max 110ms, ZERO failures "
-                "and zero 429s. Header parity — 200/200 byte-identical on "
-                "(hash, timestamp, mixHash, derived milli_ts). Head skew — "
-                "min -1 / p50 0 / max 0; publicnode was NEVER behind "
-                "bloXroute across 35 samples."
+                "nothing and only adds wake_mode=static risk. THESE ARE "
+                "n=35 HEALTHY-STATE NUMBERS: ready to DECIDE, not to "
+                "EXECUTE — a real move must re-soak; see CAVEATS below."
             )
             lines.append(
                 "CAVEATS — these make it ready to DECIDE, not ready to "
@@ -369,6 +362,15 @@ def build_message(
                 "endpoint already serving our getLogs — and that host "
                 "returned HTTP 403 to a burst of ad-hoc reads on "
                 "2026-08-24, which is the same caveat from the other side."
+            )
+            lines.append(
+                "ALREADY VERIFIED, do not re-run: fan-out — 8 concurrent "
+                "getBlockByNumber + head + header, 18 iterations (~180 "
+                "requests), wall p50 34 / p90 53 / max 110ms, ZERO failures "
+                "and zero 429s. Header parity — 200/200 byte-identical on "
+                "(hash, timestamp, mixHash, derived milli_ts). Head skew — "
+                "min -1 / p50 0 / max 0; publicnode was NEVER behind "
+                "bloXroute across 35 samples."
             )
             lines.append(
                 "DO NOT LEAN ON THE SECOND-ORDER BENEFIT: the static-"

@@ -316,27 +316,96 @@ def test_pool_uncovered_is_reported_in_the_body():
     assert trig[0].fields["pool_uncovered_rate"] > 0.4
 
 
+def _endpoint_placement_lines():
+    """(pool_call, endpoint_call, early_return_if) line numbers, by AST.
+
+    Parsed rather than string-matched. The first version of this guard
+    used src.index() on call-argument text and was brittle in the worst
+    way: a one-kwarg-per-line reflow, a kwarg reorder, or renaming our own
+    pool_ready= kwarg each made index() raise ValueError AT THE TEST, so
+    the assertion message never rendered and the next person would see an
+    opaque error from a formatting change and delete the guard — the exact
+    outcome it exists to prevent. AST is immune to all three.
+    """
+    import ast
+    src = Path(engine.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name == "_run_one_iteration"), None)
+    assert fn is not None, (
+        "engine._run_one_iteration not found — the round loop was renamed; "
+        "re-anchor this guard rather than deleting it")
+
+    def call_lines(name):
+        return sorted(n.lineno for n in ast.walk(fn)
+                      if isinstance(n, ast.Call)
+                      and isinstance(n.func, ast.Name) and n.func.id == name)
+
+    pool = call_lines("_note_pool_gate_outcome")
+    ours = call_lines("_note_endpoint_move_outcome")
+    assert pool, "_note_pool_gate_outcome is no longer called in the round loop"
+    assert ours, (
+        "_note_endpoint_move_outcome is no longer called in the round loop — "
+        "the endpoint detector is not wired in at all")
+
+    # the `if not <name>:` guard that returns out of the round
+    returns = sorted(
+        n.lineno for n in ast.walk(fn)
+        if isinstance(n, ast.If)
+        and isinstance(n.test, ast.UnaryOp) and isinstance(n.test.op, ast.Not)
+        and any(isinstance(s, ast.Return) for s in ast.walk(n))
+        and n.lineno > pool[0])
+    assert returns, (
+        "no early-return guard found after the pool-gate call — the control "
+        "flow this placement depends on has changed; re-derive it")
+    return pool[0], ours[0], returns[0]
+
+
 def test_the_call_site_sits_before_the_pool_gate_early_return():
-    """THE REAL PLACEMENT GUARD (MED-1).
+    """THE PLACEMENT GUARD (MED-1).
 
     The behavioural test below feeds the detector directly, so it passes
-    no matter where the production call site is — the reviewer moved the
-    call to the kline dispatch and NOTHING failed. Placement is the most
-    consequential decision in this change, so it is asserted at the
-    source: the call must sit AFTER _note_pool_gate_outcome and BEFORE
-    the `if not ready:` block that returns out of the round.
+    wherever the production call site is — the reviewer moved the call to
+    the kline dispatch and NOTHING failed. Placement is the most
+    consequential decision in this change, so it is asserted structurally:
+    the endpoint call must sit AFTER _note_pool_gate_outcome and BEFORE
+    the early return, because a pool-gate skip returns out of the round
+    before the kline dispatch. Sampling there would drop exactly the
+    rounds this degradation causes.
     """
-    src = Path(engine.__file__).read_text(encoding="utf-8")
-    # anchor on the CALL arguments, not the bare name: the function
-    # definitions appear earlier in the file and would match first.
-    i_pool = src.index("cfg, ready=ready, reason=ready_reason")
-    i_ours = src.index("cfg, wake_mode=wake_mode, pool_ready=ready")
-    i_ret = src.index("if not ready:", i_pool)
-    assert i_pool < i_ours < i_ret, (
-        "endpoint detector must be called between the pool-gate outcome "
-        "and the early return; a pool-gate skip returns before the kline "
-        "dispatch, so sampling there goes blind exactly when the fault "
-        "is worst")
+    pool, ours, early_return = _endpoint_placement_lines()
+    assert pool < ours < early_return, (
+        f"endpoint detector is called at line {ours}; it must sit between "
+        f"the pool-gate outcome (line {pool}) and the early return (line "
+        f"{early_return}). A pool-gate skip returns before the kline "
+        f"dispatch, so sampling later goes blind exactly when the fault "
+        f"is worst, and pool_uncovered_rate reads ~0 at peak harm.")
+
+
+def test_the_placement_guard_survives_ordinary_refactors():
+    """The guard must not be brittle enough to get deleted. Reflowing the
+    call to one kwarg per line, reordering kwargs, and renaming a kwarg
+    must all leave it working — those broke the string-matching version."""
+    import ast
+    pool, ours, early_return = _endpoint_placement_lines()
+    assert pool < ours < early_return
+    NL = chr(10)
+    reflowed = (
+        "_note_endpoint_move_outcome(" + NL
+        + "    cfg," + NL + "    wake_mode=w," + NL
+        + "    pool_ready=r," + NL + "    epoch=e," + NL + ")"
+    )
+    variants = [
+        reflowed,                                    # one kwarg per line
+        "_note_endpoint_move_outcome(cfg, epoch=e, pool_ready=r, wake_mode=w)",
+        "_note_endpoint_move_outcome(cfg, wake_mode=w, ready=r, epoch=e)",
+    ]
+    for v in variants:
+        found = [n for n in ast.walk(ast.parse(v))
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "_note_endpoint_move_outcome"]
+        assert found, v
 
 
 def test_pool_blocked_rounds_stay_in_the_denominator():
