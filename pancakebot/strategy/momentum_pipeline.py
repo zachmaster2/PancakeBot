@@ -12,6 +12,8 @@ were extracted into config in the 2026-04-26 lean&clean refactor.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import json
 import time
 from collections.abc import Mapping
@@ -131,10 +133,15 @@ class MomentumOnlyPipeline:
         min_bet_amount_bnb: float,
         treasury_fee_fraction: float,
         bankroll_tracker: BankrollTracker | None = None,
+        open_stake_provider: Callable[[], float] | None = None,
     ) -> None:
         self._cfg = config
         self._strategy = strategy_config
         self._gate = gate
+        # Returns BNB currently staked on OPEN positions. Live supplies a
+        # ledger-backed reader; backtest and dry leave it None, because
+        # settlement there is synchronous and nothing is ever in flight.
+        self._open_stake_provider = open_stake_provider
         # The gate-config / strategy-config duality (see class docstring) is
         # a real trap: live computes from `config`, backtest from
         # `strategy_config.gate`. Fail fast at construction if the
@@ -368,17 +375,62 @@ class MomentumOnlyPipeline:
                             ctx.update(self._shadow.stats())
                         return self._skip("risk_cooldown_active", skip_context=ctx)
             # Check 2: bankroll below minimum -- skip without firing cooldown.
+            # DELIBERATELY the RAW balance, not the settled-equivalent value
+            # used by Check 3. This gate is about LIQUIDITY -- can we fund a
+            # bet -- and money committed to an open position genuinely
+            # cannot be staked again. Adding it back here would let the bot
+            # bet against funds it does not hold.
             current = self._bankroll_tracker.current_bankroll()
             if current < risk.min_bankroll_bnb_to_bet:
                 return self._skip("risk_bankroll_below_min")
             # Check 3: drawdown from peak. If >= threshold, fire cooldown.
+            #
+            # SETTLED-EQUIVALENT, and the split from Check 2 is the point:
+            # this gate measures PERFORMANCE, not liquidity. An open
+            # position is not a realised loss, so valuing it at COST (its
+            # stake) rather than at ZERO is the standard treatment.
+            # Reading the raw wallet balance made every pending bet a
+            # transient 100% loss of its stake, and fired this breaker on
+            # 2026-08-24 18:41:20 at 15.28% against a 15% bar -- a margin
+            # of 0.006 BNB -- six seconds after a 0.05 bet that WON. On a
+            # settled basis that round was 12.94%: no trip.
+            #
+            # THE OLD BIAS WAS ONE-DIRECTIONAL, which is why it mattered
+            # rather than averaging out: `peak` is a MAX over the sample
+            # window, so a pending-depressed sample is by construction
+            # unlikely to BE the maximum, while `current` is a single
+            # instantaneous sample with no such filtering. The error could
+            # therefore only ever INFLATE measured drawdown.
+            #
+            # BASIS OF THE TWO SIDES -- deliberate, and safe by inequality
+            # rather than by luck. `current` is now settled-equivalent
+            # while `peak` stays the max over RAW recorded samples. Each
+            # raw sample is <= its own settled-equivalent value (they
+            # differ by the non-negative stake open at that moment), so
+            #     peak_raw <= peak_settled
+            # and therefore
+            #     1 - current/peak_raw  <=  1 - current/peak_settled
+            # i.e. the drawdown computed here is <= the drawdown a fully
+            # settled-basis comparison would give. Using the raw peak can
+            # only ever UNDERSTATE drawdown and DELAY a trip -- never
+            # manufacture one. Recomputing peak on the settled basis would
+            # need the open stake at each historical sample, which is not
+            # recorded; and persisting settled-equivalent values instead
+            # would break the property that bankroll_history.jsonl matches
+            # the on-chain balance, which is how ledger-vs-chain drift is
+            # detected.
+            open_stake = self._open_stake_bnb()
+            settled_current = current + open_stake
             peak = self._bankroll_tracker.peak_bankroll(start_at)
             if peak > 0:
-                dd_frac = (peak - current) / peak
+                dd_frac = (peak - settled_current) / peak
                 if dd_frac >= risk.max_drawdown_fraction_from_peak:
                     self._bankroll_tracker.set_paused(risk.cooldown_rounds, start_at)
                     if risk.extend_while_bleeding and self._shadow is not None:
-                        self._shadow.start(bankroll=current, start_at=start_at)
+                        # Seeded on the SAME basis so the suspension
+                        # baseline is not itself stake-depressed.
+                        self._shadow.start(
+                            bankroll=settled_current, start_at=start_at)
                     return self._skip(
                         "risk_drawdown_breaker_fired",
                         skip_context={
@@ -441,7 +493,12 @@ class MomentumOnlyPipeline:
             if payout < self._strategy.pool_filter.min_payout_multiple_at_cutoff:
                 return self._skip("payout_below_floor")
 
-        # Bankroll for the bankroll cap kwarg (None when no tracker -> cap disabled).
+        # Bankroll for the bankroll cap kwarg (None when no tracker -> cap
+        # disabled). DELIBERATELY RAW, for the same reason as Check 2: this
+        # is a LIQUIDITY bound on how much may be staked, and funds locked
+        # in an open position cannot be staked again. Raw is CORRECT here,
+        # not merely conservative -- unlike the drawdown gate, which
+        # measures performance and must value an open position at cost.
         br_current = (
             self._bankroll_tracker.current_bankroll()
             if self._bankroll_tracker is not None else None
@@ -668,6 +725,20 @@ class MomentumOnlyPipeline:
             candle_count=self._candle_count,
             eth_klines=eth_klines, sol_klines=sol_klines,
         )
+
+    def _open_stake_bnb(self) -> float:
+        """BNB staked on OPEN positions, 0.0 when unavailable.
+
+        Never raises: this feeds a CORRECTION to the drawdown reading,
+        and applying no correction is exactly the pre-fix behaviour, so a
+        failure here degrades to the old (trip-happy) reading rather than
+        to a crash on the pre-lock path."""
+        if self._open_stake_provider is None:
+            return 0.0
+        try:
+            return max(0.0, float(self._open_stake_provider()))
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     @staticmethod
     def _skip(

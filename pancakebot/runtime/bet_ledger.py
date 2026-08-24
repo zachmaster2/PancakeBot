@@ -311,6 +311,46 @@ def load_ledger(ledger_path: str) -> dict[int, dict[str, Any]]:
     return out
 
 
+def open_stake_bnb(ledger_path: str) -> float:
+    """Total BNB staked on epochs whose position is still OPEN.
+
+    A PancakeSwap bet is payable: the stake leaves the wallet with the bet
+    TX and returns only when the claim lands. Between those two moments the
+    wallet balance is stake-debited with NO credit, so any consumer that
+    reads the raw balance as "how we are doing" sees a pending bet as a
+    100% loss of its stake. That fired the drawdown breaker on 2026-08-24
+    18:41:20 (15.28% against a 15% bar, a margin of 0.006 BNB) six seconds
+    after a 0.05 bet that went on to WIN.
+
+    Uses ``_OPEN_STATUSES`` -- this module's own definition of open --
+    rather than any hand-rolled status test. Three separate hand-rolled
+    versions have now been wrong: one treated LATE as open, one tested
+    SUBMITTED-minus-terminal and so missed CONFIRMED, and one reported LATE
+    rounds as PENDING in a health check.
+
+    Terminal statuses (LATE / REVERTED / DROPPED / SETTLED_* / CLAIMED) are
+    excluded by construction, so a stake that never settles stops being
+    added back the moment its outcome is recorded. It cannot inflate the
+    figure indefinitely.
+
+    Returns 0.0 when the ledger is missing or unreadable: this feeds a
+    correction, and applying no correction is the pre-existing behaviour,
+    which errs toward tripping rather than toward trading.
+    """
+    try:
+        merged = load_ledger(ledger_path)
+    except Exception:  # noqa: BLE001 -- never break a round on a read
+        return 0.0
+    total = 0.0
+    for rec in merged.values():
+        if rec.get("status") in _OPEN_STATUSES:
+            try:
+                total += float(rec.get("amount_bnb") or 0.0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
 def epoch_was_dropped(ledger_path: str, epoch: int) -> bool:
     """True if ANY historical record for ``epoch`` carried status DROPPED.
 
