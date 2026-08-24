@@ -21,6 +21,8 @@ from pancakebot.log import info, warn
 from pancakebot.util import format_bankroll
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot.runtime.pool_gate_alarm import (
+    KIND_ENDPOINT_MOVE_CLEARED,
+    KIND_ENDPOINT_MOVE_TRIGGERED,
     KIND_BLOCKED,
     KIND_FETCH_FAILING,
     KIND_FETCH_RECOVERED,
@@ -200,7 +202,14 @@ def _reset_pool_gate_alarm() -> None:
     """Test hook: drop the blocked-round streaks AND the pending queue."""
     global _POOL_GATE_ALARM, _KLINE_GATE_ALARM, _GENUINE_RATE_ALARM
     global _FETCH_BURST_ALARM, _PUBLISH_RATE_WINDOW, _GENUINE_RATE_WINDOW
+    global _ENDPOINT_STATIC_WINDOW, _ENDPOINT_HEADER_WINDOW
+    global _ENDPOINT_POOL_WINDOW, _ENDPOINT_MOVE_ALARM, _LAST_RS_ERROR_COUNT
     _POOL_GATE_ALARM = PoolGateAlarm()
+    _ENDPOINT_STATIC_WINDOW = None
+    _ENDPOINT_HEADER_WINDOW = None
+    _ENDPOINT_POOL_WINDOW = None
+    _ENDPOINT_MOVE_ALARM = None
+    _LAST_RS_ERROR_COUNT = None
     _KLINE_GATE_ALARM = None
     _GENUINE_RATE_ALARM = None
     _FETCH_BURST_ALARM = None
@@ -398,6 +407,174 @@ def _note_kline_gate_outcome(
 # worst case of all — it fires on the very round where trading resumes.
 # Nothing here is time-critical: a 30-minute threshold tolerates a
 # one-round (~5 min) delivery delay completely.
+
+
+# ---------------------------------------------------------------------------
+# ENDPOINT_MOVE_TRIGGER — ONE alarm, TWO independent detectors, fires if
+# either trips.
+#
+# This deliberately contradicts the separation principle used for the kline
+# alarms above, and the reason is that the principle was never about
+# tidiness. The kline split exists because a publish delay and a genuine
+# fetch failure demand DIFFERENT RESPONSES, so merging them would hide the
+# serious one behind the common one. Here both detectors point at the SAME
+# single action -- execute the endpoint move using the banked constants --
+# so splitting would page twice for one decision, which is how alerts
+# become wallpaper. The masking risk that justified the split is also
+# absent: both metrics sit at zero at baseline, so neither can hide the
+# other in the noise.
+#
+# TRIGGER A — static-wake share. A degraded header/anchor path shows up
+# first as the critical-path wake falling back to its static offset.
+# ROLLING ROUND-WINDOW, NOT HOURLY BUCKETS: at ~12 rounds/h an hourly share
+# quantises to multiples of 8.3%, so every threshold between 8.4% and 16.6%
+# is literally the same rule and the "empty band" in the hourly histogram is
+# that artefact, not a natural gap. Validated on the real Aug 20-24 series:
+# fires on Aug 20/21/22/23 and is silent on Aug 24 (0 of 158 windows; peak
+# benign share 0.056 against the 0.15 bar, a 2.7x margin). Firing on Aug 20
+# is DESIRED — that was day one of the condition, and detecting on day one
+# instead of day four is the entire point.
+#
+# TRIGGER B — header failure rate, on `round-start block RPC failed`. Kept
+# even though A caught every day of this episode, because the two DECOUPLE:
+# Aug 23 ran 16.1% static with only 7 header failures, Aug 20 ran 7.4%
+# static with 2. A degradation that manifests as outright RPC failure
+# without a timing fallback is caught by exactly one of these, and it is
+# this one. CAVEAT, recorded because it is the weakest derivation here: the
+# 0.05 bar rests on FOUR DAILY DATA POINTS. If this condition recurs,
+# re-derive it from per-round data before trusting the number.
+#
+# `pool_uncovered` is REPORTED, never triggered on. It is the metric that
+# expresses HARM rather than mechanism, and a harm-based trigger fires
+# LATER by construction -- the wrong direction for an alarm whose whole
+# purpose is to open a diagnostic window while the fault is still active.
+# It rides along in the body so the reader sees the cost beside the cause.
+_ENDPOINT_STATIC_ENTER = 0.15
+_ENDPOINT_STATIC_EXIT = 0.075
+_ENDPOINT_HEADER_ENTER = 0.05
+_ENDPOINT_HEADER_EXIT = 0.025
+_ENDPOINT_WINDOW_ROUNDS = 72      # ~6h at 12 rounds/h
+# Encodes the stated "3 consecutive hours" intent. NOT derived from data —
+# recorded as intent so nobody mistakes it for a measured value. Do not cut
+# it to 24 for a 1h faster trigger without measuring the stability cost;
+# an unmeasured hour is not worth a twitchier alarm.
+_ENDPOINT_MIN_SAMPLES = 36
+# 12h, deliberately slower than the kline alarm's 6h: this is a days-long
+# condition whose response is a planned migration, and nobody executes an
+# endpoint move at 03:00.
+_ENDPOINT_REALERT_S = 12 * 3600.0
+
+_ENDPOINT_STATIC_WINDOW = None
+_ENDPOINT_HEADER_WINDOW = None
+_ENDPOINT_POOL_WINDOW = None      # report-only, never gates
+_ENDPOINT_MOVE_ALARM = None
+_LAST_RS_ERROR_COUNT: int | None = None
+
+
+def _endpoint_move_state(cfg: RuntimeConfig):
+    """Lazily build the two detector windows, the report-only pool window,
+    and the single alarm they share."""
+    global _ENDPOINT_STATIC_WINDOW, _ENDPOINT_HEADER_WINDOW
+    global _ENDPOINT_POOL_WINDOW, _ENDPOINT_MOVE_ALARM
+    if _ENDPOINT_STATIC_WINDOW is None:
+        _ENDPOINT_STATIC_WINDOW = RateWindow(
+            enter_rate=_ENDPOINT_STATIC_ENTER, exit_rate=_ENDPOINT_STATIC_EXIT,
+            window=_ENDPOINT_WINDOW_ROUNDS, min_samples=_ENDPOINT_MIN_SAMPLES,
+        )
+        _ENDPOINT_HEADER_WINDOW = RateWindow(
+            enter_rate=_ENDPOINT_HEADER_ENTER, exit_rate=_ENDPOINT_HEADER_EXIT,
+            window=_ENDPOINT_WINDOW_ROUNDS, min_samples=_ENDPOINT_MIN_SAMPLES,
+        )
+        # Same window/warm-up so the reported harm rate is comparable with
+        # the two causes; thresholds are irrelevant because nothing reads
+        # its verdict.
+        _ENDPOINT_POOL_WINDOW = RateWindow(
+            enter_rate=0.5, exit_rate=0.25,
+            window=_ENDPOINT_WINDOW_ROUNDS, min_samples=_ENDPOINT_MIN_SAMPLES,
+        )
+        _ENDPOINT_MOVE_ALARM = PoolGateAlarm(
+            threshold=1, realert_interval_s=_ENDPOINT_REALERT_S,
+            kind_blocked=KIND_ENDPOINT_MOVE_TRIGGERED,
+            kind_recovered=KIND_ENDPOINT_MOVE_CLEARED,
+        )
+    return (_ENDPOINT_STATIC_WINDOW, _ENDPOINT_HEADER_WINDOW,
+            _ENDPOINT_POOL_WINDOW, _ENDPOINT_MOVE_ALARM)
+
+
+def _note_endpoint_move_outcome(
+    cfg: RuntimeConfig, *, wake_mode: str, pool_ready: bool, epoch: int,
+) -> None:
+    """Fold one round into both endpoint detectors and QUEUE any alert.
+
+    Pure bookkeeping, no I/O — safe on the pre-lock critical path; the
+    existing ``_flush_pool_gate_alerts`` sends off it.
+
+    PLACEMENT MATTERS AND IS NOT WHERE THE DESIGN ASSUMED. This is called
+    beside ``_note_pool_gate_outcome``, NOT at the kline-gate dispatch
+    further down, because a pool-gate skip ``return``s out of the round
+    before that point. Sampling at the kline dispatch would silently drop
+    every pool-blocked round from the denominator — and pool-blocked rounds
+    are precisely the harm this degradation causes, so the detector would
+    go blind in proportion to how bad the fault was, and the reported
+    pool_uncovered rate would be structurally ~0.
+
+    A restart clears both windows, so the trigger is blind for roughly the
+    first 3 hours (min_samples=36 at ~12 rounds/h). That is the same trade
+    already accepted for the kline rate alarms: noted, not engineered
+    around.
+    """
+    try:
+        global _LAST_RS_ERROR_COUNT
+        static_win, header_win, pool_win, alarm = _endpoint_move_state(cfg)
+
+        # Header failures: diff the poller's monotonic counter. First
+        # observation after a (re)start establishes the baseline and
+        # contributes no hit -- it cannot know when those failures happened.
+        header_failed = False
+        poller = getattr(cfg, "rpc_poller", None)
+        if poller is not None:
+            count = int(getattr(poller, "rs_block_error_count", 0))
+            if _LAST_RS_ERROR_COUNT is not None:
+                header_failed = count > _LAST_RS_ERROR_COUNT
+            _LAST_RS_ERROR_COUNT = count
+
+        static_over = static_win.observe(wake_mode == "static")
+        header_over = header_win.observe(header_failed)
+        pool_win.observe(not pool_ready)
+
+        if static_over is None and header_over is None:
+            return                      # both windows still warming
+
+        triggered = bool(static_over) or bool(header_over)
+        if static_over and header_over:
+            which = "static_wake_share+header_failure_rate"
+        elif static_over:
+            which = "static_wake_share"
+        elif header_over:
+            which = "header_failure_rate"
+        else:
+            which = "none"
+
+        ev = alarm.record(
+            ready=not triggered, reason=which, epoch=int(epoch),
+            now=_utc_now(),
+            # BOTH metrics on every alert, whichever fired: the reader is
+            # deciding whether to migrate an endpoint, and one number
+            # without the other does not support that.
+            extra={
+                "trigger": which,
+                "static_wake_share": round(static_win.rate, 3),
+                "header_failure_rate": round(header_win.rate, 3),
+                "pool_uncovered_rate": round(pool_win.rate, 3),
+                "window_rounds": static_win.n,
+            },
+        )
+        if ev is not None:
+            _PENDING_POOL_GATE_EVENTS.append(ev)
+    except Exception:  # noqa: BLE001 — alerting must never break the round
+        pass
+
+
 _PENDING_POOL_GATE_EVENTS: list = []
 
 # Minimum slack before lock for a send to be allowed to start. The wake
@@ -1283,6 +1460,13 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
             # round top, off the critical path (_flush_pool_gate_alerts).
             _note_pool_gate_outcome(
                 cfg, ready=ready, reason=ready_reason, epoch=current_epoch,
+            )
+            # Here, not at the kline dispatch: a pool-gate skip returns out
+            # of this round below, and those are exactly the rounds this
+            # degradation causes.
+            _note_endpoint_move_outcome(
+                cfg, wake_mode=wake_mode, pool_ready=ready,
+                epoch=current_epoch,
             )
             if not ready:
                 skip_reason = f"pool_not_ready_{ready_reason}"

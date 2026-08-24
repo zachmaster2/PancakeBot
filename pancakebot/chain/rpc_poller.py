@@ -525,6 +525,10 @@ class RpcPoller:
         # Cause of the most recent round-start-block RPC failure, kept so
         # the epoch-advance warn can name it. Cleared on every success.
         self._last_rs_block_error: str | None = None
+        # MONOTONIC count of round-start header failures. The engine
+        # samples it once per round and diffs, so it needs no reset and
+        # cannot miss a failure that happened between samples.
+        self._rs_block_error_count: int = 0
         # Cause of the most recent feasibility head-fetch failure, and
         # a slot the engine fills with its own once-per-round facts.
         # Both ride the existing health line -- no new log lines, so
@@ -871,6 +875,17 @@ class RpcPoller:
             f"to avoid sizing the bet on an incomplete pool (F0 guarantee).",
         )
         return False, "pool_uncovered"
+
+    @property
+    def rs_block_error_count(self) -> int:
+        """Monotonic count of round-start header RPC failures.
+
+        Feeds the ENDPOINT_MOVE_TRIGGER header-rate detector. Read-only and
+        diagnostic — nothing gates on it. ``_compute_round_start_block`` is
+        called exactly once per epoch advance, so a per-round rate built by
+        diffing this counter is well defined."""
+        with self._lock:
+            return self._rs_block_error_count
 
     @property
     def last_pool_blocks_short(self) -> int | None:
@@ -1335,6 +1350,7 @@ class RpcPoller:
             # being characterised.
             with self._lock:
                 self._last_rs_block_error = f"{type(e).__name__}: {e}"
+                self._rs_block_error_count += 1
             return None
         with self._lock:
             self._last_rs_block_error = None
