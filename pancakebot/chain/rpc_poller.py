@@ -140,6 +140,20 @@ RPC_BLOXROUTE_ENDPOINT: str = "https://bsc.rpc.blxrbdn.com"
 # at most one round behind head by the per-round forward jump in
 # ``_on_epoch_advance``, and ranges are capped at _GETLOGS_CHUNK_BLOCKS,
 # so every query lands within ~6 minutes of the tip.
+#
+# RATE LIMITING, observed incidentally 2026-08-24: this host returned
+# HTTP 403 to ad-hoc chain reads issued in a burst from operator tooling
+# (a handful of eth_call/eth_getTransactionReceipt in quick succession),
+# and kept refusing until the burst stopped. It is NOT a threat to the
+# use below -- the poller issues roughly one getLogs per 8s poll, a low
+# steady rate that has soaked cleanly -- but it is direct evidence for
+# the caveat attached to the anchor peak-window measurement: that host
+# passing a BURST fan-out test is not evidence of SUSTAINED tolerance.
+# It therefore reinforces the existing NO-GO on moving the whole read
+# path here, and it is why operator scripts that read the chain should
+# carry an endpoint fallback list rather than hard-coding this host (see
+# scripts/preflight_restart.py, which fails CLOSED if every endpoint
+# refuses).
 RPC_GETLOGS_ENDPOINT: str = "https://bsc-rpc.publicnode.com"
 
 # THE routing table: read it to see which host serves which method, and
