@@ -1,13 +1,26 @@
 """ENDPOINT_MOVE_TRIGGER: one alarm, two independent detectors.
 
-Validated against the real 2026-08-20..24 series. Trigger A (static-wake
-share) must fire on Aug 20/21/22/23 and stay silent on Aug 24, whose peak
-benign share was 0.056 against a 0.15 bar. Firing on Aug 20 is DESIRED —
-that was day one of the condition.
+SCOPE OF THESE TESTS, stated because the distinction matters. They drive
+the DETECTOR against synthetic sequences at stated hit-rates: given a
+sustained share of X, does the window cross the bar. They do NOT validate
+the THRESHOLDS against the real Aug 20-24 series — that rests on an
+offline sweep which is not in this repo, so "0 of 158 windows" and "fires
+on Aug 20" are not falsifiable here.
+
+That distinction is not pedantry: this repo shipped a replay table on
+2026-08-22 whose n and trailing-gap columns claimed to be measured from
+the canonical stream and turned out not to reproduce. Treat any
+day-level claim below as a label on the fixture, not as evidence.
+
+The daily shares are recorded as the SOURCE of the chosen bar (0.15 sits
+between the benign 0.056 and the degraded 0.161-0.212), which the tests
+do check. Whether a real day's per-round sequence crosses it is a
+different question and needs the real series.
 """
 from __future__ import annotations
 
 import types
+from pathlib import Path
 
 import pytest
 
@@ -17,7 +30,9 @@ from pancakebot.runtime.pool_gate_alarm import (
     KIND_ENDPOINT_MOVE_TRIGGERED,
 )
 
-# Real daily static-wake shares, 2026-08-20..24.
+# Real daily static-wake shares, 2026-08-20..24. These are DAILY
+# AVERAGES from the offline sweep; the per-round series they came from is
+# not in the repo, so tests below feed them as sustained rates.
 DAILY_STATIC_SHARE = {
     "2026-08-20": 0.074,
     "2026-08-21": 0.212,
@@ -86,24 +101,32 @@ def setup_function():
 # ---- Trigger A, against the real series ---------------------------------
 
 @pytest.mark.parametrize("day", ["2026-08-21", "2026-08-22", "2026-08-23"])
-def test_trigger_a_fires_on_the_degraded_days(day):
+def test_a_sustained_degraded_day_share_crosses_the_bar(day):
+    """SYNTHETIC: feeds each degraded day's DAILY share as a sustained
+    per-round rate. Establishes that the bar sits below those shares and
+    that the window crosses it — not that the real per-round sequence for
+    that date did."""
     share = DAILY_STATIC_SHARE[day]
     assert share > engine._ENDPOINT_STATIC_ENTER
     events = _feed(_cfg(), statics=_pattern(share))
     assert _triggered(events), f"{day} (share {share}) must trigger"
 
 
-def test_trigger_a_is_silent_on_the_benign_day():
-    """Aug 24: 0.056 against a 0.15 bar, a 2.7x margin."""
+def test_a_sustained_benign_day_share_does_not_cross_the_bar():
+    """SYNTHETIC, same caveat: Aug 24's 0.056 fed as a sustained rate stays
+    under the 0.15 bar with a 2.7x margin. The offline sweep's stronger
+    claim — 0 of 158 real windows — is NOT checked here."""
     events = _feed(_cfg(), statics=_pattern(DAILY_STATIC_SHARE["2026-08-24"]))
     assert not _triggered(events)
 
 
-def test_day_one_detection_is_the_point():
-    """Aug 20 ran 0.074 daily — under the bar as a DAILY average, but the
-    rolling window sees the burst within the day. Fed as a sustained
-    intra-day rate above the bar, day one must trigger; that is the
-    difference between detecting on day one and on day four."""
+def test_an_intraday_burst_triggers_even_when_the_daily_average_is_low():
+    """Why day-one detection is possible at all. Aug 20's DAILY average
+    was 0.074, under the bar — the offline sweep reports it firing because
+    the rolling window sees an intra-day burst. This test feeds 0.20
+    directly and therefore demonstrates only the MECHANISM (a rolling
+    window fires on a burst a daily average would hide), not Aug 20."""
+    assert DAILY_STATIC_SHARE["2026-08-20"] < engine._ENDPOINT_STATIC_ENTER
     events = _feed(_cfg(), statics=_pattern(0.20))
     assert _triggered(events)
 
@@ -199,12 +222,33 @@ def test_pool_uncovered_is_reported_in_the_body():
     assert trig[0].fields["pool_uncovered_rate"] > 0.4
 
 
+def test_the_call_site_sits_before_the_pool_gate_early_return():
+    """THE REAL PLACEMENT GUARD (MED-1).
+
+    The behavioural test below feeds the detector directly, so it passes
+    no matter where the production call site is — the reviewer moved the
+    call to the kline dispatch and NOTHING failed. Placement is the most
+    consequential decision in this change, so it is asserted at the
+    source: the call must sit AFTER _note_pool_gate_outcome and BEFORE
+    the `if not ready:` block that returns out of the round.
+    """
+    src = Path(engine.__file__).read_text(encoding="utf-8")
+    # anchor on the CALL arguments, not the bare name: the function
+    # definitions appear earlier in the file and would match first.
+    i_pool = src.index("cfg, ready=ready, reason=ready_reason")
+    i_ours = src.index("cfg, wake_mode=wake_mode, pool_ready=ready")
+    i_ret = src.index("if not ready:", i_pool)
+    assert i_pool < i_ours < i_ret, (
+        "endpoint detector must be called between the pool-gate outcome "
+        "and the early return; a pool-gate skip returns before the kline "
+        "dispatch, so sampling there goes blind exactly when the fault "
+        "is worst")
+
+
 def test_pool_blocked_rounds_stay_in_the_denominator():
-    """PLACEMENT REGRESSION. The detector is called beside the pool-gate
-    outcome, not at the kline dispatch, because a pool-gate skip returns
-    out of the round before that point. Sampling later would drop exactly
-    the rounds this degradation causes, and the reported pool_uncovered
-    rate would be structurally ~0."""
+    """Behavioural half of the placement rule: pool-blocked rounds must
+    reach the detector. Guards the CONSEQUENCE; the source assertion
+    above guards the placement itself."""
     n = 80
     trig = _triggered(_feed(_cfg(), statics=_pattern(0.20),
                             pool_uncovered=[True] * n))
@@ -334,11 +378,20 @@ def test_recording_sends_nothing_on_the_critical_path():
     """Queued only — no Discord POST before the lock."""
     posted = []
     import pancakebot.ops.notifications as notifications
-    orig = notifications.notify
-    notifications.notify = lambda **kw: posted.append(kw)
+
+    # L3: patch BOTH bindings. The engine imports `notify` at module load,
+    # so patching only the notifications module cannot intercept it and
+    # the test would pass without proving anything.
+    patched = []
+    for mod, name in ((notifications, "notify"), (engine, "notify")):
+        if hasattr(mod, name):
+            patched.append((mod, name, getattr(mod, name)))
+            setattr(mod, name, lambda **kw: posted.append(kw))
+    assert patched, "no notify binding found to patch"
     try:
         _feed(_cfg(), statics=_pattern(0.30))
     finally:
-        notifications.notify = orig
+        for mod, name, orig in patched:
+            setattr(mod, name, orig)
     assert posted == []
     assert engine._PENDING_POOL_GATE_EVENTS, "event must be QUEUED"

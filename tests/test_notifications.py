@@ -193,3 +193,74 @@ def test_notify_send_failed_does_not_raise_with_stderr_none(tmp_path, monkeypatc
     art = _make_mode_tree(tmp_path, "live")
     outcome = notifications.notify(mode="live", kind="CRASHED", art=art)
     assert outcome == "SEND_FAILED"
+
+
+# ---------------------------------------------------------------------------
+# Deliverability: a property of the notification SYSTEM, not of any alert
+# ---------------------------------------------------------------------------
+
+def test_every_kind_is_deliverable_within_discords_content_cap():
+    """Discord REJECTS a webhook content over 2,000 chars with HTTP 400 —
+    it does not truncate. So an over-long alert is a SILENT alert, and a
+    re-alert loop regenerates the same oversized body forever.
+
+    ENDPOINT_MOVE_TRIGGERED shipped at 2,990-3,310 chars and was
+    permanently undeliverable while its own RECOVERED message (708) sent
+    fine — the alarm would have produced exactly the outcome its RECOVERED
+    text exists to warn about. The whole suite was green because every
+    test asserted substrings were PRESENT and none asserted the message
+    was SENDABLE.
+    """
+    from pancakebot.ops.notifications import (
+        _DISCORD_CONTENT_LIMIT, _SEVERITY_BY_KIND, _chunk_for_discord,
+        build_message,
+    )
+    for kind in sorted(_SEVERITY_BY_KIND):
+        msg = build_message(mode="live", kind=kind, fields={})
+        chunks = _chunk_for_discord(msg)
+        assert chunks, kind
+        for i, chunk in enumerate(chunks, 1):
+            assert len(chunk) <= _DISCORD_CONTENT_LIMIT, (
+                f"{kind} part {i}/{len(chunks)} is {len(chunk)} chars, over "
+                f"the {_DISCORD_CONTENT_LIMIT} cap — Discord will 400 it")
+
+
+def test_routine_alerts_stay_in_a_single_message():
+    """Only the endpoint-move payload is allowed to span parts. If a
+    routine alert starts chunking, it has grown a payload that belongs in
+    an artifact, not on a phone."""
+    from pancakebot.ops.notifications import (
+        _SEVERITY_BY_KIND, _chunk_for_discord, build_message,
+    )
+    multi = {k for k in _SEVERITY_BY_KIND
+             if len(_chunk_for_discord(build_message(
+                 mode="live", kind=k, fields={}))) > 1}
+    assert multi <= {"ENDPOINT_MOVE_TRIGGERED"}, multi
+
+
+def test_chunking_splits_on_line_boundaries_and_loses_nothing():
+    from pancakebot.ops.notifications import _chunk_for_discord
+    lines = [f"line {i} " + "x" * 80 for i in range(60)]
+    msg = "\n".join(lines)
+    chunks = _chunk_for_discord(msg, limit=500)
+    assert len(chunks) > 1
+    for c in chunks:
+        assert len(c) <= 500
+    rebuilt = "\n".join(c.split(") ", 1)[1] for c in chunks)
+    assert rebuilt == msg
+
+
+def test_a_single_unsplittable_line_is_hard_split_rather_than_dropped():
+    from pancakebot.ops.notifications import _chunk_for_discord
+    msg = "y" * 5000
+    chunks = _chunk_for_discord(msg, limit=500)
+    assert all(len(c) <= 500 for c in chunks)
+    assert "".join(c.split(") ", 1)[1] for c in chunks) == msg
+
+
+def test_short_messages_are_untouched_by_chunking():
+    """The overwhelming majority of alerts must be byte-identical to
+    before: no part markers, no reflow."""
+    from pancakebot.ops.notifications import _chunk_for_discord, build_message
+    msg = build_message(mode="live", kind="STARTED", fields={})
+    assert _chunk_for_discord(msg) == [msg]

@@ -338,13 +338,15 @@ def build_message(
             )
             lines.append(
                 "TIMEOUTS — NO CONSTANT NEEDS TO CHANGE. Derived at 3.5x "
-                "measured p99 (the existing derivation method) vs current: "
+                "the CANDIDATE host's p99 (publicnode, unrounded samples; "
+                "the printed p99s are rounded to ms) vs current: "
                 "_BLX_HEAD_TIMEOUT_MS 250 -> 182, _BLX_HEADER_TIMEOUT_MS "
-                "250 -> 114, _BLX_BLOCK_TS_TIMEOUT_MS 250 -> 236 (tightest "
-                "of the three), ANCHOR_POLL_TIMEOUT_MS 200 -> 114. Every "
-                "derived value sits BELOW the current one, so the move "
-                "needs no increase. KEEP the current values: tightening "
-                "buys nothing and only adds wake_mode=static risk."
+                "250 -> 114, _BLX_BLOCK_TS_TIMEOUT_MS 250 -> 236 (the "
+                "LARGEST derived value, i.e. the least slack under 250), "
+                "ANCHOR_POLL_TIMEOUT_MS 200 -> 114. Every derived value "
+                "sits BELOW the current one, so the move needs no "
+                "increase. KEEP the current values: tightening buys "
+                "nothing and only adds wake_mode=static risk."
             )
             lines.append(
                 "ALREADY VERIFIED, do not re-run: fan-out — 8 concurrent "
@@ -405,20 +407,83 @@ def build_message(
 # Discord HTTP send
 # ---------------------------------------------------------------------------
 
+# Discord rejects a webhook `content` longer than this with HTTP 400 — it
+# does NOT truncate. An over-long alert is therefore not a degraded alert,
+# it is a SILENT one, and a re-alert loop regenerates the same oversized
+# body forever. ENDPOINT_MOVE_TRIGGERED rendered 2,990-3,310 chars and was
+# permanently undeliverable, while its own RECOVERED message (708) sent
+# fine — so the alarm would have produced exactly the outcome its
+# RECOVERED text exists to warn about. Chunking lives in the transport
+# because deliverability is a property of the notification system, not of
+# any one alert.
+_DISCORD_CONTENT_LIMIT = 2000
+_DISCORD_PART_MARKER_ROOM = 12          # "(nn/nn) " plus slack
+
+
+def _chunk_for_discord(
+    message: str, limit: int = _DISCORD_CONTENT_LIMIT,
+) -> list[str]:
+    """Split ``message`` into parts that each fit Discord's content cap.
+
+    Splits on LINE boundaries so a rendered alert never breaks mid-fact;
+    a single line longer than the budget is hard-split as a last resort.
+    Part markers are added only when there is more than one part, so the
+    overwhelming majority of alerts are byte-identical to before.
+    """
+    if len(message) <= limit:
+        return [message]
+    body = limit - _DISCORD_PART_MARKER_ROOM
+    parts: list[str] = []
+    cur: list[str] = []
+
+    def _flush() -> None:
+        if cur:
+            parts.append("\n".join(cur))
+            cur.clear()
+
+    for line in message.split("\n"):
+        while len(line) > body:            # unsplittable single line
+            _flush()
+            parts.append(line[:body])
+            line = line[body:]
+        projected = sum(len(x) + 1 for x in cur) + len(line)
+        if cur and projected > body:
+            _flush()
+        cur.append(line)
+    _flush()
+    if len(parts) <= 1:
+        return parts or [message]
+    n = len(parts)
+    return [f"({i + 1}/{n}) {p}" for i, p in enumerate(parts)]
+
+
 def _send_discord(webhook_url: str, mode: str, message: str) -> tuple[bool, str]:
-    """POST a Discord message. Returns ``(ok, detail)``. Never raises."""
+    """POST a Discord message. Returns ``(ok, detail)``. Never raises.
+
+    Sends sequentially when the body exceeds the content cap. The first
+    part carries the most important lines because ``build_message``
+    already orders them that way (ACTION and the discriminator first), so
+    a partial delivery still delivers the actionable part.
+    """
     try:
         import requests
     except Exception as e:
         return False, f"requests_import_failed:{e}"
-    payload = {"content": message, "username": f"PancakeBot-{mode}"}
-    try:
-        r = requests.post(webhook_url, json=payload, timeout=10)
-    except Exception as e:
-        return False, f"post_exception:{type(e).__name__}:{e}"
-    if 200 <= r.status_code < 300:
-        return True, f"http_{r.status_code}"
-    return False, f"http_{r.status_code}:{(r.text or '')[:200]}"
+    chunks = _chunk_for_discord(message)
+    details: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        payload = {"content": chunk, "username": f"PancakeBot-{mode}"}
+        try:
+            r = requests.post(webhook_url, json=payload, timeout=10)
+        except Exception as e:
+            details.append(f"part{i}:post_exception:{type(e).__name__}:{e}")
+            return False, ";".join(details)
+        if not (200 <= r.status_code < 300):
+            details.append(
+                f"part{i}:http_{r.status_code}:{(r.text or '')[:200]}")
+            return False, ";".join(details)
+        details.append(f"part{i}:http_{r.status_code}")
+    return True, ";".join(details)
 
 
 # ---------------------------------------------------------------------------
