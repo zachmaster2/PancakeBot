@@ -330,19 +330,6 @@ def _note_kline_gate_outcome(
         (pub_win, gen_win, pub_alarm,
          gen_rate_alarm, burst_alarm) = _kline_rate_state(cfg)
 
-        # A restart blinds the publish-delay alarm until the window holds
-        # _RATE_MIN_SAMPLES rounds, and unlike the genuine class it has no
-        # burst fast path. That is acceptable and self-healing, but an
-        # operator must be able to tell "still warming" from "quiet because
-        # things are fine" -- especially given how often this bot has been
-        # restarted. Reported on the health line that already fires once
-        # per round, so no new log line is introduced.
-        if cfg.rpc_poller is not None:
-            cfg.rpc_poller.set_health_extra(
-                window_rounds=f"{pub_win.n}/{_RATE_WINDOW_ROUNDS}"
-                              f"{'' if pub_win.n >= _RATE_MIN_SAMPLES else '(warming)'}",
-            )
-
         events: list = []
         # --- rate signals: EVERY round lands in both denominators, which
         # is what makes an interleaved sequence raise both rates instead of
@@ -362,6 +349,24 @@ def _note_kline_gate_outcome(
             )
             if ev is not None:
                 events.append(ev)
+
+        # A restart blinds the publish-delay alarm until the window holds
+        # _RATE_MIN_SAMPLES rounds, and unlike the genuine class it has no
+        # burst fast path. That is acceptable and self-healing, but an
+        # operator must be able to tell "still warming" from "quiet because
+        # things are fine" -- especially given how often this bot has been
+        # restarted. Reported on the health line that already fires once
+        # per round, so no new log line is introduced.
+        #
+        # Reported AFTER the observe() loop above, not before it. Reading
+        # pub_win.n first excluded the round being processed, so the line
+        # under-reported fill by one and showed "0/120(warming)" on the
+        # very round that had just been observed.
+        if cfg.rpc_poller is not None:
+            cfg.rpc_poller.set_health_extra(
+                window_rounds=f"{pub_win.n}/{_RATE_WINDOW_ROUNDS}"
+                              f"{'' if pub_win.n >= _RATE_MIN_SAMPLES else '(warming)'}",
+            )
 
         # --- burst path (genuine only): a short run really is the signal
         # for a hard fetch outage, and it fires hours before the rate can.

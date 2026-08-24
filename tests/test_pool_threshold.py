@@ -95,10 +95,16 @@ def test_config_carries_the_new_pool_threshold():
 
 def test_the_payout_gate_is_a_separate_knob_and_did_not_move():
     """It shares the value 1.5 by coincidence and gates a different
-    quantity. Changing the pool filter must not touch it."""
+    quantity. Changing the pool filter must not touch it.
+
+    Deliberately does NOT assert the two values differ: they were equal
+    before this change and would be equal again after a legitimate
+    rollback to 1.5, so such an assertion would fail on a correct
+    rollback and point the reader at the payout gate, which never moved.
+    The two assertions below carry the real content."""
     pf = _deployed_strategy().pool_filter
     assert pf.min_payout_multiple_at_cutoff == 1.5
-    assert pf.min_pool_bnb_at_cutoff != pf.min_payout_multiple_at_cutoff
+    assert pf.min_pool_bnb_at_cutoff == THRESHOLD
 
 
 def test_pool_threshold_key_is_present_in_config():
