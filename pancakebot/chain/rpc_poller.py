@@ -196,11 +196,19 @@ _GETLOGS_TIMEOUT_MS: int = 250       # > soak max 103ms on the getLogs host
 # own diff harder to read.
 #
 # RE-MEASURED 2026-08-24 (anchor peak window 13:00-18:00 UTC, n=35,
-# production cadence). Derived at 3.5x measured p99 -- the existing
-# derivation method -- every value lands BELOW the current constant:
-#   head      bloXroute p99 15ms / publicnode p99 52ms -> derived 182
-#   header    bloXroute p99 30ms / publicnode p99 32ms -> derived 114
-#   block_ts  bloXroute p99 25ms / publicnode p99 67ms -> derived 236
+# production cadence). Derived at 3.5x the CANDIDATE host's p99 -- the
+# existing derivation method, and publicnode rather than bloXroute
+# because a timeout must cover the host being moved TO. Every value
+# lands BELOW the current constant:
+#   head      publicnode p99 52ms -> 182   (bloXroute p99 15ms)
+#   header    publicnode p99 32ms -> 114   (bloXroute p99 30ms)
+#   block_ts  publicnode p99 67ms -> 236   (bloXroute p99 25ms)
+# The p99s above are DISPLAYED ROUNDED to whole ms; the derived values
+# were computed from unrounded samples, which is why header and block_ts
+# do not reproduce exactly from the printed figures (3.5x32=112 vs 114
+# implies p99 32.57; 3.5x67=234.5 vs 236 implies 67.43). head is exact
+# because its p99 was already integral. Do NOT conclude from the
+# mismatch that the derivation method changed.
 # So an endpoint move needs NO constant to increase. Deliberately KEEPING
 # 250: tightening buys nothing and only adds wake_mode=static risk. n=35
 # is thin for a p99, so this CONFIRMS 250 is adequate rather than
@@ -1371,6 +1379,19 @@ class RpcPoller:
         with self._lock:
             self._last_rs_block_error = None
         if head_ts <= 0 or head_num <= 0:
+            # A MALFORMED RESPONSE IS STILL A HEADER FAILURE. This return
+            # used to leave the counter untouched, so trigger B
+            # under-counted under exactly the degradation shape the
+            # comment above warns about -- a provider returning garbage
+            # rather than erroring. That is the same conflation ("a
+            # timeout, an HTTP error and a malformed result read
+            # identically") that let the 2026-08 header-path degradation
+            # go a week without being characterised; do not reintroduce
+            # it by treating "arrived but useless" as success.
+            with self._lock:
+                self._last_rs_block_error = (
+                    f"malformed_header: head_num={head_num} head_ts={head_ts}")
+                self._rs_block_error_count += 1
             return None
         return self._rs_block_from_header(
             head_num, head_ts, head_milli, round_start_ts,
