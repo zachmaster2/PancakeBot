@@ -58,7 +58,9 @@ Unattended-safety (2026-07-17/18 hardening):
   * dry runs (no --apply) never advance weekly state and never touch
     systemd — pure previews. Weekly state is booked per ISO week; an
     applied same-week re-run overwrites that week's booking (recomputed
-    from the prior-week baseline), never double-advancing it.
+    from the prior-week baseline), never double-advancing it. This holds
+    for EVERY per-week counter — consecutive_weak and
+    evidence_gap_streak — which is why both go through book_streak().
   * every completed run VERIFIES Discord delivery (HTTP < 400, retry);
     undelivered -> rc=3 so the cron wrapper curls a fallback. Any crash
     Discords a ❌ CRASHED alert with the traceback tail and exits
@@ -404,23 +406,35 @@ def weak_week(trigger_window: str, stats: dict) -> bool:
                 and stats["p_upper"] > NEG_WEAK_P)
 
 
-def book_weak_week(st: dict, *, same_week_rerun: bool, weak: bool) -> tuple[int, int]:
-    """Return (baseline, consec) for this ISO week's weak booking.
+def book_streak(st: dict, key: str, *, same_week_rerun: bool,
+                hit: bool) -> tuple[int, int]:
+    """Return (baseline, counter) for a per-ISO-week consecutive counter.
 
     First run of the week: baseline = last week's persisted counter,
     advance from it. Same-ISO-week re-run: RECOMPUTE from the persisted
     baseline — overwrite semantics, so a re-run under corrected code can
     fix the week's booking, and nothing ever double-advances. The
     baseline fallback for state files that predate the key assumes the
-    last booking was weak (stored-1); a not-weak booking stores 0 either
-    way, so the fallback can only over-forgive, never over-count."""
-    stored = int(st.get("consecutive_weak", 0))
+    last booking was a hit (stored-1); a non-hit booking stores 0 either
+    way, so the fallback can only over-forgive, never over-count.
+
+    Shared rather than duplicated: evidence_gap_streak was written as a
+    bare `stored + 1` and DID double-advance on an applied same-week
+    re-run (a single blocked Sunday re-run wrote 2 and fired the
+    "2 CONSECUTIVE SUNDAYS" banner), contradicting the overwrite
+    contract in this module's docstring two lines from correct code."""
+    stored = int(st.get(key, 0))
     if same_week_rerun:
-        baseline = int(st.get("consecutive_weak_baseline",
-                              max(stored - 1, 0)))
+        baseline = int(st.get(f"{key}_baseline", max(stored - 1, 0)))
     else:
         baseline = stored
-    return baseline, (baseline + 1 if weak else 0)
+    return baseline, (baseline + 1 if hit else 0)
+
+
+def book_weak_week(st: dict, *, same_week_rerun: bool, weak: bool) -> tuple[int, int]:
+    """(baseline, consec) for this ISO week's weak booking."""
+    return book_streak(st, "consecutive_weak",
+                       same_week_rerun=same_week_rerun, hit=weak)
 
 
 def _window_desc(tag: str, stats: dict, bt: dict | None = None,
@@ -472,25 +486,31 @@ FRESH_MAX_AGE_S = 36 * 3600  # newest closed ROUND older than this = stale
 # the choice below is insensitive to the edge; state the edge when
 # re-deriving.)
 #
-# WHY 96h SPECIFICALLY: it is the LARGEST bound that still catches the
-# worst drought ever observed. Time-weighted exceedance (the quantity that
-# matters, since a Sunday samples wall-clock rather than gaps):
-#     48h -> 7.79%   72h -> 3.86%   96h -> ~1.3%   120h -> 0.00%
-# 120h flags nothing at all — it would have missed the 117.5h event, i.e.
-# it is not a gate. 96h keeps that event inside the net while paying only
-# ~1.3% of Sundays, and keeps the newest fire inside the 1-week window's
-# own span.
+# SUPERSEDED DERIVATION, kept because it is easy to re-derive by mistake:
+# 96h was originally justified as "the LARGEST bound that still catches the
+# worst drought ever observed", on time-weighted TRAILING exceedance
+# (48h -> 7.79%, 72h -> 3.86%, 96h -> ~1.3%, 120h -> 0.00%). That was true
+# of the trailing-only framing and is FALSE under the density rule: the
+# worst observed drought is a 117.5h INTERNAL gap, so EVERY bound below
+# 117.5h catches it -- 116h included. 96h is not the largest such bound, it
+# is one choice among many. Those exceedance figures are also not
+# commensurable with the block rates below: one is the time-weighted share
+# of wall clock spent inside a trailing gap, the other is the share of DAYS
+# on which the density rule would block. Do not read them as one series.
 #
-# EROSION IS NOT APPROACHING -- IT IS HERE. Re-derived 2026-08-24 against
-# the live 1,982-fire stream, replaying the monitor's own spent-window
-# selection once per day and asking how often the rule would block:
+# RE-DERIVED 2026-08-24 against the live 1,982-fire stream, replaying the
+# monitor's own spent-window selection once per day and asking how often
+# the rule would block. The band the efficacy criterion actually points at
+# is measured here rather than jumped over:
 #
-#   bound   current regime   half rate (median / worst of 9 seeds)
-#    96h        15.7%            21.4%  /  37.1%
-#   120h         4.3%            18.6%  /  34.3%
-#   144h         2.9%            17.1%  /  18.6%
-#   168h         0.0%            12.9%  /  17.1%
-#   192h         0.0%             0.0%  /  12.9%
+#   bound  catches 08-16?  current regime  half rate (med / worst, 9 seeds)
+#    96h        yes            15.7%            15.9%  /  34.4%
+#   104h        yes            15.7%            12.1%  /  34.4%
+#   112h        yes            14.3%            10.6%  /  31.2%
+#   116h        yes            14.3%            10.6%  /  31.2%
+#   120h        NO              4.3%             6.7%  /  31.2%
+#   144h        NO              2.9%             5.0%  /  15.6%
+#   168h        NO              0.0%             3.3%  /  14.1%
 #
 # "Current regime" = the last 70 evaluable days, which is the honest
 # denominator: over the preceding 180 days the rule blocks 0.0% of days,
@@ -498,21 +518,41 @@ FRESH_MAX_AGE_S = 36 * 3600  # newest closed ROUND older than this = stale
 # days 70-250 p99 26.3h max 53.6h). Measuring across both regimes averages
 # a world that no longer exists into the answer.
 #
-# NO SINGLE CONSTANT SATISFIES BOTH REQUIREMENTS, and the honest thing is
-# to say so rather than split the difference:
-#   * EFFICACY needs bound < 117.5h -- that is the max gap of 2026-08-16,
-#     the one decision this rule changes. Any bound at or above 120h makes
-#     the rule decoration: it stops catching the only case it was built for.
-#   * FALSE POSITIVES need bound >= 120h to fall under ~5%.
-# 117.5h sits 22.4% above 96h but only 2.1% BELOW 120h. The demonstrated
-# bad case is essentially ON the false-positive cliff.
+# THE CHOICE, made on those numbers instead of asserted:
+#   * EFFICACY needs bound < 117.5h -- the max internal gap of 2026-08-16,
+#     the one decision this rule changes. At 120h and above the rule is
+#     decoration: it stops catching the only case it was built for. So
+#     FALSE POSITIVES, which need >= 120h to fall under ~5%, cannot be
+#     bought at all without giving up the rule.
+#   * INSIDE the efficacy-preserving band the false-positive rate moves by
+#     exactly ONE DAY: 11 blocked days out of 70 at 96h, 10 at 116h. That
+#     is not a dominance result. It is a single day at the edge of a single
+#     episode (see COST below) and is not a basis for choosing.
+#   * What does separate them is EFFICACY MARGIN. 117.5h sits 22.4% above
+#     96h but only 1.3% above 116h -- a 116h bound would catch the one case
+#     it exists for by 1.5 hours.
 #
-# 96h is KEPT, accepting 15.7% of days blocked now and a 21-37% band if the
-# fire rate halves again. Rationale: blocking is the safe direction (it
-# refuses to ENABLE, never to disable), whereas raising the bound buys
-# quiet by giving up the rule's only demonstrated catch. The cost of the
-# choice is that the positive trigger is now blocked roughly one Sunday in
-# six -- which is why consecutive evidence-gap Sundays now escalate
+# 96h is KEPT, and explicitly NOT because it measures better: 116h is
+# weakly better on false positives (one day today, ~5pp under a simulated
+# halving of the fire rate). It is kept to cover droughts in the 96-116h
+# band, which have never been observed and cannot be ruled out, and to keep
+# the efficacy leg robust to measurement noise rather than resting it on a
+# 1.5h margin. The half-rate column argues for a wider bound but is
+# inconsistent as a tuning input: halving the fire rate lengthens the
+# droughts we want to CATCH as much as the ones we want to forgive, so it
+# cannot move the bound while the efficacy anchor stays pinned to a
+# full-rate event. Blocking is also the safe direction -- it refuses to
+# ENABLE, never to disable.
+#
+# COST OF THE CHOICE, stated correctly: 15.7% of days is 11 blocked days
+# out of 70, but they are ONE CONTIGUOUS EPISODE -- 2026-08-12 through
+# 2026-08-22, the Aug 7 -> Aug 12 drought aging through the window. Not 11
+# independent blocks, and NOT a ~1-in-6 per-Sunday probability; framing it
+# as a rate implies an independence that is not there. The real cost is
+# roughly ONE blocked episode straddling one or two Sundays, which is
+# materially cheaper than the rate suggests and cuts in this rule's favour.
+# The flip side is that a single future drought blocks a RUN of consecutive
+# Sundays -- which is why consecutive evidence-gap Sundays escalate
 # (evidence_gap_streak): a slow strangulation must announce itself instead
 # of looking like a quiet run of ordinary weeks.
 #
@@ -1103,9 +1143,13 @@ def _main() -> int:
     # evidence-gap rule. A slow strangulation otherwise looks exactly like
     # a quiet run of ordinary weeks -- the blind-spot class the bound's own
     # comment says it is guarding against.
+    # Booked through the SAME overwrite guard as consecutive_weak: an
+    # applied same-week re-run recomputes from the persisted baseline
+    # instead of advancing again.
     _gap_blocked = action.endswith("_BLOCKED_evidence_gap")
-    evidence_gap_streak = (
-        int(st.get("evidence_gap_streak", 0)) + 1 if _gap_blocked else 0)
+    gap_baseline, evidence_gap_streak = book_streak(
+        st, "evidence_gap_streak", same_week_rerun=same_week_rerun,
+        hit=_gap_blocked)
 
     decision = dict(
         week=week, run_at_utc=time.strftime("%Y-%m-%d %H:%M", time.gmtime()),
@@ -1153,6 +1197,7 @@ def _main() -> int:
         st["consecutive_weak"] = consec
         st["consecutive_weak_baseline"] = baseline
         st["evidence_gap_streak"] = evidence_gap_streak
+        st["evidence_gap_streak_baseline"] = gap_baseline
         st["last_week"] = week
         st["last_action"] = action
         hist = st.setdefault("history", [])
@@ -1195,11 +1240,19 @@ def _main() -> int:
                 f"hole in it. Positive actions blocked; the negative path "
                 f"is unaffected.\n{head}")
     if evidence_gap_streak >= 2:
+        # The counter tracks SUPPRESSED ENABLES, not sparse evidence: it
+        # only advances on a *_BLOCKED_evidence_gap action, and any week
+        # whose positive trigger did not fire resets it to 0. Saying "the
+        # fire stream has been too sparse" overclaimed — a run of quiet
+        # weeks does not raise this, and a quiet week interleaved between
+        # two blocked ones lowers it.
         head = (f"⚠️ EVIDENCE GAP x{evidence_gap_streak} CONSECUTIVE "
-                f"SUNDAYS — the fire stream has been too sparse to spend "
-                f"for {evidence_gap_streak} weeks running. This is what a "
-                f"slow strangulation looks like; check the fire RATE, not "
-                f"the bound.\n{head}")
+                f"SUNDAYS — on {evidence_gap_streak} Sundays running a "
+                f"positive trigger FIRED and was suppressed by the gap "
+                f"rule (the counter follows suppressed enables, and resets "
+                f"on any week whose triggers did not fire — so consecutive "
+                f"here means consecutive SUPPRESSIONS). Check the fire "
+                f"RATE, not the bound.\n{head}")
     if completed_blind_week:
         head += "\n(previous week ended fully blind — Sunday and every retry failed)"
     if trigger_window == "2w_fallback":
@@ -1215,6 +1268,10 @@ def _main() -> int:
             f"blind_streak={streak} gap_streak={evidence_gap_streak}; "
             f"enabled={state.get('is_enabled')} "
             f"running={state.get('is_running')} in_cooldown={in_cooldown}")
+    # `head` may already open with its own ⚠️ banner (stale data, frozen
+    # window, evidence gap, escalation). The severity prefixes below then
+    # rendered "⚠️ ⚠️ ..." in Discord.
+    warn = "" if head.startswith("⚠️") else "⚠️ "
     if retry_mode and not evidence_ok and action == "none":
         # Daily retry still blind, nothing actionable: one line, no spam.
         delivered = discord(
@@ -1223,11 +1280,11 @@ def _main() -> int:
             f"{'sync failed' if not sync_ok else 'data stale'}) — retrying "
             "daily; next full run Sunday")
     elif action in ("enable", "disable", "cooldown_override", "restart_dead_unit"):
-        delivered = discord(f"⚠️ {head} — STATE CHANGED\n{reason}\n{acted}\n{body}")
+        delivered = discord(f"{warn}{head} — STATE CHANGED\n{reason}\n{acted}\n{body}")
     elif "_BLOCKED_" in action:
         # A suppressed live-money action is never a routine no-op.
         delivered = discord(
-            f"⚠️ {head} — POSITIVE ACTION SUPPRESSED\n{reason}\n{body}")
+            f"{warn}{head} — POSITIVE ACTION SUPPRESSED\n{reason}\n{body}")
     elif action.endswith("_FAILED") or action == "systemctl_UNAVAILABLE":
         delivered = discord(f"❌ {head} — ACTION FAILED / DEGRADED\n{reason}\n{acted}\n{body}")
     else:
