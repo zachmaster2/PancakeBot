@@ -190,6 +190,33 @@ def test_booking_same_week_rerun_recomputes_from_baseline():
     assert wm.book_weak_week(st2, same_week_rerun=True, weak=False) == (2, 0)
 
 
+def test_evidence_gap_streak_does_not_double_advance_on_a_rerun():
+    """NEW-1, the one behavioural defect in this pass: the gap streak was
+    booked as a bare `stored + 1`, so an applied SAME-WEEK re-run of a
+    blocked Sunday wrote 2 and fired the "2 CONSECUTIVE SUNDAYS"
+    escalation off a single blocked week — while consecutive_weak, booked
+    two lines away, correctly stayed put. Both now go through the same
+    guard."""
+    # first run of the week: advance from last week's counter
+    assert wm.book_streak({"evidence_gap_streak": 1}, "evidence_gap_streak",
+                          same_week_rerun=False, hit=True) == (1, 2)
+    # same-week re-run of that blocked Sunday: recompute, do NOT advance
+    st = {"evidence_gap_streak": 1, "evidence_gap_streak_baseline": 0}
+    assert wm.book_streak(st, "evidence_gap_streak",
+                          same_week_rerun=True, hit=True) == (0, 1)
+    # ...and a re-run that no longer blocks clears it
+    assert wm.book_streak(st, "evidence_gap_streak",
+                          same_week_rerun=True, hit=False) == (0, 0)
+
+
+def test_evidence_gap_streak_migrates_from_a_state_file_without_baseline():
+    """Live state files predate the key. The fallback assumes the last
+    booking was a block (stored-1), so it can only over-forgive."""
+    st = {"evidence_gap_streak": 1}          # no baseline key
+    assert wm.book_streak(st, "evidence_gap_streak",
+                          same_week_rerun=True, hit=True) == (0, 1)
+
+
 def test_booking_migration_default_covers_2026_08_16_state():
     # The one real pre-baseline state file: Sunday 2026-08-16 booked weak
     # under 1w-only semantics (consec 0->1, no baseline key persisted).
@@ -414,6 +441,10 @@ def test_frozen_window_blocks_enable_end_to_end(tmp_path, monkeypatch):
     assert not (repo / "var" / "live" / "cooldown_override.json").exists()
     assert "FROZEN WINDOW" in messages[0]
     assert "placed no bet since" in messages[0]
+    # NEW-3: the severity prefix must not stack another banner on a
+    # head that already opens with one.
+    assert "⚠️ ⚠️" not in messages[0]
+    assert messages[0].count("⚠️ FROZEN WINDOW") == 1
     # state still books the week (this is not a blind week)
     st = json.loads((root / "state.json").read_text(encoding="utf-8"))
     assert st["last_action"] == "enable_BLOCKED_frozen_window"
@@ -516,25 +547,34 @@ def test_mixed_window_composition_reaches_decision_and_discord(tmp_path, monkeyp
 
 # ---- evidence-gap (density) rule -----------------------------------------
 
-# Replay of every archived Sunday, re-measured on the VM 2026-08-24 by
-# reconstructing each run's SPENT window from the live 1,982-fire canonical
-# stream (1w keyed to the newest fire at run time, 2w fallback when n<10) --
-# not from the archived window_*.epochs, which reflect whatever store state
-# existed that day and no longer reproduce (an earlier table read 07-18 as
-# n=15/trailing 177.1h off pre-backfill epochs; against the real stream it
-# is n=18/trailing 22.2h and passes).
+# Replay of every archived run day, RE-MEASURED IN FULL on the VM
+# 2026-08-24 by reconstructing each run's SPENT window from the live
+# 1,982-fire canonical stream: `now` = that day 06:00Z, windows keyed to
+# the newest fire at or before it (as the monitor does -- window() cuts
+# from max_lock, not from now), 1w when n >= POS_MIN_FIRES else 2w.
 #
-# (sunday, spent_window, n_fires, max_internal_gap_h, trailing_gap_h, action)
+# The previous version of this table claimed to be measured that way but
+# only its max_internal_gap_h column actually was; n and trailing_gap_h
+# were partly carried over from archived window_*.epochs, which reflect
+# whatever store state existed that day. Every column below now comes from
+# one replay run. Corrections: 07-08 n 18->24 / trail 6.5->15.3, 07-12
+# trail 26.0->25.7, 07-18 trail 22.2->14.8, 07-19 trail 63.0->38.8, 07-26
+# n 11->10 / trail 0.0->5.3, 08-02 trail 6.8->6.4, 08-09 trail 37.4->36.9,
+# 08-16 trail 39.3->35.9, 08-23 trail 1.4->0.9. Every max_internal_gap_h
+# reproduced unchanged -- which is the column the rule decides on, so the
+# conclusion never moved.
+#
+# (day, spent_window, n_fires, max_internal_gap_h, trailing_gap_h, action)
 REPLAY = [
-    ("2026-07-08", "1w",          18,  26.9,  6.5, "none"),
-    ("2026-07-12", "1w",          15,  28.8, 26.0, "disable"),
-    ("2026-07-18", "1w",          18,  28.0, 22.2, "none"),
-    ("2026-07-19", "1w",          18,  28.0, 63.0, "none"),
-    ("2026-07-26", "1w",          11,  45.7,  0.0, "none"),
-    ("2026-08-02", "1w",          15,  47.1,  6.8, "none"),
-    ("2026-08-09", "1w",          14,  57.0, 37.4, "none"),
-    ("2026-08-16", "2w_fallback", 19, 117.5, 39.3, "enable"),
-    ("2026-08-23", "1w",          10,  15.0,  1.4, "none"),
+    ("2026-07-08", "1w",          24,  26.9, 15.3, "none"),
+    ("2026-07-12", "1w",          15,  28.8, 25.7, "disable"),
+    ("2026-07-18", "1w",          18,  28.0, 14.8, "none"),
+    ("2026-07-19", "1w",          18,  28.0, 38.8, "none"),
+    ("2026-07-26", "1w",          10,  45.7,  5.3, "none"),
+    ("2026-08-02", "1w",          15,  47.1,  6.4, "none"),
+    ("2026-08-09", "1w",          14,  57.0, 36.9, "none"),
+    ("2026-08-16", "2w_fallback", 19, 117.5, 35.9, "enable"),
+    ("2026-08-23", "1w",          10,  15.0,  0.9, "none"),
 ]
 
 NOW = 1_787_000_000.0
@@ -586,14 +626,44 @@ def test_replay_margin_is_thin_and_rests_on_one_case():
     """KNOWN LIMITATION, recorded rather than papered over: efficacy is
     n=1. The single case the rule catches sits 22.4% above the 96h bound
     but only 2.1% BELOW 120h, the smallest bound that would drop the
-    false-positive rate under ~5%."""
+    false-positive rate under ~5%.
+
+    Note where the thinness is and is not. On the PASS side there is
+    room: the worst passing day measures 57.0h against a 96h bound. The
+    margin that is thin is on the CATCH side, and it is thin against
+    raising the bound, not against the observed traffic."""
     bound = wm.FIRE_STALE_MAX_AGE_S / 3600.0
     catches = [r for r in REPLAY if max(r[3], r[4]) > bound]
     assert len(catches) == 1
     worst_pass = max(max(r[3], r[4]) for r in REPLAY if max(r[3], r[4]) <= bound)
-    assert worst_pass == 63.0                      # 2026-07-19
+    assert worst_pass == 57.0                      # 2026-08-09
+    assert worst_pass / bound < 0.60               # not a near miss
     assert catches[0][3] == 117.5
     assert 117.5 > bound and 117.5 < 120.0
+
+
+def test_every_bound_below_the_observed_max_preserves_efficacy():
+    """M6-a: the comment's claim that 96h is 'the largest bound that still
+    catches the worst drought' was false -- the whole 96-116h band catches
+    it. 96h is a choice, and the file must not re-derive it as forced."""
+    worst = max(r[3] for r in REPLAY)
+    assert worst == 117.5
+    for candidate in (96.0, 104.0, 112.0, 116.0):
+        assert worst > candidate, candidate
+    for candidate in (120.0, 144.0, 168.0):
+        assert worst < candidate, candidate
+
+
+def test_the_blocked_days_are_one_episode_not_a_rate():
+    """M6-c: 15.7% of days = 11 blocked days out of 70, but they are one
+    contiguous run (2026-08-12..08-22) of a single drought aging through
+    the window. The replay table shows the same shape: the blocked days
+    cluster on one event, so the cost is episodes, not Sundays."""
+    bound = wm.FIRE_STALE_MAX_AGE_S / 3600.0
+    blocked = [r[0] for r in REPLAY if max(r[3], r[4]) > bound]
+    assert blocked == ["2026-08-16"]
+    # ...and the drought that causes it is visible as ONE gap, not many.
+    assert sum(1 for r in REPLAY if r[3] > bound) == 1
 
 
 def _w(now, ages_h):
