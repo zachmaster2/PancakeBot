@@ -512,3 +512,162 @@ def test_mixed_window_composition_reaches_decision_and_discord(tmp_path, monkeyp
     assert comp2["oldest_fire_age_h"] > 200
     assert "fresh 1/" in messages[0]
     assert d["fire_gap_p99_h"] is None or d["fire_gap_p99_h"] > 0
+
+
+# ---- evidence-gap (density) rule -----------------------------------------
+
+# Measured on the VM 2026-08-24 by replaying every archived Sunday's spent
+# window against the live canonical fire stream (1,982 fires).
+# (sunday, spent_window, n_fires, max_internal_gap_h, trailing_gap_h, action)
+REPLAY = [
+    ("2026-07-12", "1w",          15,  28.8,  26.0, "disable"),
+    ("2026-07-18", "1w",          15,  28.8, 177.1, "none"),
+    ("2026-07-19", "1w",          18,  28.0,  63.0, "none"),
+    ("2026-07-26", "1w",          10,  45.7,   5.7, "none"),
+    ("2026-08-02", "1w",          15,  47.1,   6.8, "none"),
+    ("2026-08-09", "1w",          14,  57.0,  37.4, "none"),
+    ("2026-08-16", "2w_fallback", 19, 117.5,  39.3, "enable"),
+    ("2026-08-23", "1w",          10,  15.0,   1.4, "none"),
+]
+
+
+def test_historical_replay_changes_exactly_one_decision():
+    bound = wm.FIRE_STALE_MAX_AGE_S / 3600.0
+    changed = [
+        day for day, _tw, _n, mx, trail, action in REPLAY
+        if max(mx, trail) > bound and action in ("enable", "cooldown_override")
+    ]
+    assert changed == ["2026-08-16"], changed
+    # 07-18 also exceeds, but only via its TRAILING gap (177.1h) -- the
+    # already-shipped frozen-window gate covers that one, and its action
+    # was "none" regardless, so no decision moves.
+    d0718 = dict((r[0], r) for r in REPLAY)["2026-07-18"]
+    assert d0718[4] > bound and d0718[3] <= bound
+
+
+def test_replay_rows_that_must_keep_passing():
+    """Six Sundays must be untouched -- including 08-09 at 57.0h, the
+    closest healthy approach to the 96h bound."""
+    bound = wm.FIRE_STALE_MAX_AGE_S / 3600.0
+    for day, _tw, _n, mx, trail, _a in REPLAY:
+        if day in ("2026-07-18", "2026-08-16"):
+            continue
+        assert max(mx, trail) <= bound, f"{day} must still pass"
+
+
+def _w(now, ages_h):
+    return [dict(epoch=1000 + i, lock=int(now - a * 3600), win=True)
+            for i, a in enumerate(ages_h)]
+
+
+def test_gap_profile_separates_internal_from_trailing():
+    now = 1_787_000_000.0
+    mx, trail = wm.window_gap_profile(_w(now, [2, 12, 24]), now)
+    assert mx == 12.0 and trail == 2.0
+    # single fire: no internal gap to measure
+    mx, trail = wm.window_gap_profile(_w(now, [5]), now)
+    assert mx is None and trail == 5.0
+    mx, trail = wm.window_gap_profile([], now)
+    assert mx is None and trail == float("inf")
+
+
+def test_one_fresh_fire_plus_eighteen_stale_is_an_evidence_gap():
+    """The demonstrated hole: this passes the shipped trailing check."""
+    now = 1_787_000_000.0
+    ages = [2.0] + [h * 24.0 for h in (9.6, 10, 10.4, 10.8, 11.2, 11.6, 12,
+                                       12.2, 12.4, 12.6, 12.8, 13, 13, 13,
+                                       13, 13, 13, 13)]
+    window = _w(now, ages)
+    assert wm.fire_evidence_fresh(max(b["lock"] for b in window), now) is True
+    mx, trail = wm.window_gap_profile(window, now)
+    assert trail == 2.0                                  # trailing looks fine
+    assert mx > wm.FIRE_STALE_MAX_AGE_S / 3600.0         # the drought does not
+
+
+def test_interior_drought_with_a_fresh_tail_is_caught():
+    now = 1_787_000_000.0
+    # dense recent fires, then a 5-day hole, then dense older fires
+    ages = [1, 3, 5, 7, 9, 130, 132, 134, 136]
+    mx, trail = wm.window_gap_profile(_w(now, ages), now)
+    assert trail == 1.0
+    assert mx == 121.0 > wm.FIRE_STALE_MAX_AGE_S / 3600.0
+
+
+def test_healthy_window_passes():
+    now = 1_787_000_000.0
+    ages = [2 + 8 * i for i in range(20)]      # a fire every 8h
+    mx, trail = wm.window_gap_profile(_w(now, ages), now)
+    assert max(mx, trail) <= wm.FIRE_STALE_MAX_AGE_S / 3600.0
+
+
+def test_rule_does_not_touch_window_selection():
+    """positive_window() must be identical with or without gap structure --
+    if it moved, spent_stats/negative_wr_leg/weak_week would all shift and
+    a density-driven 'none' would start advancing the DISABLE counter."""
+    assert wm.positive_window(GOOD_1W, GOOD_2W) == "1w"
+    assert wm.positive_window(INSUF_1W, GOOD_2W) == "2w_fallback"
+    assert wm.positive_window(INSUF_1W, INSUF_2W) == "none"
+    # the selector takes only perm stats -- it cannot see gaps at all
+    import inspect
+    assert list(inspect.signature(wm.positive_window).parameters) == ["p1", "p2"]
+
+
+def test_evidence_gap_blocks_enable_end_to_end(tmp_path, monkeypatch):
+    """Fresh tail, qualifying stats, but a 100h drought inside the spent 1w
+    window: the enable must be blocked under its OWN action name, and the
+    negative machinery must be bit-for-bit unaffected."""
+    root = tmp_path / "weekly_monitors"
+    repo = tmp_path / "repo"
+    (repo / "var" / "live").mkdir(parents=True)
+    root.mkdir(parents=True)
+    (root / "state.json").write_text(json.dumps(dict(
+        consecutive_weak=0, last_week=None, last_action=None, history=[])),
+        encoding="utf-8")
+    monkeypatch.setattr(wm, "ROOT", root)
+    monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
+    monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
+    monkeypatch.setattr(wm, "REPO", repo)
+
+    now = time.time()
+    # 6 fires in the last 20h, a 100h hole, then 6 more -- all inside 7 days
+    ages_h = [1, 4, 8, 12, 16, 20] + [120, 128, 136, 144, 152, 160]
+    bets = [dict(epoch=500 + i, lock=int(now - a * 3600), win=True)
+            for i, a in enumerate(sorted(ages_h, reverse=True))]
+    monkeypatch.setattr(wm, "build_canonical_bets",
+                        lambda: (bets, int(now - 1800)))
+    monkeypatch.setattr(wm, "perm", lambda w, n_iter=None, seed=None: (
+        dict(n=len(w), insufficient=True) if len(w) < wm.POS_MIN_FIRES
+        else dict(n=len(w), wr=0.70, obs_mean_pnl=0.24, null_mean=0.0,
+                  p_upper=0.02)))
+    monkeypatch.setattr(wm, "risk_off_backtest",
+                        lambda *a, **k: dict(net_pnl_bnb=0.31, num_bets=12,
+                                             win_rate=0.70, gas_per_bet=0.0006))
+    monkeypatch.setattr(wm, "read_bot_state", lambda: dict(
+        available=True, active="inactive", enabled="disabled",
+        is_running=False, is_enabled=False))
+    monkeypatch.setattr(wm, "do_enable", lambda: (_ for _ in ()).throw(
+        AssertionError("do_enable must not run on an evidence gap")))
+    messages = []
+    monkeypatch.setattr(wm, "discord",
+                        lambda m: (messages.append(m), True)[1])
+    monkeypatch.setattr(sys, "argv",
+                        ["wm", "--apply", "--no-sync", "--iso-week", "2026-08-30"])
+
+    assert wm._main() == 0
+    d = json.loads((root / "2026-08-30" / "decision.json").read_text(encoding="utf-8"))
+
+    assert d["triggers"]["positive"] is True          # the stats DO qualify
+    assert d["fire_fresh"] is True                    # the tail IS fresh
+    assert d["action"] == "enable_BLOCKED_evidence_gap"
+    assert d["evidence_gap_ok"] is False
+    assert d["max_internal_gap_h"] == 100.0
+    assert d["gap_bound_h"] == 96.0
+    assert not (repo / "var" / "live" / "cooldown_override.json").exists()
+
+    # the negative machinery is untouched by evidence quality
+    assert d["triggers"]["negative"] is False
+    assert d["triggers"]["neg_wr_leg"] is False
+    assert d["triggers"]["weak_this_week"] is False
+    assert d["triggers"]["consecutive_weak"] == 0
+    assert d["triggers"]["trigger_window"] == "1w"    # selection unchanged
+    assert "max_gap=100.0h/96h" in messages[0]

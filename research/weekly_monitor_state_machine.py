@@ -103,12 +103,13 @@ decisions):
              reported loudly and may not be spent on any POSITIVE action.
              It is NOT a disable trigger and never blocks the protective
              disable — see fire_evidence_fresh.
-             LIMITATION (queued follow-up): this is a POINT check on the
-             newest fire, so one recovery bet un-freezes an otherwise
-             all-stale window. Until a density leg lands, every window's
-             fresh/stale composition is reported (decision.json
-             window_*.fire_composition and the Discord body) so a mixed
-             window cannot be misread as a live one.
+             DENSITY: the point check above is generalised by the
+             evidence-gap rule -- no drought longer than
+             FIRE_STALE_MAX_AGE_S anywhere INSIDE the spent window, taking
+             the max over every consecutive-fire gap plus the trailing gap
+             to now. Same constant, same units, no new threshold. It gates
+             the ACTION only; window selection is untouched, so the whole
+             negative path is unchanged. See window_gap_profile.
   NEGATIVE:  WR leg on the SPENT positive window (the same window the
              positive legs read — a starved-1w regime must not make the
              WR floor unreachable while the 2w window shows a losing
@@ -257,6 +258,42 @@ def fire_evidence_fresh(newest_fire_lock: int, now: float) -> bool:
     runtime pool-gate alarm is what pages for "up but unable to trade".
     """
     return (now - float(newest_fire_lock)) <= FIRE_STALE_MAX_AGE_S
+
+
+def window_gap_profile(window: list, now: float) -> tuple[float | None, float]:
+    """``(largest gap BETWEEN consecutive fires, trailing gap to now)``, in
+    hours. ``None`` for the first when the window holds fewer than 2 fires.
+
+    Feeds the evidence-gap rule: no drought longer than
+    FIRE_STALE_MAX_AGE_S anywhere inside the SPENT window. The shipped
+    ``fire_evidence_fresh`` tests exactly ONE gap -- the trailing one -- so
+    18 stale fires plus a single fresh one passes it. Taking the max over
+    every gap is a strict generalisation of that test using the same
+    constant and the same units, which is why it needs no new threshold: a
+    count rule (>=K fresh) or a fraction rule (>=X% fresh) would have to be
+    fitted to seven Sunday observations, whereas 96h came from 304 real
+    inter-fire gaps. Both alternatives were swept and are dominated -- no K
+    separates the one bad decision from the good ones (K=6 misses
+    2026-08-16, K=8 also blocks 07-12 and 07-26), and X=0.30 misses
+    2026-08-16 outright.
+
+    KNOWN PROPERTY, and the next reader needs it: testing every gap instead
+    of one raises the blocked-Sunday exposure from ~1.3% to ~10% (a 2w
+    window holds ~17 gaps, each an independent chance to exceed the bound).
+    The current-regime p99 inter-fire gap is already 91.1h against a 96h
+    bound. **If the fire rate halves again, this rule AND the shipped
+    trailing gate both approach permanent-block.** The correct response
+    then is to RE-DERIVE FIRE_STALE_MAX_AGE_S from the new gap
+    distribution -- not to carve an exception into either rule.
+    """
+    locks = sorted(int(b["lock"]) for b in window)
+    if not locks:
+        return None, float("inf")
+    trailing_h = (now - locks[-1]) / 3600.0
+    if len(locks) < 2:
+        return None, trailing_h
+    gaps_h = [(locks[i + 1] - locks[i]) / 3600.0 for i in range(len(locks) - 1)]
+    return max(gaps_h), trailing_h
 
 
 def window_fire_composition(window: list, now: float) -> dict:
@@ -801,6 +838,30 @@ def _main() -> int:
     pos_stats = spent_stats(trigger_window, p1, p2)
     pos_bt = bt2 if trigger_window == "2w_fallback" else bt
 
+    # Evidence-gap rule: no drought longer than the staleness bound
+    # ANYWHERE inside the spent window (see window_gap_profile). This is an
+    # ADDITIONAL condition on positive_evidence_ok and deliberately does
+    # NOT touch positive_window(): window selection feeds spent_stats,
+    # negative_wr_leg and weak_week, and trigger_window == "none" already
+    # books weak=True, so a density-driven "none" would start advancing the
+    # DISABLE counter on evidence-quality grounds. Gate the action, not the
+    # window -- that keeps the whole negative machinery bit-for-bit
+    # unchanged. Positive-only for the same reason HIGH-1 was: degraded
+    # evidence must never rescue a losing bot from being switched off.
+    spent_bets = w2 if trigger_window == "2w_fallback" else w1
+    max_internal_gap_h, trailing_gap_h = window_gap_profile(
+        spent_bets, time.time())
+    gap_bound_h = FIRE_STALE_MAX_AGE_S / 3600.0
+    _gaps = [g for g in (max_internal_gap_h, trailing_gap_h) if g is not None]
+    max_window_gap_h = max(_gaps) if _gaps else None
+    evidence_gap_ok = (max_window_gap_h is None
+                       or max_window_gap_h <= gap_bound_h)
+    positive_evidence_ok = positive_evidence_ok and evidence_gap_ok
+    if not evidence_gap_ok and fire_fresh:
+        print(f"!!! evidence GAP in the spent {trigger_window} window: "
+              f"largest drought {max_window_gap_h:.1f}h > {gap_bound_h:.0f}h "
+              "— positive actions blocked", flush=True)
+
     latest100 = bets[-100:]
     wr100 = float(np.mean([b["win"] for b in latest100])) if len(latest100) >= 50 else None
 
@@ -881,12 +942,20 @@ def _main() -> int:
                   f"n={pos_stats.get('n')}>={POS_MIN_FIRES}, "
                   f"btPnL={pos_bt.get('net_pnl_bnb')}>0")
         if not positive_evidence_ok:
-            action = ("enable_BLOCKED_stale_evidence" if not evidence_ok
-                      else "enable_BLOCKED_frozen_window")
-            reason += (" — sync failed or data stale; refusing to enable"
-                       if not evidence_ok else
-                       f" — newest fire {fire_age_h:.1f}h old: this window is "
-                       "FROZEN evidence, not this week's; refusing to enable")
+            if not evidence_ok:
+                action = "enable_BLOCKED_stale_evidence"
+                reason += " — sync failed or data stale; refusing to enable"
+            elif not fire_fresh:
+                action = "enable_BLOCKED_frozen_window"
+                reason += (f" — newest fire {fire_age_h:.1f}h old: this window "
+                           "is FROZEN evidence, not this week's; refusing to "
+                           "enable")
+            else:
+                action = "enable_BLOCKED_evidence_gap"
+                reason += (f" — {max_window_gap_h:.1f}h drought inside the "
+                           f"spent {trigger_window} window (> {gap_bound_h:.0f}h): "
+                           "the fires are recent but not CONTINUOUS; refusing "
+                           "to enable")
         elif args.apply:
             action = "enable"
             # One-shot re-enable (2026-07-17): if the bot went down mid-
@@ -921,12 +990,20 @@ def _main() -> int:
         # (ignores extend-while-bleeding by design).
         reason = f"POSITIVE ({trigger_window}) while breaker-suspended -> override flag"
         if not positive_evidence_ok:
-            action = ("cooldown_override_BLOCKED_stale_evidence" if not evidence_ok
-                      else "cooldown_override_BLOCKED_frozen_window")
-            reason += (" — sync failed or data stale; refusing to release"
-                       if not evidence_ok else
-                       f" — newest fire {fire_age_h:.1f}h old: this window is "
-                       "FROZEN evidence, not this week's; refusing to release")
+            if not evidence_ok:
+                action = "cooldown_override_BLOCKED_stale_evidence"
+                reason += " — sync failed or data stale; refusing to release"
+            elif not fire_fresh:
+                action = "cooldown_override_BLOCKED_frozen_window"
+                reason += (f" — newest fire {fire_age_h:.1f}h old: this window "
+                           "is FROZEN evidence, not this week's; refusing to "
+                           "release")
+            else:
+                action = "cooldown_override_BLOCKED_evidence_gap"
+                reason += (f" — {max_window_gap_h:.1f}h drought inside the "
+                           f"spent {trigger_window} window (> {gap_bound_h:.0f}h): "
+                           "the fires are recent but not CONTINUOUS; refusing "
+                           "to release")
         elif args.apply:
             action = "cooldown_override"
             flag = write_override_flag(week=week, reason=reason,
@@ -969,6 +1046,10 @@ def _main() -> int:
         data_fresh=data_fresh, fire_fresh=fire_fresh,
         newest_fire_age_h=round(fire_age_h, 1),
         fire_stale_max_age_h=FIRE_STALE_MAX_AGE_S // 3600,
+        max_internal_gap_h=(round(max_internal_gap_h, 1)
+                            if max_internal_gap_h is not None else None),
+        gap_bound_h=round(gap_bound_h, 1),
+        evidence_gap_ok=evidence_gap_ok,
         fire_gap_p99_h=gap_p99_h,
         sync_fail_streak=streak,
         retry_mode=retry_mode, retry_attempts=attempts_so_far,
@@ -1023,6 +1104,8 @@ def _main() -> int:
         w2_desc = _window_desc("2w(info)", p2, None, comp2)
     body = (f"{_window_desc('1w', p1, bt, comp1)}; {w2_desc}; "
             f"fire_age={fire_age_h:.1f}h fresh={fire_fresh} "
+            f"max_gap={'-' if max_window_gap_h is None else format(max_window_gap_h, '.1f')}h"
+            f"/{gap_bound_h:.0f}h "
             f"gap_p99={gap_p99_h}h/{FIRE_STALE_MAX_AGE_S // 3600}h; "
             f"neg={neg_trigger} weak={weak_this_week} consec_weak={consec} "
             f"blind_streak={streak}; enabled={state.get('is_enabled')} "
