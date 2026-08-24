@@ -330,18 +330,60 @@ def build_message(
                 "condition clears this question cannot be answered."
             )
             lines.append(
-                "BANKED CONSTANTS (from the 2026-08-21 getLogs split, same "
-                "candidate host): publicnode eth_getLogs 18-block p50 17 / "
-                "p95 35 / p99 41 / max 51ms; 660-block p50 41 / p95 61 / "
-                "p99 103ms; timeout 250ms. The regression that motivated "
-                "that split: bloXroute 2,865ms vs publicnode 11ms on an "
-                "identical 1-block filtered call, per-METHOD not per-host."
+                "BANKED LATENCY (anchor peak-window measurement 2026-08-24, "
+                "13:00-18:00 UTC, n=35, production cadence — 8s idle, warm "
+                "pooled). p50/p90/p99/max ms. bloXroute: head 4/5/15/15, "
+                "header 4/8/30/30, block_ts 6/10/25/25. publicnode: head "
+                "19/29/52/52, header 17/25/32/32, block_ts 18/24/67/67."
             )
             lines.append(
-                "CAVEAT: publicnode HTTP 403s under burst load from ad-hoc "
-                "tooling (observed 2026-08-24). Burst tolerance is not "
-                "sustained tolerance — size any move against steady-rate "
-                "evidence, not a fan-out test."
+                "TIMEOUTS — NO CONSTANT NEEDS TO CHANGE. Derived at 3.5x "
+                "measured p99 (the existing derivation method) vs current: "
+                "_BLX_HEAD_TIMEOUT_MS 250 -> 182, _BLX_HEADER_TIMEOUT_MS "
+                "250 -> 114, _BLX_BLOCK_TS_TIMEOUT_MS 250 -> 236 (tightest "
+                "of the three), ANCHOR_POLL_TIMEOUT_MS 200 -> 114. Every "
+                "derived value sits BELOW the current one, so the move "
+                "needs no increase. KEEP the current values: tightening "
+                "buys nothing and only adds wake_mode=static risk."
+            )
+            lines.append(
+                "ALREADY VERIFIED, do not re-run: fan-out — 8 concurrent "
+                "getBlockByNumber + head + header, 18 iterations (~180 "
+                "requests), wall p50 34 / p90 53 / max 110ms, ZERO failures "
+                "and zero 429s. Header parity — 200/200 byte-identical on "
+                "(hash, timestamp, mixHash, derived milli_ts). Head skew — "
+                "min -1 / p50 0 / max 0; publicnode was NEVER behind "
+                "bloXroute across 35 samples."
+            )
+            lines.append(
+                "CAVEATS — these make it ready to DECIDE, not ready to "
+                "EXECUTE. (1) n=35 is thin for a p99: treat the numbers as "
+                "confirming 250/200 are adequate, NOT as a replacement "
+                "derivation; a real move should re-soak. (2) Both hosts "
+                "were sampled while NEITHER was degraded, so these are "
+                "healthy-state numbers for publicnode too, and the fan-out "
+                "shows BURST tolerance, not multi-day sustained tolerance. "
+                "A permanent move roughly DOUBLES sustained load on an "
+                "endpoint already serving our getLogs — and that host "
+                "returned HTTP 403 to a burst of ad-hoc reads on "
+                "2026-08-24, which is the same caveat from the other side."
+            )
+            lines.append(
+                "DO NOT LEAN ON THE SECOND-ORDER BENEFIT: the static-"
+                "fallback effect on partial-kline rate is only 0.6-1.4pp. "
+                "Settled by natural experiment — a 0% static-wake day moved "
+                "the partial rate 33.3% -> 29.2% only, because that rate is "
+                "dominated by OKX publish latency, which is structural. "
+                "Argue the move on the header path, not on this."
+            )
+            lines.append(
+                "SUPPORTING (separate, earlier measurement of the same "
+                "host — 2026-08-21 getLogs split): publicnode eth_getLogs "
+                "18-block p50 17 / p95 35 / p99 41 / max 51ms; 660-block "
+                "p50 41 / p95 61 / p99 103ms; timeout 250ms. The regression "
+                "that motivated that split: bloXroute 2,865ms vs publicnode "
+                "11ms on an identical 1-block filtered call, per-METHOD not "
+                "per-host."
             )
         elif kind == "ENDPOINT_MOVE_CLEARED":
             # NOT a normal recovery, and the wording must not read like one.
