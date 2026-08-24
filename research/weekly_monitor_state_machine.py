@@ -152,7 +152,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 import research.in_process_runner as ipr  # noqa: E402
-from pancakebot.config import load_strategy_config_from_dict  # noqa: E402
+from pancakebot.config import load_app_config  # noqa: E402
 from pancakebot.constants import BNB_WEI, MAX_GAS_COST_BET_BNB  # noqa: E402
 from pancakebot.pool_amounts import compute_pool_amounts_wei  # noqa: E402
 from pancakebot.strategy.momentum_gate import MomentumGateConfig  # noqa: E402
@@ -176,6 +176,54 @@ SEED = 20260630
 # canonical gate flat-stake bet stream
 # --------------------------------------------------------------------------
 
+# `n` (canonical fire stream) and `backtest.num_bets` sit side by side in
+# each window block and are NOT the same count. Before 2026-08-24 they were
+# not even measuring the same bot: `n` came from code defaults while the
+# backtest read config.toml, so 2026-07-26 recorded n=10 next to
+# num_bets~18 over an IDENTICAL epoch range, with nothing in the artifact
+# saying why. Both now read the deployed config, so they should track
+# closely; what remains is that the backtest simulates every round in the
+# range under its own bankroll and stake caps, while `n` counts fires in a
+# flat-stake risk-free replay. A small residual gap is expected. A LARGE
+# one means they have diverged again -- check strategy_fingerprint first.
+_N_VS_BACKTEST_NOTE = (
+    "n = fires in the canonical flat-stake risk-free stream; "
+    "backtest.num_bets = bets the risk-off backtest placed over the same "
+    "epoch range under real bankroll/stake constraints. Both read the "
+    "deployed config (see strategy_fingerprint); a large gap means they "
+    "have diverged again."
+)
+
+
+def strategy_fingerprint() -> dict:
+    """The deployed knobs this report depends on, recorded in every
+    decision.json so a reader can tell WHICH BOT a week describes.
+
+    ``min_pool_bnb_at_cutoff`` is the one that changes which rounds fire,
+    so it changes n / wr / p_upper. The stake caps do NOT change the
+    canonical stream (it is flat-stake and risk-free) but they do scale
+    every btPnL the risk-off backtest reports, which is the same class of
+    silent drift -- a reader comparing btPnL across a cap change needs to
+    know the cap moved. Recorded together for that reason.
+    """
+    try:
+        s = load_app_config(str(REPO / "config.toml")).strategy
+    except Exception as e:  # noqa: BLE001
+        # DEGRADE, do not crash. This is a reporting field, never a gate:
+        # the weekly run carries a dead-man contract, so raising here would
+        # convert an unreadable config into a missed Sunday. Record the
+        # failure in the artifact instead, where it is visible and does not
+        # cost a run.
+        return dict(error=f"{type(e).__name__}: {e}")
+    return dict(
+        min_pool_bnb_at_cutoff=s.pool_filter.min_pool_bnb_at_cutoff,
+        min_payout_multiple_at_cutoff=s.pool_filter.min_payout_multiple_at_cutoff,
+        max_bet_bnb_btc_primary=s.risk.max_bet_bnb_btc_primary,
+        max_bet_bnb_eth_sol_fallback=s.risk.max_bet_bnb_eth_sol_fallback,
+        max_bet_fraction_of_bankroll=s.risk.max_bet_fraction_of_bankroll,
+    )
+
+
 def build_canonical_bets():
     """Return (bets, newest_round_lock). Freshness must be judged from the
     newest closed ROUND in the store — the newest FIRE can lag days behind
@@ -195,7 +243,44 @@ def build_canonical_bets():
         sliced[sym] = {ep: ipr._slice_per_entry(
             kl, kline_cutoff_seconds=CUTOFF, max_lookback=max_lb,
             earliest_offset=CUTOFF + max_lb + 1) for ep, kl in uni.items()}
-    sc = load_strategy_config_from_dict({})
+    # THE DEPLOYED strategy config, not code defaults. Until 2026-08-24
+    # this read load_strategy_config_from_dict({}), so the canonical fire
+    # stream described a bot with whatever the code defaults happened to
+    # be while a differently-configured bot traded. That went unnoticed
+    # until the pool filter moved 1.5 -> 1.25 and the two diverged by
+    # +29.3% of fires all-history, +51.4% over the last 70 days.
+    #
+    # Why that was sharp rather than cosmetic:
+    #   * The POSITIVE trigger became a conjunction across TWO bots --
+    #     n/wr/p_upper from the default-config stream, bt.net_pnl_bnb from
+    #     a deployed-config backtest over the same declared epochs. No
+    #     single bot's configuration makes that conjunction the right test.
+    #   * The DISABLE path is the exposed one. Replaying window selection
+    #     with the real stream: on 2026-07-26 and 2026-08-23 this stream
+    #     sat at EXACTLY POS_MIN_FIRES (n=10) while the deployed filter
+    #     gave 18 and 11. One fire lower and trigger_window becomes
+    #     "none", which books weak=True, and three consecutive weak weeks
+    #     auto-disable the live unit. The monitor could reach that on
+    #     evidence starvation the bot was not experiencing.
+    #   * The WR bias is small and FLIPS SIGN by regime (+0.0071
+    #     all-time, -0.0174 over 70d), so there is no direction to
+    #     correct for -- only an unknown.
+    #
+    # Chosen over freezing the stream at a pinned config. A frozen stream
+    # is comparable across history and wrong about the present; a
+    # config-tracking stream that RECORDS its config is right about the
+    # present and still comparable, because the frozen view can be
+    # re-derived from the append-only store while the live view cannot be
+    # re-derived from an artifact that never recorded which bot it
+    # described. Freezing discards information that recording keeps --
+    # hence strategy_fingerprint() below, written to every decision.json.
+    #
+    # COST, stated because it is real: n, WR and p_upper are now
+    # DISCONTINUOUS at any config change, so consecutive_weak and the
+    # permutation p-values are not comparable across that boundary. Treat
+    # a change in the fingerprint as an explicit epoch boundary when
+    # reading artifact history.
+    sc = load_app_config(str(REPO / "config.toml")).strategy
     gate_cfg = MomentumGateConfig(
         enabled=True, bnb_symbol="BNB-USDT", btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT", sol_symbol="SOL-USDT", kline_cutoff_seconds=CUTOFF,
@@ -1157,9 +1242,15 @@ def _main() -> int:
             "%Y-%m-%d %H:%M", time.gmtime(newest_round_lock)),
         newest_fire_lock=time.strftime("%Y-%m-%d %H:%M", time.gmtime(max_lock)),
         window_1w=dict(epochs=list(e1), **p1, backtest=bt,
-                       fire_composition=comp1),
+                       fire_composition=comp1,
+                       n_vs_backtest=_N_VS_BACKTEST_NOTE),
         window_2w=dict(epochs=list(e2), **p2, backtest=bt2,
-                       fire_composition=comp2), latest100_wr=wr100,
+                       fire_composition=comp2,
+                       n_vs_backtest=_N_VS_BACKTEST_NOTE), latest100_wr=wr100,
+        # WHICH BOT this week describes. A change here makes n / wr /
+        # p_upper / btPnL discontinuous against previous weeks -- treat it
+        # as an epoch boundary rather than a trend.
+        strategy_fingerprint=strategy_fingerprint(),
         triggers=dict(positive=pos_trigger, trigger_window=trigger_window,
                       negative=neg_trigger,
                       neg_wr_leg=neg_wr_leg, weak_this_week=weak_this_week,
