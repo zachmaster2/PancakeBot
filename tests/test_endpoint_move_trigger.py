@@ -1,21 +1,19 @@
 """ENDPOINT_MOVE_TRIGGER: one alarm, two independent detectors.
 
-SCOPE OF THESE TESTS, stated because the distinction matters. They drive
-the DETECTOR against synthetic sequences at stated hit-rates: given a
-sustained share of X, does the window cross the bar. They do NOT validate
-the THRESHOLDS against the real Aug 20-24 series — that rests on an
-offline sweep which is not in this repo, so "0 of 158 windows" and "fires
-on Aug 20" are not falsifiable here.
+The thresholds are validated against the REAL per-round series, checked
+into tests/data/static_wake_series_2026_08.csv (1.5 KB) and extracted
+from var/live/cycle_audit.csv on the VM — one bit per round, in epoch
+order, for 2026-08-20..24. Replaying it through the real RateWindow
+reproduces the design claim exactly: fires on 20/21/22/23, silent on 24,
+with a peak benign rate of 0.056 against the 0.15 bar.
 
-That distinction is not pedantry: this repo shipped a replay table on
-2026-08-22 whose n and trailing-gap columns claimed to be measured from
-the canonical stream and turned out not to reproduce. Treat any
-day-level claim below as a label on the fixture, not as evidence.
-
-The daily shares are recorded as the SOURCE of the chosen bar (0.15 sits
-between the benign 0.056 and the degraded 0.161-0.212), which the tests
-do check. Whether a real day's per-round sequence crosses it is a
-different question and needs the real series.
+That series was checked in specifically because the earlier version of
+this file validated the thresholds against SYNTHETIC evenly-spread
+sequences, which made "0 of 158 windows" and "fires on Aug 20"
+unfalsifiable here — and this repo shipped a replay table on 2026-08-22
+whose columns claimed to be measured and did not reproduce. Synthetic
+sequences are still used below for the detector's MECHANISM (hysteresis,
+warm-up, the OR); day-level claims now use the real data.
 """
 from __future__ import annotations
 
@@ -30,15 +28,23 @@ from pancakebot.runtime.pool_gate_alarm import (
     KIND_ENDPOINT_MOVE_TRIGGERED,
 )
 
-# Real daily static-wake shares, 2026-08-20..24. These are DAILY
-# AVERAGES from the offline sweep; the per-round series they came from is
-# not in the repo, so tests below feed them as sustained rates.
+# Daily static-wake shares MEASURED from the checked-in series (counts /
+# rounds), not relayed. Two differ slightly from the figures in the
+# design brief and one differs in kind:
+#   08-21  0.216 measured vs 0.212 reported
+#   08-22  0.209 measured vs 0.198 reported
+#   08-24  0.000 measured vs 0.056 reported -- NOT a discrepancy: 0.056
+#          is the peak ROLLING-WINDOW rate early on 08-24, carried in
+#          from 08-23's tail by a 72-round window. Aug 24 itself had ZERO
+#          static wakes, which is also the "0% static-wake day" natural
+#          experiment that settled the second-order benefit question.
+# 08-20 and 08-23 reproduce exactly.
 DAILY_STATIC_SHARE = {
-    "2026-08-20": 0.074,
-    "2026-08-21": 0.212,
-    "2026-08-22": 0.198,
-    "2026-08-23": 0.161,
-    "2026-08-24": 0.056,
+    "2026-08-20": 21 / 282,
+    "2026-08-21": 61 / 282,
+    "2026-08-22": 59 / 282,
+    "2026-08-23": 45 / 279,
+    "2026-08-24": 0 / 187,
 }
 
 
@@ -98,7 +104,95 @@ def setup_function():
     engine._reset_pool_gate_alarm()
 
 
-# ---- Trigger A, against the real series ---------------------------------
+SERIES_PATH = Path(__file__).parent / "data" / "static_wake_series_2026_08.csv"
+
+
+def _real_series():
+    """[(day, start_epoch, n, bitmap)] in epoch order. 1 = wake_mode was
+    static that round."""
+    out = []
+    for line in SERIES_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        day, ep, n, bitmap = line.split(",")
+        out.append((day, int(ep), int(n), bitmap))
+    return out
+
+
+def _replay_real_series():
+    """Drive the REAL RateWindow over the real rounds, continuously across
+    day boundaries (a 72-round window early on one day still contains the
+    previous day's tail — which is exactly why Aug 24 peaks at 0.056
+    despite having zero static wakes of its own).
+
+    Returns {day: (fired, peak_rate)}.
+    """
+    from pancakebot.runtime.pool_gate_alarm import RateWindow
+    w = RateWindow(
+        enter_rate=engine._ENDPOINT_STATIC_ENTER,
+        exit_rate=engine._ENDPOINT_STATIC_EXIT,
+        window=engine._ENDPOINT_WINDOW_ROUNDS,
+        min_samples=engine._ENDPOINT_MIN_SAMPLES,
+    )
+    result = {}
+    for day, _ep, _n, bitmap in _real_series():
+        fired, peak = False, 0.0
+        for ch in bitmap:
+            over = w.observe(ch == "1")
+            peak = max(peak, w.rate)
+            if over:
+                fired = True
+        result[day] = (fired, peak)
+    return result
+
+
+# ---- Trigger A, REPLAYED ON REAL DATA -----------------------------------
+
+def test_the_real_series_is_intact_and_matches_the_recorded_shares():
+    """Fixture integrity. If the file is truncated or reordered the
+    replay below would silently test something else."""
+    series = _real_series()
+    assert [d for d, _, _, _ in series] == [
+        "2026-08-20", "2026-08-21", "2026-08-22", "2026-08-23", "2026-08-24"]
+    assert sum(n for _, _, n, _ in series) == 1312
+    for day, _ep, n, bitmap in series:
+        assert len(bitmap) == n, day
+        assert set(bitmap) <= {"0", "1"}, day
+        share = bitmap.count("1") / n
+        assert abs(share - DAILY_STATIC_SHARE[day]) < 0.002, (day, share)
+
+
+def test_the_real_series_reproduces_the_design_claim():
+    """THE validation: fires on the four degraded days, silent on the
+    benign one, driven by the real per-round sequence rather than a
+    synthetic rate."""
+    r = _replay_real_series()
+    assert [d for d in r if r[d][0]] == [
+        "2026-08-20", "2026-08-21", "2026-08-22", "2026-08-23"]
+    assert r["2026-08-24"][0] is False
+
+
+def test_the_benign_day_peaks_at_the_reported_margin():
+    """0.056 against a 0.15 bar — a 2.7x margin, and the same figure the
+    offline sweep reported, arrived at independently here."""
+    peak = _replay_real_series()["2026-08-24"][1]
+    assert peak == pytest.approx(0.056, abs=0.001)
+    assert engine._ENDPOINT_STATIC_ENTER / peak > 2.5
+
+
+def test_day_one_fires_even_though_its_daily_average_is_under_the_bar():
+    """Real day-one detection, previously only demonstrable
+    synthetically. Aug 20's DAILY share is 0.074 — under the 0.15 bar —
+    yet the rolling window fires on it, because the burst is intra-day.
+    Detecting on day one instead of day four is the whole point."""
+    assert DAILY_STATIC_SHARE["2026-08-20"] < engine._ENDPOINT_STATIC_ENTER
+    fired, peak = _replay_real_series()["2026-08-20"]
+    assert fired is True
+    assert peak > engine._ENDPOINT_STATIC_ENTER
+
+
+# ---- Trigger A, synthetic (mechanism only) ------------------------------
 
 @pytest.mark.parametrize("day", ["2026-08-21", "2026-08-22", "2026-08-23"])
 def test_a_sustained_degraded_day_share_crosses_the_bar(day):
@@ -112,11 +206,11 @@ def test_a_sustained_degraded_day_share_crosses_the_bar(day):
     assert _triggered(events), f"{day} (share {share}) must trigger"
 
 
-def test_a_sustained_benign_day_share_does_not_cross_the_bar():
-    """SYNTHETIC, same caveat: Aug 24's 0.056 fed as a sustained rate stays
-    under the 0.15 bar with a 2.7x margin. The offline sweep's stronger
-    claim — 0 of 158 real windows — is NOT checked here."""
-    events = _feed(_cfg(), statics=_pattern(DAILY_STATIC_SHARE["2026-08-24"]))
+def test_a_sustained_benign_rate_does_not_cross_the_bar():
+    """SYNTHETIC mechanism check at the peak benign rate the real replay
+    produces (0.056). The real-data version of this claim is
+    test_the_benign_day_peaks_at_the_reported_margin."""
+    events = _feed(_cfg(), statics=_pattern(0.056))
     assert not _triggered(events)
 
 
