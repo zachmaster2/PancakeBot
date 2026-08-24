@@ -28,6 +28,31 @@ recomputes the week's booking from the baseline and overwrites it
 counter: `consecutive_weak` and `evidence_gap_streak` both go through the
 same booking guard.
 
+### Config changes and Sunday runs are now coupled
+
+Since 2026-08-24 the canonical fire stream reads the DEPLOYED config, so
+changing a strategy knob in `config.toml` changes `n`, `WR` and `p_upper`
+— they are not comparable across that boundary. The monitor records a
+`strategy_fingerprint` in `decision.json`, in `state.json` and on each
+`history` entry, and raises a **CONFIG CHANGED** banner on the first
+Sunday whose fingerprint differs from the previous one, naming the keys
+that moved.
+
+Practical consequences after any config change:
+
+* The **next Sunday's report is an epoch boundary, not a trend.** Read
+  `n`/`WR`/`p_upper` against that week onward, not against the weeks
+  before it.
+* `consecutive_weak` is deliberately **NOT** reset by a config change.
+  Resetting would delay the protective disable. The bound is small: one
+  config change can contribute at most one spurious weak week, and three
+  are needed to disable.
+* If the fingerprint is ever absent (a fresh `state.json`), the
+  comparison is a no-op and no banner fires. `scripts/seed_monitor_
+  fingerprint.py` exists because of exactly that gap on 2026-08-30; if it
+  recurs, backfill from the run's own `risk_off_config.toml` copy rather
+  than from memory.
+
 ### Evidence gates — two ways an enable is silently withheld
 
 Both gate the POSITIVE path only; neither can block a disable, and both
