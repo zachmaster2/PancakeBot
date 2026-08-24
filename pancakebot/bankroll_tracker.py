@@ -35,14 +35,35 @@ class _Entry:
     start_at: int
     bankroll: float
     event: str   # "init" | "settlement"
+    # BNB staked on positions that were still OPEN when this sample was
+    # taken. `bankroll` stays the RAW wallet balance so that
+    # bankroll_history.jsonl continues to reconcile against the chain --
+    # this is the extra column that makes the sample's SETTLED-equivalent
+    # value (bankroll + open_stake) recomputable after the fact.
+    #
+    # Why it is worth recording: `peak_bankroll` is a max over raw samples
+    # while the breaker now compares a settled-equivalent current, so the
+    # two sides sit on different bases. The residual understatement is
+    # C*s/(P*(P+s)) -- about 2.0pp with one 0.05 stake in flight and 4pp
+    # with two. It can only DELAY a trip, never manufacture one, and is
+    # near zero in practice because a stake-depressed sample is
+    # structurally unlikely to BE the max. Recording the stake makes every
+    # peak within one rolling window computable on the settled basis
+    # instead of merely bounded.
+    open_stake: float = 0.0
 
 
 class BankrollTracker(ABC):
     """Abstract tracker. Concrete classes: InMemoryBankrollTracker, PersistedBankrollTracker."""
 
     @abstractmethod
-    def record_settlement(self, bankroll: float, start_at: int) -> None:
+    def record_settlement(self, bankroll: float, start_at: int,
+                          open_stake: float = 0.0) -> None:
         """Record a bankroll snapshot tied to a round's ``start_at``.
+
+        ``bankroll`` is the RAW balance; ``open_stake`` is what was in
+        flight at that moment, recorded alongside rather than folded in so
+        the persisted series still reconciles against the chain.
 
         If the new value equals the last recorded value, this is a no-op (dedup).
         """
@@ -146,7 +167,8 @@ class InMemoryBankrollTracker(BankrollTracker):
         # ever ratchets up. Used by ``peak_mode == "absolute_ratchet"``.
         self._absolute_peak = float(initial_bankroll)
 
-    def record_settlement(self, bankroll: float, start_at: int) -> None:
+    def record_settlement(self, bankroll: float, start_at: int,
+                          open_stake: float = 0.0) -> None:
         if not self._seeded:
             self._entries.append(_Entry(
                 start_at=int(start_at), bankroll=float(self._initial), event="init",
@@ -161,6 +183,7 @@ class InMemoryBankrollTracker(BankrollTracker):
             return
         self._entries.append(_Entry(
             start_at=int(start_at), bankroll=float(bankroll), event="settlement",
+            open_stake=float(open_stake),
         ))
         self._prune()
 
@@ -291,6 +314,10 @@ class PersistedBankrollTracker(InMemoryBankrollTracker):
                         start_at=int(obj["start_at"]),
                         bankroll=float(obj["bankroll"]),
                         event=str(obj.get("event", "settlement")),
+                        # Absent on every sample written before this column
+                        # existed, and on samples with nothing in flight;
+                        # 0.0 is correct for both.
+                        open_stake=float(obj.get("open_stake", 0.0) or 0.0),
                     )
                     if entry.event == "peak_reseed":
                         # Reseed barrier (suspension release): history before
@@ -320,11 +347,17 @@ class PersistedBankrollTracker(InMemoryBankrollTracker):
                 ) from e
 
     def _append_history(self, entry: _Entry) -> None:
-        line = json.dumps({
+        doc = {
             "start_at": entry.start_at,
             "bankroll": entry.bankroll,
             "event": entry.event,
-        }, separators=(",", ":"))
+        }
+        # Emitted only when non-zero: the overwhelming majority of samples
+        # have nothing in flight, and an always-present 0.0 would churn
+        # every line of a 5,900-entry history for no information.
+        if entry.open_stake:
+            doc["open_stake"] = entry.open_stake
+        line = json.dumps(doc, separators=(",", ":"))
         with self._history_path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
 
@@ -340,9 +373,10 @@ class PersistedBankrollTracker(InMemoryBankrollTracker):
 
     # Override mutating methods to persist changes.
 
-    def record_settlement(self, bankroll: float, start_at: int) -> None:
+    def record_settlement(self, bankroll: float, start_at: int,
+                          open_stake: float = 0.0) -> None:
         prev_len = len(self._entries)
-        super().record_settlement(bankroll, start_at)
+        super().record_settlement(bankroll, start_at, open_stake)
         if len(self._entries) > prev_len:
             # Append only the newest entry.
             self._append_history(self._entries[-1])
