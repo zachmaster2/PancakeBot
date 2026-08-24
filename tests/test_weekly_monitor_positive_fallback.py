@@ -43,6 +43,17 @@ BT_NEG = dict(net_pnl_bnb=-0.11, num_bets=19, win_rate=0.5263,
 
 # ---- window selection -----------------------------------------------------
 
+def _seed_config(repo):
+    """The monitor reads REPO/config.toml for the DEPLOYED strategy
+    (MED-A1). Give each temp repo the real one so e2e runs exercise the
+    normal path; a fixture that writes its own config keeps it."""
+    repo.mkdir(parents=True, exist_ok=True)
+    cfg = repo / "config.toml"
+    if not cfg.exists():
+        cfg.write_text((REPO / "config.toml").read_text(encoding="utf-8"),
+                       encoding="utf-8")
+
+
 def test_sufficient_1w_spends_1w_even_when_2w_is_strong():
     assert wm.positive_window(GOOD_1W, GOOD_2W) == "1w"
     assert wm.positive_window(WEAK_1W, GOOD_2W) == "1w"
@@ -239,6 +250,7 @@ def test_backtest_summary_window_mismatch_is_error(tmp_path, monkeypatch):
         "min_bankroll_bnb_to_bet = 0.5\ncooldown_rounds = 3\n",
         encoding="utf-8")
     monkeypatch.setattr(wm, "REPO", repo)
+    _seed_config(repo)
     monkeypatch.setattr(wm, "subprocess", types.SimpleNamespace(
         run=lambda *a, **k: types.SimpleNamespace(returncode=0, stderr=""),
         TimeoutExpired=Exception))
@@ -279,6 +291,7 @@ def test_fallback_enable_path_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
     monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
     monkeypatch.setattr(wm, "REPO", repo)
+    _seed_config(repo)
 
     now = time.time()
     newest_fire = int(now - 3600)
@@ -402,6 +415,7 @@ def test_frozen_window_blocks_enable_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
     monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
     monkeypatch.setattr(wm, "REPO", repo)
+    _seed_config(repo)
 
     now = time.time()
     frozen_fire = int(now - 9 * 86400)          # fires stopped 9 days ago
@@ -509,6 +523,7 @@ def test_mixed_window_composition_reaches_decision_and_discord(tmp_path, monkeyp
     monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
     monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
     monkeypatch.setattr(wm, "REPO", repo)
+    _seed_config(repo)
 
     now = time.time()
     pre = int(now - 9 * 86400)
@@ -724,6 +739,7 @@ def test_mixed_window_composition_reaches_decision_and_discord(tmp_path, monkeyp
     monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
     monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
     monkeypatch.setattr(wm, "REPO", repo)
+    _seed_config(repo)
 
     now = time.time()
     pre = int(now - 9 * 86400)
@@ -832,6 +848,7 @@ def test_evidence_gap_blocks_enable_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
     monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
     monkeypatch.setattr(wm, "REPO", repo)
+    _seed_config(repo)
 
     now = time.time()
     # 6 fires in the last 20h, a 100h hole, then 6 more -- all inside 7 days
@@ -892,6 +909,7 @@ def test_evidence_gap_block_is_never_a_silent_no_op(tmp_path, monkeypatch):
     monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
     monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
     monkeypatch.setattr(wm, "REPO", repo)
+    _seed_config(repo)
 
     now = time.time()
     ages_h = [1, 4, 8, 12, 16, 20] + [120, 128, 136, 144, 152, 160]
@@ -969,3 +987,118 @@ def test_unmeasurable_window_fails_closed():
     max_window_gap_h = max(gaps) if gaps else None
     assert (max_window_gap_h is not None
             and max_window_gap_h <= wm.FIRE_STALE_MAX_AGE_S / 3600.0) is False
+
+
+def test_unreadable_config_does_not_stop_a_protective_disable(
+        tmp_path, monkeypatch):
+    """MED-A1, the safety regression. An unreadable config.toml must NOT
+    cost the disable: degraded evidence may never ENABLE, but it must
+    never block the path that stops a losing bot. The first version of the
+    config-tracking change raised here instead — rc=1, no decision.json,
+    no systemd action, bot still trading."""
+    root = tmp_path / "weekly_monitors"
+    repo = tmp_path / "repo"
+    (repo / "var" / "live").mkdir(parents=True)
+    (repo / "config.toml").write_text("this is not valid toml {{{",
+                                      encoding="utf-8")
+    root.mkdir(parents=True)
+    (root / "state.json").write_text(json.dumps(dict(
+        consecutive_weak=0, last_week=None, last_action=None, history=[])),
+        encoding="utf-8")
+    monkeypatch.setattr(wm, "ROOT", root)
+    monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
+    monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
+    monkeypatch.setattr(wm, "REPO", repo)
+
+    now = time.time()
+    bets = [dict(epoch=100 + i, lock=int(now - (12 - i) * 3600), win=False)
+            for i in range(12)]
+    monkeypatch.setattr(wm, "build_canonical_bets",
+                        lambda: (bets, int(now - 1800)))
+    # losing week: WR well under the 0.45 floor -> negative trigger
+    monkeypatch.setattr(wm, "perm", lambda w, n_iter=None, seed=None: (
+        dict(n=len(w), insufficient=True) if len(w) < wm.POS_MIN_FIRES
+        else dict(n=len(w), wr=0.20, obs_mean_pnl=-0.3, null_mean=0.0,
+                  p_upper=0.99)))
+    monkeypatch.setattr(wm, "risk_off_backtest",
+                        lambda *a, **k: dict(net_pnl_bnb=-0.4, num_bets=12,
+                                             win_rate=0.20, gas_per_bet=0.0006))
+    monkeypatch.setattr(wm, "read_bot_state", lambda: dict(
+        available=True, active="active", enabled="enabled",
+        is_running=True, is_enabled=True))
+    disabled = []
+    monkeypatch.setattr(wm, "do_disable",
+                        lambda: (disabled.append(True), (0, "ok"))[1])
+    messages = []
+    monkeypatch.setattr(wm, "discord",
+                        lambda msg: (messages.append(msg), True)[1])
+    monkeypatch.setattr(sys, "argv", [
+        "wm", "--apply", "--no-sync", "--iso-week", "2026-08-23"])
+
+    assert wm._main() == 0
+    assert disabled, "an unreadable config must not block a protective disable"
+    decision = json.loads(
+        (root / "2026-08-23" / "decision.json").read_text(encoding="utf-8"))
+    assert decision["action"] == "disable"
+    assert "error" in decision["strategy_fingerprint"]
+    assert decision["strategy_fingerprint"]["fell_back_to_defaults"] is True
+
+
+def test_a_config_change_is_announced_and_does_not_reset_the_counter(
+        tmp_path, monkeypatch):
+    """MED-A3(b). A fingerprint change makes n/WR/p_upper non-comparable,
+    so it must be announced. It must NOT reset consecutive_weak: that
+    would delay the protective disable, converting a visible discontinuity
+    into a silent weakening of the path that stops a losing bot."""
+    root = tmp_path / "weekly_monitors"
+    repo = tmp_path / "repo"
+    (repo / "var" / "live").mkdir(parents=True)
+    root.mkdir(parents=True)
+    stale_fp = dict(min_pool_bnb_at_cutoff=1.5)     # last week's bot
+    (root / "state.json").write_text(json.dumps(dict(
+        consecutive_weak=1, consecutive_weak_baseline=0,
+        last_week="2026-08-16", last_action="none", history=[],
+        strategy_fingerprint=stale_fp)), encoding="utf-8")
+    monkeypatch.setattr(wm, "ROOT", root)
+    monkeypatch.setattr(wm, "STATE_PATH", root / "state.json")
+    monkeypatch.setattr(wm, "RETRY_MARKER_PATH", root / "retry_pending.json")
+    monkeypatch.setattr(wm, "REPO", repo)
+    _seed_config(repo)
+
+    now = time.time()
+    bets = [dict(epoch=100 + i, lock=int(now - (12 - i) * 3600), win=True)
+            for i in range(12)]
+    monkeypatch.setattr(wm, "build_canonical_bets",
+                        lambda: (bets, int(now - 1800)))
+    # a WEAK week (p_upper > 0.5) so the counter has something to advance
+    monkeypatch.setattr(wm, "perm", lambda w, n_iter=None, seed=None: (
+        dict(n=len(w), insufficient=True) if len(w) < wm.POS_MIN_FIRES
+        else dict(n=len(w), wr=0.50, obs_mean_pnl=0.0, null_mean=0.0,
+                  p_upper=0.80)))
+    monkeypatch.setattr(wm, "risk_off_backtest",
+                        lambda *a, **k: dict(net_pnl_bnb=0.01, num_bets=12,
+                                             win_rate=0.50, gas_per_bet=0.0006))
+    monkeypatch.setattr(wm, "read_bot_state", lambda: dict(
+        available=True, active="inactive", enabled="disabled",
+        is_running=False, is_enabled=False))
+    messages = []
+    monkeypatch.setattr(wm, "discord",
+                        lambda msg: (messages.append(msg), True)[1])
+    monkeypatch.setattr(sys, "argv", [
+        "wm", "--apply", "--no-sync", "--iso-week", "2026-08-23"])
+
+    assert wm._main() == 0
+    decision = json.loads(
+        (root / "2026-08-23" / "decision.json").read_text(encoding="utf-8"))
+    assert decision["config_changed"] is True
+    assert decision["prev_strategy_fingerprint"] == stale_fp
+    assert "CONFIG CHANGED" in messages[0]
+    assert "not reset" in messages[0].lower()
+
+    st = json.loads((root / "state.json").read_text(encoding="utf-8"))
+    # advanced from the prior-week baseline, NOT reset by the config change
+    assert st["consecutive_weak"] == 2   # ADVANCED 1->2, not reset to 0
+    assert st["strategy_fingerprint"] == decision["strategy_fingerprint"]
+    assert st["history"][-1]["config_changed"] is True
+    assert st["history"][-1]["strategy_fingerprint"] == \
+        decision["strategy_fingerprint"]
