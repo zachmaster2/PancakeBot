@@ -276,10 +276,49 @@ def test_the_alert_body_carries_the_discriminator_instruction():
     assert "DISCRIMINATOR" in msg
     assert "eth_getBlockByNumber" in msg
     assert "ONLY WORKS WHILE THIS IS ACTIVE" in msg
-    assert "BANKED CONSTANTS" in msg
-    assert "250ms" in msg                       # decision needs no report
     # both metrics rendered
     assert "static_wake_share" in msg and "header_failure_rate" in msg
+
+
+def test_the_alert_carries_the_banked_constants_and_their_caveats():
+    """The decision must not require finding the report. Measured values,
+    the derived-vs-current verdict, the gates already passed, and the two
+    caveats that separate 'ready to decide' from 'ready to execute'."""
+    from pancakebot.ops.notifications import build_message
+    msg = build_message(mode="live", kind=KIND_ENDPOINT_MOVE_TRIGGERED,
+                        fields={"trigger": "static_wake_share"})
+
+    # measured latency, both hosts
+    assert "BANKED LATENCY" in msg and "n=35" in msg
+    assert "4/5/15/15" in msg and "19/29/52/52" in msg
+
+    # the verdict that actually drives the change
+    assert "NO CONSTANT NEEDS TO CHANGE" in msg
+    for derived in ("182", "114", "236"):
+        assert derived in msg, derived
+    assert "KEEP the current values" in msg
+    assert "wake_mode=static risk" in msg
+
+    # gates already passed
+    assert "zero 429s" in msg
+    assert "200/200 byte-identical" in msg
+    assert "NEVER behind" in msg
+
+    # the two caveats must travel with the numbers
+    assert "ready to DECIDE, not ready to" in msg
+    assert "re-soak" in msg
+    assert "BURST tolerance, not multi-day sustained" in msg
+    assert "DOUBLES sustained load" in msg
+    assert "403" in msg
+
+    # and the thing nobody should argue the move on
+    assert "DO NOT LEAN ON THE SECOND-ORDER BENEFIT" in msg
+    assert "0.6-1.4pp" in msg
+    assert "33.3% -> 29.2%" in msg
+
+    # the earlier getLogs measurement is kept but clearly separated
+    assert "SUPPORTING (separate, earlier measurement" in msg
+    assert "2,865ms" in msg
 
 
 def test_cleared_says_the_window_closed_not_that_things_are_fine():

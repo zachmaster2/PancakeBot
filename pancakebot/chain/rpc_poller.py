@@ -189,6 +189,22 @@ _GETLOGS_FETCH_RTT_P99_MS: int = 250
 # start inside the 950ms single-poll cap (250 + 25 backoff + 250 = 525ms),
 # restoring the in-call retry that the old value silently disabled.
 _GETLOGS_TIMEOUT_MS: int = 250       # > soak max 103ms on the getLogs host
+# NAMING DEBT, flagged not fixed: the _BLX_ prefix becomes a misnomer the
+# moment the read path moves off bloXroute (see ENDPOINT_MOVE_TRIGGER).
+# Rename to _READ_* / _RPC_* AS PART OF a move, not before it -- renaming
+# now churns every call site for no behaviour change and makes the move's
+# own diff harder to read.
+#
+# RE-MEASURED 2026-08-24 (anchor peak window 13:00-18:00 UTC, n=35,
+# production cadence). Derived at 3.5x measured p99 -- the existing
+# derivation method -- every value lands BELOW the current constant:
+#   head      bloXroute p99 15ms / publicnode p99 52ms -> derived 182
+#   header    bloXroute p99 30ms / publicnode p99 32ms -> derived 114
+#   block_ts  bloXroute p99 25ms / publicnode p99 67ms -> derived 236
+# So an endpoint move needs NO constant to increase. Deliberately KEEPING
+# 250: tightening buys nothing and only adds wake_mode=static risk. n=35
+# is thin for a p99, so this CONFIRMS 250 is adequate rather than
+# replacing the original derivation; a real move should re-soak.
 _BLX_HEAD_TIMEOUT_MS: int = 250      # eth_blockNumber, > ~3.6x p99 69ms
 _BLX_HEADER_TIMEOUT_MS: int = 250    # getBlockByNumber(latest), > ~3.5x p99 71ms
 _BLX_BLOCK_TS_TIMEOUT_MS: int = 250  # getBlockByNumber(bn), > ~5.9x p99 42ms
