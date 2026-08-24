@@ -152,7 +152,10 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 import research.in_process_runner as ipr  # noqa: E402
-from pancakebot.config import load_app_config  # noqa: E402
+from pancakebot.config import (  # noqa: E402
+    load_app_config,
+    load_strategy_config_from_dict,
+)
 from pancakebot.constants import BNB_WEI, MAX_GAS_COST_BET_BNB  # noqa: E402
 from pancakebot.pool_amounts import compute_pool_amounts_wei  # noqa: E402
 from pancakebot.strategy.momentum_gate import MomentumGateConfig  # noqa: E402
@@ -162,6 +165,10 @@ ROOT = REPO / "var" / "strategy_review" / "weekly_monitors"
 STATE_PATH = ROOT / "state.json"
 LIVE_UNIT = "pancakebot-live"
 CUTOFF, LOOKBACKS, FEE = 2, (3, 7, 15), 0.03
+# Named so the fingerprint can report them instead of literals buried in
+# the pipeline construction below (MED-A2).
+POOL_CUTOFF = 6
+MIN_BET_AMOUNT_BNB = 0.001
 BREAKEVEN_WR = 0.55
 POS_RAW_P = 0.10           # raw permutation p_upper, single test (user decision)
 POS_MIN_FIRES = 10         # per-WINDOW information floor; 1w starved -> positive falls back to 2w
@@ -195,6 +202,36 @@ _N_VS_BACKTEST_NOTE = (
 )
 
 
+def deployed_strategy():
+    """``(strategy_config, error_or_None)`` — the DEPLOYED config, falling
+    back to CODE DEFAULTS if config.toml cannot be read.
+
+    MED-A1, a safety regression introduced by the first version of this
+    change and caught in review. Reading the deployed config made the
+    monitor describe the right bot, but doing it UNGUARDED made an
+    unreadable config.toml raise inside build_canonical_bets: rc=1, no
+    decision.json, no systemd action, no protective disable — with the bot
+    enabled and trading. Before that change an unreadable config was
+    invisible here (this ran on defaults), so capital protection was
+    intact. The commit therefore converted "unreadable config -> evaluates
+    on defaults, protection intact" into "unreadable config -> crashes,
+    takes no action, bot keeps trading". config.toml is HAND-EDITED for
+    exactly the threshold changes this function exists to track, so an
+    invalid one is a plausible Sunday, not a hypothetical.
+
+    The fix follows the asymmetry the rest of this file is built on:
+    degraded evidence may never ENABLE, but must never stop a DISABLE.
+    Falling back to defaults keeps the negative path running on the same
+    stream it always had; the returned error blocks every positive action
+    and raises a loud banner.
+    """
+    try:
+        return load_app_config(str(REPO / "config.toml")).strategy, None
+    except Exception as e:  # noqa: BLE001
+        return (load_strategy_config_from_dict({}),
+                f"{type(e).__name__}: {e}")
+
+
 def strategy_fingerprint() -> dict:
     """The deployed knobs this report depends on, recorded in every
     decision.json so a reader can tell WHICH BOT a week describes.
@@ -206,21 +243,39 @@ def strategy_fingerprint() -> dict:
     silent drift -- a reader comparing btPnL across a cap change needs to
     know the cap moved. Recorded together for that reason.
     """
-    try:
-        s = load_app_config(str(REPO / "config.toml")).strategy
-    except Exception as e:  # noqa: BLE001
-        # DEGRADE, do not crash. This is a reporting field, never a gate:
-        # the weekly run carries a dead-man contract, so raising here would
-        # convert an unreadable config into a missed Sunday. Record the
-        # failure in the artifact instead, where it is visible and does not
-        # cost a run.
-        return dict(error=f"{type(e).__name__}: {e}")
+    s, err = deployed_strategy()
+    if err is not None:
+        # DEGRADE, do not crash: a reporting field must never cost a
+        # Sunday against the dead-man contract. deployed_strategy() has
+        # already fallen back to code defaults, so record BOTH the error
+        # and the fact that the numbers in this report describe the
+        # default-config bot rather than the deployed one.
+        return dict(error=err, fell_back_to_defaults=True)
     return dict(
         min_pool_bnb_at_cutoff=s.pool_filter.min_pool_bnb_at_cutoff,
         min_payout_multiple_at_cutoff=s.pool_filter.min_payout_multiple_at_cutoff,
         max_bet_bnb_btc_primary=s.risk.max_bet_bnb_btc_primary,
         max_bet_bnb_eth_sol_fallback=s.risk.max_bet_bnb_eth_sol_fallback,
         max_bet_fraction_of_bankroll=s.risk.max_bet_fraction_of_bankroll,
+        # MED-A2. These are not read from config by build_canonical_bets --
+        # they are hardcoded module constants HERE -- which is exactly why
+        # they belong in the fingerprint: a drift between them and the
+        # deployed gate is invisible otherwise. The sharpest is
+        # mtf_lookbacks: the gate is handed the DEPLOYED value while the
+        # kline slice is cut with max(LOOKBACKS) from this module, so
+        # raising the deployed lookbacks past this constant silently
+        # starves the gate of history instead of failing.
+        kline_cutoff_seconds=CUTOFF,
+        mtf_lookbacks_used_for_slicing=list(LOOKBACKS),
+        mtf_lookbacks_deployed=list(s.gate.mtf_lookbacks),
+        pool_cutoff_seconds=POOL_CUTOFF,
+        treasury_fee_fraction=FEE,
+        # The stake caps do not change WHICH rounds fire, but that
+        # inertness is CONTINGENT, not structural: it holds because
+        # min_bet_threshold_bnb (0.01) >= min_bet_amount_bnb (0.001), so a
+        # capped stake still clears the contract minimum. Drop the caps
+        # below the contract minimum and they would start removing fires.
+        min_bet_threshold_bnb=s.tier2_sizing.min_bet_threshold_bnb,
     )
 
 
@@ -280,7 +335,7 @@ def build_canonical_bets():
     # permutation p-values are not comparable across that boundary. Treat
     # a change in the fingerprint as an explicit epoch boundary when
     # reading artifact history.
-    sc = load_app_config(str(REPO / "config.toml")).strategy
+    sc, _cfg_err = deployed_strategy()
     gate_cfg = MomentumGateConfig(
         enabled=True, bnb_symbol="BNB-USDT", btc_symbol="BTC-USDT",
         eth_symbol="ETH-USDT", sol_symbol="SOL-USDT", kline_cutoff_seconds=CUTOFF,
@@ -288,7 +343,8 @@ def build_canonical_bets():
         mtf_min_return_threshold=sc.gate.mtf_min_return_threshold)
     pipe = MomentumOnlyPipeline(
         config=gate_cfg, strategy_config=sc, gate=None, kline_cutoff_seconds=CUTOFF,
-        pool_cutoff_seconds=6, min_bet_amount_bnb=0.001, treasury_fee_fraction=FEE,
+        pool_cutoff_seconds=POOL_CUTOFF, min_bet_amount_bnb=MIN_BET_AMOUNT_BNB,
+        treasury_fee_fraction=FEE,
         bankroll_tracker=None)
     pipe.refresh_btc_klines(btc_klines_by_epoch=sliced["btc"])
     pipe.refresh_eth_klines(eth_klines_by_epoch=sliced["eth"])
@@ -1044,7 +1100,16 @@ def _main() -> int:
     # the case it cannot see.
     evidence_gap_ok = (max_window_gap_h is not None
                        and max_window_gap_h <= gap_bound_h)
-    positive_evidence_ok = positive_evidence_base and evidence_gap_ok
+    # MED-A1: an unreadable config means the stream fell back to code
+    # defaults, so it no longer describes the deployed bot. That is
+    # degraded evidence: it may not ENABLE. It deliberately does NOT gate
+    # the negative path below -- a protective disable on default-config
+    # evidence is the same disable this monitor made for months, and
+    # withholding it would be the unsafe direction.
+    _, config_error = deployed_strategy()
+    config_ok = config_error is None
+    positive_evidence_ok = (positive_evidence_base and evidence_gap_ok
+                            and config_ok)
     if not evidence_gap_ok and fire_fresh:
         print(f"!!! evidence GAP in the spent {trigger_window} window: "
               f"largest drought {max_window_gap_h:.1f}h > {gap_bound_h:.0f}h "
@@ -1139,7 +1204,12 @@ def _main() -> int:
             # -> gap, weakest precondition first.
             assert not (evidence_gap_ok and not fire_fresh), (
                 "gap rule must imply freshness; precedence below relies on it")
-            if not evidence_ok:
+            if not config_ok:
+                action = "enable_BLOCKED_config_unreadable"
+                reason += (f" — config.toml unreadable ({config_error}); the "
+                           "fire stream fell back to CODE DEFAULTS and does "
+                           "not describe the deployed bot; refusing to enable")
+            elif not evidence_ok:
                 action = "enable_BLOCKED_stale_evidence"
                 reason += " — sync failed or data stale; refusing to enable"
             elif not fire_fresh:
@@ -1187,7 +1257,12 @@ def _main() -> int:
         # (ignores extend-while-bleeding by design).
         reason = f"POSITIVE ({trigger_window}) while breaker-suspended -> override flag"
         if not positive_evidence_ok:
-            if not evidence_ok:
+            if not config_ok:
+                action = "cooldown_override_BLOCKED_config_unreadable"
+                reason += (f" — config.toml unreadable ({config_error}); the "
+                           "fire stream fell back to CODE DEFAULTS and does "
+                           "not describe the deployed bot; refusing to release")
+            elif not evidence_ok:
                 action = "cooldown_override_BLOCKED_stale_evidence"
                 reason += " — sync failed or data stale; refusing to release"
             elif not fire_fresh:
@@ -1231,6 +1306,24 @@ def _main() -> int:
     # Booked through the SAME overwrite guard as consecutive_weak: an
     # applied same-week re-run recomputes from the persisted baseline
     # instead of advancing again.
+    # MED-A3(b). The fingerprint was written to decision.json and NOWHERE
+    # ELSE: not state.json, not the history entry, never compared week over
+    # week. So consecutive_weak advanced across a config discontinuity
+    # blind, mitigated only by a source comment asking a human to notice --
+    # the same shape as the defect this whole change exists to fix.
+    #
+    # RECORD AND ALERT, DO NOT AUTO-RESET. Resetting consecutive_weak on a
+    # config change would be WORSE than the status quo: it would delay the
+    # protective disable, turning a visible discontinuity into a silent
+    # weakening of the path that stops a losing bot. The bound on the harm
+    # of not resetting is small and worth stating -- one config change can
+    # contribute at most ONE spurious weak week, and three are needed to
+    # disable.
+    fingerprint = strategy_fingerprint()
+    prev_fingerprint = st.get("strategy_fingerprint")
+    config_changed = (prev_fingerprint is not None
+                      and prev_fingerprint != fingerprint)
+
     _gap_blocked = action.endswith("_BLOCKED_evidence_gap")
     gap_baseline, evidence_gap_streak = book_streak(
         st, "evidence_gap_streak", same_week_rerun=same_week_rerun,
@@ -1250,7 +1343,9 @@ def _main() -> int:
         # WHICH BOT this week describes. A change here makes n / wr /
         # p_upper / btPnL discontinuous against previous weeks -- treat it
         # as an epoch boundary rather than a trend.
-        strategy_fingerprint=strategy_fingerprint(),
+        strategy_fingerprint=fingerprint,
+        prev_strategy_fingerprint=prev_fingerprint,
+        config_changed=config_changed,
         triggers=dict(positive=pos_trigger, trigger_window=trigger_window,
                       negative=neg_trigger,
                       neg_wr_leg=neg_wr_leg, weak_this_week=weak_this_week,
@@ -1291,10 +1386,16 @@ def _main() -> int:
         st["evidence_gap_streak_baseline"] = gap_baseline
         st["last_week"] = week
         st["last_action"] = action
+        # Persisted so NEXT week can detect the discontinuity, and stamped
+        # on the history entry so a later reader can see which bot each
+        # booked week described without re-reading old artifacts.
+        st["strategy_fingerprint"] = fingerprint
         hist = st.setdefault("history", [])
         entry = dict(week=week, action=action, wr_1w=p1.get("wr"),
                      p_1w=p1.get("p_upper"), trigger_window=trigger_window,
-                     sidak=round(sidak_p, 4))
+                     sidak=round(sidak_p, 4),
+                     strategy_fingerprint=fingerprint,
+                     config_changed=config_changed)
         if same_week_rerun and hist and hist[-1].get("week") == last_week:
             hist[-1] = entry
         else:
@@ -1330,6 +1431,18 @@ def _main() -> int:
                 f"continuous, so the stats below rest on a window with a "
                 f"hole in it. Positive actions blocked; the negative path "
                 f"is unaffected.\n{head}")
+    if config_changed:
+        changed_keys = sorted(
+            k for k in set(fingerprint) | set(prev_fingerprint or {})
+            if (prev_fingerprint or {}).get(k) != fingerprint.get(k))
+        detail = ", ".join(
+            f"{k}: {(prev_fingerprint or {}).get(k)} -> {fingerprint.get(k)}"
+            for k in changed_keys)
+        head = (f"⚠️ CONFIG CHANGED — n/WR/p_upper are NOT comparable to "
+                f"previous weeks ({detail}). consecutive_weak is "
+                f"deliberately NOT reset: resetting would delay the "
+                f"protective disable. Treat this week as an epoch boundary "
+                f"when reading the series.\n{head}")
     if evidence_gap_streak >= 2:
         # The counter tracks SUPPRESSED ENABLES, not sparse evidence: it
         # only advances on a *_BLOCKED_evidence_gap action, and any week
