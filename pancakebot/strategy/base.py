@@ -46,6 +46,8 @@ _SKIP_CONTEXT_SCHEMA: Mapping[str, frozenset[str]] = {
     "risk_drawdown_breaker_fired": frozenset({"drawdown_pct", "threshold_pct"}),
     "risk_cooldown_active": frozenset({"rounds_remaining"}),
     "pool_below_minimum": frozenset({"pool_bnb", "min_pool_bnb_at_cutoff"}),
+    "risk_worst_case_exposure": frozenset(
+        {"worst_case_pct", "threshold_pct", "open_stake_bnb"}),
 }
 
 
@@ -67,6 +69,8 @@ class StrategyPipelineDecision:
       - ``risk_drawdown_breaker_fired`` → {"drawdown_pct", "threshold_pct"}
       - ``risk_cooldown_active`` → {"rounds_remaining"}
       - ``pool_below_minimum`` → {"pool_bnb", "min_pool_bnb_at_cutoff"}
+      - ``risk_worst_case_exposure`` →
+        {"worst_case_pct", "threshold_pct", "open_stake_bnb"}
     """
 
     action: str
