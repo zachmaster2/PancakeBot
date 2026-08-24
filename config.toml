@@ -138,9 +138,34 @@ shadow_recovery_peak_fraction = 0.85   # hypo bankroll must exceed hypo peak * t
 drawdown_peak_window_days = 7                        # rolling window for peak calculation
 drawdown_peak_mode = "rolling_7d"      # peak-tracking semantics; alt: "absolute_ratchet" (monotonic since-launch peak)
 # Absolute per-bet BNB caps (formerly under btc_primary.sizing / eth_sol_fallback.sizing).
-# 2026-06-30 new-VM deploy: capped to 0.1 BNB (small-stake live-validation
-# ceiling; min floor is min_bet_threshold_bnb=0.01). Whether real 0.01-0.1
-# sizing applies is gated by min_bet_only in [live] (see its comment; a new
-# VM bring-up sets it true for the ladder's min-bet step, then restores false).
-max_bet_bnb_btc_primary = 0.1          # hard cap on BTC primary stake (deploy: 0.1)
-max_bet_bnb_eth_sol_fallback = 0.1     # hard cap on ETH+SOL regime-2 stake (deploy: 0.1)
+# min floor is min_bet_threshold_bnb=0.01. Whether real sizing applies at all
+# is gated by min_bet_only in [live] (see its comment; a new VM bring-up sets
+# it true for the ladder's min-bet step, then restores false).
+#
+# 2026-08-24: 0.1 -> 0.05, a DILUTION correction. These caps are what
+# actually set the stake: _compute_bet_size clamps bankroll-fraction ->
+# absolute cap -> floor, and the adaptive terms never survive. Even the
+# weakest admissible signal computes a raw bet of 0.1106 BNB (pool 2.72, our
+# share 0.535, payout_mult 0.813); mid-signal 0.3096; saturating 0.6635. All
+# sit above both caps, so the bot FLAT-STAKES at the binding cap -- the code
+# reads as payout-proportional and is not.
+#
+# Measured EV per unit staked against pool depth (~2.7 BNB): 9.94% at 0.05,
+# 9.73% at 0.02, 8.94% at 0.10. 0.05 is the peak of the 0.02-0.05
+# dilution-optimal band, so it is used rather than the mid-band.
+#
+# The ABSOLUTE cap is the right lever, not max_bet_fraction_of_bankroll: the
+# dilution optimum depends on POOL DEPTH, not on our bankroll, so an absolute
+# cap pins us in the band and stays there. Matching today's effect via the
+# bankroll fraction (0.05 -> ~0.0265) would drift back out as the bankroll
+# moves and would degrade the risk control that fraction exists to provide.
+# The fraction stays as the risk floor: below ~1.0 BNB bankroll it binds
+# again and stakes scale down naturally.
+#
+# CAVEAT: the 0.02-0.05 optimum is measured on golden-era data (n=1,446, real
+# pool splits, impact-aware settlement). The post-June sample (n=98) is
+# negative at every stake with CIs spanning zero, so it can neither confirm
+# nor contradict. This is a dilution correction; it does NOT make an
+# unprofitable strategy profitable.
+max_bet_bnb_btc_primary = 0.05         # hard cap on BTC primary stake
+max_bet_bnb_eth_sol_fallback = 0.05    # hard cap on ETH+SOL regime-2 stake
