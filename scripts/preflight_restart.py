@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -49,6 +50,9 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from pancakebot import paths  # noqa: E402
+from pancakebot.chain.prediction_contract import (  # noqa: E402
+    ROUNDS_LOCK_TS_IDX,
+)
 from pancakebot.constants import PREDICTION_V2_CONTRACT_ADDRESS  # noqa: E402
 from pancakebot.runtime.bet_ledger import (  # noqa: E402
     _OPEN_STATUSES,
@@ -73,10 +77,26 @@ DEFAULT_RPCS = (
 
 # ---- 1. open positions ---------------------------------------------------
 
+class LedgerUnavailable(RuntimeError):
+    """The bet ledger could not be read, so the money check cannot run."""
+
+
 def open_positions(ledger_path: str = paths.LIVE_BETS_LEDGER_PATH,
                    *, loader=load_ledger) -> list[tuple[int, str]]:
     """``[(epoch, status)]`` for every epoch whose MERGED latest status is
-    still open. Empty list means nothing is at risk."""
+    still open. Empty list means nothing is at risk.
+
+    Raises ``LedgerUnavailable`` if the file is missing. "No ledger" is NOT
+    evidence of "no position" -- a mistyped --ledger or a wiped var/ would
+    otherwise make the money check silently vacuous, which is precisely the
+    failure this script exists to eliminate. ``load_ledger`` returns {} for
+    a missing file (correct for the bot, which starts with none); a GATE
+    must not inherit that reading.
+    """
+    if not Path(ledger_path).exists():
+        raise LedgerUnavailable(
+            f"bet ledger not found at {ledger_path} — cannot verify that no "
+            f"position is open; check the path before restarting")
     merged = loader(ledger_path)
     return sorted(
         (int(epoch), str(rec.get("status", "?")))
@@ -85,24 +105,54 @@ def open_positions(ledger_path: str = paths.LIVE_BETS_LEDGER_PATH,
     )
 
 
+def newest_ledger_epoch(ledger_path: str = paths.LIVE_BETS_LEDGER_PATH,
+                        *, loader=load_ledger) -> int | None:
+    """Highest epoch the bot has ever bet on, or None if it never has."""
+    merged = loader(ledger_path)
+    return max((int(e) for e in merged), default=None)
+
+
 # ---- 2. the last decision ------------------------------------------------
 
+class JournalUnavailable(RuntimeError):
+    """journalctl could not be run, so the decision check cannot run."""
+
+
 def _journal(unit: str, lines: int) -> str:
-    return subprocess.run(
-        ["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"],
-        capture_output=True, text=True, timeout=30,
-    ).stdout
+    try:
+        return subprocess.run(
+            ["journalctl", "-u", unit, "-n", str(lines), "--no-pager",
+             "-o", "cat"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        # Missing binary, permission denied, or a hung journal. A gate that
+        # tracebacks is a gate that gets bypassed.
+        raise JournalUnavailable(f"journalctl failed: {e}") from e
+
+
+_SKIP_EPOCH_RE = re.compile(r"Skipped epoch (\d+)")
 
 
 def last_decision(unit: str = DEFAULT_UNIT, *, lines: int = 200,
-                  journal=_journal) -> tuple[str | None, str]:
-    """``("SKIP"|"BET"|None, line)`` for the most recent round decision."""
+                  journal=_journal) -> tuple[str | None, str, int | None]:
+    """``("SKIP"|"BET"|None, line, skip_epoch)`` for the newest decision.
+
+    RESTATES THE ENGINE'S LOG WORDING, which is the very failure class this
+    script exists to fix -- so it is not trusted alone. Rewording the BET
+    message makes this scan walk PAST it to an older SKIP and wrongly
+    report a quiet round; ``check`` therefore cross-checks the returned
+    skip epoch against the newest epoch in the bet ledger, which is
+    structured data rather than prose. Condition 1 (imported
+    ``_OPEN_STATUSES``) is the other backstop.
+    """
     for line in reversed((journal(unit, lines) or "").splitlines()):
         if "Skipped epoch" in line:
-            return "SKIP", line.strip()
+            m = _SKIP_EPOCH_RE.search(line)
+            return "SKIP", line.strip(), (int(m.group(1)) if m else None)
         if " BET " in line and "Bet " in line:
-            return "BET", line.strip()
-    return None, ""
+            return "BET", line.strip(), None
+    return None, "", None
 
 
 # ---- 3. slack before the next lock ---------------------------------------
@@ -122,7 +172,8 @@ def _chain_next_lock(rpcs=DEFAULT_RPCS) -> tuple[int, int]:
                 address=Web3.to_checksum_address(PREDICTION_V2_CONTRACT_ADDRESS),
                 abi=abi)
             epoch = int(c.functions.currentEpoch().call())
-            return epoch, int(c.functions.rounds(epoch).call()[2])
+            return epoch, int(
+                c.functions.rounds(epoch).call()[ROUNDS_LOCK_TS_IDX])
         except Exception as e:  # noqa: BLE001 — try the next endpoint
             last_err = e
     raise RuntimeError(f"every RPC endpoint failed; last error: {last_err!r}")
@@ -141,20 +192,44 @@ def check(*, unit: str, ledger_path: str, min_slack_s: float) -> list[str]:
     """Return the list of blockers. Empty list means safe to restart."""
     blockers: list[str] = []
 
-    positions = open_positions(ledger_path)
-    if positions:
-        detail = ", ".join(f"epoch {e} status={s}" for e, s in positions)
-        blockers.append(f"OPEN POSITION: {detail} — wait for settlement")
+    newest_bet_epoch: int | None = None
+    try:
+        positions = open_positions(ledger_path)
+        newest_bet_epoch = newest_ledger_epoch(ledger_path)
+    except LedgerUnavailable as e:
+        blockers.append(f"LEDGER UNAVAILABLE: {e}")
+    else:
+        if positions:
+            detail = ", ".join(f"epoch {e} status={s}" for e, s in positions)
+            blockers.append(f"OPEN POSITION: {detail} — wait for settlement")
 
-    kind, line = last_decision(unit)
-    if kind == "BET":
-        blockers.append(
-            f"LAST DECISION WAS A BET, not a skip — a submit may be in "
-            f"flight: {line}")
-    elif kind is None:
-        blockers.append(
-            "NO DECISION FOUND in the recent journal — cannot confirm the "
-            "bot is cycling; check the unit before restarting")
+    try:
+        kind, line, skip_epoch = last_decision(unit)
+    except JournalUnavailable as e:
+        blockers.append(f"JOURNAL UNAVAILABLE: {e}")
+    else:
+        if kind == "BET":
+            blockers.append(
+                f"LAST DECISION WAS A BET, not a skip — a submit may be in "
+                f"flight: {line}")
+        elif kind is None:
+            blockers.append(
+                "NO DECISION FOUND in the recent journal — cannot confirm "
+                "the bot is cycling; check the unit before restarting")
+        elif kind == "SKIP":
+            # MED-B1 backstop: the SKIP was found by matching the engine's
+            # log PROSE. If the ledger holds a bet at or after that epoch,
+            # the scan walked past a bet whose wording changed.
+            if skip_epoch is None:
+                blockers.append(
+                    "SKIP LINE HAS NO EPOCH — the engine's log format has "
+                    "changed; this check cannot be trusted, verify by hand")
+            elif newest_bet_epoch is not None and newest_bet_epoch >= skip_epoch:
+                blockers.append(
+                    f"LEDGER DISAGREES WITH THE JOURNAL: newest bet is epoch "
+                    f"{newest_bet_epoch} but the newest skip found is epoch "
+                    f"{skip_epoch} — a BET line may have been missed "
+                    f"(log wording changed?); verify by hand")
 
     try:
         epoch, slack = lock_slack()
