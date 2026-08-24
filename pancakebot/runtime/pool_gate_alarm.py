@@ -48,6 +48,12 @@ KIND_KLINE_RECOVERED = "KLINE_GATE_RECOVERED"
 KIND_FETCH_FAILING = "KLINE_FETCH_FAILING"
 KIND_FETCH_RECOVERED = "KLINE_FETCH_RECOVERED"
 
+# Endpoint-move trigger. Deliberately NOT reusing the pool-gate or kline
+# kinds: this alarm asks for a PLANNED MIGRATION, not for patience while
+# something self-heals, and it must be filterable on its own.
+KIND_ENDPOINT_MOVE_TRIGGERED = "ENDPOINT_MOVE_TRIGGERED"
+KIND_ENDPOINT_MOVE_CLEARED = "ENDPOINT_MOVE_CLEARED"
+
 # The reasons ``is_pool_ready`` returns when the pool path itself is the
 # blocker. Listed for the operator-facing histogram; the counter itself
 # deliberately advances on ANY not-ready reason, so a future reason added

@@ -69,6 +69,8 @@ _CHANNEL_BY_KIND: dict[str, str] = {
     "KLINE_GATE_BLOCKED": "mode",
     "KLINE_GATE_RECOVERED": "mode",
     "KLINE_FETCH_FAILING": "mode",
+    "ENDPOINT_MOVE_TRIGGERED": "mode",
+    "ENDPOINT_MOVE_CLEARED": "mode",
     "KLINE_FETCH_RECOVERED": "mode",
 }
 
@@ -94,6 +96,8 @@ _SEVERITY_BY_KIND: dict[str, str] = {
     "KLINE_GATE_BLOCKED": "CRIT",
     "KLINE_GATE_RECOVERED": "INFO",
     "KLINE_FETCH_FAILING": "CRIT",
+    "ENDPOINT_MOVE_TRIGGERED": "CRIT",
+    "ENDPOINT_MOVE_CLEARED": "INFO",
     "KLINE_FETCH_RECOVERED": "INFO",
 }
 
@@ -268,11 +272,14 @@ def build_message(
         lines.append("note: service failed to spawn a bot child; manual intervention required")
     elif kind in ("POOL_GATE_BLOCKED", "POOL_GATE_RECOVERED",
                   "KLINE_GATE_BLOCKED", "KLINE_GATE_RECOVERED",
-                  "KLINE_FETCH_FAILING", "KLINE_FETCH_RECOVERED"):
+                  "KLINE_FETCH_FAILING", "KLINE_FETCH_RECOVERED",
+                  "ENDPOINT_MOVE_TRIGGERED", "ENDPOINT_MOVE_CLEARED"):
         # Structured kv rendering ordered for phone triage: how bad, how
         # long, why, how far behind, where coverage last held. The same
         # field set also arrives on the `detail` line.
-        for k in ("signal", "rate", "window_rounds", "consecutive",
+        for k in ("signal", "rate", "trigger", "static_wake_share",
+                  "header_failure_rate", "pool_uncovered_rate",
+                  "window_rounds", "consecutive",
                   "recovered_after", "blocked_for", "reason",
                   "blocks_short", "getlogs_p99_ms", "last_ok_epoch", "epoch"):
             if k in fields:
@@ -301,6 +308,51 @@ def build_message(
             )
         elif kind == "KLINE_FETCH_RECOVERED":
             lines.append("note: kline fetches succeeding again.")
+        elif kind == "ENDPOINT_MOVE_TRIGGERED":
+            # THE DISCRIMINATOR INSTRUCTION LIVES HERE, NOT IN THE DESIGN
+            # DOC. An alarm that fires without it wastes the window, which
+            # is exactly what happened between 2026-08-23 and 08-24: the
+            # condition was active for four days and the ours-vs-theirs
+            # question is still circumstantial because nobody ran the test
+            # while it could still be run.
+            lines.append(
+                "ACTION: execute the endpoint move for the header/anchor "
+                "path. Both metrics are above; either one alone is "
+                "sufficient to act."
+            )
+            lines.append(
+                "RUN THE DISCRIMINATOR FIRST — IT ONLY WORKS WHILE THIS IS "
+                "ACTIVE. From the VM, issue the SAME eth_getBlockByNumber "
+                "request to bloXroute and to an independent host "
+                "back-to-back, n>=30, and compare p50/p99. Both slow = "
+                "network/VM (ours). bloXroute slow, independent host fast = "
+                "provider (theirs). Save the paired output; once the "
+                "condition clears this question cannot be answered."
+            )
+            lines.append(
+                "BANKED CONSTANTS (from the 2026-08-21 getLogs split, same "
+                "candidate host): publicnode eth_getLogs 18-block p50 17 / "
+                "p95 35 / p99 41 / max 51ms; 660-block p50 41 / p95 61 / "
+                "p99 103ms; timeout 250ms. The regression that motivated "
+                "that split: bloXroute 2,865ms vs publicnode 11ms on an "
+                "identical 1-block filtered call, per-METHOD not per-host."
+            )
+            lines.append(
+                "CAVEAT: publicnode HTTP 403s under burst load from ad-hoc "
+                "tooling (observed 2026-08-24). Burst tolerance is not "
+                "sustained tolerance — size any move against steady-rate "
+                "evidence, not a fan-out test."
+            )
+        elif kind == "ENDPOINT_MOVE_CLEARED":
+            # NOT a normal recovery, and the wording must not read like one.
+            lines.append(
+                "note: THE DIAGNOSTIC WINDOW HAS CLOSED. This is not "
+                "\"fine now\" — the discriminator can no longer be run "
+                "until the condition returns. If it was not run while the "
+                "condition was active, the ours-vs-theirs question stays "
+                "CIRCUMSTANTIAL and the next occurrence starts from the "
+                "same place."
+            )
         else:
             lines.append("note: pool coverage restored; betting resumed.")
 
