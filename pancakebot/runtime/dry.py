@@ -794,6 +794,16 @@ def init_runtime_state(cfg: RuntimeConfig) -> RuntimeState:
 def _build_momentum_pipeline(*, cfg: RuntimeConfig) -> MomentumOnlyPipeline:
     """Build momentum-only strategy pipeline (shared by dry AND live)."""
     gate_config = cfg.momentum_gate_config
+    # LIVE ONLY. The drawdown gate values an open position at cost, which
+    # requires knowing what is in flight -- but only the live path reads a
+    # raw WALLET balance that the stake has already left. Dry runs on
+    # `simulated_bankroll_bnb`, which dry.py credits and debits at
+    # settlement and is therefore ALREADY on a settled basis; adding open
+    # stakes back there would double-count them.
+    open_stake_provider = None
+    if not cfg.dry:
+        def open_stake_provider() -> float:  # noqa: F811
+            return bet_ledger.open_stake_bnb(_paths.LIVE_BETS_LEDGER_PATH)
     return MomentumOnlyPipeline(
         config=gate_config,
         strategy_config=cfg.strategy,
@@ -802,4 +812,5 @@ def _build_momentum_pipeline(*, cfg: RuntimeConfig) -> MomentumOnlyPipeline:
         pool_cutoff_seconds=cfg.pool_cutoff_seconds,
         min_bet_amount_bnb=cfg.min_bet_amount_bnb,
         treasury_fee_fraction=cfg.treasury_fee_fraction,
+        open_stake_provider=open_stake_provider,
     )
