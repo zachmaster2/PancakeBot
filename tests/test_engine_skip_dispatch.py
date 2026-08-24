@@ -41,18 +41,62 @@ def _dispatch_branches():
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                and n.name == "_run_one_iteration"), None)
     assert fn is not None, "engine._run_one_iteration not found"
+    def reason_of(test) -> str | None:
+        """The reason a branch test selects, for ANY shape that contains a
+        `reason == "..."` comparison -- a bare Compare, or one inside a
+        BoolOp such as
+        `reason == "kline_fetch_transient_failure" and gate is not None`.
+        Matching only the bare Compare made that branch invisible, and an
+        invisible branch is exempt from every check in this file."""
+        for n in ast.walk(test):
+            if (isinstance(n, ast.Compare)
+                    and isinstance(n.left, ast.Name) and n.left.id == "reason"
+                    and len(n.ops) == 1 and isinstance(n.ops[0], ast.Eq)
+                    and isinstance(n.comparators[0], ast.Constant)
+                    and isinstance(n.comparators[0].value, str)):
+                return n.comparators[0].value
+        return None
+
     out: dict[str, ast.If] = {}
     for node in ast.walk(fn):
         if not isinstance(node, ast.If):
             continue
-        test = node.test
-        if (isinstance(test, ast.Compare)
-                and isinstance(test.left, ast.Name) and test.left.id == "reason"
-                and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)
-                and isinstance(test.comparators[0], ast.Constant)
-                and isinstance(test.comparators[0].value, str)):
-            out[test.comparators[0].value] = node
+        reason = reason_of(node.test)
+        if reason is not None:
+            out[reason] = node
     assert out, "no `reason == ...` branches found — dispatch was restructured"
+
+    # COMPLETENESS. The matcher above only understands a bare
+    # `reason == "..."` Compare, so ANY other shape is invisible to it and
+    # every assertion in this file passes vacuously for that branch. One
+    # such branch already exists -- `if reason == "kline_fetch_transient_failure"
+    # and gate is not None:` is a BoolOp -- and injecting
+    # `closed.in_cooldown = True` into it was proven to leave this file at
+    # 8 passed.
+    #
+    # Rather than enumerate shapes (which only ever covers the ones someone
+    # thought of), count every If in the round loop whose test mentions
+    # `reason` at all and require the matcher to have understood all of
+    # them. A shape it cannot parse now fails LOUDLY here instead of
+    # silently exempting itself from the checks below.
+    # Keyed on the NAME `reason`, not the substring: `_cd_reason` and
+    # `ready_reason` are different variables in this function and are not
+    # part of the skip dispatch.
+    def references_reason(test) -> bool:
+        return any(isinstance(n, ast.Name) and n.id == "reason"
+                   for n in ast.walk(test))
+
+    mentions_reason = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.If) and references_reason(n.test)
+    ]
+    unparsed = [ast.unparse(n.test) for n in mentions_reason
+                if n not in out.values()]
+    assert not unparsed, (
+        f"{len(unparsed)} branch test(s) mention `reason` but this parser "
+        f"does not understand them, so they are exempt from every check in "
+        f"this file: {unparsed}. Extend _dispatch_branches rather than "
+        f"deleting this assertion.")
     return out
 
 
