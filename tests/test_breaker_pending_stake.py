@@ -287,3 +287,132 @@ def test_the_suspension_baseline_is_seeded_on_the_settled_basis(tmp_path):
         "suspension baseline must be the settled-equivalent value, not the "
         "stake-depressed wallet balance")
     assert shadow.suspension_bankroll != pytest.approx(wallet)
+
+
+# ---- Check 4: worst-case exposure admission gate -------------------------
+#
+# TWO DECISIONS, TWO VALUATIONS:
+#   suspend?      -> open positions valued at COST (settled-equivalent)
+#   open a bet?   -> open positions valued at ZERO (worst case = raw wallet)
+# The worst case IS the raw wallet balance, because a losing stake never
+# comes back -- the same number the breaker was wrongly tripping on, wired
+# to the question it actually answers.
+
+def test_the_incident_declines_a_new_bet_without_suspending(tmp_path):
+    """THE incident, exercising both halves at once. At 18:41:20 the raw
+    wallet gave 15.28% >= 15%, so a new position was not survivable; the
+    settled-equivalent gave 12.94%, so the account was not in trouble.
+    Correct behaviour: DECLINE the round, do NOT suspend."""
+    pipe, tracker = _pipeline_with(
+        tmp_path, wallet=INCIDENT_WALLET, peak=INCIDENT_PEAK,
+        open_stake=INCIDENT_STAKE)
+    d = _decide(pipe)
+    assert d.action == "SKIP"
+    assert d.skip_reason == "risk_worst_case_exposure", d.skip_reason
+    assert d.skip_context["worst_case_pct"] == pytest.approx(15.2836, abs=1e-3)
+    assert d.skip_context["open_stake_bnb"] == pytest.approx(0.05)
+    tracker.set_paused.assert_not_called()      # declining != suspending
+
+
+def test_the_gate_is_a_no_op_when_nothing_is_in_flight(tmp_path):
+    """With no open position, worst case == settled-equivalent, so any
+    round that passes the breaker passes this by construction. It costs
+    nothing in normal conditions."""
+    pipe, tracker = _pipeline_with(
+        tmp_path, wallet=2.00, peak=INCIDENT_PEAK, open_stake=0.0)
+    d = _decide(pipe)
+    assert d.skip_reason != "risk_worst_case_exposure"
+    tracker.set_paused.assert_not_called()
+
+
+def test_a_survivable_pending_loss_still_permits_consecutive_bets(tmp_path):
+    """The rule is 'bet consecutive rounds IF the breaker would not fire
+    should the pending bet lose'. Well clear of the bar -> bet allowed
+    even with a position open."""
+    pipe, tracker = _pipeline_with(
+        tmp_path, wallet=2.00, peak=INCIDENT_PEAK, open_stake=0.05)
+    d = _decide(pipe)
+    assert d.skip_reason != "risk_worst_case_exposure"
+    tracker.set_paused.assert_not_called()
+
+
+def test_the_gate_generalises_to_several_open_positions(tmp_path):
+    """No special casing for N: `current` already excludes every open
+    stake, so 'assume they all lose' is just 'use current'. Two stakes
+    open, each individually survivable, together not."""
+    peak = 2.0
+    wallet = peak * 0.86                      # 14% -- under the bar alone
+    pipe, _ = _pipeline_with(tmp_path, wallet=wallet, peak=peak,
+                             open_stake=0.0)
+    assert _decide(pipe).skip_reason != "risk_worst_case_exposure"
+    # same wallet, but 0.10 is in flight: worst case is unchanged at 14%,
+    # so it still admits -- the gate keys on the WALLET, not the stake count
+    pipe2, _ = _pipeline_with(tmp_path, wallet=wallet, peak=peak,
+                              open_stake=0.10)
+    assert _decide(pipe2).skip_reason != "risk_worst_case_exposure"
+    # push the wallet under the bar and it declines regardless of N
+    pipe3, _ = _pipeline_with(tmp_path, wallet=peak * 0.84, peak=peak,
+                              open_stake=0.10)
+    assert _decide(pipe3).skip_reason == "risk_worst_case_exposure"
+
+
+def test_declining_never_fires_the_cooldown(tmp_path):
+    """Conflating 'decline this round' with 'suspend for 24h' would let a
+    single in-flight bet trigger a stand-down."""
+    pipe, tracker = _pipeline_with(
+        tmp_path, wallet=INCIDENT_WALLET, peak=INCIDENT_PEAK, open_stake=0.05)
+    _decide(pipe)
+    tracker.set_paused.assert_not_called()
+
+
+def test_the_breaker_still_wins_when_the_account_is_genuinely_down(tmp_path):
+    """Check 3 runs first: if even the settled-equivalent value is under
+    the bar, this is a suspension, not a declined round."""
+    pipe, tracker = _pipeline_with(
+        tmp_path, wallet=1.70, peak=INCIDENT_PEAK, open_stake=0.05)
+    d = _decide(pipe)
+    assert d.skip_reason == "risk_drawdown_breaker_fired"
+    tracker.set_paused.assert_called_once()
+
+
+def test_the_lockout_releases_when_the_position_reaches_a_terminal_status(
+        tmp_path):
+    """DEGENERATE CASE. A stuck position must not produce a silent,
+    permanent no-bet state: blocked from betting, never suspended, no
+    alert. Terminal statuses drop open_stake to 0, after which worst case
+    == settled-equivalent and the state resolves one way or the other --
+    the position won (wallet recovered, betting resumes) or it lost (the
+    breaker fires on the next round). It cannot hang."""
+    from pancakebot.runtime.bet_ledger import _TERMINAL_STATUSES
+
+    stakes = {"open": 0.05}
+    pipe, tracker = _pipeline_with(
+        tmp_path, wallet=INCIDENT_WALLET, peak=INCIDENT_PEAK, open_stake=0.05)
+    assert _decide(pipe).skip_reason == "risk_worst_case_exposure"
+
+    # every terminal status clears the stake from open_stake_bnb ...
+    for terminal in sorted(_TERMINAL_STATUSES):
+        path = _ledger(tmp_path, [
+            {"epoch": 1, "status": "SUBMITTED", "amount_bnb": 0.05},
+            {"epoch": 1, "status": terminal},
+        ])
+        assert open_stake_bnb(path) == 0.0, terminal
+
+    # ... and with nothing open the round is no longer merely declined:
+    # the same wallet is now a genuine 15.28% drawdown, so it SUSPENDS.
+    pipe2, tracker2 = _pipeline_with(
+        tmp_path, wallet=INCIDENT_WALLET, peak=INCIDENT_PEAK, open_stake=0.0)
+    d2 = _decide(pipe2)
+    assert d2.skip_reason == "risk_drawdown_breaker_fired"
+    tracker2.set_paused.assert_called_once()
+
+
+def test_a_recovering_position_releases_the_gate(tmp_path):
+    """The other resolution path: the pending bet wins, the wallet rises,
+    and betting resumes with no operator action."""
+    pipe, _ = _pipeline_with(
+        tmp_path, wallet=INCIDENT_WALLET + 0.0444, peak=INCIDENT_PEAK,
+        open_stake=0.0)
+    d = _decide(pipe)
+    assert d.skip_reason not in (
+        "risk_worst_case_exposure", "risk_drawdown_breaker_fired")

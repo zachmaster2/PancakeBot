@@ -1,0 +1,16 @@
+{
+  "active": true,
+  "suspension_start_at": 1787596580,
+  "suspension_bankroll": 1.75,
+  "cum_pnl": 0.0,
+  "n_settled": 0,
+  "n_wins": 0,
+  "extensions": 0,
+  "pending": {},
+  "trajectory": [
+    [
+      1787596580,
+      1.75
+    ]
+  ]
+}

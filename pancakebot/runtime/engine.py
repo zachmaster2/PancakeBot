@@ -1474,6 +1474,20 @@ def _run_one_iteration(cfg: RuntimeConfig, closed: RuntimeState) -> None:
                     f"({_ctx['drawdown_pct']:.1f}% from peak, "
                     f"threshold {_ctx['threshold_pct']:.0f}%)",
                 )
+            elif reason == "risk_worst_case_exposure":
+                # NOT a suspension. The round is declined because if the
+                # open position(s) lost, the breaker WOULD fire — so the
+                # new exposure is not survivable. Betting resumes by
+                # itself the moment those positions resolve.
+                _ctx = decision.skip_context
+                warn(
+                    "SKIP",
+                    f"Skipped epoch {current_epoch}: worst-case exposure "
+                    f"({_ctx['worst_case_pct']:.1f}% if the "
+                    f"{_ctx['open_stake_bnb']:.4f} BNB in flight lost, "
+                    f"threshold {_ctx['threshold_pct']:.0f}%) — declining a "
+                    f"new position, NOT suspended",
+                )
                 # D3: COOLDOWN ENTERED alert on the trip edge (once per entry).
                 if not closed.in_cooldown:
                     closed.in_cooldown = True
