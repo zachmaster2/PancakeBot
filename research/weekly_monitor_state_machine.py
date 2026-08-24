@@ -58,7 +58,9 @@ Unattended-safety (2026-07-17/18 hardening):
   * dry runs (no --apply) never advance weekly state and never touch
     systemd — pure previews. Weekly state is booked per ISO week; an
     applied same-week re-run overwrites that week's booking (recomputed
-    from the prior-week baseline), never double-advancing it.
+    from the prior-week baseline), never double-advancing it. This holds
+    for EVERY per-week counter — consecutive_weak and
+    evidence_gap_streak — which is why both go through book_streak().
   * every completed run VERIFIES Discord delivery (HTTP < 400, retry);
     undelivered -> rc=3 so the cron wrapper curls a fallback. Any crash
     Discords a ❌ CRASHED alert with the traceback tail and exits
@@ -103,12 +105,13 @@ decisions):
              reported loudly and may not be spent on any POSITIVE action.
              It is NOT a disable trigger and never blocks the protective
              disable — see fire_evidence_fresh.
-             LIMITATION (queued follow-up): this is a POINT check on the
-             newest fire, so one recovery bet un-freezes an otherwise
-             all-stale window. Until a density leg lands, every window's
-             fresh/stale composition is reported (decision.json
-             window_*.fire_composition and the Discord body) so a mixed
-             window cannot be misread as a live one.
+             DENSITY: the point check above is generalised by the
+             evidence-gap rule -- no drought longer than
+             FIRE_STALE_MAX_AGE_S anywhere INSIDE the spent window, taking
+             the max over every consecutive-fire gap plus the trailing gap
+             to now. Same constant, same units, no new threshold. It gates
+             the ACTION only; window selection is untouched, so the whole
+             negative path is unchanged. See window_gap_profile.
   NEGATIVE:  WR leg on the SPENT positive window (the same window the
              positive legs read — a starved-1w regime must not make the
              WR floor unreachable while the 2w window shows a losing
@@ -259,14 +262,67 @@ def fire_evidence_fresh(newest_fire_lock: int, now: float) -> bool:
     return (now - float(newest_fire_lock)) <= FIRE_STALE_MAX_AGE_S
 
 
+def window_gap_profile(window: list, now: float) -> tuple[float | None, float]:
+    """``(largest gap BETWEEN consecutive fires, trailing gap to now)``, in
+    hours. ``None`` for the first when the window holds fewer than 2 fires.
+
+    Feeds the evidence-gap rule: no drought longer than
+    FIRE_STALE_MAX_AGE_S anywhere inside the SPENT window. The shipped
+    ``fire_evidence_fresh`` tests exactly ONE gap -- the trailing one -- so
+    18 stale fires plus a single fresh one passes it. Taking the max over
+    every gap is a strict generalisation of that test using the same
+    constant and the same units, which is why it needs no new threshold: a
+    count rule (>=K fresh) or a fraction rule (>=X% fresh) would have to be
+    fitted to seven Sunday observations, whereas 96h came from 304 real
+    inter-fire gaps. Both alternatives were swept and are dominated -- no K
+    separates the one bad decision from the good ones (K=6 misses
+    2026-08-16, K=8 also blocks 07-12 and 07-26), and X=0.30 misses
+    2026-08-16 outright.
+
+    KNOWN LIMITATIONS, recorded rather than implied away:
+
+    * EFFICACY IS n=1. Across all nine archived Sundays this rule changes
+      exactly one decision (2026-08-16, max gap 117.5h). The "derived from
+      304 real gaps" framing describes where the 96h CONSTANT came from,
+      not how much evidence supports the rule catching anything: that
+      rests on a single case, and it clears the bound by 22.4% while
+      sitting only 2.1% below 120h, the smallest bound that would drop the
+      false-positive rate under ~5%.
+
+    * THE SHAPE IS NARROWED, NOT CLOSED. A mostly-stale window that is
+      sparsely BRIDGED still passes: 2026-08-09's spent window was 86%
+      stale by composition and its largest gap was 57.0h, comfortably
+      inside the bound. This rule removes the "one fresh fire rescues 18
+      stale ones" hole; it does not guarantee the window is dense.
+
+    * EXPOSURE IS REAL AND MEASURED. Replaying the monitor's own window
+      selection once per day against the live stream: 15.7% of days in the
+      current regime are blocked at 96h, against 0.0% over the preceding
+      180 days. At half the fire rate the median is 21.4% and the worst of
+      nine seeds is 37.1%. See FIRE_STALE_MAX_AGE_S for why 96h is kept
+      anyway and why no single constant satisfies both efficacy and
+      false-positive rate.
+    """
+    locks = sorted(int(b["lock"]) for b in window)
+    if not locks:
+        return None, float("inf")
+    trailing_h = (now - locks[-1]) / 3600.0
+    if len(locks) < 2:
+        return None, trailing_h
+    gaps_h = [(locks[i + 1] - locks[i]) / 3600.0 for i in range(len(locks) - 1)]
+    return max(gaps_h), trailing_h
+
+
 def window_fire_composition(window: list, now: float) -> dict:
     """How much of a window's evidence is RECENT, not merely present.
 
     ``fire_evidence_fresh`` is a POINT check on the newest fire, so a
     single recovery bet un-freezes an otherwise all-stale window: 18 fires
-    aged 9-13 days plus one fire 2h old passes the gate. This does not
-    change that decision (a density leg is the queued follow-up); it makes
-    the composition VISIBLE so a mixed window cannot be read as a live one.
+    aged 9-13 days plus one fire 2h old passes it. The evidence-gap rule
+    (``window_gap_profile``) now blocks that shape, so this composition is
+    no longer the only defence -- it remains the human-readable summary,
+    reported every week so a mixed window cannot be MISREAD even when the
+    gap rule lets it through.
     """
     n = len(window)
     fresh = sum(1 for b in window
@@ -350,23 +406,35 @@ def weak_week(trigger_window: str, stats: dict) -> bool:
                 and stats["p_upper"] > NEG_WEAK_P)
 
 
-def book_weak_week(st: dict, *, same_week_rerun: bool, weak: bool) -> tuple[int, int]:
-    """Return (baseline, consec) for this ISO week's weak booking.
+def book_streak(st: dict, key: str, *, same_week_rerun: bool,
+                hit: bool) -> tuple[int, int]:
+    """Return (baseline, counter) for a per-ISO-week consecutive counter.
 
     First run of the week: baseline = last week's persisted counter,
     advance from it. Same-ISO-week re-run: RECOMPUTE from the persisted
     baseline — overwrite semantics, so a re-run under corrected code can
     fix the week's booking, and nothing ever double-advances. The
     baseline fallback for state files that predate the key assumes the
-    last booking was weak (stored-1); a not-weak booking stores 0 either
-    way, so the fallback can only over-forgive, never over-count."""
-    stored = int(st.get("consecutive_weak", 0))
+    last booking was a hit (stored-1); a non-hit booking stores 0 either
+    way, so the fallback can only over-forgive, never over-count.
+
+    Shared rather than duplicated: evidence_gap_streak was written as a
+    bare `stored + 1` and DID double-advance on an applied same-week
+    re-run (a single blocked Sunday re-run wrote 2 and fired the
+    "2 CONSECUTIVE SUNDAYS" banner), contradicting the overwrite
+    contract in this module's docstring two lines from correct code."""
+    stored = int(st.get(key, 0))
     if same_week_rerun:
-        baseline = int(st.get("consecutive_weak_baseline",
-                              max(stored - 1, 0)))
+        baseline = int(st.get(f"{key}_baseline", max(stored - 1, 0)))
     else:
         baseline = stored
-    return baseline, (baseline + 1 if weak else 0)
+    return baseline, (baseline + 1 if hit else 0)
+
+
+def book_weak_week(st: dict, *, same_week_rerun: bool, weak: bool) -> tuple[int, int]:
+    """(baseline, consec) for this ISO week's weak booking."""
+    return book_streak(st, "consecutive_weak",
+                       same_week_rerun=same_week_rerun, hit=weak)
 
 
 def _window_desc(tag: str, stats: dict, bt: dict | None = None,
@@ -418,20 +486,79 @@ FRESH_MAX_AGE_S = 36 * 3600  # newest closed ROUND older than this = stale
 # the choice below is insensitive to the edge; state the edge when
 # re-deriving.)
 #
-# WHY 96h SPECIFICALLY: it is the LARGEST bound that still catches the
-# worst drought ever observed. Time-weighted exceedance (the quantity that
-# matters, since a Sunday samples wall-clock rather than gaps):
-#     48h -> 7.79%   72h -> 3.86%   96h -> ~1.3%   120h -> 0.00%
-# 120h flags nothing at all — it would have missed the 117.5h event, i.e.
-# it is not a gate. 96h keeps that event inside the net while paying only
-# ~1.3% of Sundays, and keeps the newest fire inside the 1-week window's
-# own span.
+# SUPERSEDED DERIVATION, kept because it is easy to re-derive by mistake:
+# 96h was originally justified as "the LARGEST bound that still catches the
+# worst drought ever observed", on time-weighted TRAILING exceedance
+# (48h -> 7.79%, 72h -> 3.86%, 96h -> ~1.3%, 120h -> 0.00%). That was true
+# of the trailing-only framing and is FALSE under the density rule: the
+# worst observed drought is a 117.5h INTERNAL gap, so EVERY bound below
+# 117.5h catches it -- 116h included. 96h is not the largest such bound, it
+# is one choice among many. Those exceedance figures are also not
+# commensurable with the block rates below: one is the time-weighted share
+# of wall clock spent inside a trailing gap, the other is the share of DAYS
+# on which the density rule would block. Do not read them as one series.
 #
-# EROSION WATCH: this bound is absolute, so a falling fire rate eats the
-# margin. At the current (halved) rate the trailing p99 gap is already
-# ~91.1h against this 96h bound; another halving pushes legitimate quiet
-# weeks through it. decision.json therefore records fire_gap_p99_h beside
-# the threshold every week so the erosion is visible before it bites.
+# RE-DERIVED 2026-08-24 against the live 1,982-fire stream, replaying the
+# monitor's own spent-window selection once per day and asking how often
+# the rule would block. The band the efficacy criterion actually points at
+# is measured here rather than jumped over:
+#
+#   bound  catches 08-16?  current regime  half rate (med / worst, 9 seeds)
+#    96h        yes            15.7%            15.9%  /  34.4%
+#   104h        yes            15.7%            12.1%  /  34.4%
+#   112h        yes            14.3%            10.6%  /  31.2%
+#   116h        yes            14.3%            10.6%  /  31.2%
+#   120h        NO              4.3%             6.7%  /  31.2%
+#   144h        NO              2.9%             5.0%  /  15.6%
+#   168h        NO              0.0%             3.3%  /  14.1%
+#
+# "Current regime" = the last 70 evaluable days, which is the honest
+# denominator: over the preceding 180 days the rule blocks 0.0% of days,
+# because the gap distribution has MOVED (last 70d p99 117.5h max 161.5h;
+# days 70-250 p99 26.3h max 53.6h). Measuring across both regimes averages
+# a world that no longer exists into the answer.
+#
+# THE CHOICE, made on those numbers instead of asserted:
+#   * EFFICACY needs bound < 117.5h -- the max internal gap of 2026-08-16,
+#     the one decision this rule changes. At 120h and above the rule is
+#     decoration: it stops catching the only case it was built for. So
+#     FALSE POSITIVES, which need >= 120h to fall under ~5%, cannot be
+#     bought at all without giving up the rule.
+#   * INSIDE the efficacy-preserving band the false-positive rate moves by
+#     exactly ONE DAY: 11 blocked days out of 70 at 96h, 10 at 116h. That
+#     is not a dominance result. It is a single day at the edge of a single
+#     episode (see COST below) and is not a basis for choosing.
+#   * What does separate them is EFFICACY MARGIN. 117.5h sits 22.4% above
+#     96h but only 1.3% above 116h -- a 116h bound would catch the one case
+#     it exists for by 1.5 hours.
+#
+# 96h is KEPT, and explicitly NOT because it measures better: 116h is
+# weakly better on false positives (one day today, ~5pp under a simulated
+# halving of the fire rate). It is kept to cover droughts in the 96-116h
+# band, which have never been observed and cannot be ruled out, and to keep
+# the efficacy leg robust to measurement noise rather than resting it on a
+# 1.5h margin. The half-rate column argues for a wider bound but is
+# inconsistent as a tuning input: halving the fire rate lengthens the
+# droughts we want to CATCH as much as the ones we want to forgive, so it
+# cannot move the bound while the efficacy anchor stays pinned to a
+# full-rate event. Blocking is also the safe direction -- it refuses to
+# ENABLE, never to disable.
+#
+# COST OF THE CHOICE, stated correctly: 15.7% of days is 11 blocked days
+# out of 70, but they are ONE CONTIGUOUS EPISODE -- 2026-08-12 through
+# 2026-08-22, the Aug 7 -> Aug 12 drought aging through the window. Not 11
+# independent blocks, and NOT a ~1-in-6 per-Sunday probability; framing it
+# as a rate implies an independence that is not there. The real cost is
+# roughly ONE blocked episode straddling one or two Sundays, which is
+# materially cheaper than the rate suggests and cuts in this rule's favour.
+# The flip side is that a single future drought blocks a RUN of consecutive
+# Sundays -- which is why consecutive evidence-gap Sundays escalate
+# (evidence_gap_streak): a slow strangulation must announce itself instead
+# of looking like a quiet run of ordinary weeks.
+#
+# What a constant CANNOT do is distinguish "evidence is thin because the
+# market is thin" from "evidence is thin because we are broken". If this
+# keeps firing, the fix is the fire rate, not the bound.
 #
 # A RELATIVE threshold (k x trailing mean gap) was rejected deliberately:
 # it inflates as the fire rate collapses, so it goes quiet exactly during
@@ -723,15 +850,25 @@ def _main() -> int:
     # newest closed ROUND in the store; the newest FIRE (max_lock, which
     # keys the evaluation windows) lags days behind in normal signal
     # droughts and must not trip this gate.
-    data_fresh = (time.time() - newest_round_lock) <= FRESH_MAX_AGE_S
+    # ONE clock for the whole evidence evaluation. The gap check lands on
+    # the far side of the risk-off backtests (BACKTEST_TIMEOUT_S = 1800s
+    # each), so re-reading time.time() there drifted 5-60 minutes against a
+    # 96h bound and could disagree with the label, the reason text and the
+    # banner at the boundary.
+    now_ts = time.time()
+    data_fresh = (now_ts - newest_round_lock) <= FRESH_MAX_AGE_S
     evidence_ok = sync_ok and data_fresh
     # Fire-stream freshness is a SEPARATE gate, deliberately NOT folded into
     # evidence_ok: a quiet week is not a sync failure, so it must not freeze
     # the weekly counters or arm the daily retry machinery. It gates the
     # POSITIVE actions only (see fire_evidence_fresh).
-    fire_age_h = (time.time() - max_lock) / 3600.0
-    fire_fresh = fire_evidence_fresh(max_lock, time.time())
-    positive_evidence_ok = evidence_ok and fire_fresh
+    fire_age_h = (now_ts - max_lock) / 3600.0
+    fire_fresh = fire_evidence_fresh(max_lock, now_ts)
+    # Named _base because it is NOT the final verdict: the evidence-gap
+    # rule below ANDs into it once the spent window is known. The rename
+    # makes the two-stage assignment structurally impossible to misread as
+    # a finished value.
+    positive_evidence_base = evidence_ok and fire_fresh
     if not fire_fresh:
         print(f"!!! fire stream STALE: newest fire "
               f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(max_lock))}Z "
@@ -779,9 +916,9 @@ def _main() -> int:
     # Composition of each window's evidence (see window_fire_composition):
     # reported always, so a window that passes the point-in-time freshness
     # gate on one recent fire cannot be misread as a live window.
-    comp1 = window_fire_composition(w1, time.time())
-    comp2 = window_fire_composition(w2, time.time())
-    gap_p99_h = fire_gap_p99_h(bets, time.time())
+    comp1 = window_fire_composition(w1, now_ts)
+    comp2 = window_fire_composition(w2, now_ts)
+    gap_p99_h = fire_gap_p99_h(bets, now_ts)
     e1 = (min(b["epoch"] for b in w1), max(b["epoch"] for b in w1)) if w1 else (0, 0)
     e2 = (min(b["epoch"] for b in w2), max(b["epoch"] for b in w2)) if w2 else (0, 0)
     p2, p1 = perm(w2), perm(w1)
@@ -800,6 +937,33 @@ def _main() -> int:
                                 cfg_name="risk_off_config_2w.toml")
     pos_stats = spent_stats(trigger_window, p1, p2)
     pos_bt = bt2 if trigger_window == "2w_fallback" else bt
+
+    # Evidence-gap rule: no drought longer than the staleness bound
+    # ANYWHERE inside the spent window (see window_gap_profile). This is an
+    # ADDITIONAL condition on positive_evidence_ok and deliberately does
+    # NOT touch positive_window(): window selection feeds spent_stats,
+    # negative_wr_leg and weak_week, and trigger_window == "none" already
+    # books weak=True, so a density-driven "none" would start advancing the
+    # DISABLE counter on evidence-quality grounds. Gate the action, not the
+    # window -- that keeps the whole negative machinery bit-for-bit
+    # unchanged. Positive-only for the same reason HIGH-1 was: degraded
+    # evidence must never rescue a losing bot from being switched off.
+    spent_bets = w2 if trigger_window == "2w_fallback" else w1
+    max_internal_gap_h, trailing_gap_h = window_gap_profile(spent_bets, now_ts)
+    gap_bound_h = FIRE_STALE_MAX_AGE_S / 3600.0
+    _gaps = [g for g in (max_internal_gap_h, trailing_gap_h) if g is not None]
+    max_window_gap_h = max(_gaps) if _gaps else None
+    # FAIL CLOSED: no measurable gap means no evidence that the window is
+    # continuous, and this is a fail-safe gate. Defaulting an unmeasurable
+    # window to "fine" would be the gate declining to do its job in exactly
+    # the case it cannot see.
+    evidence_gap_ok = (max_window_gap_h is not None
+                       and max_window_gap_h <= gap_bound_h)
+    positive_evidence_ok = positive_evidence_base and evidence_gap_ok
+    if not evidence_gap_ok and fire_fresh:
+        print(f"!!! evidence GAP in the spent {trigger_window} window: "
+              f"largest drought {max_window_gap_h:.1f}h > {gap_bound_h:.0f}h "
+              "— positive actions blocked", flush=True)
 
     latest100 = bets[-100:]
     wr100 = float(np.mean([b["win"] for b in latest100])) if len(latest100) >= 50 else None
@@ -881,12 +1045,29 @@ def _main() -> int:
                   f"n={pos_stats.get('n')}>={POS_MIN_FIRES}, "
                   f"btPnL={pos_bt.get('net_pnl_bnb')}>0")
         if not positive_evidence_ok:
-            action = ("enable_BLOCKED_stale_evidence" if not evidence_ok
-                      else "enable_BLOCKED_frozen_window")
-            reason += (" — sync failed or data stale; refusing to enable"
-                       if not evidence_ok else
-                       f" — newest fire {fire_age_h:.1f}h old: this window is "
-                       "FROZEN evidence, not this week's; refusing to enable")
+            # PRECEDENCE IS LOAD-BEARING, not stylistic. The spent window
+            # always ends at the newest fire, so its trailing gap IS
+            # `now - newest_fire` -- the quantity fire_evidence_fresh
+            # tests. evidence_gap_ok therefore IMPLIES fire_fresh, and
+            # checking the gap rule first would make
+            # *_BLOCKED_frozen_window unreachable. Order: stale -> frozen
+            # -> gap, weakest precondition first.
+            assert not (evidence_gap_ok and not fire_fresh), (
+                "gap rule must imply freshness; precedence below relies on it")
+            if not evidence_ok:
+                action = "enable_BLOCKED_stale_evidence"
+                reason += " — sync failed or data stale; refusing to enable"
+            elif not fire_fresh:
+                action = "enable_BLOCKED_frozen_window"
+                reason += (f" — newest fire {fire_age_h:.1f}h old: this window "
+                           "is FROZEN evidence, not this week's; refusing to "
+                           "enable")
+            else:
+                action = "enable_BLOCKED_evidence_gap"
+                reason += (f" — {max_window_gap_h:.1f}h drought inside the "
+                           f"spent {trigger_window} window (> {gap_bound_h:.0f}h): "
+                           "the fires are recent but not CONTINUOUS; refusing "
+                           "to enable")
         elif args.apply:
             action = "enable"
             # One-shot re-enable (2026-07-17): if the bot went down mid-
@@ -921,12 +1102,20 @@ def _main() -> int:
         # (ignores extend-while-bleeding by design).
         reason = f"POSITIVE ({trigger_window}) while breaker-suspended -> override flag"
         if not positive_evidence_ok:
-            action = ("cooldown_override_BLOCKED_stale_evidence" if not evidence_ok
-                      else "cooldown_override_BLOCKED_frozen_window")
-            reason += (" — sync failed or data stale; refusing to release"
-                       if not evidence_ok else
-                       f" — newest fire {fire_age_h:.1f}h old: this window is "
-                       "FROZEN evidence, not this week's; refusing to release")
+            if not evidence_ok:
+                action = "cooldown_override_BLOCKED_stale_evidence"
+                reason += " — sync failed or data stale; refusing to release"
+            elif not fire_fresh:
+                action = "cooldown_override_BLOCKED_frozen_window"
+                reason += (f" — newest fire {fire_age_h:.1f}h old: this window "
+                           "is FROZEN evidence, not this week's; refusing to "
+                           "release")
+            else:
+                action = "cooldown_override_BLOCKED_evidence_gap"
+                reason += (f" — {max_window_gap_h:.1f}h drought inside the "
+                           f"spent {trigger_window} window (> {gap_bound_h:.0f}h): "
+                           "the fires are recent but not CONTINUOUS; refusing "
+                           "to release")
         elif args.apply:
             action = "cooldown_override"
             flag = write_override_flag(week=week, reason=reason,
@@ -950,6 +1139,18 @@ def _main() -> int:
         else:
             action = "restart_dead_unit_DRYRUN"
 
+    # Consecutive Sundays whose positive action was blocked by the
+    # evidence-gap rule. A slow strangulation otherwise looks exactly like
+    # a quiet run of ordinary weeks -- the blind-spot class the bound's own
+    # comment says it is guarding against.
+    # Booked through the SAME overwrite guard as consecutive_weak: an
+    # applied same-week re-run recomputes from the persisted baseline
+    # instead of advancing again.
+    _gap_blocked = action.endswith("_BLOCKED_evidence_gap")
+    gap_baseline, evidence_gap_streak = book_streak(
+        st, "evidence_gap_streak", same_week_rerun=same_week_rerun,
+        hit=_gap_blocked)
+
     decision = dict(
         week=week, run_at_utc=time.strftime("%Y-%m-%d %H:%M", time.gmtime()),
         data_newest_lock=time.strftime(
@@ -969,6 +1170,17 @@ def _main() -> int:
         data_fresh=data_fresh, fire_fresh=fire_fresh,
         newest_fire_age_h=round(fire_age_h, 1),
         fire_stale_max_age_h=FIRE_STALE_MAX_AGE_S // 3600,
+        max_internal_gap_h=(round(max_internal_gap_h, 1)
+                            if max_internal_gap_h is not None else None),
+        # The value the gate ACTUALLY tests. Without it a trailing-driven
+        # block writes max_internal_gap_h=8.0 beside evidence_gap_ok=false,
+        # which is self-contradictory to any future replay.
+        max_window_gap_h=(round(max_window_gap_h, 1)
+                          if max_window_gap_h is not None else None),
+        trailing_gap_h=round(trailing_gap_h, 1),
+        gap_bound_h=round(gap_bound_h, 1),
+        evidence_gap_ok=evidence_gap_ok,
+        evidence_gap_streak=evidence_gap_streak,
         fire_gap_p99_h=gap_p99_h,
         sync_fail_streak=streak,
         retry_mode=retry_mode, retry_attempts=attempts_so_far,
@@ -984,6 +1196,8 @@ def _main() -> int:
     if args.apply and evidence_ok:
         st["consecutive_weak"] = consec
         st["consecutive_weak_baseline"] = baseline
+        st["evidence_gap_streak"] = evidence_gap_streak
+        st["evidence_gap_streak_baseline"] = gap_baseline
         st["last_week"] = week
         st["last_action"] = action
         hist = st.setdefault("history", [])
@@ -1015,6 +1229,30 @@ def _main() -> int:
                 f"blocked; the bot has placed no bet since "
                 f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(max_lock))}Z.\n"
                 f"{head}")
+    if not evidence_gap_ok and fire_fresh:
+        # H1: without this the suppressed enable fell through to the
+        # plain `else` below and read as a routine no-op week -- a
+        # silenced live-money action looking like nothing happened.
+        head = (f"⚠️ EVIDENCE GAP — a {max_window_gap_h:.1f}h drought "
+                f"inside the spent {trigger_window} window "
+                f"(> {gap_bound_h:.0f}h). The fires are recent but NOT "
+                f"continuous, so the stats below rest on a window with a "
+                f"hole in it. Positive actions blocked; the negative path "
+                f"is unaffected.\n{head}")
+    if evidence_gap_streak >= 2:
+        # The counter tracks SUPPRESSED ENABLES, not sparse evidence: it
+        # only advances on a *_BLOCKED_evidence_gap action, and any week
+        # whose positive trigger did not fire resets it to 0. Saying "the
+        # fire stream has been too sparse" overclaimed — a run of quiet
+        # weeks does not raise this, and a quiet week interleaved between
+        # two blocked ones lowers it.
+        head = (f"⚠️ EVIDENCE GAP x{evidence_gap_streak} CONSECUTIVE "
+                f"SUNDAYS — on {evidence_gap_streak} Sundays running a "
+                f"positive trigger FIRED and was suppressed by the gap "
+                f"rule (the counter follows suppressed enables, and resets "
+                f"on any week whose triggers did not fire — so consecutive "
+                f"here means consecutive SUPPRESSIONS). Check the fire "
+                f"RATE, not the bound.\n{head}")
     if completed_blind_week:
         head += "\n(previous week ended fully blind — Sunday and every retry failed)"
     if trigger_window == "2w_fallback":
@@ -1023,10 +1261,17 @@ def _main() -> int:
         w2_desc = _window_desc("2w(info)", p2, None, comp2)
     body = (f"{_window_desc('1w', p1, bt, comp1)}; {w2_desc}; "
             f"fire_age={fire_age_h:.1f}h fresh={fire_fresh} "
+            f"max_gap={'-' if max_window_gap_h is None else format(max_window_gap_h, '.1f')}h"
+            f"/{gap_bound_h:.0f}h "
             f"gap_p99={gap_p99_h}h/{FIRE_STALE_MAX_AGE_S // 3600}h; "
             f"neg={neg_trigger} weak={weak_this_week} consec_weak={consec} "
-            f"blind_streak={streak}; enabled={state.get('is_enabled')} "
+            f"blind_streak={streak} gap_streak={evidence_gap_streak}; "
+            f"enabled={state.get('is_enabled')} "
             f"running={state.get('is_running')} in_cooldown={in_cooldown}")
+    # `head` may already open with its own ⚠️ banner (stale data, frozen
+    # window, evidence gap, escalation). The severity prefixes below then
+    # rendered "⚠️ ⚠️ ..." in Discord.
+    warn = "" if head.startswith("⚠️") else "⚠️ "
     if retry_mode and not evidence_ok and action == "none":
         # Daily retry still blind, nothing actionable: one line, no spam.
         delivered = discord(
@@ -1035,7 +1280,11 @@ def _main() -> int:
             f"{'sync failed' if not sync_ok else 'data stale'}) — retrying "
             "daily; next full run Sunday")
     elif action in ("enable", "disable", "cooldown_override", "restart_dead_unit"):
-        delivered = discord(f"⚠️ {head} — STATE CHANGED\n{reason}\n{acted}\n{body}")
+        delivered = discord(f"{warn}{head} — STATE CHANGED\n{reason}\n{acted}\n{body}")
+    elif "_BLOCKED_" in action:
+        # A suppressed live-money action is never a routine no-op.
+        delivered = discord(
+            f"{warn}{head} — POSITIVE ACTION SUPPRESSED\n{reason}\n{body}")
     elif action.endswith("_FAILED") or action == "systemctl_UNAVAILABLE":
         delivered = discord(f"❌ {head} — ACTION FAILED / DEGRADED\n{reason}\n{acted}\n{body}")
     else:
