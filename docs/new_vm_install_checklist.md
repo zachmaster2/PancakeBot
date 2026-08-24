@@ -74,8 +74,10 @@ Installs python3.13 + venv + systemd units (DISABLED) + chrony drop-in.
 .venv/bin/python bootstrap/common/config_check.py
 ```
 (config.toml + .env + webhook presence; no mutation.) Confirm the deploy
-sizing: `max_bet_bnb_*` = 0.1 ceiling. NOTE the committed `min_bet_only`
-default is `false` (real 0.01–0.1 sizing, flipped 2026-07-01 after the
+sizing: `max_bet_bnb_*` = 0.05 ceiling (halved from 0.1 on 2026-08-24 as
+a dilution correction; see the comment in `config.toml [strategy.risk]`).
+NOTE the committed `min_bet_only` default is `false` (real 0.01–0.05
+sizing, flipped 2026-07-01 after the
 first ladder run) — for a NEW VM bring-up set it to `true` locally before
 Step B of the ladder and restore `false` at Step C.
 
@@ -153,9 +155,9 @@ the outcome, and a claim TX fires on a win — the full gate→sign→broadcast�
 confirm→settle→claim path. Any anomaly (LATE, gas-cap breach, POOL UNCOVERED,
 ANCHOR STALE, balance drift) → stop + investigate.
 
-**Step C — normal sizing (0.01–0.1 BNB).** After ≥1 clean full round at Step B:
+**Step C — normal sizing (0.01–0.05 BNB).** After ≥1 clean full round at Step B:
 restore `min_bet_only = false` (the committed default; the `max_bet_bnb_*` =
-0.1 ceiling and `min_bet_threshold_bnb` = 0.01 floor are already committed),
+0.05 ceiling and `min_bet_threshold_bnb` = 0.01 floor are already committed),
 `systemctl restart pancakebot-live`. The weekly monitor then becomes the
 recurring evaluator (autonomous enable AND disable).
 
