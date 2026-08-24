@@ -24,7 +24,40 @@ fallback is engaged). `decision.json` records the spent window as
 state (consecutive-weak counter + its prior-week baseline, history) in
 `.../state.json`. State books once per ISO week — a same-week re-run
 recomputes the week's booking from the baseline and overwrites it
-(idempotent, never double-advancing).
+(idempotent, never double-advancing). That applies to every per-week
+counter: `consecutive_weak` and `evidence_gap_streak` both go through the
+same booking guard.
+
+### Evidence gates — two ways an enable is silently withheld
+
+Both gate the POSITIVE path only; neither can block a disable, and both
+report in `decision.json` and in the Sunday Discord message. If the bot is
+not being re-enabled and no trigger explanation is obvious, check these
+first — they suppress an action that otherwise never happened.
+
+| gate | fails when | field |
+|---|---|---|
+| **Frozen window** | the newest fire is older than 96h. The stats are then re-scoring bets that already happened and describe a week the bot did not trade in — the 2026-08-17 pool outage shape: rounds fresh, fires frozen. | `fire_fresh`, `newest_fire_age_h` |
+| **Evidence gap** (density) | *any* drought longer than 96h sits inside the SPENT window — internal gaps as well as the trailing one. The frozen-window check tests only the newest fire, so 18 fires aged 9–13 days plus one fire 2h old passes it; this one does not. | `evidence_gap_ok`, `max_window_gap_h`, `max_internal_gap_h`, `trailing_gap_h`, `gap_bound_h` |
+
+The gap rule is a strict generalisation of the freshness rule (same
+constant, same units: the spent window ends at the newest fire, so its
+trailing gap *is* the freshness quantity), which is why a blocked run
+reports `enable_BLOCKED_frozen_window` before `enable_BLOCKED_evidence_gap`
+— weakest precondition first.
+
+Both blocks alert as **POSITIVE ACTION SUPPRESSED**, never as a routine
+no-op. Consecutive suppressed enables raise `evidence_gap_streak`; at 2 the
+message escalates. Note what that counter means: it follows *suppressed
+enables*, not sparse evidence — a week whose triggers did not fire resets
+it to 0.
+
+Expect the gap rule to block in EPISODES, not at a steady rate. Measured
+over the last 70 evaluable days it blocks 11 of them — but as one
+contiguous run (2026-08-12 → 08-22) as a single drought ages through the
+window, not as 11 independent Sundays. A run of blocked Sundays is one
+event, and the fix for a persistent one is the fire RATE, not the bound
+(see the derivation on `FIRE_STALE_MAX_AGE_S`).
 
 ## Cron installation (reproducible)
 
