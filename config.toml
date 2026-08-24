@@ -67,6 +67,14 @@ initial_bankroll_bnb = 50.0
 # clock on learning whether the strategy works at all, for a small and
 # uncertain cost.
 #
+# THE -0.00175 IS IMPACT-AWARE and you will not reproduce it without that.
+# It models OUR OWN 0.05 stake entering the pool, which for these rounds
+# has a median size of 0.944 BNB, so we are a material share of it. A flat
+# replay that ignores self-dilution returns +0.01015 per unit stake --
+# OPPOSITE SIGN. Ours is the pessimistic and physically correct one; if a
+# future re-derivation comes out positive, check whether it modelled
+# impact before concluding the filter got better.
+#
 # Pool-filter sweep, replaying the real bet sequence through the real
 # breaker rules (15% rolling-7d, 288-round cooldown) at the deployed 0.05
 # stake against a 2.03 bankroll:
@@ -82,6 +90,12 @@ initial_bankroll_bnb = 50.0
 # rate peaks around T=1.0-1.25 and then FALLS: past that the breaker
 # suspends often enough to destroy the volume the looser filter bought,
 # which is why T=0 is dominated on every axis rather than merely worse.
+#
+# THE +45% IS A CURRENT-REGIME FIGURE, not an all-history one. It matches
+# the sweep's recent-regime column. Measured fire-count uplift by horizon:
+#     all history  +29.3%      last 140d  +36.5%      last 70d  +51.4%
+# Quote the horizon whenever you quote the number. The regime dependence
+# is real and large, and +45% is the one a reader carries away.
 #
 # Overall the volume trade is worth about 1.6x, NOT the 7x that was
 # claimed at one point and then self-corrected. Do not repeat the 7x.
@@ -106,7 +120,13 @@ initial_bankroll_bnb = 50.0
 #     BNB). It shares the value 1.5 by coincidence and is NOT changed.
 #   * The SHADOW ledger uses the same threshold, so counterfactual fires
 #     rise at the same rate. That feeds the breaker's release test
-#     (shadow_min_fires = 3), which will now be satisfied sooner.
+#     (shadow_min_fires_to_release = 3), which will now be satisfied
+#     sooner. DIRECTION OF RISK: that means suspensions RELEASE EARLIER,
+#     on younger evidence drawn from a population this very comment
+#     describes as EV-neutral at best. Mechanically benign -- no leg of
+#     the release test is weakened in kind, all three still have to pass
+#     -- but it is the unsafe direction, and it is the breaker, so it is
+#     called out rather than left as a footnote.
 #   * The code default in config.py stays 1.5. If this key were ever
 #     dropped from this file the bot would revert to the tighter filter --
 #     the safe direction, unlike min_bet_only.

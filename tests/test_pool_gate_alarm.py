@@ -454,3 +454,30 @@ def test_rate_window_length_and_warmup_are_independent():
     events = _feed(engine, _kcfg(), seq)
     assert events, "must alert once min_samples is reached, not at full W"
     engine._reset_pool_gate_alarm()
+
+
+def test_window_rounds_counts_the_round_being_processed():
+    """Off-by-one fix: the health line read pub_win.n BEFORE observe(), so
+    it excluded the round it was reporting on and showed 0/120(warming)
+    immediately after a restart had already seen one round. Reported after
+    the observe loop now, so the count includes the current round."""
+    from pancakebot.runtime import engine
+
+    engine._reset_pool_gate_alarm()
+    seen = []
+
+    class _Poller:
+        def set_health_extra(self, **kw):
+            seen.append(kw.get("window_rounds"))
+
+    cfg = types.SimpleNamespace(
+        dry=False, rpc_poller=_Poller(),
+        max_consecutive_kline_fetch_failures=5,
+    )
+    for i in range(3):
+        engine._note_kline_gate_outcome(cfg, transient_class=None, epoch=i)
+
+    assert seen[0].startswith("1/"), seen
+    assert seen[1].startswith("2/"), seen
+    assert seen[2].startswith("3/"), seen
+    assert "(warming)" in seen[0]
