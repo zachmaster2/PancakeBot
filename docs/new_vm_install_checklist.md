@@ -161,6 +161,36 @@ restore `min_bet_only = false` (the committed default; the `max_bet_bnb_*` =
 `systemctl restart pancakebot-live`. The weekly monitor then becomes the
 recurring evaluator (autonomous enable AND disable).
 
+## Restarting a LIVE unit — always gate it
+
+Never `systemctl restart pancakebot-live` on a live unit from judgement
+alone. Run the gate and let its exit code decide:
+
+```bash
+cd /root/pancakebot
+.venv/bin/python scripts/preflight_restart.py && systemctl restart pancakebot-live
+```
+
+It blocks unless all three hold: no open position (`SUBMITTED`/`CONFIRMED`
+in the bet ledger — `LATE`/`REVERTED`/`DROPPED` are terminal and do NOT
+block), the most recent decision was a SKIP rather than a BET, and at
+least 90s remain before the next lock. It fails CLOSED if the chain
+cannot be read.
+
+This exists because on 2026-08-24 two restarts went out behind
+hand-written checks that passed when they should have failed: one before
+the deploy had been pulled, and one 17 seconds after a bet was submitted,
+while that position was open. Both hand-written open-position tests were
+wrong, in opposite directions. The gate imports the ledger's own status
+sets instead of restating them.
+
+Also pull BEFORE restarting, and verify the SHA — a restart on an
+unpulled tree reloads identical code and deploys nothing:
+
+```bash
+git pull --ff-only && git rev-parse --short HEAD
+```
+
 ## After install — weekly monitor
 Installed as cron in step 13; both directions are autonomous under
 `--apply` (negative → disable, positive → enable + release). Manual dry
