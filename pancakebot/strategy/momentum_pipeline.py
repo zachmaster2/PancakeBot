@@ -440,6 +440,52 @@ class MomentumOnlyPipeline:
                             ),
                         },
                     )
+            # Check 4: WORST-CASE EXPOSURE -- an ADMISSION gate, not a
+            # breaker. Deliberately placed here, with the other pre-bet
+            # risk checks and AFTER Check 3, because it decides whether to
+            # open NEW exposure rather than whether the account is already
+            # in trouble. It never fires the cooldown: declining a round is
+            # not a suspension, and conflating them would let a single
+            # in-flight bet trigger a 24h stand-down.
+            #
+            # TWO DECISIONS, TWO VALUATIONS -- the whole model in one place:
+            #   * whether to SUSPEND (Check 3) values open positions at
+            #     COST, because an unresolved bet is not a realised loss;
+            #   * whether to PLACE A NEW BET (here) values them at ZERO,
+            #     because the exposure is about to be committed and cannot
+            #     be recalled, so it is admitted only if survivable.
+            #
+            # And the worst case IS the raw wallet balance: a stake that
+            # loses is one that never comes back, so `current` -- the very
+            # number this breaker was wrongly tripping on before the
+            # settled-equivalent fix -- is exactly right for this different
+            # question. The same figure, wired to the right decision. That
+            # is why this gate costs nothing to compute.
+            #
+            # GENERALISES TO ANY NUMBER OF OPEN POSITIONS with no special
+            # casing: `current` already excludes every open stake, so
+            # "assume they all lose" is simply "use current". Measured
+            # settlement spans (max 351s against a ~306s round interval,
+            # zero over 612s) cap real concurrency at 2, but nothing here
+            # depends on that bound.
+            #
+            # NO-OP IN NORMAL CONDITIONS: with nothing open, open_stake is
+            # 0 and worst_case == settled_current, so a round that passed
+            # Check 3 passes here by construction. It bites only in the
+            # band where a pending loss would trip the breaker.
+            if peak > 0 and open_stake > 0.0:
+                worst_case_dd = (peak - current) / peak
+                if worst_case_dd >= risk.max_drawdown_fraction_from_peak:
+                    return self._skip(
+                        "risk_worst_case_exposure",
+                        skip_context={
+                            "worst_case_pct": float(worst_case_dd * 100.0),
+                            "threshold_pct": float(
+                                risk.max_drawdown_fraction_from_peak * 100.0
+                            ),
+                            "open_stake_bnb": float(open_stake),
+                        },
+                    )
 
         if self._gate is not None:
             # Live/dry: gate fetches BTC/ETH/SOL/BNB klines in parallel via
