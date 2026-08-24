@@ -10,6 +10,15 @@ Discord lists by ARRIVAL, so the pair displayed as STARTED-then-STOPPED.
 The fix orders them at the source: the started hook waits for its stopped
 sibling's unit to leave a busy state before posting. These pin that it costs
 nothing on a fresh start, is bounded, and never raises.
+
+Verified live on the 2026-08-24T00:15:53Z restart, the first since the wait
+landed: both hooks launched 44ms apart (stopped .350841, started .394938),
+the STOPPED POST went at .063858 of the next second, the stopped unit
+deactivated at .116242, and the STARTED POST followed at .588507 -- 472ms
+later, i.e. the started hook demonstrably waited for its sibling.
+
+Because ordering is structural, the messages carry no ordering metadata:
+no evt_mono_us, no pid, and a plain whole-second local timestamp.
 """
 import re
 
@@ -17,25 +26,29 @@ from pancakebot.ops import notify_lifecycle as nl
 from pancakebot.ops.notifications import _local_time_str, build_message
 
 
-def test_local_time_str_has_millisecond_and_utc():
-    """Whole-second stamps made the pair look simultaneous; UTC keeps the
-    alert correlatable with the journal, which is UTC throughout."""
+def test_local_time_str_is_a_plain_local_whole_second_stamp():
+    """The millisecond + dual-UTC stamp existed only to order a pair that
+    Discord listed by arrival. That job is structural now, and the long
+    form wrapped onto two lines on a phone. This fails if it comes back."""
     s = _local_time_str()
-    assert re.search(
-        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \w+ / "
-        r"\d{2}:\d{2}:\d{2}\.\d{3}Z", s), s
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+", s), s
+    assert "." not in s          # no milliseconds
+    assert not s.endswith("Z")   # no appended UTC
 
 
-def test_no_ordering_proof_field_in_messages():
-    """Ordering is structural now, so the messages carry no proof metadata."""
+def test_lifecycle_alerts_carry_no_ordering_metadata():
+    """Ordering is structural, so the messages carry no proof metadata --
+    and the lifecycle path no longer collects a pid to carry."""
     stopped = build_message(mode="live", kind="STOPPED",
                             fields={"intentional": True})
-    started = build_message(mode="live", kind="STARTED", fields={"pid": 637773})
+    started = build_message(mode="live", kind="STARTED", fields={})
     for m in (stopped, started):
         assert "evt_mono_us" not in m
         assert "lower = earlier" not in m
-    assert "pid: `637773`" in started
-    assert "pid:" not in stopped
+        assert "pid:" not in m
+    # The generic renderer still supports a pid for callers that pass one
+    # (it predates all of this); nothing in the lifecycle path does.
+    assert not hasattr(nl, "started_pid_field")
 
 
 # ---- the structural wait --------------------------------------------------
@@ -113,18 +126,18 @@ def test_wait_treats_a_failed_query_as_not_busy():
     assert waited == 0.0
 
 
-# ---- pid field ------------------------------------------------------------
+# ---- the wait is the only thing doing ordering work ----------------------
 
-def test_pid_reported_only_for_started():
-    out = "MainPID=637773\n"
-    assert nl.started_pid_field("u", "started", run_cmd=lambda a: out) == {
-        "pid": 637773}
-    # by the time the stopped hook queries, MainPID already names the NEW
-    # process, so the stopped alert carries no pid rather than a wrong one
-    assert nl.started_pid_field("u", "stopped", run_cmd=lambda a: out) == {}
+def test_wait_needs_no_pid_or_timestamp():
+    """It queries the SIBLING UNIT's state and nothing else, which is why
+    removing the pid and the sub-second stamp cannot affect ordering."""
+    seen = []
 
+    def run(argv):
+        seen.append(argv)
+        return "inactive"
 
-def test_pid_absent_when_zero_or_unavailable():
-    assert nl.started_pid_field("u", "started",
-                                run_cmd=lambda a: "MainPID=0\n") == {}
-    assert nl.started_pid_field("u", "started", run_cmd=lambda a: "") == {}
+    nl.wait_for_stopped_sibling("pancakebot-live", "started", run_cmd=run,
+                                sleep=lambda s: None)
+    assert seen == [["systemctl", "is-active",
+                     "pancakebot-notify@pancakebot-live-stopped.service"]]
