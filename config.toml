@@ -138,9 +138,78 @@ shadow_recovery_peak_fraction = 0.85   # hypo bankroll must exceed hypo peak * t
 drawdown_peak_window_days = 7                        # rolling window for peak calculation
 drawdown_peak_mode = "rolling_7d"      # peak-tracking semantics; alt: "absolute_ratchet" (monotonic since-launch peak)
 # Absolute per-bet BNB caps (formerly under btc_primary.sizing / eth_sol_fallback.sizing).
-# 2026-06-30 new-VM deploy: capped to 0.1 BNB (small-stake live-validation
-# ceiling; min floor is min_bet_threshold_bnb=0.01). Whether real 0.01-0.1
-# sizing applies is gated by min_bet_only in [live] (see its comment; a new
-# VM bring-up sets it true for the ladder's min-bet step, then restores false).
-max_bet_bnb_btc_primary = 0.1          # hard cap on BTC primary stake (deploy: 0.1)
-max_bet_bnb_eth_sol_fallback = 0.1     # hard cap on ETH+SOL regime-2 stake (deploy: 0.1)
+# min floor is min_bet_threshold_bnb=0.01. Whether real sizing applies at all
+# is gated by min_bet_only in [live] (see its comment; a new VM bring-up sets
+# it true for the ladder's min-bet step, then restores false).
+#
+# 2026-08-24: 0.1 -> 0.05, a DILUTION correction.
+#
+# WHICH CLAMP ACTUALLY BINDS (measured across all 1,982 canonical fires with
+# real pools and real signal strengths, not a worked example):
+#   raw bet, no caps:  min 0.0249  p05 0.0549  p25 0.1144  p50 0.1977
+#                      p95 0.7630  max 2.5133
+#   raw < 0.10: 391/1982 (19.7%)      raw < 0.05: 74/1982 (3.7%)
+# Nearly all sub-cap cases are the ETH/SOL FALLBACK regime, which sizes off
+# base_pool_fraction = 0.02 (see [strategy.eth_sol_fallback.sizing]) against
+# the primary's 0.04: 280 of the 391 come from it, and its minimum raw bet is
+# 0.0249 versus 0.0505 for BTC primary.
+#
+# At the live bankroll of 1.889 BNB the OLD 0.1 absolute cap bound 0 times
+# out of 1982 -- max_bet_fraction_of_bankroll bound every round. That is why
+# observed live stakes tracked 0.05 x 1.889 = 0.0945 rather than 0.1000.
+# (Strictly: the bankroll fraction bound ~82% and the other ~18% were
+# RAW-bound -- their adaptive size was already under 0.0945. The absolute
+# cap bound in neither case.)
+#
+# After this change the ABSOLUTE cap binds 96.3% of rounds at any bankroll
+# >= 1.0. The remaining 3.7% are RAW-bound, not fraction-bound: their
+# adaptive size already sits under 0.05, so no clamp touches them.
+#
+# So the practical effect IS a near-flat 0.05 stake, but note what changed:
+# the operative clamp moves from the bankroll fraction to the absolute cap.
+# An earlier version of this comment claimed the adaptive terms "never
+# survive" and that these caps "are what actually set the stake" -- both were
+# false, generalised from one hand-picked BTC-primary example onto a path
+# that serves both regimes. Do not act on the old framing: in particular,
+# max_bet_fraction_of_bankroll is NOT inert, and raising it would change
+# real behaviour.
+#
+# Measured EV per unit staked against pool depth (~2.7 BNB): 9.94% at 0.05,
+# 9.73% at 0.02, 8.94% at 0.10 -- gross of gas. Gas doubles as a share of a
+# halved stake, which costs 0.20pp at backtest gas (0.036pp at the
+# live-observed median) against the 1.00pp advantage over 0.10, so it
+# narrows the margin without changing the ranking and it strengthens 0.05
+# over the 0.02 end of the band. 0.05 is the peak of the 0.02-0.05
+# dilution-optimal band, so the top of the band is used rather than the
+# middle.
+#
+# The ABSOLUTE cap is the right lever, not max_bet_fraction_of_bankroll: the
+# dilution optimum depends on POOL DEPTH, not on our bankroll, so an absolute
+# cap pins us in the band and stays there. Matching today's effect via the
+# bankroll fraction would drift back out as the bankroll moves and would
+# degrade the risk control that fraction exists to provide. The fraction is
+# unchanged and remains the risk floor: at any bankroll below ~1.0 it binds
+# again and scales every stake down with the bankroll. Above 1.0 it is
+# dormant but NOT dead -- raising it would raise the crossover bankroll and
+# hand control back to it.
+#
+# REPORTING CONSEQUENCE: the weekly monitor copies this file verbatim and
+# overrides only four keys, NOT max_bet_bnb_*. Every btPnL it reports
+# therefore HALVES for reasons unrelated to strategy performance (7d
+# 0.2277 -> 0.1142, 14d 0.5234 -> 0.2621). Sign flips are negligible -- that
+# needs gross PnL in ~0.002-0.008 against typical 0.11-0.26 -- but do not
+# read the smaller numbers as decay.
+#
+# DRAWDOWN BREAKER: the capital ceiling is UNCHANGED, because both the
+# threshold and the loss are bankroll fractions -- the worst-case episode
+# actually improves from 20.0% to 17.65% of bankroll. What halves is
+# DETECTION SPEED: 6 consecutive max-losses to trip instead of 3, roughly
+# 2.4 days instead of 1.2.
+#
+# CAVEAT: the 0.02-0.05 optimum is measured on golden-era data (n=1,446, real
+# pool splits, impact-aware settlement). The post-June sample (n=98) is
+# negative at every stake with CIs spanning zero, so it can neither confirm
+# nor contradict. This is a dilution correction; it does NOT make an
+# unprofitable strategy profitable.
+max_bet_bnb_btc_primary = 0.05         # hard cap on BTC primary stake
+max_bet_bnb_eth_sol_fallback = 0.05    # hard cap on ETH+SOL regime-2 stake

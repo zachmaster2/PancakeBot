@@ -109,6 +109,13 @@ A (false-)positive re-enable is bounded by three independent layers:
    peak suspends betting for 288 rounds (~24 h). Every release path reseeds
    the peak baseline to the current bankroll, so a re-enable after a long
    gap can never trip on a months-old peak.
+
+   *Since the 2026-08-24 stake halving:* the CAPITAL ceiling is unchanged —
+   both the threshold and the per-bet loss are bankroll fractions, so the
+   worst-case episode actually improves (20.0% → 17.65%). What changed is
+   DETECTION SPEED: reaching the 15% threshold now takes 6 consecutive
+   max-losses instead of 3, i.e. roughly 2.4 days instead of 1.2. A slow
+   bleed is caught later in wall-clock time while costing no more capital.
 2. **Shadow ledger** (intra-week): at cooldown expiry the suspension is
    extended unless the shadow (counterfactual) ledger shows genuine
    recovery — ≥ 3 settled shadow fires, cumulative PnL ≥ 0, and
@@ -119,13 +126,24 @@ A (false-)positive re-enable is bounded by three independent layers:
 
 Worst case for one bad episode: the breaker suspends after ~15% drawdown
 from the (reseeded) bankroll plus at most one max-size bet of overshoot
-(~0.1 BNB + gas) — roughly 20% of bankroll — after which the shadow ledger
+(~0.05 BNB + gas) — roughly 17.6% of bankroll — after which the shadow ledger
 holds the suspension, and the following Sunday disables outright if the
 week's WR fell below 45% (or after 3 weak weeks). A slow bleed that
 evades both weekly legs stays bounded per-episode by the breaker: every
 resumption requires fresh statistical evidence (a new positive trigger at
-p < 0.10, or genuine shadow recovery), so repeated 20% episodes each need
+p < 0.10, or genuine shadow recovery), so repeated ~17.6% episodes each need
 independently "good-looking" weeks to precede them.
+
+### Reading `btPnL` after 2026-08-24
+
+The monitor copies `config.toml` verbatim and overrides only four keys —
+`max_bet_bnb_*` is NOT among them. The stake halving therefore HALVES every
+`btPnL` figure the Sunday report prints (on the 2026-08-23 data: 7d
+0.2277 → 0.1142, 14d 0.5234 → 0.2621) for reasons that have nothing to do
+with strategy performance. Do not read the step down as decay. The backtest
+leg is a SIGN test (`> 0`), and a sign flip would need gross PnL inside
+~0.002–0.008 BNB against typical values of 0.11–0.26, so the trigger
+behaviour is effectively unaffected — only the printed magnitude moves.
 
 ## Research tripwire monitor (separate tool)
 
