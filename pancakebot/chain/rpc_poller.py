@@ -156,6 +156,28 @@ RPC_BLOXROUTE_ENDPOINT: str = "https://bsc.rpc.blxrbdn.com"
 # refuses).
 RPC_GETLOGS_ENDPOINT: str = "https://bsc-rpc.publicnode.com"
 
+# CANDIDATE RE-SURVEY 2026-08-25 (14 free BSC hosts, production's exact
+# filter, paired against a live block). The 2026-06-09 finding that the
+# whole free-DATASEED set rejects eth_getLogs still holds -- bnbchain,
+# defibit1/2 and ninicoin1 all still answer -32005 "limit exceeded" -- but
+# two hosts OUTSIDE that set now serve it:
+#   nodereal-public  98ms, 12/12 identical to publicnode on LOG-BEARING
+#                    blocks -> VALIDATED FAILOVER TARGET if one is ever
+#                    needed. Its 98ms sits against a 250ms timeout sized
+#                    for publicnode (~40ms), so the timeout MUST be
+#                    re-derived before any move; do not inherit it.
+#   drpc             STRUCK. It answered the single capability probe, but
+#                    errored on 8 of 12 log-bearing blocks in the paired
+#                    follow-up. Do not re-propose it without new evidence.
+# Failed outright: ankr (key required), 1rpc (403), blast (429), meowrpc
+# (method not supported), llama (DNS), omnia (521).
+#
+# HOLD on the current split was the verdict of that run, not inertia:
+# bloXroute's getLogs has NOT recovered (n=216 paired, p50 250.9ms, p90
+# 1411ms, p99 3811ms, 50.0% over this 250ms timeout, and 8/12 over it at
+# the 750-block chunk cap), while publicnode measured p50 26.6 / p99 68.2
+# / max 144.4ms with 0/218 over the timeout and 0 errors.
+
 # THE routing table: read it to see which host serves which method, and
 # the docstring above for why the split exists at all.
 _ENDPOINT_BY_METHOD: dict[str, str] = {
@@ -535,8 +557,22 @@ class RpcPoller:
         # it). Timeouts are recorded as censored observations at the timeout
         # bound rather than dropped — see ``getlogs_p99_ms``.
         self._getlogs_latency_ms: deque[float] = deque(maxlen=200)
-        self._getlogs_censored: int = 0
-        self._getlogs_errors: int = 0
+        # LIFETIME totals. Monotonic since process start, never windowed.
+        # Named _total (and rendered *_life) because printing a monotonic
+        # counter beside `samples=200` read as "30 out of 200" and cost a
+        # day of misdiagnosis on 2026-08-25: it was 30 out of ~8,500 calls,
+        # i.e. 0.35%, and the apparent "climbing across two episodes" was
+        # two PROCESS LIFETIMES either side of a deploy restart.
+        self._getlogs_censored_total: int = 0
+        self._getlogs_errors_total: int = 0
+        # WINDOWED outcomes: one entry per getLogs ATTEMPT, which is the
+        # only honest denominator for an error rate. It cannot be the
+        # latency ring: a fast RPC rejection increments errors but appends
+        # NO latency sample (only attempts that consumed >=90% of the
+        # budget are recorded, censored at the bound), so the two have
+        # genuinely different populations.
+        self._getlogs_outcomes: deque[str] = deque(maxlen=200)
+        self._proc_start_monotonic: float = time.monotonic()
 
         # ``(needed_ms, available_ms)`` from the most recent catchup
         # feasibility check that returned True (= infeasible). Reset
@@ -616,7 +652,16 @@ class RpcPoller:
         with self._lock:
             self._getlogs_latency_ms.append(float(ms))
             if censored:
-                self._getlogs_censored += 1
+                self._getlogs_censored_total += 1
+
+    def _record_getlogs_outcome(self, outcome: str) -> None:
+        """One entry per getLogs ATTEMPT: "ok" | "censored" | "error".
+
+        Separate from the latency ring on purpose -- see
+        ``_getlogs_outcomes``. This is what makes a printed rate a rate.
+        """
+        with self._lock:
+            self._getlogs_outcomes.append(outcome)
 
     @property
     def getlogs_p99_ms(self) -> int | None:
@@ -650,8 +695,11 @@ class RpcPoller:
                 "connected": self._connected,
                 "current_endpoint": RPC_BLOXROUTE_ENDPOINT,
                 "getlogs_endpoint": RPC_GETLOGS_ENDPOINT,
-                "getlogs_censored_samples": self._getlogs_censored,
-                "getlogs_errors": self._getlogs_errors,
+                "getlogs_censored_total": self._getlogs_censored_total,
+                "getlogs_errors_total": self._getlogs_errors_total,
+                "getlogs_window_calls": len(self._getlogs_outcomes),
+                "getlogs_window_errors": sum(
+                    1 for o in self._getlogs_outcomes if o == "error"),
                 "poll_count": self._poll_count,
                 "last_poll_at": self._last_poll_at,
                 "last_poll_rtt_ms": self._last_poll_rtt_ms,
@@ -1121,10 +1169,18 @@ class RpcPoller:
         """
         p99 = self.getlogs_p99_ms
         with self._lock:
-            censored, errors = self._getlogs_censored, self._getlogs_errors
-            samples = len(self._getlogs_latency_ms)
+            cens_life = self._getlogs_censored_total
+            err_life = self._getlogs_errors_total
+            lat_n = len(self._getlogs_latency_ms)
+            win = list(self._getlogs_outcomes)
+            uptime_s = time.monotonic() - self._proc_start_monotonic
             head_fetch = self._last_head_fetch_error or "ok"
             extra = dict(self._health_extra)
+        win_n = len(win)
+        win_err = sum(1 for o in win if o == "error")
+        win_cens = sum(1 for o in win if o == "censored")
+        pct = (lambda k: f"{100.0 * k / win_n:.1f}%") if win_n else (lambda k: "n/a")
+        uptime_txt = f"{int(uptime_s // 3600)}h{int(uptime_s % 3600 // 60):02d}m"
         # ">=" ONLY when at least one sample is a censored timeout. With
         # censored=0 the p99 is an exact measurement, and an unconditional
         # ">=" makes a bound indistinguishable from a measurement — which
@@ -1132,11 +1188,21 @@ class RpcPoller:
         if p99 is None:
             p99_txt = "n/a"
         else:
-            p99_txt = f"{'>=' if censored else ''}{p99}ms"
+            p99_txt = f"{'>=' if cens_life else ''}{p99}ms"
+        # FIELD NAMING IS THE FIX. `_win` numbers are rates over
+        # `calls_win`, a real denominator (one entry per ATTEMPT). `_life`
+        # numbers are monotonic since process start and say so in the name,
+        # so they cannot be read against calls_win. `uptime` makes two
+        # lines from different process lifetimes impossible to mistake for
+        # a trend -- the 2026-08-25 misdiagnosis inferred a rising rate
+        # from counters that had merely restarted at zero.
         info(
             "POLL",
-            f"getlogs health: p99={p99_txt} "
-            f"samples={samples} censored={censored} errors={errors} "
+            f"getlogs health: p99={p99_txt} lat_n={lat_n} "
+            f"calls_win={win_n} "
+            f"err_win={win_err}({pct(win_err)}) "
+            f"cens_win={win_cens}({pct(win_cens)}) "
+            f"err_life={err_life} cens_life={cens_life} uptime={uptime_txt} "
             f"head_fetch={head_fetch} "
             + "".join(f"{k}={v} " for k, v in sorted(extra.items()))
             + f"host={RPC_GETLOGS_ENDPOINT}",
@@ -2244,7 +2310,12 @@ class RpcPoller:
                     )
                 payload = json.loads(resp_bytes)
                 if "error" in payload:
+                    # NOT an "ok" outcome: the transport succeeded but the
+                    # call did not. Falls through to the except below,
+                    # which records it as an error.
                     raise InvariantError(f"rpc_error:{method}:{payload['error']}")
+                if method == "eth_getLogs":
+                    self._record_getlogs_outcome("ok")
                 return payload.get("result")
             except Exception as e:  # noqa: BLE001
                 if method == "eth_getLogs":
@@ -2254,12 +2325,15 @@ class RpcPoller:
                     # all, so only attempts that actually consumed the
                     # budget are recorded, censored at the bound.
                     with self._lock:
-                        self._getlogs_errors += 1
+                        self._getlogs_errors_total += 1
                     elapsed_ms = (time.monotonic() - t_attempt) * 1000.0
                     if elapsed_ms >= timeout_ms * 0.9:
                         self._record_getlogs_latency(
                             max(elapsed_ms, float(timeout_ms)), censored=True,
                         )
+                        self._record_getlogs_outcome("censored")
+                    else:
+                        self._record_getlogs_outcome("error")
                 last_error = e
         assert last_error is not None  # attempts >= 1 guaranteed by callers
         raise last_error

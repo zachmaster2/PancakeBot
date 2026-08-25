@@ -22,7 +22,9 @@ CANDIDATES = [
     "https://bsc-dataseed1.ninicoin.io",
     "https://bsc.publicnode.com",
     "https://1rpc.io/bnb",
-    "https://bsc.drpc.org",
+    # STRUCK 2026-08-25: answers a single capability probe but errored on
+    # 8 of 12 log-bearing blocks in the paired follow-up. Not a candidate.
+    # "https://bsc.drpc.org",
     "https://bsc.meowrpc.com",
     "https://binance.llamarpc.com",
     "https://bsc.blockpi.network/v1/rpc/public",
