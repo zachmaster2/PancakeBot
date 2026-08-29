@@ -7,7 +7,7 @@ Covers ``_bloxroute_call`` — THE transport every read RPC goes through:
 - JSON-RPC error envelopes raise (and are retried like transport errors)
 - wall-clock cap: an attempt whose timeout cannot complete before
   ``abort_at`` is NOT started (the cap is a hard bound by construction)
-- ``_bloxroute_block_number`` parsing on top of it
+- ``_head_block_number`` parsing on top of it
 
 All tests stub ``_rpc_post`` — no network.
 """
@@ -139,15 +139,21 @@ def test_block_number_parses_and_propagates_attempts(monkeypatch):
     p = _make_poller()
     captured: dict = {}
 
-    def _capture_call(method, params, *, timeout_ms, attempts, abort_at=None):
+    def _capture_call(method, params, *, timeout_ms, attempts, abort_at=None,
+                      endpoint=None):
         captured["method"] = method
         captured["attempts"] = attempts
+        captured["endpoint"] = endpoint
         return hex(103_000_000)
 
     monkeypatch.setattr(p, "_bloxroute_call", _capture_call)
-    assert p._bloxroute_block_number(attempts=3) == 103_000_000
+    assert p._head_block_number(endpoint=RPC_BLOXROUTE_ENDPOINT, attempts=3) == 103_000_000
     assert captured["method"] == "eth_blockNumber"
     assert captured["attempts"] == 3
+    # The endpoint must reach the transport. A head is node-relative, so a
+    # silently-dropped override would resurrect the cross-node bound that
+    # caused the 2026-08-26/28 -32602 head-race.
+    assert captured["endpoint"] == RPC_BLOXROUTE_ENDPOINT
 
 
 def test_block_number_raises_on_unexpected_result(monkeypatch):
@@ -157,4 +163,4 @@ def test_block_number_raises_on_unexpected_result(monkeypatch):
         lambda method, params, **kw: {"not": "a_string"},
     )
     with pytest.raises(InvariantError, match="eth_blockNumber_unexpected_result"):
-        p._bloxroute_block_number(attempts=1)
+        p._head_block_number(endpoint=RPC_BLOXROUTE_ENDPOINT, attempts=1)

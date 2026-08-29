@@ -39,12 +39,14 @@ from pancakebot.util import InvariantError  # noqa: E402
 def _make_poller() -> RpcPoller:
     """Construct a poller with default args, hermetically stubbed.
 
-    The poll head comes from ``_bloxroute_block_number`` (the single read
+    The poll head comes from ``_poll_head_block_number`` -- the tip of the
+    host that SERVES the getLogs, not bloXroute (fixed 2026-08-29; the
+    cross-node bound produced the -32602 head-race). It is the single read
     endpoint); stub it high by default so tests that don't poll never hit
     the real endpoint. Head-sensitive tests override it.
     """
     p = RpcPoller(interval_seconds=300)
-    p._bloxroute_block_number = lambda **kw: 10**12  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw: 10**12  # type: ignore[assignment]
     return p
 
 
@@ -171,7 +173,7 @@ def test_poll_head_is_bloxroute_and_cursor_advances_to_it():
     p = _make_poller()
     p._last_polled_block_number = 99_990
     p._lock_at = 0  # skip the feasibility branch
-    p._bloxroute_block_number = lambda **kw: 99_995  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw: 99_995  # type: ignore[assignment]
     fetched: list = []
     p._fetch_and_process_logs = (  # type: ignore[assignment]
         lambda frm, to, **kw: fetched.append((frm, to))
@@ -318,7 +320,7 @@ def test_set_round_phase_advancing_epoch_drops_past_round_pools(monkeypatch):
     # Stub the hook's RPCs (no network).
     monkeypatch.setattr(p, "_compute_round_start_block", lambda ts: None)
     monkeypatch.setattr(
-        p, "_bloxroute_block_number",
+        p, "_poll_head_block_number",
         lambda **kw: (_ for _ in ()).throw(RuntimeError("no network")),
     )
 
@@ -452,7 +454,7 @@ def test_on_epoch_advance_clamps_cursor_after_long_silence():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 1_000  # very stale
 
-    p._bloxroute_block_number = lambda **kw: 100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw: 100_000  # type: ignore[assignment]
     # head_ts = 1_000_300 (seconds-only header: ms None), lock_at = 1_000_350,
     # round_start_ts = 1_000_050. Seconds fallback errs EARLY:
     # delta = ceil(250_000/450) + 3 = 556 + 3 = 559 -> rs = 100_000 - 559
@@ -473,7 +475,7 @@ def test_on_epoch_advance_does_not_rewind_cursor_when_in_round():
 
     # Same mocks as the clamp test but cursor is in-round.
     p._bloxroute_latest_header = lambda **kw: (100_000, 1_000_300, None)  # type: ignore[assignment]
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
     p._on_epoch_advance(lock_at=1_000_350, current_epoch=101)
 
@@ -492,7 +494,7 @@ def test_on_epoch_advance_resets_infeasibility_flag():
 
     # Mock: very small backlog, plenty of time -> still feasible.
     p._bloxroute_latest_header = lambda **kw: (100_000, 1_000_300, None)  # type: ignore[assignment]
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
     # lock_at far in the future to ensure feasibility.
     import time as _t
@@ -521,7 +523,7 @@ def test_on_epoch_advance_marks_infeasible_when_catchup_exceeds_budget():
     p._last_polled_block_number = 1_000  # very stale; clamp jumps to round_start
 
     p._bloxroute_latest_header = lambda **kw: (100_000, _t.time(), None)  # type: ignore[assignment]
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
     # ~150ms to lock: available < the 250ms one-chunk estimate, but still
     # pre-lock so the flag is not suppressed.
@@ -539,7 +541,7 @@ def test_on_epoch_advance_handles_block_number_failure_gracefully():
     p._last_polled_block_number = 99_900
 
     p._bloxroute_latest_header = lambda **kw: (100_000, 1_000_300, None)  # type: ignore[assignment]
-    p._bloxroute_block_number = lambda **kw:(_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:(_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
 
     # Should not raise.
     p._on_epoch_advance(lock_at=1_000_350, current_epoch=101)
@@ -590,7 +592,7 @@ def test_epoch_advance_atomic_no_torn_state_during_rs_rpc(monkeypatch):
         return 99_500
 
     monkeypatch.setattr(p, "_compute_round_start_block", fake_rs)
-    p._bloxroute_block_number = lambda **kw: 99_510  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw: 99_510  # type: ignore[assignment]
 
     p.set_round_phase(current_epoch=101, lock_at=new_lock_at)
 
@@ -622,7 +624,7 @@ def test_epoch_advance_cursor_jump_respects_concurrent_daemon_advance(monkeypatc
         return 99_500
 
     monkeypatch.setattr(p, "_compute_round_start_block", fake_rs)
-    p._bloxroute_block_number = lambda **kw: 99_810  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw: 99_810  # type: ignore[assignment]
 
     p.set_round_phase(current_epoch=101, lock_at=int(_t.time()) + 300)
     assert p._last_polled_block_number == 99_800, (
@@ -644,7 +646,7 @@ def test_epoch_advance_rs_failure_still_commits_transition(monkeypatch):
     new_lock_at = int(_t.time()) + 300
 
     monkeypatch.setattr(p, "_compute_round_start_block", lambda ts: None)
-    p._bloxroute_block_number = lambda **kw: 1_005  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw: 1_005  # type: ignore[assignment]
     warns: list = []
     monkeypatch.setattr(mod, "warn", lambda action, msg: warns.append((action, msg)))
 
@@ -677,7 +679,7 @@ def test_epoch_advance_prunes_block_ts_round_aware(monkeypatch):
         p._block_ts[100_000 + i] = round_start_ts - 10 - i
 
     monkeypatch.setattr(p, "_compute_round_start_block", lambda ts: 200_000)
-    p._bloxroute_block_number = lambda **kw: 200_010  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw: 200_010  # type: ignore[assignment]
 
     p.set_round_phase(current_epoch=101, lock_at=new_lock_at)
 
@@ -1074,7 +1076,7 @@ def test_poll_lock_arbitration_periodic_yields_to_concurrent_ramp_poll():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 99_990  # 10 blocks behind; feasible budget
 
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
     # Plenty of time to lock so feasibility doesn't trip.
     p._lock_at = int(_t.time()) + 60
 
@@ -1204,7 +1206,7 @@ def test_poll_now_aborts_early_when_catchup_infeasible_mid_round(caplog):
     p._last_polled_block_number = 1_000
 
     # Mock: head jumped to 100_000 (99_000 blocks behind).
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
     # If the batch fetcher is invoked, blow up the test.
     p._fetch_and_process_logs = (  # type: ignore[assignment]
         lambda *a, **kw: pytest.fail("should not have fetched")
@@ -1237,7 +1239,7 @@ def test_poll_now_post_lock_infeas_does_not_set_flag(capsys):
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 1_000
 
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
     p._fetch_and_process_logs = (  # type: ignore[assignment]
         lambda *a, **kw: pytest.fail("should not have fetched")
     )
@@ -1280,7 +1282,7 @@ def test_poll_now_post_lock_cursor_advances_after_set_round_phase():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 99_900  # 100 blocks behind head=100_000
 
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
     fetched: list = []
     p._fetch_and_process_logs = (  # type: ignore[assignment]
@@ -1319,7 +1321,7 @@ def test_poll_now_skips_feasibility_check_when_lock_at_zero():
     p._lock_at = 0
 
     fetched: list = []
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
     p._fetch_and_process_logs = (  # type: ignore[assignment]
         lambda frm, to, **kw: fetched.append((frm, to))
     )
@@ -1339,7 +1341,7 @@ def test_poll_now_logs_partial_at_info_when_some_batches_succeeded(caplog):
     # 1500 blocks behind -> two 750-block getLogs chunks, so a mid-fetch
     # failure (chunk 2 raises) leaves a genuine PARTIAL: chunk 1 advanced the
     # cursor, chunk 2 didn't.
-    p._bloxroute_block_number = lambda **kw:101_400  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:101_400  # type: ignore[assignment]
 
     fetched: list = []
     call_count = {"n": 0}
@@ -1392,7 +1394,7 @@ def test_poll_now_sets_and_clears_poll_in_progress_on_success():
         # Snapshot the flag while inside the fetch.
         seen_flag.append(p._poll_in_progress)
 
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
     p._fetch_and_process_logs = fake_fetch  # type: ignore[assignment]
 
     # Plenty of time for feasibility.
@@ -1411,7 +1413,7 @@ def test_poll_now_clears_poll_in_progress_on_failure():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 99_999
 
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
 
     def boom(from_block, to_block, **kw):
         raise RuntimeError("publicnode_error")
@@ -1433,7 +1435,7 @@ def test_poll_now_clears_poll_in_progress_when_head_fetch_fails():
     def head_boom(**kw):
         raise RuntimeError("head_unreachable")
 
-    p._bloxroute_block_number = head_boom  # type: ignore[assignment]
+    p._poll_head_block_number = head_boom  # type: ignore[assignment]
     p._poll_now(deadline_ms=0, label="period")
     assert p._poll_in_progress is False
 
@@ -1453,7 +1455,7 @@ def test_poll_now_clears_poll_in_progress_when_infeasible_aborts_early():
     _prep_for_epoch_advance(p)
     p._last_polled_block_number = 1_000  # very stale
 
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]
     p._fetch_and_process_logs = (  # type: ignore[assignment]
         lambda *a, **kw: pytest.fail("should not have fetched")
     )
@@ -1625,7 +1627,7 @@ def test_last_catchup_detail_reset_on_epoch_advance():
     # Mock the RPC head fetch + round_start derivation so
     # _on_epoch_advance can run without real chain calls.
     p._compute_round_start_block = lambda _ts: 99_000  # type: ignore[assignment]
-    p._bloxroute_block_number = lambda **kw:99_010  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:99_010  # type: ignore[assignment]
 
     # _on_epoch_advance is the canonical round-boundary hook; calling
     # it directly exercises the reset without the first-call cursor-init
@@ -1738,7 +1740,7 @@ def test_first_successful_poll_latches_connected_and_cold_start_done():
     assert p._cold_start_done.is_set() is False
 
     # Mock a successful poll: head advanced 50 blocks since cursor.
-    p._bloxroute_block_number = lambda **kw:99_950  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:99_950  # type: ignore[assignment]
     fetched: list = []
     p._fetch_and_process_logs = (  # type: ignore[assignment]
         lambda frm, to, **kw: fetched.append((frm, to))
@@ -1770,7 +1772,7 @@ def test_first_successful_poll_latch_fires_in_no_new_blocks_branch():
     p._lock_at = int(_t.time()) + 290
     p._last_polled_block_number = 100_000
 
-    p._bloxroute_block_number = lambda **kw:100_000  # type: ignore[assignment]  # head == cursor
+    p._poll_head_block_number = lambda **kw:100_000  # type: ignore[assignment]  # head == cursor
     p._fetch_and_process_logs = (  # type: ignore[assignment]
         lambda *a, **kw: pytest.fail("no-new-blocks branch must not fetch")
     )
@@ -1793,7 +1795,7 @@ def test_first_poll_failure_does_not_set_latch():
 
     def boom(**kw):
         raise RuntimeError("endpoint_unreachable")
-    p._bloxroute_block_number = boom  # type: ignore[assignment]
+    p._poll_head_block_number = boom  # type: ignore[assignment]
     p._poll_now(deadline_ms=0, label="period")
 
     assert p._connected is False
@@ -1801,7 +1803,7 @@ def test_first_poll_failure_does_not_set_latch():
     assert p._last_poll_succeeded is False
 
     # Now a successful poll: head fetches OK, no new blocks.
-    p._bloxroute_block_number = lambda **kw:99_900  # type: ignore[assignment]
+    p._poll_head_block_number = lambda **kw:99_900  # type: ignore[assignment]
     p._poll_now(deadline_ms=0, label="period")
     assert p._connected is True
     assert p._cold_start_done.is_set() is True
