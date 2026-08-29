@@ -76,7 +76,7 @@ class KlineStore:
         self._validate_ascending(records_asc)
 
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as f:
+        with open(self._path, "w", encoding="utf-8", newline="") as f:
             for rec in records_asc:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
@@ -95,7 +95,7 @@ class KlineStore:
             )
         self._validate_ascending(records_asc)
 
-        with open(self._path, "a", encoding="utf-8") as f:
+        with open(self._path, "a", encoding="utf-8", newline="") as f:
             for rec in records_asc:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
                 f.flush()
@@ -113,7 +113,7 @@ class KlineStore:
 
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         tmp_path = self._path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
             for rec in records_asc:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
         os.replace(tmp_path, self._path)
@@ -140,7 +140,7 @@ class KlineStore:
                 kept.append(line)
 
         if purged > 0:
-            with open(self._path, "w", encoding="utf-8") as f:
+            with open(self._path, "w", encoding="utf-8", newline="") as f:
                 for line in kept:
                     f.write(line + "\n")
 
