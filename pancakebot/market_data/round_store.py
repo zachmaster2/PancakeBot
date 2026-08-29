@@ -102,7 +102,7 @@ class ClosedRoundsStore:
             prev = r.epoch
 
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        with open(self._path, "w") as f:
+        with open(self._path, "w", encoding="utf-8", newline="") as f:
             for r in rounds_asc:
                 f.write(json.dumps(r.to_json(), separators=(",", ":")) + "\n")
 
@@ -143,7 +143,7 @@ class ClosedRoundsStore:
             prev = r.epoch
 
         # Use r+ so the file must already exist.
-        with open(self._path, "r+") as f:
+        with open(self._path, "r+", encoding="utf-8", newline="") as f:
             f.seek(0, os.SEEK_END)
             for r in rounds_asc:
                 f.write(json.dumps(r.to_json(), separators=(",", ":")) + "\n")
@@ -170,7 +170,7 @@ class ClosedRoundsStore:
             raise InvariantError("prepend_chunk_not_strictly_older_than_store")
 
         os.makedirs(os.path.dirname(replace_path) or ".", exist_ok=True)
-        with open(replace_path, "w") as out:
+        with open(replace_path, "w", encoding="utf-8", newline="") as out:
             for r in chunk_asc:
                 out.write(json.dumps(r.to_json(), separators=(",", ":")) + "\n")
             with open(self._path, "r") as existing:
