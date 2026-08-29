@@ -95,10 +95,13 @@ class KlineStore:
             )
         self._validate_ascending(records_asc)
 
+        # Already flushed per record; the fsync makes the batch durable
+        # against power loss rather than merely against process death.
         with open(self._path, "a", encoding="utf-8", newline="") as f:
             for rec in records_asc:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
                 f.flush()
+            os.fsync(f.fileno())
         return int(records_asc[-1]["epoch"])
 
     def rewrite(self, records_asc: list[dict]) -> None:
