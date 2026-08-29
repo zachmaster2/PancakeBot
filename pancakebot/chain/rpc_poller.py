@@ -1333,8 +1333,17 @@ class RpcPoller:
 
         # Phase 3 — feasibility check: how far behind are we vs how much
         # time remains, with a single fresh head fetch.
+        #
+        # From the GETLOGS host (2026-08-29). `blocks_behind = head -
+        # cursor` compares a head against a cursor that getLogs advanced
+        # against THAT host, so reading the head from bloXroute mixed two
+        # nodes tips inside one subtraction. The error was only +/-1 and
+        # this gate is a heuristic, so it never failed loudly the way the
+        # range bound did -- but it is the same cross-node shape and the
+        # same one-line correction removes it. Both terms are now the same
+        # host, so the quantity is exact rather than approximately right.
         try:
-            head = self._bloxroute_block_number(attempts=_RPC_ATTEMPTS_PERIODIC)
+            head = self._poll_head_block_number(attempts=_RPC_ATTEMPTS_PERIODIC)
         except Exception as e:  # noqa: BLE001
             # Behaviour unchanged: return bare, leaving
             # _catchup_infeasible_for_round False so the next poll/round
@@ -1915,7 +1924,9 @@ class RpcPoller:
     def _poll_now(self, *, deadline_ms: int, label: str) -> None:
         """Core poll: fetch new blocks since _last_polled_block_number,
         in eth_getLogs ranges of _GETLOGS_CHUNK_BLOCKS, until caught up to
-        bloXroute's head.
+        the head of the host that SERVES those ranges (not bloXroute --
+        see _poll_head_block_number for why that distinction is the
+        whole of the 2026-08-26/28 head-race).
 
         Wall-clock capped (``RPC_POLL_WALL_CAP_SINGLE_MS`` /
         ``RPC_POLL_WALL_CAP_PERIODIC_MS``, further tightened by ``deadline_ms``
@@ -1959,16 +1970,21 @@ class RpcPoller:
                 cap_ms = min(cap_ms, deadline_ms)
             abort_at = time.monotonic() + cap_ms / 1000.0
 
-            # Head = bloXroute's own tip. The getLogs toBlock can never
-            # exceed what bloXroute has synced (-32000 "invalid block range
-            # params") because it IS bloXroute's reported head. The cursor
-            # tracks bloXroute's polled position contiguously — NO block is
-            # skipped — and the F0 gate in is_pool_ready is the hard
+            # Head = the GETLOGS HOST tip, not bloXroute's. Every use of
+            # `head` below asks the same node-relative question -- how far
+            # can I poll right now -- so it must come from the host that
+            # serves the range: the toBlock bound, the `head < from_block`
+            # short-circuit, and blocks_to_catchup all read it. Taking it
+            # from bloXroute while eth_getLogs went elsewhere is what
+            # produced the -32602 head-race (see _poll_head_block_number).
+            # The cursor tracks the polled position contiguously — NO block
+            # is skipped — and the F0 gate in is_pool_ready is the hard
             # guarantee that we never BET while the cursor is short of the
-            # pool-cutoff block (the cutoff is contract+clock-anchored, so
-            # bloXroute lagging real time cannot hide from it).
+            # pool-cutoff block (that cutoff is contract+clock-anchored and
+            # therefore node-independent: no endpoint lagging real time can
+            # hide from it).
             try:
-                head = self._bloxroute_block_number(
+                head = self._poll_head_block_number(
                     attempts=attempts, abort_at=abort_at,
                 )
             except Exception as e:  # noqa: BLE001
@@ -1976,7 +1992,8 @@ class RpcPoller:
                     self._last_poll_succeeded = False
                     self._last_poll_error = f"head_fetch:{type(e).__name__}:{e}"
                 warn("ALERT",
-                     f"{label} poll: bloXroute eth_blockNumber failed: {self._last_poll_error}")
+                     f"{label} poll: getLogs-host eth_blockNumber failed: "
+                     f"{self._last_poll_error}")
                 return
 
             with self._lock:
@@ -2321,6 +2338,7 @@ class RpcPoller:
     def _bloxroute_call(
         self, method: str, params: list, *,
         timeout_ms: int, attempts: int, abort_at: float | None = None,
+        endpoint: str | None = None,
     ) -> Any:
         """THE transport for every read RPC: a JSON-RPC POST to
         ``RPC_BLOXROUTE_ENDPOINT`` with a tight per-attempt timeout and up to
@@ -2354,7 +2372,7 @@ class RpcPoller:
             t_attempt = time.monotonic()
             try:
                 resp_bytes = self._rpc_post(
-                    _endpoint_for(method), body,
+                    endpoint or _endpoint_for(method), body,
                     timeout_seconds=timeout_ms / 1000.0,
                 )
                 if method == "eth_getLogs":
@@ -2391,22 +2409,62 @@ class RpcPoller:
         assert last_error is not None  # attempts >= 1 guaranteed by callers
         raise last_error
 
-    def _bloxroute_block_number(
-        self, *, attempts: int, abort_at: float | None = None,
+    def _head_block_number(
+        self, *, endpoint: str, attempts: int, abort_at: float | None = None,
     ) -> int:
-        """Current head block number as seen by bloXroute. This IS the poll
-        head: a getLogs range never requests a toBlock beyond it, so the
-        -32000 "invalid block range params" reply (range past the endpoint's
-        synced tip) is unreachable by construction. Raises on transport/RPC
-        error; the caller fails the poll (the next poll retries)."""
+        """Head block number AS SEEN BY ``endpoint``.
+
+        The endpoint is explicit because a head is a NODE-RELATIVE fact --
+        which blocks this host holds right now -- unlike a block timestamp,
+        which is chain-global and identical from any honest node. Reading
+        one host head and applying it to another is the defect this
+        parameter exists to make unstateable.
+
+        Raises on transport/RPC error; the caller fails the poll (the next
+        poll retries)."""
         result = self._bloxroute_call(
             "eth_blockNumber", [],
             timeout_ms=_BLX_HEAD_TIMEOUT_MS, attempts=attempts,
-            abort_at=abort_at,
+            abort_at=abort_at, endpoint=endpoint,
         )
         if not isinstance(result, str):
             raise InvariantError(f"eth_blockNumber_unexpected_result: {result!r}")
         return int(result, 16)
+
+    def _poll_head_block_number(
+        self, *, attempts: int, abort_at: float | None = None,
+    ) -> int:
+        """THE poll head: the tip of the host that will SERVE the getLogs.
+
+        Every consumer of this value asks the same node-relative question
+        -- how far can I poll RIGHT NOW -- so it must come from the host
+        that answers the range query, not from whichever host happens to
+        be fastest for other reads.
+
+        Before 2026-08-29 this read bloXroute while eth_getLogs was routed
+        to RPC_GETLOGS_ENDPOINT (the Era 13 split, 2026-08-21). The bound
+        ``min(chunk_start + CHUNK - 1, head)`` was therefore correct
+        against bloXroute and could exceed the getLogs host by one block
+        whenever ordinary propagation left it behind, producing
+            -32602 "block range extends beyond current head block:
+                    requested N, head N-1"
+        Twice in five days (2026-08-26 periodic poll, 2026-08-28 single
+        poll), and the second cost a round: the chunk raised, the chunk
+        loop broke with the cursor un-advanced, and the next round skipped
+        on POOL UNCOVERED.
+
+        Asking the serving host removes the failure mode by construction.
+        The rejected alternative was a one-block backoff, which would have
+        paid permanent lag -- the very quantity the F0 coverage guarantee
+        is measured against -- to avoid a twice-weekly error. Measured cost
+        of this route on the VM (n=40): eth_blockNumber p50 23.4ms / p99
+        37.1ms on publicnode vs 9.5 / 26.0ms on bloXroute, so ~+14ms p50.
+        It is a SWAP, not an extra call, and _BLX_HEAD_TIMEOUT_MS (250ms)
+        keeps ~6.7x headroom over the measured p99."""
+        return self._head_block_number(
+            endpoint=_endpoint_for("eth_getLogs"),
+            attempts=attempts, abort_at=abort_at,
+        )
 
     def _bloxroute_latest_header(
         self, *, attempts: int,
