@@ -23,7 +23,7 @@ from pathlib import Path
 from pancakebot.bankroll_tracker import BankrollTracker
 from pancakebot.config import StrategyConfig
 from pancakebot.constants import BNB_WEI, MAX_GAS_COST_BET_BNB
-from pancakebot.log import info
+from pancakebot.log import info, warn
 from pancakebot.strategy.shadow_ledger import ShadowLedger
 from pancakebot.util import InvariantError
 from pancakebot.strategy.momentum_gate import (
@@ -142,6 +142,8 @@ class MomentumOnlyPipeline:
         # ledger-backed reader; backtest and dry leave it None, because
         # settlement there is synchronous and nothing is ever in flight.
         self._open_stake_provider = open_stake_provider
+        # One WARN per process for a wiring fault (see _open_stake_bnb).
+        self._open_stake_wiring_warned = False
         # The gate-config / strategy-config duality (see class docstring) is
         # a real trap: live computes from `config`, backtest from
         # `strategy_config.gate`. Fail fast at construction if the
@@ -781,11 +783,52 @@ class MomentumOnlyPipeline:
         Never raises: this feeds a CORRECTION to the drawdown reading,
         and applying no correction is exactly the pre-fix behaviour, so a
         failure here degrades to the old (trip-happy) reading rather than
-        to a crash on the pre-lock path."""
+        to a crash on the pre-lock path.
+
+        TWO KINDS OF FAILURE, AND THEY ARE NOT THE SAME. Degrading quietly
+        is right for a TRANSIENT fault -- an unreadable ledger, a partial
+        write, an I/O hiccup -- which self-corrects next round and costs
+        one conservative reading. It was WRONG for a WIRING fault, which is
+        permanent, silent, and identical on every round forever. The
+        original closure referenced a name that was never imported at
+        module scope; the resulting NameError landed in this bare handler
+        and the breaker compared the RAW balance for four days, ending in
+        a phantom ~24h suspension on 2026-08-28. It produced no log line,
+        no alert, and no artifact -- the only trace was an open_stake
+        column that was never written, and that absence was twice
+        explained away.
+
+        So the net stays, but it discriminates. NameError / AttributeError
+        / ImportError / TypeError out of a zero-argument call is a
+        programming error, not a runtime condition, and it says so ONCE per
+        process at WARN. Once, not per round: at ~12 rounds/hour an
+        unthrottled warning would bury the log it needs to be found in.
+        Everything else keeps degrading in silence, as designed.
+
+        Why WARN and not raise: this runs on the PRE-LOCK path, where
+        engine.py documents there is NO top-level catch. Raising would take
+        a live-money process into a systemd restart loop on every round,
+        which is strictly worse than one loud line plus the old
+        conservative reading.
+        """
         if self._open_stake_provider is None:
             return 0.0
         try:
             return max(0.0, float(self._open_stake_provider()))
+        except (NameError, AttributeError, ImportError, TypeError) as e:
+            if not self._open_stake_wiring_warned:
+                self._open_stake_wiring_warned = True
+                warn(
+                    "RISK",
+                    "WIRING BUG: open_stake provider raised "
+                    f"{type(e).__name__} ({e}) -- a programming error, not a "
+                    "transient fault, so it recurs every round. The drawdown "
+                    "breaker is now reading the RAW wallet balance and "
+                    "counting every OPEN position as a total loss, which "
+                    "trips it early. Suspensions taken while this line "
+                    "stands are suspect.",
+                )
+            return 0.0
         except Exception:  # noqa: BLE001
             return 0.0
 

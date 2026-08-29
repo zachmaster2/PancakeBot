@@ -21,6 +21,7 @@ from pancakebot import paths as _paths
 from pancakebot.constants import RETRY_BACKOFF_SECONDS
 from pancakebot.util import InvariantError, TransientRpcError
 from pancakebot.log import info, warn
+from pancakebot.runtime import bet_ledger as _bet_ledger
 from pancakebot.runtime.audit import (
     append_audit_row as _append_dry_audit_row,
     ensure_audit_csv as _ensure_dry_audit_csv,
@@ -642,7 +643,6 @@ def dry_settle_available_bets(cfg: RuntimeConfig, closed: RuntimeState) -> None:
         # helper live reconcile uses so both modes agree on status+delta
         # semantics (Fix #6 unification of the classification logic without
         # refactoring this pipeline).
-        from pancakebot.runtime import bet_ledger as _bet_ledger
         _dry_status, _dry_delta = _bet_ledger.classify_settlement(
             outcome=outcome, bet_bnb=bet_bnb, credit_bnb=credit_bnb,
         )
@@ -800,10 +800,21 @@ def _build_momentum_pipeline(*, cfg: RuntimeConfig) -> MomentumOnlyPipeline:
     # `simulated_bankroll_bnb`, which dry.py credits and debits at
     # settlement and is therefore ALREADY on a settled basis; adding open
     # stakes back there would double-count them.
+    #
+    # The module-scope `_bet_ledger` alias is LOAD-BEARING, not style. This
+    # closure originally read a bare `bet_ledger`, which was never imported
+    # at module scope -- the only import was a function-local
+    # `... as _bet_ledger` inside dry_settle_available_bets. Every call
+    # therefore raised NameError, which _open_stake_bnb swallowed into a
+    # permanent 0.0, and the drawdown breaker silently kept comparing the
+    # RAW wallet balance for four days. That produced a phantom ~24h
+    # suspension on 2026-08-28 16:29:01 (tripped at 15.7% on raw when the
+    # settled-equivalent reading was 13.1%). ONE name for this module,
+    # imported once, at module scope.
     open_stake_provider = None
     if not cfg.dry:
         def open_stake_provider() -> float:  # noqa: F811
-            return bet_ledger.open_stake_bnb(_paths.LIVE_BETS_LEDGER_PATH)
+            return _bet_ledger.open_stake_bnb(_paths.LIVE_BETS_LEDGER_PATH)
     return MomentumOnlyPipeline(
         config=gate_config,
         strategy_config=cfg.strategy,
