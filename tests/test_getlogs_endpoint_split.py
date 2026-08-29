@@ -41,7 +41,7 @@ def test_stats_surface_names_both_endpoints():
     st = p.stats
     assert st["current_endpoint"] == RPC_BLOXROUTE_ENDPOINT
     assert st["getlogs_endpoint"] == RPC_GETLOGS_ENDPOINT
-    assert st["getlogs_censored_samples"] == 0
+    assert st["getlogs_censored_total"] == 0
 
 
 def test_p99_none_until_enough_samples():
@@ -62,7 +62,7 @@ def test_timeouts_are_censored_observations_not_dropped():
         p._record_getlogs_latency(float(_GETLOGS_TIMEOUT_MS), censored=True)
     assert p.getlogs_p99_ms is not None
     assert p.getlogs_p99_ms >= _GETLOGS_TIMEOUT_MS
-    assert p.stats["getlogs_censored_samples"] == 50
+    assert p.stats["getlogs_censored_total"] == 50
 
 
 def test_healthy_samples_do_not_mask_a_degrading_tail():
@@ -84,7 +84,7 @@ def test_transport_records_timeout_but_not_fast_rpc_errors(monkeypatch):
     monkeypatch.setattr(p, "_rpc_post", slow_boom)
     with pytest.raises(TimeoutError):
         p._bloxroute_call("eth_getLogs", [{}], timeout_ms=20, attempts=1)
-    assert p.stats["getlogs_censored_samples"] == 1
+    assert p.stats["getlogs_censored_total"] == 1
 
     def fast_boom(url, body, *, timeout_seconds):
         raise ConnectionRefusedError("refused")
@@ -93,13 +93,13 @@ def test_transport_records_timeout_but_not_fast_rpc_errors(monkeypatch):
     with pytest.raises(ConnectionRefusedError):
         p._bloxroute_call("eth_getLogs", [{}], timeout_ms=20, attempts=1)
     # a fast rejection is not a latency observation
-    assert p.stats["getlogs_censored_samples"] == 1
+    assert p.stats["getlogs_censored_total"] == 1
 
     # and a non-getLogs method never feeds the getLogs metric
     monkeypatch.setattr(p, "_rpc_post", slow_boom)
     with pytest.raises(TimeoutError):
         p._bloxroute_call("eth_blockNumber", [], timeout_ms=20, attempts=1)
-    assert p.stats["getlogs_censored_samples"] == 1
+    assert p.stats["getlogs_censored_total"] == 1
 
 
 def test_transport_posts_getlogs_to_the_getlogs_host(monkeypatch):
@@ -115,7 +115,7 @@ def test_transport_posts_getlogs_to_the_getlogs_host(monkeypatch):
     p._bloxroute_call("eth_blockNumber", [], timeout_ms=50, attempts=1)
     assert seen == [RPC_GETLOGS_ENDPOINT, RPC_BLOXROUTE_ENDPOINT]
     # a successful call is recorded as an uncensored sample
-    assert p.stats["getlogs_censored_samples"] == 0
+    assert p.stats["getlogs_censored_total"] == 0
 
 
 def test_alarm_payload_carries_the_censored_p99():
@@ -132,7 +132,7 @@ def test_alarm_payload_carries_the_censored_p99():
 
 def test_stats_exposes_error_counter():
     p = RpcPoller(interval_seconds=300)
-    assert p.stats["getlogs_errors"] == 0
+    assert p.stats["getlogs_errors_total"] == 0
 
 
 def test_health_line_reports_host_and_censored_p99(monkeypatch):
@@ -155,14 +155,14 @@ def test_health_line_reports_host_and_censored_p99(monkeypatch):
     p._log_getlogs_health()
     assert "p99=20ms" in lines[-1][1]
     assert ">=" not in lines[-1][1]
-    assert "censored=0" in lines[-1][1]
+    assert "cens_life=0" in lines[-1][1]
 
     for _ in range(30):
         p._record_getlogs_latency(float(_GETLOGS_TIMEOUT_MS), censored=True)
     p._log_getlogs_health()
     # censored samples must surface as a lower bound, never as a flat number
     assert ">=%dms" % _GETLOGS_TIMEOUT_MS in lines[-1][1]
-    assert "censored=30" in lines[-1][1]
+    assert "cens_life=30" in lines[-1][1]
 
 
 def test_transport_counts_every_getlogs_error_not_just_timeouts(monkeypatch):
@@ -175,8 +175,8 @@ def test_transport_counts_every_getlogs_error_not_just_timeouts(monkeypatch):
     with pytest.raises(ConnectionRefusedError):
         p._bloxroute_call("eth_getLogs", [{}], timeout_ms=20, attempts=1)
     # a fast rejection is not a LATENCY sample, but it IS an error
-    assert p.stats["getlogs_censored_samples"] == 0
-    assert p.stats["getlogs_errors"] == 1
+    assert p.stats["getlogs_censored_total"] == 0
+    assert p.stats["getlogs_errors_total"] == 1
 
 
 # ---- diagnosability: swallowed causes must survive ------------------------
