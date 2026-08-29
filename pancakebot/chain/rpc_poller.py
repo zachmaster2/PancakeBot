@@ -211,6 +211,30 @@ _GETLOGS_FETCH_RTT_P99_MS: int = 250
 # start inside the 950ms single-poll cap (250 + 25 backoff + 250 = 525ms),
 # restoring the in-call retry that the old value silently disabled.
 _GETLOGS_TIMEOUT_MS: int = 250       # > soak max 103ms on the getLogs host
+# NAMING DEBT, flagged not fixed: the _BLX_ prefix becomes a misnomer the
+# moment the read path moves off bloXroute (see ENDPOINT_MOVE_TRIGGER).
+# Rename to _READ_* / _RPC_* AS PART OF a move, not before it -- renaming
+# now churns every call site for no behaviour change and makes the move's
+# own diff harder to read.
+#
+# RE-MEASURED 2026-08-24 (anchor peak window 13:00-18:00 UTC, n=35,
+# production cadence). Derived at 3.5x the CANDIDATE host's p99 -- the
+# existing derivation method, and publicnode rather than bloXroute
+# because a timeout must cover the host being moved TO. Every value
+# lands BELOW the current constant:
+#   head      publicnode p99 52ms -> 182   (bloXroute p99 15ms)
+#   header    publicnode p99 32ms -> 114   (bloXroute p99 30ms)
+#   block_ts  publicnode p99 67ms -> 236   (bloXroute p99 25ms)
+# The p99s above are DISPLAYED ROUNDED to whole ms; the derived values
+# were computed from unrounded samples, which is why header and block_ts
+# do not reproduce exactly from the printed figures (3.5x32=112 vs 114
+# implies p99 32.57; 3.5x67=234.5 vs 236 implies 67.43). head is exact
+# because its p99 was already integral. Do NOT conclude from the
+# mismatch that the derivation method changed.
+# So an endpoint move needs NO constant to increase. Deliberately KEEPING
+# 250: tightening buys nothing and only adds wake_mode=static risk. n=35
+# is thin for a p99, so this CONFIRMS 250 is adequate rather than
+# replacing the original derivation; a real move should re-soak.
 _BLX_HEAD_TIMEOUT_MS: int = 250      # eth_blockNumber, > ~3.6x p99 69ms
 _BLX_HEADER_TIMEOUT_MS: int = 250    # getBlockByNumber(latest), > ~3.5x p99 71ms
 _BLX_BLOCK_TS_TIMEOUT_MS: int = 250  # getBlockByNumber(bn), > ~5.9x p99 42ms
@@ -547,6 +571,10 @@ class RpcPoller:
         # Cause of the most recent round-start-block RPC failure, kept so
         # the epoch-advance warn can name it. Cleared on every success.
         self._last_rs_block_error: str | None = None
+        # MONOTONIC count of round-start header failures. The engine
+        # samples it once per round and diffs, so it needs no reset and
+        # cannot miss a failure that happened between samples.
+        self._rs_block_error_count: int = 0
         # Cause of the most recent feasibility head-fetch failure, and
         # a slot the engine fills with its own once-per-round facts.
         # Both ride the existing health line -- no new log lines, so
@@ -919,6 +947,17 @@ class RpcPoller:
             f"to avoid sizing the bet on an incomplete pool (F0 guarantee).",
         )
         return False, "pool_uncovered"
+
+    @property
+    def rs_block_error_count(self) -> int:
+        """Monotonic count of round-start header RPC failures.
+
+        Feeds the ENDPOINT_MOVE_TRIGGER header-rate detector. Read-only and
+        diagnostic — nothing gates on it. ``_compute_round_start_block`` is
+        called exactly once per epoch advance, so a per-round rate built by
+        diffing this counter is well defined."""
+        with self._lock:
+            return self._rs_block_error_count
 
     @property
     def last_pool_blocks_short(self) -> int | None:
@@ -1401,10 +1440,24 @@ class RpcPoller:
             # being characterised.
             with self._lock:
                 self._last_rs_block_error = f"{type(e).__name__}: {e}"
+                self._rs_block_error_count += 1
             return None
         with self._lock:
             self._last_rs_block_error = None
         if head_ts <= 0 or head_num <= 0:
+            # A MALFORMED RESPONSE IS STILL A HEADER FAILURE. This return
+            # used to leave the counter untouched, so trigger B
+            # under-counted under exactly the degradation shape the
+            # comment above warns about -- a provider returning garbage
+            # rather than erroring. That is the same conflation ("a
+            # timeout, an HTTP error and a malformed result read
+            # identically") that let the 2026-08 header-path degradation
+            # go a week without being characterised; do not reintroduce
+            # it by treating "arrived but useless" as success.
+            with self._lock:
+                self._last_rs_block_error = (
+                    f"malformed_header: head_num={head_num} head_ts={head_ts}")
+                self._rs_block_error_count += 1
             return None
         return self._rs_block_from_header(
             head_num, head_ts, head_milli, round_start_ts,
