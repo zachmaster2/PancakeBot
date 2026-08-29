@@ -186,6 +186,10 @@ SIGNAL_COMPUTE_TIME_MS: int = 50
 #   engine stores the AnchorState in a local variable and passes it to
 #   the wake + deadline math.
 ANCHOR_POLL_OFFSET_BEFORE_LOCK_MS: int = 1500
+# 2026-08-24 anchor peak window (n=35): derived 3.5x p99 = 114ms, BELOW
+# this value, so an endpoint move needs no increase here either.
+# Kept at 200 deliberately -- see the _BLX_*_TIMEOUT_MS block in
+# chain/rpc_poller.py for the full measurement and why not to tighten.
 ANCHOR_POLL_TIMEOUT_MS: int = 200
 
 
