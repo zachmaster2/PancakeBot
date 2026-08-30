@@ -121,33 +121,6 @@ class KlineStore:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
         os.replace(tmp_path, self._path)
 
-    def purge_and_rewrite(self) -> int:
-        """Remove any error records and re-validate ordering.
-
-        Returns the number of records purged.
-        """
-        if not self.exists():
-            return 0
-
-        kept: list[str] = []
-        purged = 0
-        with open(self._path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                rec = json.loads(line)
-                if rec.get("error"):
-                    purged += 1
-                    continue
-                kept.append(line)
-
-        if purged > 0:
-            with open(self._path, "w", encoding="utf-8", newline="") as f:
-                for line in kept:
-                    f.write(line + "\n")
-
-        return purged
 
     @staticmethod
     def _validate_ascending(records: list[dict]) -> None:
