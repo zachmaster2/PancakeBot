@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Iterator, Sequence
 
+from pancakebot.log import warn
 from pancakebot.types import Round
 from pancakebot.util import InvariantError
 
@@ -102,7 +104,7 @@ class ClosedRoundsStore:
             prev = r.epoch
 
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        with open(self._path, "w") as f:
+        with open(self._path, "w", encoding="utf-8", newline="") as f:
             for r in rounds_asc:
                 f.write(json.dumps(r.to_json(), separators=(",", ":")) + "\n")
 
@@ -143,10 +145,17 @@ class ClosedRoundsStore:
             prev = r.epoch
 
         # Use r+ so the file must already exist.
-        with open(self._path, "r+") as f:
+        # Flush per record and fsync once at the end. Without the
+        # flush the whole batch sits in a buffer, so a kill mid-append
+        # can lose complete records AND leave a torn line; with it the
+        # window narrows to a single record. The fsync makes the batch
+        # durable against power loss, not just process death.
+        with open(self._path, "r+", encoding="utf-8", newline="") as f:
             f.seek(0, os.SEEK_END)
             for r in rounds_asc:
                 f.write(json.dumps(r.to_json(), separators=(",", ":")) + "\n")
+                f.flush()
+            os.fsync(f.fileno())
         return prev
 
     def replace_with_prepended_chunk(self, chunk_asc: Sequence[Round], *, replace_path: str) -> None:
@@ -170,7 +179,7 @@ class ClosedRoundsStore:
             raise InvariantError("prepend_chunk_not_strictly_older_than_store")
 
         os.makedirs(os.path.dirname(replace_path) or ".", exist_ok=True)
-        with open(replace_path, "w") as out:
+        with open(replace_path, "w", encoding="utf-8", newline="") as out:
             for r in chunk_asc:
                 out.write(json.dumps(r.to_json(), separators=(",", ":")) + "\n")
             with open(self._path, "r") as existing:
@@ -181,3 +190,75 @@ class ClosedRoundsStore:
         os.replace(replace_path, self._path)
 
     # JSON codecs live on Round/Bet in pancakebot.types.
+
+def repair_torn_tail(path: str) -> int:
+    """Truncate a TRAILING partial line, if and only if there is one.
+
+    A process killed mid-append (sleep, reboot, power) can leave a final
+    line that is not valid JSON. Measured behaviour of that state:
+
+        iter_closed_rounds()  raises InvariantError jsonl_parse_failed
+        load_latest_epoch()   raises JSONDecodeError
+        count_rounds()        returns the torn line as a RECORD
+
+    The first two are the good failure -- loud, no silent corruption. But
+    load_latest_epoch is how a sync finds its resume point, so the job dies
+    before it can fix anything, and count_rounds quietly disagrees with
+    both. Left alone that means an unattended daily job stops permanently
+    on the first torn write and waits for a human to truncate a line.
+
+    So: repair, but ONLY the tail, and only when the tail alone is bad.
+      * If the file is empty or every line parses -> return 0, touch nothing.
+      * If the LAST line does not parse and every earlier line does ->
+        truncate exactly that line and return the bytes removed.
+      * If any NON-final line does not parse -> raise. That is not a torn
+        write, it is corruption in the body of the store, and silently
+        deleting data to make a reader happy is the opposite of what this
+        codebase does everywhere else.
+
+    Returns the number of bytes truncated (0 if nothing was wrong).
+    """
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        return 0
+
+    # Walk in binary, tracking the byte offset each line starts at, so the
+    # truncation point is exact and no decoding step can shift it.
+    bad_offset = None
+    offset = 0
+    n = 0
+    with open(p, "rb") as f:
+        for raw in f:
+            n += 1
+            start = offset
+            offset += len(raw)
+            body = raw.strip()
+            if not body:
+                continue
+            try:
+                json.loads(body)
+            except ValueError:
+                if bad_offset is not None:
+                    raise InvariantError(
+                        f"jsonl_multiple_unparsable_lines: {path} line={n} "
+                        f"-- body corruption, not a torn tail; refusing to "
+                        f"truncate")
+                bad_offset = (start, n)
+
+    if bad_offset is None:
+        return 0
+    start, line_no = bad_offset
+    if start + (offset - start) != offset or line_no != n:
+        raise InvariantError(
+            f"jsonl_unparsable_line_not_at_tail: {path} line={line_no} of "
+            f"{n} -- body corruption, not a torn tail; refusing to truncate")
+
+    removed = offset - start
+    with open(p, "r+b") as f:
+        f.truncate(start)
+        f.flush()
+        os.fsync(f.fileno())
+    warn("STORE", f"repaired torn tail in {path}: dropped {removed} bytes "
+                  f"(partial line {line_no}); a previous run was killed "
+                  f"mid-append")
+    return removed

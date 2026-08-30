@@ -76,7 +76,7 @@ class KlineStore:
         self._validate_ascending(records_asc)
 
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as f:
+        with open(self._path, "w", encoding="utf-8", newline="") as f:
             for rec in records_asc:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
@@ -95,10 +95,13 @@ class KlineStore:
             )
         self._validate_ascending(records_asc)
 
-        with open(self._path, "a", encoding="utf-8") as f:
+        # Already flushed per record; the fsync makes the batch durable
+        # against power loss rather than merely against process death.
+        with open(self._path, "a", encoding="utf-8", newline="") as f:
             for rec in records_asc:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
                 f.flush()
+            os.fsync(f.fileno())
         return int(records_asc[-1]["epoch"])
 
     def rewrite(self, records_asc: list[dict]) -> None:
@@ -113,7 +116,7 @@ class KlineStore:
 
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         tmp_path = self._path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
             for rec in records_asc:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
         os.replace(tmp_path, self._path)
@@ -140,7 +143,7 @@ class KlineStore:
                 kept.append(line)
 
         if purged > 0:
-            with open(self._path, "w", encoding="utf-8") as f:
+            with open(self._path, "w", encoding="utf-8", newline="") as f:
                 for line in kept:
                     f.write(line + "\n")
 
