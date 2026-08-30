@@ -18,6 +18,7 @@ from pancakebot.config import AppConfig
 from pancakebot.util import InvariantError, TransientGraphError, TransientOkxError
 from pancakebot.log import error, info, warn
 from pancakebot.market_data.round_store import ClosedRoundsStore
+from pancakebot.market_data.store_rewrite_gate import store_rewrite_allowed as _store_rewrite_allowed
 from pancakebot.market_data.round_sync import sync_closed_rounds
 from pancakebot.market_data.graph_client import GraphClient
 from pancakebot.market_data.okx_client import OkxClient, RETRY_SYNC, okx_rate_acquire
@@ -243,14 +244,82 @@ def _sync_1s_klines(
     earliest_on_disk = store.load_earliest_epoch()
     latest_on_disk = store.load_latest_epoch()
 
-    # Split into prepend (older) and append (newer) groups.
+    # THREE-WAY PARTITION WITH A CLOSURE CHECK.
+    #
+    # The original split computed only prepend (< earliest) and append
+    # (> latest) and never named what sits BETWEEN them. An epoch inside
+    # the on-disk range but absent from it fell into neither list and was
+    # dropped with NO log line, NO error, and a total_to_fetch that
+    # under-reported it. That is how 23 missing epochs stayed invisible for
+    # months -- the absence of a signal is not the presence of health.
+    #
+    # ON THE CLOSURE CHECK BELOW -- read this before trusting it.
+    #
+    # For a WELL-FORMED ascending store the check is a TAUTOLOGY. When
+    # earliest <= latest, the three predicates (< earliest), (> latest) and
+    # (earliest <= e <= latest) partition the integers exhaustively, so the
+    # sum always equals len(remaining) and the branch is unreachable no
+    # matter what data arrives. It is NOT what protects the normal path.
+    # The interior_rounds report below is doing that work.
+    #
+    # It is not entirely dead, though. load_earliest_epoch and
+    # load_latest_epoch return the FIRST and LAST records in FILE ORDER,
+    # not min() and max(). On an out-of-order store earliest > latest, the
+    # predicates OVERLAP instead of partitioning, and an epoch between them
+    # is counted twice -- which this check catches. So it fires on store
+    # corruption, never on a healthy store.
+    #
+    # Kept deliberately, as a guard against exactly that corruption and as
+    # documentation of the invariant. Not dressed up as the thing that
+    # makes the normal path safe, because it is not.
     if latest_on_disk is not None:
         prepend_rounds = [r for r in remaining if int(r.epoch) < earliest_on_disk]
         append_rounds = [r for r in remaining if int(r.epoch) > latest_on_disk]
+        interior_rounds = [
+            r for r in remaining
+            if earliest_on_disk <= int(r.epoch) <= latest_on_disk
+        ]
     else:
-        # Fresh store -- everything goes into append.
+        # Fresh store -- everything goes into append, and interior is empty
+        # by construction. The closure check still runs: it is a property of
+        # the partition, not of this branch.
         prepend_rounds = []
         append_rounds = remaining
+        interior_rounds = []
+
+    _partitioned = len(prepend_rounds) + len(append_rounds) + len(interior_rounds)
+    if _partitioned != len(remaining):
+        # The message must name BOTH directions. Under-counting means an
+        # epoch landed in no bucket (a silent drop); over-counting means it
+        # landed in two, which is what an out-of-order store produces.
+        _how = ("an epoch landed in NO bucket and would have been dropped "
+                "silently" if _partitioned < len(remaining) else
+                "an epoch landed in TWO buckets -- earliest > latest, so the "
+                "store is not in ascending order")
+        raise InvariantError(
+            f"kline_partition_not_exhaustive: {label} remaining={len(remaining)} "
+            f"prepend={len(prepend_rounds)} append={len(append_rounds)} "
+            f"interior={len(interior_rounds)} sum={_partitioned} "
+            f"earliest={earliest_on_disk} latest={latest_on_disk} -- {_how}")
+
+    # An interior gap is a DATA problem, not a code problem, and it is not
+    # self-repairing: backfilling the middle of an append-only store is a
+    # separate authorised operation. Surface it loudly and keep going.
+    #
+    # DELIBERATE DEVIATION from the original design, which raised here.
+    # Raising would stop an unattended daily job permanently on a condition
+    # that does not block forward progress -- recreating the exact silent
+    # permanent stall this work exists to prevent. Forward collection
+    # continues; the gap is reported every run until a human acts on it.
+    if interior_rounds:
+        _iep = [int(r.epoch) for r in interior_rounds]
+        warn("GAP",
+             f"{label}: INTERIOR GAP -- {len(_iep)} epoch(s) sit inside the "
+             f"on-disk range [{earliest_on_disk}..{latest_on_disk}] but are "
+             f"absent from the store: first={_iep[0]} last={_iep[-1]}. These "
+             f"are NOT fetched by a routine sync; backfilling the middle of "
+             f"an append-only store is a separate authorised operation. "
+             f"Forward sync continues.")
 
     total_to_fetch = len(prepend_rounds) + len(append_rounds)
     info(
@@ -275,16 +344,45 @@ def _sync_1s_klines(
         )
 
     # --- Pass 2: Prepend (epochs before existing store) ---
+    #
+    # THE PREPEND PATH REWRITES THE WHOLE STORE. _prepend_staging_to_store
+    # calls store.rewrite(), which writes every record to a temp file and
+    # os.replace()s it over the original. On a machine where these files are
+    # the ONLY surviving copy of irreplaceable history, an unattended job
+    # must not do that: a bug anywhere in the merge silently replaces GB of
+    # data with whatever the merge produced, and the original is gone.
+    #
+    # A backfill is also never what the DAILY job needs. The daily sync only
+    # ever moves forward; prepend>0 means a gap was discovered, which is a
+    # human's decision to act on, not a robot's.
+    #
+    # CRITICAL: refusing the prepend must NOT abort the run. Pass 1 (append)
+    # has already completed and its data is on disk. If a discovered gap
+    # aborted the sync, one gap would stop ALL forward data collection
+    # indefinitely -- converting a backfill need into the permanent quiet
+    # failure this whole design exists to prevent. So: skip the prepend,
+    # keep the forward progress, and alarm loudly so a human runs the
+    # backfill deliberately with ALLOW_STORE_REWRITE=1.
     if prepend_rounds:
-        staging_path = store.path_jsonl + ".prepend_staging"
-        synced = _fetch_to_staging(
-            rounds_asc=prepend_rounds, inst_id=inst_id,
-            staging_path=staging_path, label=label,
-            okx_client=okx_client,
-        )
-        if synced > 0:
-            _prepend_staging_to_store(store=store, staging_path=staging_path, label=label)
-            total_synced += synced
+        if not _store_rewrite_allowed():
+            warn("GAP",
+                 f"{label}: REFUSING to prepend {len(prepend_rounds)} older "
+                 f"epochs -- the prepend path rewrites the entire store and "
+                 f"is disabled in unattended runs. Forward sync COMPLETED "
+                 f"and is safe. To backfill deliberately, re-run with "
+                 f"ALLOW_STORE_REWRITE=1. earliest_wanted="
+                 f"{int(prepend_rounds[0].epoch)} "
+                 f"latest_wanted={int(prepend_rounds[-1].epoch)}")
+        else:
+            staging_path = store.path_jsonl + ".prepend_staging"
+            synced = _fetch_to_staging(
+                rounds_asc=prepend_rounds, inst_id=inst_id,
+                staging_path=staging_path, label=label,
+                okx_client=okx_client,
+            )
+            if synced > 0:
+                _prepend_staging_to_store(store=store, staging_path=staging_path, label=label)
+                total_synced += synced
 
     info("DONE", f"{label}: {total_synced} synced")
     return total_synced
@@ -311,15 +409,48 @@ def _fetch_and_append(
             time.sleep(1.0)
 
         results = _fetch_batch(batch, inst_id, okx_client=okx_client)
-        if not results:
-            continue
+
+        # A FETCH THAT RETURNS FEWER RECORDS THAN REQUESTED IS A GAP, NOT A
+        # RESULT.
+        #
+        # The old code did `if not results: continue` and then filtered to
+        # `> prev_epoch` under a "skip gaps" comment. That comment encoded
+        # an assumption that is false: a transient upstream omission -- an
+        # http_429 that recovers short, a window OKX has not published yet
+        # -- became a PERMANENT hole in an append-only store, because the
+        # epoch is never revisited once the cursor moves past it.
+        #
+        # A set comparison against what was actually requested turns that
+        # into a loud failure. Raising costs a re-run of a resumable sync;
+        # every batch before this one is already appended and flushed, and
+        # the epochs in THIS batch stay un-done so the next run refetches
+        # them. A silent hole costs months of invisible data loss.
+        requested_epochs = {int(r.epoch) for r in batch}
+        got_epochs = {int(r["epoch"]) for r in results}
+        if got_epochs != requested_epochs:
+            missing = sorted(requested_epochs - got_epochs)
+            unexpected = sorted(got_epochs - requested_epochs)
+            raise InvariantError(
+                f"kline_batch_incomplete: {label} requested={len(requested_epochs)} "
+                f"got={len(got_epochs)} missing={missing[:20]} "
+                f"unexpected={unexpected[:20]} -- refusing to advance the "
+                f"cursor past an epoch that was not fetched, which would "
+                f"leave a permanent hole in an append-only store")
 
         results.sort(key=lambda r: int(r["epoch"]))
 
-        # Filter to only records strictly after prev_epoch (skip gaps).
-        appendable = [r for r in results if int(r["epoch"]) > prev_epoch]
-        if not appendable:
-            continue
+        # Monotonicity survives as an ASSERTION, not a filter. Filtering
+        # here is what silently dropped records; if the fetch returns
+        # something at or before the cursor, that is a bug to surface, not
+        # a record to discard.
+        _offenders = [int(r["epoch"]) for r in results if int(r["epoch"]) <= prev_epoch]
+        if _offenders:
+            raise InvariantError(
+                f"kline_batch_not_after_cursor: {label} prev_epoch={prev_epoch} "
+                f"offending={_offenders[:20]} -- a record at or before the "
+                f"cursor cannot be appended to an ascending store")
+
+        appendable = results
 
         if not store.exists():
             store.write_new(appendable)

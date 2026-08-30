@@ -17,7 +17,10 @@ from pancakebot.market_data.contract_constants import (
 )
 from pancakebot.market_data.okx_client import OkxClient
 from pancakebot.strategy.momentum_gate import MomentumGate, MomentumGateConfig
-from pancakebot.market_data.round_store import ClosedRoundsStore
+from pancakebot.market_data.round_store import (
+    ClosedRoundsStore,
+    repair_torn_tail,
+)
 from pancakebot.market_data.graph_client import GraphClient
 from pancakebot.chain.rpc_chooser import choose_rpc_url
 from pancakebot.chain.contract_config import Web3ContractConfig
@@ -25,10 +28,45 @@ from pancakebot.chain.prediction_contract import Web3PredictionContract
 from pancakebot.runtime.config import RuntimeConfig
 from pancakebot.runtime import engine
 from pancakebot.market_data.sync import sync_runtime_market_data
+from pancakebot.market_data.epoch_scan import contiguity, format_report
 from pancakebot.util import InvariantError
-from pancakebot.log import configure_file_logging, info
+from pancakebot.log import configure_file_logging, info, warn
 from pancakebot.chain.rpc_poller import RpcPoller
 from pancakebot import paths
+
+
+def _emit_contiguity_report() -> None:
+    """WHOLE-STORE CONTIGUITY REPORT.
+
+    The tail assert guards only the last backtest_round_count rounds --
+    what the backtest consumes. Everything older is invisible to it BY
+    CONSTRUCTION, which is how 23 missing epochs survived for months. This
+    reads every store end to end on every sync.
+
+    It is a REPORT, not an assert: it never fails the run, and it never
+    propagates. A gap below the tail does not endanger anything the bot
+    reads, and stopping collection over one would be strictly worse than
+    seeing it. Swallowing here is also what makes it safe to call from a
+    `finally` -- a raising report would MASK the original sync exception,
+    replacing a real diagnosis with its own.
+
+    Byte scan, no JSON parse: ~6s for 4.5GB against ~2min to parse. That
+    cost difference is the entire reason no such report existed before.
+    """
+    try:
+        rows = [
+            contiguity(p) for p in (
+                paths.CLOSED_ROUNDS_PATH,
+                paths.BNB_SPOT_PRICES_PATH,
+                paths.BTC_SPOT_PRICES_PATH,
+                paths.ETH_SPOT_PRICES_PATH,
+                paths.SOL_SPOT_PRICES_PATH,
+            )
+        ]
+        for line in format_report(rows):
+            info("AUDIT", line)
+    except Exception as e:      # noqa: BLE001 - see docstring
+        warn("AUDIT", f"contiguity report failed: {type(e).__name__}: {e}")
 
 
 def run_from_config(
@@ -113,6 +151,29 @@ def run_from_config(
     if sync:
         load_env()
 
+        # A kill mid-append (reboot, power loss, network drop) leaves a
+        # trailing partial line. Every reader raises jsonl_parse_failed on
+        # it, so an unrepaired torn tail makes EVERY subsequent scheduled
+        # sync fail identically and forever -- a silent permanent stop that
+        # looks exactly like a quiet week. This is the only truncation the
+        # sync may perform: repair_torn_tail removes a trailing partial
+        # line and nothing else, and refuses outright on body corruption.
+        # Run it before any store is opened for reading.
+        for _store_path in (
+            paths.CLOSED_ROUNDS_PATH,
+            paths.BNB_SPOT_PRICES_PATH,
+            paths.BTC_SPOT_PRICES_PATH,
+            paths.ETH_SPOT_PRICES_PATH,
+            paths.SOL_SPOT_PRICES_PATH,
+        ):
+            _removed = repair_torn_tail(_store_path)
+            if _removed:
+                info("REPAIR",
+                     f"torn tail repaired: {_store_path} "
+                     f"removed_bytes={_removed} -- a previous run was killed "
+                     f"mid-append; the partial trailing line has been dropped")
+
+
         # Bootstrap: refresh ``var/contract_constants.json`` from chain
         # BEFORE the Graph parser tries to load it. ``graph_client.py``'s
         # ``_parse_round`` calls ``load_contract_constants()`` for every
@@ -152,12 +213,20 @@ def run_from_config(
         # connections=4 explicitly so all 4 sockets are pre-warmed; the
         # default (3) tracks the live/dry gate's symbol count.
         okx_client.warmup(connections=4)
-        summary = sync_runtime_market_data(
-            cfg=cfg,
-            graph=graph,
-            round_store=round_store,
-            okx_client=okx_client,
-        )
+        # The contiguity report runs in a `finally` so it emits on the
+        # FAILURE path too. A store's integrity is most in question exactly
+        # when the run that touched it went wrong -- reporting only on
+        # success means the report is absent precisely when it is needed,
+        # and the operator is left reasoning about a store nobody measured.
+        try:
+            summary = sync_runtime_market_data(
+                cfg=cfg,
+                graph=graph,
+                round_store=round_store,
+                okx_client=okx_client,
+            )
+        finally:
+            _emit_contiguity_report()
         info(
             "DONE",
             f"sync done: closed_rounds={int(summary.stored_closed_round_count)} "

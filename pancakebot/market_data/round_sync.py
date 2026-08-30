@@ -7,7 +7,8 @@ from pathlib import Path
 from pancakebot.market_data.graph_client import GraphClient
 from pancakebot.market_data.round_store import ClosedRoundsStore
 from pancakebot.util import InvariantError
-from pancakebot.log import info
+from pancakebot.log import info, warn
+from pancakebot.market_data.store_rewrite_gate import store_rewrite_allowed
 
 
 def sync_closed_rounds(*, graph: GraphClient, store: ClosedRoundsStore, cache_n: int) -> None:
@@ -48,6 +49,26 @@ def sync_closed_rounds(*, graph: GraphClient, store: ClosedRoundsStore, cache_n:
         return
     if stored_n <= 0:
         raise InvariantError("sync_store_empty")
+
+    # THE OLDER-BACKFILL PATH REPLACES THE ENTIRE STORE. It builds a tmp of
+    # older rounds, stream-copies the existing store onto it, then does
+    # tmp_path.replace(store_path). On a machine where this file is the ONLY
+    # surviving copy of irreplaceable history, an unattended job must not do
+    # that.
+    #
+    # Returning here is SAFE and deliberate: every newer round has already
+    # been appended above, so forward data collection is complete and on
+    # disk. Only the historical backfill is skipped. Aborting instead would
+    # let one discovered gap stop all collection indefinitely -- the exact
+    # permanent quiet failure this design exists to prevent.
+    if not store_rewrite_allowed():
+        warn("GAP",
+             f"REFUSING historical backfill: store holds {stored_n} rounds, "
+             f"cache_n={cache_n} wants {cache_n - stored_n} more. The backfill "
+             f"path REPLACES the whole store and is disabled in unattended "
+             f"runs. Forward sync COMPLETED and is safe. To backfill "
+             f"deliberately, re-run with ALLOW_STORE_REWRITE=1.")
+        return
 
     earliest_on_disk = store.load_earliest_epoch()
     if earliest_on_disk is None:
