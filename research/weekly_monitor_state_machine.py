@@ -169,10 +169,26 @@ CUTOFF, LOOKBACKS, FEE = 2, (3, 7, 15), 0.03
 # the pipeline construction below (MED-A2).
 POOL_CUTOFF = 6
 MIN_BET_AMOUNT_BNB = 0.001
-BREAKEVEN_WR = 0.55
+BREAKEVEN_WR = 0.56
 POS_RAW_P = 0.10           # raw permutation p_upper, single test (user decision)
 POS_MIN_FIRES = 10         # per-WINDOW information floor; 1w starved -> positive falls back to 2w
-NEG_WR_FLOOR = 0.45        # spent-window WR below this -> disable
+# NEG_WR_FLOOR (was 0.45) IS DELETED, not moved. It tested the RAW
+# point estimate -- `wr < floor` -- which fires inside the noise. Measured
+# on the real weekly series: at n=15 and WR=0.40 the raw floor disables
+# while the 95% upper bound on that WR is 0.6404, i.e. the evidence cannot
+# distinguish 0.40 from well above breakeven. Raising the floor to 0.52 as
+# first proposed would have made this worse: with a true win rate sitting
+# exactly at BREAKEVEN_WR, a raw floor at 0.52 disables a healthy strategy
+# 23.7% of weeks at n=50 and 37.4% at n=20.
+#
+# The disable leg now reasons about a BOUND, exactly as the enable leg
+# already does with p_upper < POS_RAW_P. One criterion, not two: a raw
+# floor beneath the bound rule would re-introduce the noise-firing this
+# change exists to remove, and POS_MIN_FIRES already guarantees n >= 10 on
+# any spendable window, where a catastrophic WR is comfortably caught
+# (n=10, WR=0.00 -> upper95 = 0.2589). Where the bound rule declines to
+# fire on a small-n bad week it is being CORRECT -- the evidence does not
+# support a disable -- and the weak-week streak below catches persistence.
 NEG_CONSECUTIVE_WEAK = 3
 NEG_WEAK_P = 0.5           # weak week: SPENT-window p_upper above this (or both windows starved)
 N_PERM = 10_000
@@ -512,15 +528,71 @@ def spent_stats(trigger_window: str, p1: dict, p2: dict) -> dict:
     return p2 if trigger_window == "2w_fallback" else p1
 
 
+def _binom_cdf(k: int, n: int, p: float) -> float:
+    """P(X <= k) for X ~ Binomial(n, p). Exact; no SciPy on the VM."""
+    from math import comb
+    return sum(comb(n, i) * p ** i * (1.0 - p) ** (n - i)
+               for i in range(0, k + 1))
+
+
+def wr_upper_bound(wins: int, n: int, *, alpha: float = 0.05) -> float:
+    """One-sided Clopper-Pearson UPPER bound on the win rate.
+
+    The largest p for which observing <= `wins` in `n` still has
+    probability >= alpha -- i.e. the optimistic end of the interval. EXACT
+    (bisection on the binomial CDF) rather than a normal approximation,
+    because the weekly n is small enough that the approximation moves the
+    decision: at n=15, wins=6 the normal bound reads 0.6081 against an
+    exact 0.6404.
+    """
+    if n <= 0:
+        return 1.0
+    if wins >= n:
+        return 1.0
+    lo, hi = 0.0, 1.0
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if _binom_cdf(wins, n, mid) < alpha:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2.0
+
+
 def negative_wr_leg(trigger_window: str, stats: dict) -> bool:
-    """The disable WR leg reads the SPENT window, same source as the
-    positive legs — a starved-1w regime must not make the WR floor
-    unreachable while the 2w window shows a losing edge. With no
-    spendable window ('none') the leg is unevaluable; weak-booking
-    covers total starvation."""
-    return bool(trigger_window != "none"
-                and stats.get("wr") is not None
-                and stats["wr"] < NEG_WR_FLOOR)
+    """Disable when the spent window is STATISTICALLY below breakeven.
+
+    Reads the SPENT window, same source as the positive legs — a starved-1w
+    regime must not make the leg unreachable while the 2w window shows a
+    losing edge. With no spendable window ('none') the leg is unevaluable;
+    weak-booking covers total starvation.
+
+    THE TEST IS A BOUND, NOT A POINT ESTIMATE (2026-08-30). The leg used
+    `wr < NEG_WR_FLOOR`, comparing the raw weekly win rate against a fixed
+    number. A weekly window carries n ~ 10-50 fires, so the standard error
+    on WR is ~0.07-0.15 and the raw test fires deep inside the noise. It
+    now asks the question the enable side already asks: is the evidence
+    strong enough? Specifically -- can we rule out breakeven? The disable
+    fires only when even the 95% UPPER bound on the observed win rate sits
+    below BREAKEVEN_WR, so a bad point estimate on thin evidence does not
+    stop a live strategy.
+
+    Backtested over the real weekly series (8 evaluable weeks): this fires
+    ONCE, on 2026-07-12 (n=15, WR=0.20, upper95=0.4398) -- the week the bot
+    genuinely was disabled. The raw floor fired twice, adding 2026-08-02
+    (n=15, WR=0.40, upper95=0.6404), which is not distinguishable from a
+    healthy strategy on 15 observations.
+
+    Keyed off BREAKEVEN_WR so both sides of the decision move together: a
+    change to what "breakeven" means tightens the enable bar and the
+    disable bar coherently, instead of leaving a silent gap between them.
+    """
+    if trigger_window == "none":
+        return False
+    wr, n = stats.get("wr"), stats.get("n")
+    if wr is None or not n:
+        return False
+    return wr_upper_bound(round(float(wr) * int(n)), int(n)) < BREAKEVEN_WR
 
 
 def evaluate_positive(stats: dict, bt: dict) -> bool:
@@ -1182,8 +1254,9 @@ def _main() -> int:
         neg_desc = (_window_desc("2w(fallback SPENT)", p2)
                     if trigger_window == "2w_fallback"
                     else _window_desc("1w", p1))
-        reason = (f"NEGATIVE: {neg_desc} (WR<{NEG_WR_FLOOR}: {neg_wr_leg}) "
-                  f"or consecutive_weak={consec}>={NEG_CONSECUTIVE_WEAK}")
+        reason = (f"NEGATIVE: {neg_desc} (WR upper95 < {BREAKEVEN_WR}: "
+                  f"{neg_wr_leg}) or consecutive_weak={consec}>="
+                  f"{NEG_CONSECUTIVE_WEAK}")
         if args.apply:
             action = "disable"
             acted = do_disable()
