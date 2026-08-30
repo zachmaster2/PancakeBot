@@ -106,18 +106,30 @@ def test_both_insufficient_cannot_fire():
 
 
 def test_negative_wr_leg_follows_spent_window():
-    # The reviewer's starved-1w regime: 2w evaluable at WR=0.40 with
-    # 0.10 < p_upper <= 0.5 — not weak, but the WR floor must still bite.
-    losing_2w = dict(n=19, wr=0.40, obs_mean_pnl=-0.12, null_mean=0.0,
+    # The reviewer's starved-1w regime: 2w evaluable and LOSING with
+    # 0.10 < p_upper <= 0.5 — not weak, but the disable leg must still
+    # bite, and must bite on the SPENT (2w) window rather than being
+    # unreachable. That structural point is what this test defends.
+    #
+    # WR moved 0.40 -> 6/19 (0.3158) when the leg became a bound test
+    # (2026-08-30). At n=19, WR=0.40 has a 95% upper bound of 0.6319 —
+    # NOT distinguishable from a healthy strategy, so the leg correctly
+    # declines. 6/19 gives upper95=0.5300, genuinely below breakeven.
+    # The fixture had to become actually-losing rather than merely
+    # low-looking; that is the change working, not a weakened test.
+    losing_2w = dict(n=19, wr=6 / 19, obs_mean_pnl=-0.12, null_mean=0.0,
                      p_upper=0.30)
     assert wm.weak_week("2w_fallback", losing_2w) is False
     assert wm.negative_wr_leg("2w_fallback", losing_2w) is True
     # healthy spent windows do not trip it
     assert wm.negative_wr_leg("2w_fallback", GOOD_2W) is False
     assert wm.negative_wr_leg("1w", GOOD_1W) is False
-    assert wm.negative_wr_leg("1w", dict(GOOD_1W, wr=0.40)) is True
-    # strict inequality at the floor
-    assert wm.negative_wr_leg("1w", dict(GOOD_1W, wr=wm.NEG_WR_FLOOR)) is False
+    # The leg is now a BOUND test, not a raw floor (2026-08-30). WR=0.40 on
+    # n=15 has a 95% upper bound of 0.6404 -- indistinguishable from a
+    # healthy strategy -- so it must NOT disable. The old raw floor did.
+    assert wm.negative_wr_leg("1w", dict(GOOD_1W, wr=0.40)) is False
+    # Genuinely below breakeven on the same n: 3/15, upper95 = 0.4398.
+    assert wm.negative_wr_leg("1w", dict(GOOD_1W, wr=0.20)) is True
     # no spendable window: the leg is unevaluable (weak-booking covers it)
     assert wm.negative_wr_leg("none", INSUF_1W) is False
 
@@ -127,11 +139,16 @@ def test_boundary_values_do_not_fire():
     at_bars = dict(n=10, wr=wm.BREAKEVEN_WR, obs_mean_pnl=0.0,
                    null_mean=0.0, p_upper=wm.POS_RAW_P)
     assert wm.evaluate_positive(at_bars, BT_POS) is False
-    assert wm.evaluate_positive(dict(at_bars, wr=0.56), BT_POS) is False  # p at bar
+    # 0.57 clears the bar; BREAKEVEN_WR moved 0.55 -> 0.56 on 2026-08-30,
+    # so the old literal 0.56 now sits EXACTLY AT it and the strict `>`
+    # correctly rejects. Expressed relative to the constant so the next
+    # move does not silently turn this into a boundary test again.
+    _above = wm.BREAKEVEN_WR + 0.01
+    assert wm.evaluate_positive(dict(at_bars, wr=_above), BT_POS) is False  # p at bar
     assert wm.evaluate_positive(
-        dict(at_bars, wr=0.56, p_upper=0.09), dict(net_pnl_bnb=0.0)) is False
+        dict(at_bars, wr=_above, p_upper=0.09), dict(net_pnl_bnb=0.0)) is False
     assert wm.evaluate_positive(
-        dict(at_bars, wr=0.56, p_upper=0.09), BT_POS) is True
+        dict(at_bars, wr=_above, p_upper=0.09), BT_POS) is True
 
 
 # ---- message formatting ---------------------------------------------------

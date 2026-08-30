@@ -319,7 +319,11 @@ class MomentumOnlyPipeline:
                     self._release_suspension(start_at, reason="monitor_override")
                     # fall through to the normal decision flow below
                 else:
-                    self._bankroll_tracker.tick_cooldown()
+                    # Pass the round anchor: the counter is denominated
+                    # in ROUNDS, and this call site fires once per LOOP
+                    # ITERATION. Without the anchor a spinning loop burns
+                    # the suspension (2026-08-30: ~220x real time).
+                    self._bankroll_tracker.tick_cooldown(start_at)
                     # cooldown_remaining is read AFTER tick_cooldown, so it
                     # reflects the rounds remaining INCLUDING the next round
                     # the bot will observe (not counting the current skipped
