@@ -89,8 +89,12 @@ class BankrollTracker(ABC):
         """Enter cooldown for ``cooldown_rounds`` rounds starting now."""
 
     @abstractmethod
-    def tick_cooldown(self) -> None:
-        """Decrement the cooldown counter by one; floor at 0."""
+    def tick_cooldown(self, as_of_start_at: int | None = None) -> None:
+        """Consume ONE ROUND of cooldown; floor at 0.
+
+        ``as_of_start_at`` is the round anchor: passing it makes a repeat
+        of the same round a no-op, so a fast-looping engine cannot burn a
+        risk timer. See the concrete implementation for the incident."""
 
     @abstractmethod
     def cooldown_remaining(self) -> int:
@@ -135,6 +139,7 @@ class InMemoryBankrollTracker(BankrollTracker):
 
     __slots__ = (
         "_entries", "_window_days", "_cooldown", "_triggered_at", "_seeded",
+        "_last_tick_start_at",
         "_initial", "_peak_mode", "_absolute_peak",
     )
 
@@ -158,6 +163,8 @@ class InMemoryBankrollTracker(BankrollTracker):
         self._window_days = int(drawdown_peak_window_days)
         self._cooldown: int = 0
         self._triggered_at: int | None = None
+        # Round anchor of the last cooldown tick (epoch-keyed guard).
+        self._last_tick_start_at: int | None = None
         # Seeded lazily on first record_settlement when we know a real start_at;
         # prior to that, current_bankroll returns the initial value.
         self._seeded = False
@@ -252,7 +259,25 @@ class InMemoryBankrollTracker(BankrollTracker):
         self._cooldown = int(cooldown_rounds)
         self._triggered_at = int(triggered_at)
 
-    def tick_cooldown(self) -> None:
+    def tick_cooldown(self, as_of_start_at: int | None = None) -> None:
+        """Consume ONE ROUND of cooldown.
+
+        EPOCH-KEYED. The counter is denominated in ROUNDS but was being
+        decremented once per CALL, and the caller is the pipeline decision
+        -- i.e. once per LOOP ITERATION. Those coincide only while the loop
+        behaves. On 2026-08-30 a stale-read fault made the loop free-run at
+        ~1.4s/iteration for 29 minutes; this counter fell ~220x real time,
+        hit zero, extended the suspension, and repeated -- five spurious
+        +288-round extensions, adding ~22h to a live risk stand-down.
+        Passing the round anchor makes a repeated round a no-op, so a spin
+        can no longer move a risk timer.
+
+        as_of_start_at=None preserves the old unconditional behaviour for
+        callers that genuinely have no round anchor (tests, backtest)."""
+        if as_of_start_at is not None:
+            if self._last_tick_start_at == int(as_of_start_at):
+                return
+            self._last_tick_start_at = int(as_of_start_at)
         if self._cooldown > 0:
             self._cooldown -= 1
         if self._cooldown == 0:
@@ -399,9 +424,12 @@ class PersistedBankrollTracker(InMemoryBankrollTracker):
     def persist_dir(self) -> Path | None:
         return self._history_path.parent
 
-    def tick_cooldown(self) -> None:
+    def tick_cooldown(self, as_of_start_at: int | None = None) -> None:
         was_paused = self._cooldown > 0
-        super().tick_cooldown()
+        before = self._cooldown
+        super().tick_cooldown(as_of_start_at)
+        if self._cooldown == before and was_paused:
+            return          # deduped repeat round: nothing to persist
         # Persist on every tick while paused; on unpause the file reflects paused=false.
         if was_paused:
             self._persist_pause_state()

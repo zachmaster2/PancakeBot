@@ -347,7 +347,9 @@ def _note_kline_gate_outcome(
             (pub_win, pub_alarm, pub_hit, "publish_delay_rate"),
             (gen_win, gen_rate_alarm, gen_hit, "fetch_failure_rate"),
         ):
-            over = win.observe(hit)
+            # epoch-keyed: a spinning loop must not flush the window
+            # with repeats of one round (see RateWindow.observe).
+            over = win.observe(hit, epoch=int(epoch))
             if over is None:
                 continue        # window still filling
             ev = alarm.record(
@@ -538,9 +540,11 @@ def _note_endpoint_move_outcome(
                 header_failed = count > _LAST_RS_ERROR_COUNT
             _LAST_RS_ERROR_COUNT = count
 
-        static_over = static_win.observe(wake_mode == "static")
-        header_over = header_win.observe(header_failed)
-        pool_win.observe(not pool_ready)
+        # epoch-keyed on all three: these windows are denominated in
+        # ROUNDS and this function is called once per LOOP ITERATION.
+        static_over = static_win.observe(wake_mode == "static", epoch=int(epoch))
+        header_over = header_win.observe(header_failed, epoch=int(epoch))
+        pool_win.observe(not pool_ready, epoch=int(epoch))
 
         if static_over is None and header_over is None:
             return                      # both windows still warming
@@ -950,6 +954,22 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
     # RETRY_BACKOFF_SECONDS sized so cumulative wait crosses
     # buffer_seconds + _RPC_ALIGNMENT_PADDING_SECONDS (~35s) by the 5th
     # retry, with grace beyond.
+    # DEFENCE IN DEPTH ON THE PACING. This loop has no sleep of its own;
+    # every bit of pacing lives inside _run_one_iteration as
+    # _sleep_until_ts calls, and each of those returns IMMEDIATELY when its
+    # target is already past. So ANY fault that leaves the wake schedule
+    # stale -- not just the already-locked round fixed in _epoch_handshake
+    # -- silently turns this into a busy loop. On 2026-08-30 that ran at
+    # ~1.4s/iteration for 29 minutes and burned a risk timer that is
+    # decremented once per iteration.
+    #
+    # The floor makes the failure MODE bounded and, more importantly,
+    # VISIBLE: before this there was no signal at all for "the loop is
+    # running too fast", which is why it took a log post-mortem to find.
+    # It is a backstop, not the fix -- a floor that fires means something
+    # upstream is wrong and the WARN says so.
+    min_iter_s = max(1.0, cfg.interval_seconds * _MIN_ITERATION_FRACTION_OF_ROUND)
+    fast_iterations = 0
     while True:
         # Per-subsystem TransientRpcError handling lives at each callsite:
         #   - _epoch_handshake: bounded local retry
@@ -959,7 +979,49 @@ def run_realtime_loop(cfg: RuntimeConfig) -> None:
         #   - bet submission: crash → systemd restart (round was lost anyway)
         # No top-level catch — there is no remaining bubble path where a
         # generic 10s-sleep-and-retry helps.
+        _iter_started = time.monotonic()
         _run_one_iteration(cfg, closed_state)
+        _elapsed = time.monotonic() - _iter_started
+        if _elapsed < min_iter_s:
+            fast_iterations += 1
+            # Rate-limited so a sustained spin cannot bury its own signal:
+            # first occurrence, then every 20th.
+            if fast_iterations == 1 or fast_iterations % 20 == 0:
+                warn("LOOP",
+                     f"iteration completed in {_elapsed:.2f}s, under the "
+                     f"{min_iter_s:.0f}s floor (round={cfg.interval_seconds}s) "
+                     f"— the wake schedule is not pacing this loop, which "
+                     f"means an upstream read is stale. Sleeping the "
+                     f"remainder. consecutive_fast={fast_iterations}")
+            sleep_seconds(min_iter_s - _elapsed)
+        else:
+            fast_iterations = 0
+
+
+# Handshake retry ladder. SHORT AND HONEST, replacing the shared
+# RETRY_BACKOFF_SECONDS ([2,4,6,10,14,20,26,34] = 9 attempts, ~116s).
+# Measured: of 13 lifetime locked_lock_price_zero episodes, 12 ran that
+# ladder to exhaustion and crashed; the single survivor needed 7 of 8
+# retries. A ~1-in-13 success rate does not justify two minutes of
+# retrying -- it just delays the restart that resolves it. Four attempts
+# (~12s) still spans a genuine one-block settlement blip, which is the
+# case the original ladder was actually sized for.
+_HANDSHAKE_BACKOFF_SECONDS = [2, 4, 6]
+
+# MINIMUM WALL TIME FOR ONE ITERATION. The outer loop is a bare
+# `while True: _run_one_iteration(...)` with no sleep of its own -- ALL
+# pacing comes from _sleep_until_ts calls inside, and every one of them
+# returns immediately when its target is already past. Any fault that
+# makes the wake schedule stale therefore removes the pacing entirely.
+#
+# Derived from the data, not intuition: the 2026-08-30 spin ran at
+# ~1.4s/iteration against a ~306s round, and healthy iterations are
+# bounded below by the wake schedule (the earliest wake, okx_warmup, sits
+# ~7s before lock, so a legitimate iteration spans nearly a whole round).
+# A floor at one tenth of a round is ~30s -- 20x above the observed spin
+# and an order of magnitude below any healthy iteration, so it cannot fire
+# in normal operation and cannot be outrun by a spin.
+_MIN_ITERATION_FRACTION_OF_ROUND = 0.10
 
 
 def _mono_ms() -> float:
@@ -2124,17 +2186,20 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int]:
 
     Returns (locked_round_stub, open_round_stub, current_epoch).
     """
-    for idx, delay_seconds in enumerate([0] + list(RETRY_BACKOFF_SECONDS)):
+    last_reason: str | None = None
+    for idx, delay_seconds in enumerate([0] + list(_HANDSHAKE_BACKOFF_SECONDS)):
         if delay_seconds > 0:
             sleep_seconds(delay_seconds)
         try:
             current_epoch = int(cfg.contract.current_epoch())
         except TransientRpcError as e:
+            last_reason = "rpc_current_epoch"
             warn("RETRY", f"epoch_handshake: rpc_current_epoch attempt={idx} err={e}")
             continue
 
         locked_epoch = current_epoch - 1
         if locked_epoch <= 0:
+            last_reason = "locked_epoch_nonpositive"
             warn("RETRY", f"epoch_handshake: locked_epoch_nonpositive attempt={idx}")
             continue
 
@@ -2142,10 +2207,12 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int]:
             locked_rd = cfg.contract.round_data(locked_epoch)
             open_rd = cfg.contract.round_data(current_epoch)
         except TransientRpcError as e:
+            last_reason = "rpc_round_data"
             warn("RETRY", f"epoch_handshake: rpc_round_data attempt={idx} err={e}")
             continue
 
         if locked_rd.lock_ts <= 0:
+            last_reason = "locked_lock_ts_zero"
             warn("RETRY", f"epoch_handshake: locked_lock_ts_zero attempt={idx}")
             continue
         # Two other zero-state conditions appear during the
@@ -2158,10 +2225,33 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int]:
             locked_rd.lock_price_usd is None
             or locked_rd.lock_price_usd <= 0.0
         ):
+            last_reason = "locked_lock_price_zero"
             warn("RETRY", f"epoch_handshake: locked_lock_price_zero attempt={idx}")
             continue
         if open_rd.lock_ts <= 0:
+            last_reason = "open_lock_ts_zero"
             warn("RETRY", f"epoch_handshake: open_lock_ts_zero attempt={idx}")
+            continue
+
+        # THE OPEN ROUND MUST STILL BE OPEN. Every wake in
+        # _run_one_iteration is computed as an offset before
+        # open_round.lock_at, and _sleep_until_ts returns IMMEDIATELY for a
+        # target already past. So a round whose lock has already gone by
+        # silently converts the entire iteration into a no-op sleep
+        # schedule and the outer `while True` free-runs at RPC speed.
+        #
+        # That is not hypothetical: on 2026-08-30 the loop spun on epoch
+        # 511439 at ~1.4s per iteration for ~29 minutes, decrementing the
+        # drawdown cooldown once per iteration until it hit zero, extending
+        # the suspension, and repeating -- five spurious +288-round
+        # extensions in 27 minutes. Checking lock_ts > 0 was never enough;
+        # a stale currentEpoch from a lagging node passes it.
+        if open_rd.lock_ts <= _utc_now():
+            warn("RETRY",
+                 f"epoch_handshake: open_round_already_locked attempt={idx} "
+                 f"epoch={current_epoch} lock_ts={open_rd.lock_ts} "
+                 f"now={int(_utc_now())} -- chain read is behind real time")
+            last_reason = "open_round_already_locked"
             continue
 
         locked_round = Round(
@@ -2186,7 +2276,23 @@ def _epoch_handshake(cfg: RuntimeConfig) -> tuple[Round, Round, int]:
         )
         return locked_round, open_round, current_epoch
 
-    raise InvariantError("epoch_handshake_exhausted")
+    # BUDGET EXHAUSTED. Measured behaviour of the retry ladder against
+    # the condition it actually meets in production: over 13 lifetime
+    # episodes of locked_lock_price_zero, 12 ran the full ladder and
+    # crashed; ONE recovered, on the 8th of 8 retries. A ~1-in-13 success
+    # rate means the ~116s ladder is mostly delay before an inevitable
+    # restart, and the design comment sizes it for a fresh-spawn
+    # round-transition window that is not the case being hit.
+    #
+    # Raising is still correct -- an epoch snapshot we cannot make coherent
+    # is genuinely unrecoverable in-process, and betting on a guess is the
+    # one thing worse than restarting. But it should be an honest, fast
+    # failure rather than two minutes of theatre, so the budget is now
+    # short (see _HANDSHAKE_BACKOFF_SECONDS) and the exception says which
+    # condition defeated it instead of a bare "exhausted".
+    raise InvariantError(
+        f"epoch_handshake_exhausted: last={last_reason or 'unknown'} "
+        f"attempts={idx + 1}")
 
 
 def _current_bankroll_estimate(closed: RuntimeState) -> float:
