@@ -107,6 +107,8 @@ class PoolGateAlarm:
         self.kind_blocked = kind_blocked
         self.kind_recovered = kind_recovered
         self._streak = 0
+        # Round anchor for the epoch-keyed streak guard.
+        self._last_seen_epoch: int | None = None
         self._first_blocked_at: float | None = None
         self._last_alert_at: float | None = None
         self._alerting = False
@@ -219,6 +221,16 @@ class PoolGateAlarm:
         self, *, reason: str, epoch: int, now: float, blocks_short: int | None,
         getlogs_p99_ms: int | None = None, extra: dict | None = None,
     ) -> PoolGateEvent | None:
+        # EPOCH-KEYED. `_streak` counts CONSECUTIVE BLOCKED ROUNDS and the
+        # threshold (6) is reasoned about in wall time -- ~30 minutes at 12
+        # rounds/hour. It was advancing once per CALL, and the caller is the
+        # engine round loop, so a loop spinning at ~1.4s/iteration (as on
+        # 2026-08-30) would cross a 30-minute threshold in ~9 SECONDS. Same
+        # defect class as the drawdown cooldown; this one did not bite only
+        # because the pool gate happened to be passing throughout that spin.
+        if self._last_seen_epoch == epoch:
+            return None
+        self._last_seen_epoch = epoch
         if self._streak == 0:
             self._first_blocked_at = now
         self._streak += 1
@@ -280,6 +292,8 @@ class RateWindow:
         self.min_samples = int(min_samples)
         self._hits: deque[int] = deque(maxlen=self.window)
         self._over = False
+        # Round anchor for the epoch-keyed observe() guard.
+        self._last_seen_epoch: int | None = None
 
     @property
     def n(self) -> int:
@@ -293,9 +307,20 @@ class RateWindow:
     def over(self) -> bool:
         return self._over
 
-    def observe(self, hit: bool) -> bool | None:
-        """Fold one round in. Returns True/False once the window holds at
-        least ``min_samples`` rounds, else None (not enough evidence)."""
+    def observe(self, hit: bool, epoch: int | None = None) -> bool | None:
+        """Fold one ROUND in. Returns True/False once the window holds at
+        least ``min_samples`` rounds, else None (not enough evidence).
+
+        EPOCH-KEYED when ``epoch`` is supplied. The window is denominated in
+        ROUNDS but was appending once per CALL; a spinning round loop would
+        flush the entire window with repeats of one round and REPLACE the
+        measured rate with the spin's own. Same defect class as the
+        drawdown cooldown and the blocked-round streak. ``epoch=None``
+        keeps the old behaviour for callers with no round anchor."""
+        if epoch is not None:
+            if self._last_seen_epoch == epoch:
+                return self._over if len(self._hits) >= self.min_samples else None
+            self._last_seen_epoch = epoch
         self._hits.append(1 if hit else 0)
         if len(self._hits) < self.min_samples:
             return None
