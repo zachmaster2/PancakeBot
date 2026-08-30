@@ -3,6 +3,10 @@
 # -- Shared --
 ABI_JSON_PATH = "abi/prediction_v2_abi.json"
 CLOSED_ROUNDS_PATH = "var/closed_rounds.jsonl"
+# Lock artifact for --sync single-instance (see runtime/process_lock.py).
+# The FILE is not the lock -- the OS byte-range lock on it is -- so its
+# presence on disk means nothing and it is never cleaned up.
+SYNC_LOCK_PATH = "var/sync.lock"
 CONTRACT_CONSTANTS_PATH = "var/contract_constants.json"
 
 # Spot price klines (synced by --sync, consumed by --backtest).

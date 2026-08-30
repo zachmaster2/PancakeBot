@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -112,6 +113,26 @@ def main() -> None:
         if archived is not None:
             info("START", f"archived lingering crash.json -> {archived.name}")
 
+    # SINGLE-INSTANCE FOR --sync. The guard above covers --dry/--live only,
+    # so --sync had none: on an unattended daily schedule a long run can
+    # still be appending when the next day fires. Two syncs read the same
+    # done-epoch set, fetch the same rounds and append them twice; the
+    # ascending validators catch it, but as an InvariantError MID-WRITE --
+    # exactly the state that leaves a torn line. An OS-held lock has no
+    # staleness question: the kernel drops it when the holder dies, however
+    # it dies. Exit rather than queue -- a daily job that finds yesterday
+    # still running should say so, not double the overlap.
+    _sync_lock = contextlib.nullcontext()
+    if args.sync:
+        from pancakebot.runtime.process_lock import LockHeldError, exclusive_lock
+        try:
+            _sync_lock = exclusive_lock(paths.SYNC_LOCK_PATH, label="sync")
+            _sync_lock.__enter__()
+        except LockHeldError as e:
+            from pancakebot.log import error
+            error("START", str(e))
+            sys.exit(3)
+
     try:
         run_from_config(
             config_path=args.config,
@@ -132,6 +153,9 @@ def main() -> None:
         if crash_path is not None:
             write_crash(crash_path, e, last_epoch=None)
         raise
+    finally:
+        if args.sync:
+            _sync_lock.__exit__(None, None, None)
 
 
 if __name__ == "__main__":
