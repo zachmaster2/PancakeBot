@@ -65,8 +65,16 @@ Register-ScheduledTask -TaskName 'PancakeBotDailySync' `
     -Force | Out-Null
 
 # ------------------------------------------------------------ watchdog ----
-$wdAction = New-ScheduledTaskAction -Execute $Py `
-    -Argument 'scripts\sync_watchdog.py' -WorkingDirectory $Repo
+#
+# Run through a wrapper rather than invoking python directly, ONLY so its
+# stdout is captured. Task Scheduler keeps the exit code and nothing else,
+# so a direct invocation leaves no record of WHY a marker was raised -- just
+# the marker. That is precisely the kind of gap that costs an hour of
+# archaeology months later, and this whole system exists to avoid exactly
+# that shape of missing signal.
+$wdAction = New-ScheduledTaskAction -Execute $Ps `
+    -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $Repo 'scripts\watchdog_run.ps1')) `
+    -WorkingDirectory $Repo
 
 # Deliberately offset from the sync and repeated through the day. The
 # watchdog must run even on days the sync never does -- that is its entire

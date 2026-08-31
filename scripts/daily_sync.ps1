@@ -38,7 +38,17 @@ $log   = Join-Path $LogDir "sync_$stamp.log"
 
 "=== PancakeBot daily sync $stamp UTC ===" | Out-File -FilePath $log -Encoding utf8
 
-& $Py -u run.py --sync *>&1 | Tee-Object -FilePath $log -Append
+# Append per line with an EXPLICIT encoding rather than via Tee-Object.
+# Tee-Object on PS 5.1 has no -Encoding and defaults to UTF-16LE, so the
+# header was UTF-8 and the body UTF-16 -- readable by eye, but grep treats
+# the file as binary. A log that cannot be searched is most of the way back
+# to having no log. Per-line (rather than buffering the whole run) keeps the
+# file useful while a long sync is still in flight.
+& $Py -u run.py --sync *>&1 | ForEach-Object {
+    $line = [string]$_
+    $line | Out-File -FilePath $log -Append -Encoding utf8
+    Write-Output $line
+}
 $code = $LASTEXITCODE
 
 if ($code -eq 0) {
