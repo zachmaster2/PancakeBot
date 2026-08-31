@@ -33,11 +33,28 @@ def scan_epochs(path: str) -> list[int]:
     Reads in chunks aligned to line boundaries so a match can never be
     split across a chunk edge.
     """
+    return _scan(path)[0]
+
+
+def scan_epochs_and_crlf(path: str) -> tuple[list[int], int]:
+    """Epochs plus a count of CRLF line terminators, in ONE pass.
+
+    CRLF is counted here rather than in a separate read because the scan
+    already has every byte in hand. The stores were normalised to LF and
+    the writers pinned to it; a non-zero count means something wrote
+    through a path that translates newlines, which is a silent corruption
+    of an append-only file the project cannot refetch.
+    """
+    return _scan(path)
+
+
+def _scan(path: str) -> tuple[list[int], int]:
     out: list[int] = []
+    crlf = 0
     try:
         fh = open(path, "rb")
     except FileNotFoundError:
-        return out
+        return out, 0
     with fh:
         remainder = b""
         while True:
@@ -49,13 +66,16 @@ def scan_epochs(path: str) -> list[int]:
             if cut == -1:
                 remainder = buf
                 continue
-            for m in _EPOCH_RE.finditer(buf[: cut + 1]):
+            head = buf[: cut + 1]
+            crlf += head.count(b"\r\n")
+            for m in _EPOCH_RE.finditer(head):
                 out.append(int(m.group(1)))
             remainder = buf[cut + 1 :]
         if remainder:
+            crlf += remainder.count(b"\r\n")
             for m in _EPOCH_RE.finditer(remainder):
                 out.append(int(m.group(1)))
-    return out
+    return out, crlf
 
 
 def gap_runs(epochs: list[int]) -> list[tuple[int, int]]:
@@ -103,12 +123,13 @@ def contiguity(path: str, known_absent: frozenset[int] | None = None) -> dict:
         from pancakebot.market_data.known_absent import known_absent_for
         known_absent = known_absent_for(path)
 
-    epochs = scan_epochs(path)
+    epochs, crlf = scan_epochs_and_crlf(path)
     if not epochs:
         return {
             "path": path, "n": 0, "distinct": 0, "earliest": None,
             "latest": None, "span": 0, "missing": 0, "runs": [],
             "duplicates": 0, "out_of_order": 0, "known_absent": 0,
+            "crlf": crlf,
         }
     distinct = set(epochs)
     lo, hi = min(distinct), max(distinct)
@@ -136,6 +157,7 @@ def contiguity(path: str, known_absent: frozenset[int] | None = None) -> dict:
         "duplicates": len(epochs) - len(distinct),
         "out_of_order": out_of_order,
         "known_absent": len(excused),
+        "crlf": crlf,
     }
 
 

@@ -38,3 +38,4 @@ Desktop.ini
 # into a MagicMock/ tree in the repo root. Fixed at the source (tests use
 # tmp_path), but ignored so a recurrence cannot be committed silently.
 MagicMock/
+var/store_baseline.json

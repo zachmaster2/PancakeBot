@@ -44,6 +44,13 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from pancakebot.ops.store_guard import (  # noqa: E402
+    evaluate,
+    failure_tag,
+    load_baseline,
+    save_baseline,
+    snapshot,
+)
 from pancakebot.ops.sync_health import assess, summary_line  # noqa: E402
 
 # Resolved explicitly rather than via GetFolderPath: this runs as SYSTEM,
@@ -68,8 +75,13 @@ def _clear_markers(desktop: str) -> list[str]:
     return removed
 
 
-def _marker_name(a: dict) -> str:
+def _marker_name(a: dict, fails: list[str] | None = None) -> str:
     """The filename carries the diagnosis, so it needs no opening."""
+    if fails:
+        # Integrity beats staleness in the name: a store that is CORRUPTING
+        # is a more urgent thing to read off a desktop than one that is
+        # merely behind.
+        return f"{_MARKER_PREFIX}_INTEGRITY_{failure_tag(fails)}.txt"
     st = a["status"]
     if st == "NEVER_RUN":
         return f"{_MARKER_PREFIX}_HAS_NEVER_RUN.txt"
@@ -80,7 +92,31 @@ def _marker_name(a: dict) -> str:
     return f"{_MARKER_PREFIX}_STOPPED_{hours}_HOURS_AGO.txt"
 
 
-def _marker_body(a: dict) -> str:
+def _marker_body(a: dict, fails: list[str] | None = None) -> str:
+    if fails:
+        return (
+            "PANCAKEBOT STORE INTEGRITY REGRESSED\n"
+            "====================================\n\n"
+            + "\n".join("  * " + f for f in fails) + "\n\n"
+            f"Sync recency is separate and currently reads: {summary_line(a)}\n\n"
+            "WHY THIS FILE EXISTS\n"
+            "The daily sync may be running perfectly on schedule and still\n"
+            "be corrupting or losing data. This file appears when the store\n"
+            "files themselves failed a check, not when the sync stopped.\n\n"
+            "WHAT IS AT RISK\n"
+            "The five store files are the only surviving copy of data that\n"
+            "cannot be refetched: OKX serves 1s klines for about 171.6 days,\n"
+            "and anything older exists nowhere else.\n\n"
+            "DO NOT let the sync keep running blindly if a store SHRANK or\n"
+            "REWOUND. A backup exists at:\n"
+            "  C:\\Users\\zking\\Downloads\\pancakebot_store_backup_20260829\\\n\n"
+            "WHAT TO DO\n"
+            "  1. Do not delete this file to make it go away; it clears\n"
+            "     itself once the check passes.\n"
+            "  2. Inspect:  .venv\\Scripts\\python.exe scripts\\store_integrity.py\n"
+            "  3. Compare against var\\store_baseline.json, which holds the\n"
+            "     previous run's numbers.\n"
+        )
     return (
         "PANCAKEBOT DAILY SYNC IS NOT RUNNING\n"
         "====================================\n\n"
@@ -127,6 +163,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--desktop", default=DEFAULT_DESKTOP)
     ap.add_argument("--health", default="var/sync_health.json")
+    ap.add_argument("--baseline", default="var/store_baseline.json")
     ap.add_argument("--no-discord", action="store_true")
     args = ap.parse_args()
 
@@ -134,7 +171,45 @@ def main() -> int:
     line = summary_line(a)
     print(line)
 
-    if a["status"] == "OK":
+    # ---- integrity, evaluated INDEPENDENTLY of recency -------------------
+    #
+    # These answer different questions and either can fail alone. A sync
+    # that runs every day on schedule while quietly losing records is
+    # healthy by recency and broken by integrity, and that combination is
+    # exactly the one nothing used to catch.
+    #
+    # Wrapped so a fault in the CHECK cannot be mistaken for a clean store:
+    # an exception here is reported as a failure, never swallowed into a
+    # pass. "The check could not run" and "the check found nothing" must
+    # not look alike.
+    fails: list[str] = []
+    try:
+        snap = snapshot()
+        fails = evaluate(snap, load_baseline(args.baseline))
+        for name, c in sorted((snap.get("stores") or {}).items()):
+            if c.get("error"):
+                print(f"  {name}: ERROR {c['error']}")
+            else:
+                print(f"  {name}: n={c['n']} latest={c['latest']} "
+                      f"crlf={c['crlf']} missing={c['missing']} "
+                      f"known_absent={c['known_absent']}")
+        # Advance the baseline only when the stores are readable, so a
+        # transient read failure cannot poison the comparison point. A
+        # regression is deliberately still recorded: the next run compares
+        # against today, which stops one bad day alarming forever, and the
+        # marker for today has already been raised.
+        if not any(c.get("error") for c in (snap.get("stores") or {}).values()):
+            save_baseline(snap, args.baseline)
+    except Exception as e:      # noqa: BLE001
+        fails = [f"CHECKFAILED: the integrity check itself raised "
+                 f"{type(e).__name__}: {e}"]
+
+    for f in fails:
+        print(f"  INTEGRITY FAIL: {f}")
+
+    healthy = (a["status"] == "OK") and not fails
+
+    if healthy:
         removed = _clear_markers(args.desktop)
         if removed:
             print(f"cleared stale marker(s): {removed}")
@@ -142,18 +217,19 @@ def main() -> int:
 
     # Not OK: replace any existing marker so the filename reflects TODAY.
     _clear_markers(args.desktop)
-    name = _marker_name(a)
+    name = _marker_name(a, fails)
     try:
         os.makedirs(args.desktop, exist_ok=True)
         with open(os.path.join(args.desktop, name), "w",
                   encoding="utf-8", newline="") as f:
-            f.write(_marker_body(a))
+            f.write(_marker_body(a, fails))
         print(f"WROTE DESKTOP MARKER: {name}")
     except OSError as e:
         print(f"FAILED to write desktop marker: {e}", file=sys.stderr)
 
     if not args.no_discord:
-        print(_try_discord(f"**PancakeBot sync problem**\n{line}"))
+        body = "\n".join(fails) if fails else line
+        print(_try_discord(f"**PancakeBot sync problem**\n{body}"))
 
     # Non-zero so Task Scheduler's Last Result also carries the signal.
     return 1
