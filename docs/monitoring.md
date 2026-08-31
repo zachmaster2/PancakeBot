@@ -1,3 +1,16 @@
+> ## PARTLY STALE as of 2026-08-31
+>
+> The Sunday cron and the VM it ran on **no longer exist**, and the bot is
+> stopped and disabled. The Sunday Discord dead-man contract is **retired**
+> — silence is no longer evidence of anything. See
+> `docs/alerting_retirement_2026_08_31.md`.
+>
+> **Thresholds below are out of date.** The positive leg is now
+> `BREAKEVEN_WR = 0.56` (was 0.55), and the negative leg no longer uses a
+> raw `WR < 0.45` floor — it fires only when the Clopper-Pearson 95% upper
+> bound on the observed win rate falls below `BREAKEVEN_WR`. Treat the
+> table below as a record of the rules as they stood before 2026-08-30.
+
 # Monitoring & autonomous operation
 
 The bot is governed unattended by the **weekly monitor state machine**

@@ -1,3 +1,14 @@
+> ## HISTORICAL as of 2026-08-31 — DO NOT FOLLOW
+>
+> The droplet described below was **destroyed on 2026-08-31** when the
+> project moved to data-collection-only. Nothing here is live.
+>
+> **Do not connect to the IP.** DigitalOcean reassigns addresses; it now
+> belongs to an unrelated machine.
+>
+> Kept as the only record of how the deployment was built. See
+> `docs/alerting_retirement_2026_08_31.md`.
+
 # New VM install checklist — Frankfurt droplet `139.59.209.230`
 
 Bring a fresh DigitalOcean droplet (1 vCPU, $8/mo, AlmaLinux 9.x) to a
