@@ -138,6 +138,53 @@ def test_the_known_absent_epochs_do_not_raise(tmp_path):
     assert f == [], f
 
 
+# ---- MUTATION: duplicates and disorder ------------------------------------
+
+def test_a_duplicate_epoch_raises(store):
+    """These fields were CAPTURED and never EVALUATED -- the same
+    "emitted but not asserted" defect the guard exists to close, committed
+    inside the guard itself. A duplicate double-counts a round in every
+    per-round rate."""
+    p, stores, base = store
+    _write(p, list(range(1000, 1100)) + [1099])
+    f = _fails(stores, base)
+    assert any(x.startswith("DUPLICATES") for x in f), f
+    assert "1 duplicate" in " ".join(f)
+    assert failure_tag(f) == "DUPLICATES"
+
+
+def test_many_duplicates_are_counted(store):
+    p, stores, base = store
+    _write(p, list(range(1000, 1100)) + list(range(1090, 1100)))
+    f = _fails(stores, base)
+    assert "10 duplicate" in " ".join(f), f
+
+
+def test_a_non_ascending_store_raises(store):
+    """load_earliest/load_latest return first/last in FILE ORDER, not
+    min/max -- so disorder is the one condition that makes the sync's
+    partition overlap instead of partition."""
+    p, stores, base = store
+    _write(p, list(range(1000, 1100)) + [1050])   # goes backwards at the end
+    f = _fails(stores, base)
+    assert any(x.startswith("DISORDER") for x in f), f
+
+
+def test_a_fully_reversed_store_raises(store):
+    p, stores, base = store
+    _write(p, list(reversed(range(1000, 1100))))
+    f = _fails(stores, base)
+    assert any(x.startswith("DISORDER") for x in f), f
+
+
+def test_a_healthy_ascending_store_raises_neither(store):
+    p, stores, base = store
+    _write(p, range(1000, 1200))
+    f = _fails(stores, base)
+    assert not any(x.startswith("DUPLICATES") for x in f), f
+    assert not any(x.startswith("DISORDER") for x in f), f
+
+
 # ---- MUTATION: stores drift apart -----------------------------------------
 
 def test_stores_drifting_apart_raises(tmp_path):

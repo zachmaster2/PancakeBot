@@ -157,6 +157,33 @@ def evaluate(current: dict[str, Any],
                 f"GAP {name}: {c['missing']} unexplained missing epoch(s) "
                 f"beyond the {c.get('known_absent', 0)} known-absent")
 
+    # --- duplicates and ordering ------------------------------------------
+    #
+    # These were CAPTURED in the snapshot and never EVALUATED -- the exact
+    # "emitted but not asserted" defect this guard was written to close,
+    # reproduced inside the guard itself. Recorded plainly so the lesson
+    # survives: a field that is measured and not checked is indistinguishable
+    # from one that is not measured at all.
+    #
+    # Both matter beyond tidiness. A duplicate epoch double-counts a round in
+    # any per-round rate and silently biases a backtest. A non-ascending
+    # store breaks the append cursor AND makes load_earliest/load_latest --
+    # which return first/last in FILE ORDER, not min/max -- return values
+    # that no longer bound the data, which is the one condition that can make
+    # the sync's partition overlap instead of partition.
+    for name, c in sorted(cur.items()):
+        if c.get("duplicates", 0):
+            fails.append(
+                f"DUPLICATES {name}: {c['duplicates']} duplicate epoch "
+                f"record(s) -- a round counted twice biases every per-round "
+                f"rate computed from this store")
+    for name, c in sorted(cur.items()):
+        if c.get("out_of_order", 0):
+            fails.append(
+                f"DISORDER {name}: {c['out_of_order']} record(s) not in "
+                f"ascending epoch order -- append-only stores are strictly "
+                f"ascending, and first/last stop bounding the data")
+
     # --- co-advancement ---------------------------------------------------
     latests = [c["latest"] for c in cur.values() if c.get("latest") is not None]
     if latests:
