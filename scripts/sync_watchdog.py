@@ -85,6 +85,12 @@ def _marker_name(a: dict, fails: list[str] | None = None) -> str:
     st = a["status"]
     if st == "NEVER_RUN":
         return f"{_MARKER_PREFIX}_HAS_NEVER_RUN.txt"
+    if st == "ORPHANED":
+        # A run started and never reported an outcome. Naming this as
+        # staleness would send the reader to the wrong diagnosis: the sync
+        # is FIRING, it is dying without saying so.
+        h = int(a.get("hours_since_orphaned_attempt") or 0)
+        return f"{_MARKER_PREFIX}_RUN_VANISHED_{h}_HOURS_AGO.txt"
     days = int((a["hours_since_success"] or 0) // 24)
     if days >= 1:
         return f"{_MARKER_PREFIX}_STOPPED_{days}_DAYS_AGO.txt"
@@ -116,6 +122,32 @@ def _marker_body(a: dict, fails: list[str] | None = None) -> str:
             "  2. Inspect:  .venv\\Scripts\\python.exe scripts\\store_integrity.py\n"
             "  3. Compare against var\\store_baseline.json, which holds the\n"
             "     previous run's numbers.\n"
+        )
+    if a.get("status") == "ORPHANED":
+        return (
+            "PANCAKEBOT SYNC STARTED AND VANISHED\n"
+            "====================================\n\n"
+            f"{summary_line(a)}\n\n"
+            "WHAT THIS MEANS\n"
+            "The scheduled sync FIRED but never reported success or failure.\n"
+            "The task is running fine; something is killing the run partway\n"
+            "through without it saying so. This is a different problem from\n"
+            "the sync not running at all.\n\n"
+            "This state is detected from timestamps alone -- an attempt newer\n"
+            "than every recorded outcome -- so it catches failure modes\n"
+            "nobody anticipated. It exists because on 2026-09-01 a wrapper\n"
+            "died mid-run and the health file still read as clean.\n\n"
+            "WHERE TO LOOK\n"
+            "  1. var\\sync_logs\\ -- the newest log, which will stop mid-run\n"
+            "     with no RESULT line.\n"
+            "  2. Task Scheduler LastTaskResult for PancakeBotDailySync.\n"
+            "  3. Run it by hand and watch:\n"
+            "       .venv\\Scripts\\python.exe run.py --sync\n\n"
+            "WHAT IS AT RISK\n"
+            "The five store files are the only surviving copy of data that\n"
+            "cannot be refetched: OKX serves 1s klines for about 171.6 days.\n"
+            "A single missed day is harmless -- the next sync catches up --\n"
+            "but a run that dies every day is a stall that looks like health.\n"
         )
     return (
         "PANCAKEBOT DAILY SYNC IS NOT RUNNING\n"

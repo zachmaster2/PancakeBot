@@ -2,27 +2,38 @@
     Watchdog wrapper. Exists ONLY to capture the watchdog's stdout.
 
     WHY. The watchdog task previously invoked python.exe directly, so its
-    output went nowhere. Task Scheduler retains the exit code and nothing
-    else. That meant a raised Desktop marker had no accompanying record of
-    WHY it was raised -- the marker said a stall had happened, and the
-    reason had to be reconstructed from whatever else happened to be on
-    disk.
+    output went nowhere: Task Scheduler retains the exit code and nothing
+    else. A raised Desktop marker had no accompanying record of WHY.
 
-    That is the same shape as every failure this project has hit: the
-    signal existed but the explanation did not survive. A system built to
-    make silence legible should not itself go quiet about its own
-    decisions.
+    ------------------------------------------------------------------
+    2026-09-01: THIS SCRIPT HAD THE SAME DEFECT AS daily_sync.ps1.
 
-    Exit code is passed through unchanged: 0 = healthy, 1 = stale/never-run.
-    Task Scheduler's Last Result therefore still carries the signal, and
-    this wrapper only adds the narrative.
+    `$ErrorActionPreference = 'Stop'` plus `*>&1` on a native command makes
+    every stderr line a TERMINATING error in PowerShell 5.1, aborting the
+    wrapper mid-stream. In the sync that produced a failed run with a
+    health file still reading clean.
+
+    Here it would be WORSE. A watchdog that dies silently removes the very
+    thing that reports silence -- the alarm and the thing it watches fail
+    together, and nothing is left to notice either. The exit code would
+    still reach Task Scheduler, but nobody reads LastTaskResult daily; the
+    Desktop marker is the channel that works, and a dead watchdog never
+    writes one.
+
+    So: ErrorActionPreference stays 'Continue', stderr is captured as data,
+    and the exit code is resolved in a finally block.
+    ------------------------------------------------------------------
+
+    Exit code is passed through unchanged: 0 = healthy, 1 = not healthy
+    (stale, never-run, orphaned attempt, or a store integrity failure).
 
     --no-discord is deliberate and must stay. Discord is the operator's
     channel; an automated job is not the thing that should be posting to
-    it, and a webhook failure must never be able to affect the exit code
-    that reports store health.
+    it, and a webhook failure must never affect the exit code that reports
+    store health.
 #>
 
+# NOT 'Stop'. See the incident note above.
 $ErrorActionPreference = 'Continue'
 
 $Repo   = 'C:\Users\zking\Documents\GitHub\PancakeBot'
@@ -37,27 +48,35 @@ $log   = Join-Path $LogDir "watchdog_$stamp.log"
 
 "=== PancakeBot watchdog $stamp UTC ===" | Out-File -FilePath $log -Encoding utf8
 
-# Append per line with an EXPLICIT encoding rather than via Tee-Object.
-# Tee-Object on PS 5.1 has no -Encoding and defaults to UTF-16LE, which
-# produced a file whose header was UTF-8 and whose body was UTF-16 -- still
-# readable by eye, but grep treats it as binary, and a log you cannot grep
-# is most of the way back to having no log.
-& $Py scripts\sync_watchdog.py --no-discord *>&1 | ForEach-Object {
-    $line = [string]$_
-    $line | Out-File -FilePath $log -Append -Encoding utf8
-    Write-Output $line
+$code = $null
+try {
+    & $Py scripts\sync_watchdog.py --no-discord 2>&1 | ForEach-Object {
+        $line = [string]$_
+        $line | Out-File -FilePath $log -Append -Encoding utf8
+        Write-Output $line
+    }
+    $code = $LASTEXITCODE
 }
-$code = $LASTEXITCODE
+catch {
+    $code = 90
+    ("WRAPPER EXCEPTION: " + $_.Exception.GetType().Name + ": " +
+     $_.Exception.Message) | Out-File -FilePath $log -Append -Encoding utf8
+}
+finally {
+    if ($null -eq $code) { $code = 91 }
 
-"RESULT: exit=$code  ($(if ($code -eq 0) { 'healthy' } else { 'STALE or NEVER_RUN - a Desktop marker was raised' }))" |
-    Out-File -FilePath $log -Append -Encoding utf8
+    $meaning = if ($code -eq 0) { 'healthy' }
+               elseif ($code -eq 90 -or $code -eq 91) { 'THE WATCHDOG ITSELF FAILED -- no marker was written' }
+               else { 'NOT healthy: stale, never-run, orphaned attempt, or a store integrity failure -- a Desktop marker was raised' }
+    "RESULT: exit=$code  ($meaning)" | Out-File -FilePath $log -Append -Encoding utf8
 
-# Retain 60 days. The watchdog runs daily and its logs are tiny, but this
-# machine now holds the only copy of the data and unbounded growth anywhere
-# in var\ is its own small risk.
-Get-ChildItem $LogDir -Filter 'watchdog_*.log' -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -Skip 60 |
-    Remove-Item -Force -ErrorAction SilentlyContinue
+    # Retain 60 days. The watchdog runs daily and its logs are tiny, but
+    # this machine holds the only copy of the data and unbounded growth
+    # anywhere in var\ is its own small risk.
+    Get-ChildItem $LogDir -Filter 'watchdog_*.log' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -Skip 60 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
 
 exit $code
