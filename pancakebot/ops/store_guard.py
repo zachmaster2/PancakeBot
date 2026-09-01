@@ -72,7 +72,8 @@ def _name(path: str) -> str:
     return path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
 
 
-def snapshot(stores: tuple[str, ...] = STORES) -> dict[str, Any]:
+def snapshot(stores: tuple[str, ...] = STORES,
+             staging_dir: str | None = None) -> dict[str, Any]:
     """Current integrity facts for every store.
 
     An unreadable store is recorded as an explicit error entry rather than
@@ -83,7 +84,27 @@ def snapshot(stores: tuple[str, ...] = STORES) -> dict[str, Any]:
     for p in stores:
         try:
             c = contiguity(p)
+            # Records captured into staging but NOT yet merged into this
+            # store. Computed statelessly from the two files every run, so
+            # the "you still owe a merge" condition cannot be lost, cleared
+            # by accident, or drift out of date. This is what makes the
+            # marker persist until the merge actually happens.
+            unmerged = 0
+            try:
+                from pancakebot.market_data.epoch_scan import scan_epochs
+                from pancakebot.ops.gap_capture import (
+                    staged_epochs,
+                    staging_path,
+                )
+                st = staged_epochs(
+                    staging_path(_name(p), staging_dir)
+                    if staging_dir else staging_path(_name(p)))
+                if st:
+                    unmerged = len(st - set(scan_epochs(p)))
+            except Exception:      # noqa: BLE001
+                unmerged = 0
             out["stores"][_name(p)] = {
+                "unmerged_staged": unmerged,
                 "n": c["n"],
                 "distinct": c["distinct"],
                 "latest": c["latest"],
@@ -202,6 +223,7 @@ def evaluate(current: dict[str, Any],
         # statements and must not look alike.
         fails.append("NOBASELINE: first run, monotonicity not yet checkable "
                      "(this is expected exactly once)")
+        fails.extend(_unmerged_staged_failures(cur))
         return fails
 
     for name, c in sorted(cur.items()):
@@ -218,7 +240,34 @@ def evaluate(current: dict[str, Any],
                 f"REWOUND {name}: last epoch {b['latest']} -> {c['latest']} "
                 f"-- append-only stores never go backwards")
 
+    fails.extend(_unmerged_staged_failures(cur))
     return fails
+
+
+def _unmerged_staged_failures(cur: dict[str, Any]) -> list[str]:
+    """THE REQUIREMENT THAT DECIDES WHETHER STAGING WORKS AT ALL.
+
+    Capture succeeding must DOWNGRADE urgency, never clear the marker. If a
+    successful capture cleared it, the data would be safe forever and merged
+    never -- and the backtest would go on silently running against a store
+    with a hole in it. That is not solving the problem, it is moving it
+    somewhere harder to see.
+
+    So this is a standing condition, recomputed from the files every run,
+    and it clears only when the records are actually IN the store.
+
+    Appended LAST by every caller, so it can never win the marker filename
+    over a genuine fault. Staged-and-unmerged is the lowest urgency state
+    in the system: the data is safe, the store is not yet whole.
+    """
+    out: list[str] = []
+    for name, c in sorted(cur.items()):
+        if c.get("unmerged_staged", 0):
+            out.append(
+                f"CAPTURED {name}: {c['unmerged_staged']} record(s) staged "
+                f"and NOT YET MERGED -- the data is safe but the store still "
+                f"has the hole. Merge with scripts/merge_staged.py")
+    return out
 
 
 def failure_tag(fails: list[str]) -> str:
