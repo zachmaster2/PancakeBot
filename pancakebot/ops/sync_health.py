@@ -44,6 +44,29 @@ STALE_AFTER_HOURS = 36.0
 # Two consecutive misses is no longer bad luck.
 DEAD_AFTER_HOURS = 60.0
 
+# An attempt with no outcome after this long is ORPHANED: a run started and
+# never reported success or failure.
+#
+# WHY THIS EXISTS, and why it is the more important half of the 2026-09-01
+# fix. The wrapper died mid-stream that morning, so record_failure never
+# ran, and the health file showed consecutive_failures=0 with a stale
+# last_exit_code=0 -- a FAILED run was indistinguishable from a run that had
+# not happened yet. Making record_failure unconditional fixes THAT way of
+# dying. It cannot fix the next one.
+#
+# This rule needs no theory about how the wrapper died. If an attempt is
+# newer than every recorded outcome and enough time has passed, something
+# began and never finished, whatever the mechanism. It would have caught
+# 2026-09-01 with nobody having anticipated PowerShell's stderr semantics,
+# which is exactly the category of failure that keeps hurting this project.
+#
+# 2 hours: observed syncs run 5-7 minutes, so this is ~20x a normal run, and
+# it is comfortably inside the 2.5h between the sync's 06:30 and the
+# watchdog's 09:00 -- so a morning orphan is caught the SAME day rather than
+# a day later. A sync legitimately running longer than 2h would be abnormal
+# in its own right and worth surfacing.
+ORPHAN_AFTER_HOURS = 2.0
+
 
 def _utc_now() -> float:
     return time.time()
@@ -164,15 +187,48 @@ def assess(path: str = HEALTH_PATH, *, now: float | None = None) -> dict:
         status = "STALE"
     else:
         status = "OK"
+
+    orphan_hours = _orphan_age_hours(d, now)
+    detail = d.get("last_detail", "")
+    if orphan_hours is not None:
+        # An orphan outranks OK -- a run that started and vanished is a real
+        # condition, not a quiet day. It does NOT outrank STALE/DEAD, which
+        # are strictly more serious; there the orphan rides in the detail.
+        if status == "OK":
+            status = "ORPHANED"
+        detail = (f"a run started {orphan_hours:.1f}h ago and never reported "
+                  f"an outcome (attempt newer than every success and failure)"
+                  + (f"; {detail}" if detail else ""))
+
     return {
         "status": status,
         "hours_since_success": round(hours, 2),
+        "hours_since_orphaned_attempt": (None if orphan_hours is None
+                                         else round(orphan_hours, 2)),
         "last_success_utc": d.get("last_success_utc"),
         "last_attempt_utc": d.get("last_attempt_utc"),
         "consecutive_failures": int(d.get("consecutive_failures", 0)),
         "last_error": d.get("last_error"),
-        "detail": d.get("last_detail", ""),
+        "detail": detail,
     }
+
+
+def _orphan_age_hours(d: dict, now: float) -> float | None:
+    """Age of an attempt that never reported an outcome, else None.
+
+    Deliberately makes no assumption about HOW the outcome went missing.
+    The only inputs are three timestamps.
+    """
+    at = d.get("last_attempt_ts")
+    if at is None:
+        return None
+    at = float(at)
+    for k in ("last_success_ts", "last_failure_ts"):
+        v = d.get(k)
+        if v is not None and float(v) >= at:
+            return None            # an outcome was recorded for this attempt
+    age = (now - at) / 3600.0
+    return age if age >= ORPHAN_AFTER_HOURS else None
 
 
 def summary_line(a: dict) -> str:
@@ -184,5 +240,7 @@ def summary_line(a: dict) -> str:
         f"SYNC {s}: last success {a['last_success_utc']} "
         f"({a['hours_since_success']}h ago), "
         f"consecutive_failures={a['consecutive_failures']}"
+        + (f", ORPHANED ATTEMPT {a['hours_since_orphaned_attempt']}h old"
+           if a.get("hours_since_orphaned_attempt") is not None else "")
         + (f", last_error={a['last_error']}" if a.get("last_error") else "")
     )

@@ -46,13 +46,24 @@ $syncTriggers = @(
 )
 
 # StartWhenAvailable is the "run as soon as possible after a missed start"
-# requirement. RestartCount/RestartInterval retry a genuinely failed run,
-# which covers a transient network drop without waiting a whole day.
-# The battery settings matter on a laptop: the default is to refuse to
-# start on battery, which would silently skip runs.
+# requirement. The battery settings matter on a laptop: the default is to
+# refuse to start on battery, which would silently skip runs.
+#
+# RESTARTCOUNT IS DELIBERATELY ABSENT. It was set to 3/PT20M and read like
+# retry protection. On 2026-09-01 the sync failed with exit 1 and NOTHING
+# retried: RestartCount covers a task that TERMINATES UNEXPECTEDLY, not one
+# that exits non-zero. Verified against that run -- one log file, no
+# retries, LastResult=1.
+#
+# Rather than leave a setting that reads as protection and is not, the
+# behaviour is honestly one-shot: the retry is TOMORROW'S RUN. The sync is
+# idempotent and resumable -- it fetches whatever is newer than what is on
+# disk -- so a missed day costs a day and nothing else, and the 171.6-day
+# horizon leaves months of margin.
+#
+# Do not add RestartCount back believing it retries a non-zero exit.
 $syncSettings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
-    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 20) `
     -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
     -MultipleInstances IgnoreNew `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
