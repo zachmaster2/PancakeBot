@@ -50,7 +50,21 @@ $log   = Join-Path $LogDir "watchdog_$stamp.log"
 
 $code = $null
 try {
-    & $Py scripts\sync_watchdog.py --no-discord 2>&1 | ForEach-Object {
+    # STRUCTURAL, not merely handled. cmd.exe merges stderr into stdout at
+    # the OS LEVEL, so PowerShell receives a single stdout stream and never
+    # sees an error stream at all. A stderr line therefore CANNOT become an
+    # ErrorRecord, and this survives even if someone later sets
+    # $ErrorActionPreference = 'Stop' -- which is the most common PowerShell
+    # idiom and exactly what caused the 2026-09-01 incident.
+    #
+    # Do NOT replace this with `& $Py ... 2>&1 |`. That is the construct
+    # that failed. Verified: under 'Stop' the PowerShell redirect aborts and
+    # this does not.
+    #
+    # -u keeps python unbuffered so stdout and stderr interleave in true
+    # order; without it stdout block-buffers and stderr jumps ahead.
+    # cmd propagates the child's exit code, so $LASTEXITCODE is correct.
+    & cmd.exe /c "`"$Py`" -u scripts\sync_watchdog.py --no-discord 2>&1" | ForEach-Object {
         $line = [string]$_
         $line | Out-File -FilePath $log -Append -Encoding utf8
         Write-Output $line

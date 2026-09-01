@@ -75,10 +75,21 @@ $log   = Join-Path $LogDir "sync_$stamp.log"
 
 $code = $null
 try {
-    # 2>&1 merges stderr into the success stream so it reaches the log.
-    # With ErrorActionPreference='Continue' those records flow through as
-    # data instead of terminating the script.
-    & $Py -u run.py --sync 2>&1 | ForEach-Object {
+    # STRUCTURAL, not merely handled. cmd.exe merges stderr into stdout at
+    # the OS LEVEL, so PowerShell receives a single stdout stream and never
+    # sees an error stream at all. A stderr line therefore CANNOT become an
+    # ErrorRecord, and this survives even if someone later sets
+    # $ErrorActionPreference = 'Stop' -- which is the most common PowerShell
+    # idiom and exactly what caused the 2026-09-01 incident.
+    #
+    # Do NOT replace this with `& $Py ... 2>&1 |`. That is the construct
+    # that failed. Verified: under 'Stop' the PowerShell redirect aborts and
+    # this does not.
+    #
+    # -u keeps python unbuffered so stdout and stderr interleave in true
+    # order; without it stdout block-buffers and stderr jumps ahead.
+    # cmd propagates the child's exit code, so $LASTEXITCODE is correct.
+    & cmd.exe /c "`"$Py`" -u run.py --sync 2>&1" | ForEach-Object {
         $line = [string]$_
         $line | Out-File -FilePath $log -Append -Encoding utf8
         Write-Output $line

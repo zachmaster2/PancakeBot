@@ -62,11 +62,27 @@ def _code_only(path: Path) -> str:
     documentation and fails. These tests are about what the script DOES.
     """
     src = path.read_text(encoding="utf-8")
-    return re.sub(r"<#.*?#>", "", src, flags=re.DOTALL)
+    src = re.sub(r"<#.*?#>", "", src, flags=re.DOTALL)
+    # Also drop whole-line `#` comments: the inline incident notes quote the
+    # dangerous constructs on purpose, and these tests are about what the
+    # script DOES, not what it explains.
+    return chr(10).join(l for l in src.splitlines()
+                        if not l.strip().startswith("#"))
 
 
 _SYNC_WRAPPER = _REPO_ROOT / "scripts" / "daily_sync.ps1"
 _WD_WRAPPER = _REPO_ROOT / "scripts" / "watchdog_run.ps1"
+
+# Deliberately set to 'Stop' -- the whole point is that the structural fix
+# holds even under the preference that caused the incident.
+PS_PROBE_TEMPLATE = """$ErrorActionPreference = 'Stop'
+try {{
+    & cmd.exe /c '"{py}" -u "{prog}" 2>&1' | ForEach-Object {{ [string]$_ }} | Out-Null
+    Write-Output ('SURVIVED exit=' + $LASTEXITCODE)
+}} catch {{
+    Write-Output 'ABORTED'
+}}
+"""
 
 
 # ---- LAYER 2: the general rule --------------------------------------------
@@ -265,3 +281,88 @@ def test_restartcount_is_not_claimed_as_retry_protection():
         "RestartCount is back; it does not retry a non-zero exit")
     assert "retry is TOMORROW" in src.replace("\n", " ").replace("  ", " ") \
         or "retry is TOMORROW'S RUN" in src
+
+
+# ---- STRUCTURAL: the failure mode is impossible, not merely avoided -------
+
+def test_the_wrapper_survives_stderr_EVEN_UNDER_STOP():
+    """THE proof of 'impossible' rather than 'avoided'.
+
+    The fix must not depend on ErrorActionPreference being right. cmd.exe
+    merges stderr at the OS level, so PowerShell receives one stdout stream
+    and never sees an error stream -- a stderr line cannot become an
+    ErrorRecord no matter what the preference is set to.
+    """
+    import os
+    import tempfile
+
+    py = str(_REPO_ROOT / ".venv" / "Scripts" / "python.exe")
+    helper = _REPO_ROOT / "tests" / "_stderr_probe.py"
+
+    # Driven from a real .ps1 file, and the python program from a real .py
+    # file, so no layer of nested quoting can distort what is being tested.
+    body = PS_PROBE_TEMPLATE.format(py=py, prog=str(helper))
+
+    fd, path = tempfile.mkstemp(suffix=".ps1")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-File", path],
+            capture_output=True, text=True, timeout=120).stdout
+    finally:
+        os.unlink(path)
+    assert "SURVIVED" in out, f"the structural fix does not hold under Stop: {out!r}"
+    assert "exit=5" in out, f"exit code lost through cmd: {out!r}"
+
+
+def test_neither_wrapper_redirects_stderr_into_the_POWERSHELL_pipeline():
+    """THE GUARD THAT CATCHES A FUTURE REINTRODUCTION.
+
+    The hazard is specific: a native `&` invocation whose stderr is
+    redirected into PowerShell's object pipeline. Unredirected stderr is
+    harmless even under 'Stop' (verified). So this lints for the dangerous
+    construct itself rather than for today's known instances -- a NEWLY
+    added `& $Py ... 2>&1 |` fails this test even though nobody edited the
+    lines we already fixed.
+    """
+    bad = []
+    for w in (_SYNC_WRAPPER, _WD_WRAPPER):
+        for i, line in enumerate(_code_only(w).splitlines(), 1):
+            s = line.strip()
+            if s.startswith("#"):
+                continue
+            redirects = ("2>&1" in s) or ("*>&1" in s)
+            # A cmd.exe /c '... 2>&1' merges at the OS level and is safe;
+            # the danger is PowerShell itself doing the redirect.
+            if redirects and s.startswith("&") and "cmd.exe" not in s:
+                bad.append(f"{w.name}:{i}: {s[:80]}")
+    assert not bad, (
+        "a native command redirects stderr into the PowerShell pipeline; "
+        "under ErrorActionPreference='Stop' that aborts the wrapper "
+        "mid-run. Use `& cmd.exe /c \"...2>&1\"` instead:\n  " +
+        "\n  ".join(bad))
+
+
+def test_both_wrappers_merge_stderr_at_the_os_level():
+    for w in (_SYNC_WRAPPER, _WD_WRAPPER):
+        src = _code_only(w)
+        assert "cmd.exe /c" in src, (
+            f"{w.name} no longer merges stderr at the OS level")
+        assert "-u " in src, (
+            f"{w.name} lost -u; stdout would block-buffer and stderr would "
+            f"jump ahead of it in the log")
+
+
+def test_unredirected_native_stderr_is_harmless_even_under_stop():
+    """Pins WHY only the redirecting call sites needed changing, so a future
+    reader does not 'fix' the other four unnecessarily."""
+    py = str(_REPO_ROOT / ".venv" / "Scripts" / "python.exe")
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"try {{ & '{py}' -c \"import sys; sys.stderr.write('w\n')\"; "
+        "Write-Output 'SURVIVED' } catch { Write-Output 'ABORTED' }"
+    )
+    assert "SURVIVED" in _run_ps(script).stdout
