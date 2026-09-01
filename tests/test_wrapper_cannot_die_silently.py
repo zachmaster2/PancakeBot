@@ -366,3 +366,53 @@ def test_unredirected_native_stderr_is_harmless_even_under_stop():
         "Write-Output 'SURVIVED' } catch { Write-Output 'ABORTED' }"
     )
     assert "SURVIVED" in _run_ps(script).stdout
+
+
+# ---- why the PS7 preference variable is not the answer here ---------------
+
+def test_the_tasks_run_windows_powershell_51_not_pwsh():
+    """The registered tasks invoke powershell.exe (Windows PowerShell 5.1),
+    and PowerShell 7 is not installed on this machine. Recorded so the
+    question is not re-investigated: $PSNativeCommandUseErrorActionPreference
+    is a PowerShell 7 feature and has no effect here."""
+    src = (_REPO_ROOT / "scripts" / "register_sync_tasks.ps1").read_text(
+        encoding="utf-8")
+    assert "$Ps   = 'powershell.exe'" in src or "'powershell.exe'" in src
+
+
+def test_the_ps7_preference_variable_does_nothing_in_51():
+    """PROVEN, not asserted from memory.
+
+    $PSNativeCommandUseErrorActionPreference = $false is the PowerShell 7
+    way to stop native stderr being subject to ErrorActionPreference. In
+    5.1 it is not an automatic variable at all -- assigning it creates an
+    ordinary user variable that nothing reads, and the pipeline still
+    aborts. This test fails if that ever stops being true (e.g. if the task
+    is switched to pwsh), which is exactly when the assumption should be
+    re-examined.
+    """
+    py = str(_REPO_ROOT / ".venv" / "Scripts" / "python.exe")
+    probe = str(_REPO_ROOT / "tests" / "_stderr_probe.py")
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "$PSNativeCommandUseErrorActionPreference = $false; "
+        f"try {{ & '{py}' -u '{probe}' 2>&1 | ForEach-Object {{ [string]$_ }} "
+        "| Out-Null; Write-Output 'SURVIVED' } catch { Write-Output 'ABORTED' }"
+    )
+    out = _run_ps(script).stdout
+    assert "ABORTED" in out, (
+        "the PS7 preference variable now works under the shell the tasks "
+        "use -- re-examine whether the structural fix is still needed, and "
+        "whether the shell has changed")
+
+
+def test_the_structural_fix_is_shell_version_independent():
+    """The reason it is preferred over the PS7 preference: cmd.exe merging
+    behaves identically on 5.1 and 7.x, so migrating shells later cannot
+    reintroduce the bug, and nothing depends on PowerShell 7 remaining
+    installed on a machine that must run unattended for months."""
+    for w in (_SYNC_WRAPPER, _WD_WRAPPER):
+        src = _code_only(w)
+        assert "cmd.exe /c" in src
+        assert "PSNativeCommandUseErrorActionPreference" not in src, (
+            "the wrappers must not depend on a PS7-only preference")
