@@ -43,6 +43,27 @@ KNOWN_ABSENT_BY_STORE: dict[str, frozenset[int]] = {
 
 
 def known_absent_for(path: str) -> frozenset[int]:
-    """Known-absent epochs for a store path, empty when none are recorded."""
+    """Known-absent epochs for a store path, empty when none are recorded.
+
+    The static set above is unioned with anything PROMOTED at runtime by
+    the gap-capture path -- epochs whose age exceeded OKX's retention
+    horizon, so no future fetch by anyone can succeed. Without that union
+    a permanently-lost epoch fails capture every run forever, and an alarm
+    that always fires is an alarm nobody reads.
+
+    THIS IS A SUPPRESSION PATH, so it is deliberately narrow: promotion is
+    conservative (age past the horizon only), entries are never removed,
+    each carries its own timestamp and justification in
+    var/permanently_absent.json, and the integrity report counts these
+    separately as `known_absent` rather than folding them into silence.
+    A missing or unreadable promotion file degrades to the static set --
+    it can only ever REPORT MORE, never less.
+    """
     name = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    return KNOWN_ABSENT_BY_STORE.get(name, frozenset())
+    static = KNOWN_ABSENT_BY_STORE.get(name, frozenset())
+    try:
+        from pancakebot.ops.gap_capture import permanent_epochs_for
+        promoted = permanent_epochs_for(name)
+    except Exception:      # noqa: BLE001 - suppression must fail CLOSED
+        promoted = frozenset()
+    return frozenset(static | promoted)

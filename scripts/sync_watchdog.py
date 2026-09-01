@@ -165,6 +165,9 @@ def main() -> int:
     ap.add_argument("--health", default="var/sync_health.json")
     ap.add_argument("--baseline", default="var/store_baseline.json")
     ap.add_argument("--no-discord", action="store_true")
+    ap.add_argument("--staging-dir", default="staged_captures")
+    ap.add_argument("--no-capture", action="store_true",
+                    help="report gaps but do not fetch them into staging")
     args = ap.parse_args()
 
     a = assess(args.health)
@@ -184,7 +187,7 @@ def main() -> int:
     # not look alike.
     fails: list[str] = []
     try:
-        snap = snapshot()
+        snap = snapshot(staging_dir=args.staging_dir)
         fails = evaluate(snap, load_baseline(args.baseline))
         for name, c in sorted((snap.get("stores") or {}).items()):
             if c.get("error"):
@@ -203,6 +206,48 @@ def main() -> int:
     except Exception as e:      # noqa: BLE001
         fails = [f"CHECKFAILED: the integrity check itself raised "
                  f"{type(e).__name__}: {e}"]
+
+    # ---- capture: preserve gap records before the horizon takes them -----
+    #
+    # Runs only when a gap is actually present, and NEVER from the sync
+    # task -- this is the watchdog, a separate task, so a failing or slow
+    # capture cannot block or delay data collection. Collection always wins.
+    #
+    # Wrapped whole: a capture that explodes must not be able to suppress
+    # the integrity findings that prompted it.
+    if any(f.startswith("GAP") for f in fails) and not args.no_capture:
+        try:
+            from capture_gaps import run as capture_run
+            cap = capture_run(staging_dir=args.staging_dir)
+            print(f"  capture: captured={cap['captured']} "
+                  f"failed={cap['failed']} "
+                  f"unrecoverable={cap['unrecoverable']} "
+                  f"blocked={cap['blocked']} "
+                  f"already_staged={cap['already_staged']}")
+            if cap["failed"]:
+                # HIGH urgency and deliberately FIRST: the horizon clock is
+                # running on records that are still fetchable today and will
+                # not be forever.
+                fails.insert(0, f"CAPTUREFAILED: {cap['failed']} gap record(s) "
+                                f"could not be fetched -- still recoverable "
+                                f"today, permanently lost after the "
+                                f"171.6-day horizon")
+            if cap["unrecoverable"]:
+                # INFO. Nothing can be done, and saying so plainly is what
+                # stops a lost cause training the operator to ignore the
+                # states that DO need action.
+                fails.append(f"UNRECOVERABLE: {cap['unrecoverable']} epoch(s) "
+                             f"are past the OKX horizon and gone for good; "
+                             f"recorded as permanently absent, no retry")
+            # Re-read staging so a capture that just succeeded shows up as
+            # CAPTURED (unmerged) in the SAME run rather than a day later.
+            fails = [f for f in fails if not f.startswith("CAPTURED")]
+            from pancakebot.ops.store_guard import _unmerged_staged_failures
+            fails.extend(_unmerged_staged_failures(
+                (snapshot(staging_dir=args.staging_dir).get("stores") or {})))
+        except Exception as e:      # noqa: BLE001
+            fails.insert(0, f"CAPTUREFAILED: capture itself raised "
+                            f"{type(e).__name__}: {e}")
 
     for f in fails:
         print(f"  INTEGRITY FAIL: {f}")
