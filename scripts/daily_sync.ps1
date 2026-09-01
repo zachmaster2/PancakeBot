@@ -30,13 +30,18 @@
     to stderr. It would have aborted a SUCCESSFUL run just as readily.
 
     THE RULES THAT FOLLOW FROM IT:
-      * ErrorActionPreference stays 'Continue' around the native call.
-        Do not set it to 'Stop' at script scope.
-      * stderr is captured with 2>&1 into the log INSIDE the pipeline, and
-        never allowed to become a terminating error.
+      * stderr is merged by cmd.exe at the OS LEVEL, so PowerShell never
+        receives an error stream and a stderr line CANNOT become an
+        ErrorRecord. This is the structural fix and it holds regardless of
+        ErrorActionPreference -- see the note at the call site.
+      * ErrorActionPreference is nonetheless left at 'Continue' rather than
+        'Stop', as defence in depth for the other native calls here.
       * The outcome is recorded in a finally block, so no failure mode --
         including ones nobody has thought of -- can leave the health file
         reading clean.
+      * A lint test scans every .ps1 under scripts\ for a native call that
+        redirects stderr into the PowerShell pipeline, so reintroducing the
+        construct anywhere fails the suite.
     ------------------------------------------------------------------
 
     EXIT CODES

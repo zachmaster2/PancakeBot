@@ -329,7 +329,14 @@ def test_neither_wrapper_redirects_stderr_into_the_POWERSHELL_pipeline():
     lines we already fixed.
     """
     bad = []
-    for w in (_SYNC_WRAPPER, _WD_WRAPPER):
+    # Scanned BY PATTERN, not from an enumerated list. An earlier version
+    # checked only the two known wrappers, which meant a THIRD .ps1 written
+    # later was never scanned unless somebody remembered to add it here --
+    # and "somebody remembers" is the failure mode this whole area exists to
+    # remove. Globbing costs nothing (3 files today) and closes it.
+    scanned = sorted((_REPO_ROOT / "scripts").glob("*.ps1"))
+    assert scanned, "no .ps1 files found -- the lint is scanning nothing"
+    for w in scanned:
         for i, line in enumerate(_code_only(w).splitlines(), 1):
             s = line.strip()
             if s.startswith("#"):

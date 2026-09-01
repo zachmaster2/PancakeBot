@@ -61,8 +61,16 @@ logged in and no stored password:
 
 | task | role |
 |---|---|
-| `PancakeBotDailySync` | does the work. Daily 06:30 + at startup, `StartWhenAvailable` for missed windows, 3 retries at 20-minute intervals. |
+| `PancakeBotDailySync` | does the work. Daily 06:30 + at startup, `StartWhenAvailable` for missed windows. |
 | `PancakeBotSyncWatchdog` | checks the work happened. Own trigger at 09:00 + at startup. |
+
+> **Amended 2026-09-01.** This section originally credited the sync task
+> with "3 retries at 20-minute intervals". That was wrong and has been
+> removed: `RestartCount` fires on *unexpected termination*, not on a
+> non-zero exit, so nothing retried when the sync failed on 2026-09-01.
+> The behaviour is now honestly one-shot and the retry is **tomorrow's
+> run** — the sync is idempotent and resumable, and the 171.6-day horizon
+> leaves months of margin.
 
 **Two tasks, not one, and that is the point.** A task cannot report its own
 absence. If the sync task is disabled, deleted, or never fires, it emits
@@ -87,6 +95,44 @@ live problem. A Desktop file was chosen over the alternatives deliberately:
 a log needs you to know to look, which is the failure mode itself; a toast
 only fires while someone is logged in and cannot represent a multi-day
 state; Discord needs the network, which is one of the things that breaks.
+
+### Added 2026-09-01 — two more layers, both from a real failure
+
+This note was written the day the VM was destroyed. The replacement has
+since grown two layers, both because the first genuinely unattended run
+failed and exposed a hole.
+
+**Orphan detection — "started and never finished" is now a state.** On
+2026-09-01 the sync fired at 06:30, died mid-run, and the health file still
+read `consecutive_failures: 0` with a stale `last_exit_code: 0`. A FAILED
+run was indistinguishable from one that had not happened. The specific
+cause was fixed, but the general rule matters more: if `last_attempt` is
+newer than **every** recorded outcome and 2 hours have passed, a run began
+and vanished — whatever the mechanism. That needs no theory about how the
+wrapper died, so it holds for failure modes nobody has anticipated. It
+raises its own marker, deliberately not worded as staleness:
+
+    PANCAKEBOT_SYNC_RUN_VANISHED_2_HOURS_AGO.txt
+
+because the task **is** firing; it is dying without saying so, and calling
+that "stopped" sends the reader to the wrong diagnosis.
+
+**Integrity assertion — "did it run CORRECTLY", not just "recently".** The
+watchdog originally measured only recency, which catches a stopped sync and
+nothing else. A sync running happily every day while silently losing
+records, picking up CRLF, or developing a gap would refresh the timestamp,
+report success, and raise nothing. It now compares each run against a
+persisted baseline and fails on: a record count or last epoch **decreasing**
+(append-only stores never shrink), any CRLF, contiguity breaking beyond the
+8 known-unfetchable epochs, duplicates, non-ascending order, or the five
+stores drifting apart. Marker names carry the diagnosis —
+`INTEGRITY_SHRANK`, `INTEGRITY_CRLF`, `INTEGRITY_GAP`.
+
+**And a forensic channel.** `Microsoft-Windows-TaskScheduler/Operational`
+was enabled 2026-09-01, because the 06:30 diagnosis only worked since the
+sync happened to log up to the moment it stopped. See
+`docs/task_scheduler_forensics.md` — and note it is **machine state, not
+repo state**: a Windows reset or new machine loses it silently.
 
 ### The honest limit
 
