@@ -42,9 +42,66 @@ autoBackup         : false         no .evtx archives accumulate
 fileMax            : 1             a single fixed-size file
 ```
 
-Measured at ~68 KB after a few runs, and roughly 7 events per task run. At
-two runs a day this will never approach the cap; it self-rotates if it ever
-does. It costs nothing worth counting on a machine with ~72 GB free.
+### ⚠️ THE FORENSIC WINDOW IS ABOUT 4 DAYS, NOT MONTHS
+
+**Corrected 2026-09-02.** This section originally said the channel "will
+never approach the cap." That was measured after a handful of runs and was
+wrong by roughly an order of magnitude. A wrong number in a forensics guide
+is worse than no number, because it gets relied on in November precisely
+when it cannot be afforded.
+
+The channel logs **every scheduled task on the machine**, not only ours.
+Measured over the first 20.7 hours after enabling:
+
+```
+oldest event    2026-09-01 11:25:08
+elapsed         20.7 h
+size            2,116 KB  of a 10,240 KB cap
+rate          ~ 2,451 KB/day
+=> retention  ~ 4.2 DAYS before circular overwrite begins
+
+scheduled tasks on this machine : 270
+our events                      : 13 of 2,850
+```
+
+Ours are **13 events out of 2,850** — well under 1%. The rate is set almost
+entirely by the other 268 tasks, so **it will drift as software is
+installed and removed.** Re-derive rather than trust this figure:
+
+```powershell
+$f     = Get-Item ($env:SystemRoot+'\System32\Winevt\Logs\Microsoft-Windows-TaskScheduler%4Operational.evtx')
+$first = (Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -Oldest -MaxEvents 1).TimeCreated
+$hrs   = ((Get-Date) - $first).TotalHours
+$kb    = $f.Length/1KB
+'{0:N0} KB/day -> {1:N1} days retention' -f ($kb/$hrs*24), (10240/($kb/$hrs*24))
+```
+
+If `-Oldest` returns an event close to now, the log has already wrapped and
+that IS the window.
+
+**What this means in practice.** The disk cost is still nothing — bounded,
+self-rotating, one fixed-size file on a machine with ~72 GB free. But if a
+run fails and nobody looks for a week, **the events will have rotated out**,
+which is the exact scenario the channel was enabled for. The wrapper's own
+logs in `var\sync_logs\` are retained 30 days and `var\watchdog_logs\` 60,
+so those remain the longer record; this channel is the shorter-lived but
+more trustworthy one, because the service writes it rather than our code.
+
+### The cap is at the Windows default, deliberately
+
+`MaximumSizeInBytes` is untouched at 10 MB. Raising it to 100 MB would buy
+roughly **six weeks** of history at the measured rate, for 100 MB against
+~72 GB free:
+
+```powershell
+wevtutil sl "Microsoft-Windows-TaskScheduler/Operational" /ms:104857600   # needs elevation
+```
+
+Not done as of 2026-09-02. Enabling the channel was authorised; changing
+its cap is an adjacent but separate decision about a system setting, and
+nothing was failing, so it was left for the operator rather than inferred.
+Recorded here so the option exists on paper instead of only in a
+conversation. If retention matters more later, this is the lever.
 
 ## What a HEALTHY run looks like
 
