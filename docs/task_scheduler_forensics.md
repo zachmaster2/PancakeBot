@@ -2,22 +2,29 @@
 
 ## ⚠️ THIS IS A MACHINE SETTING, NOT A REPO SETTING
 
-It lives in the Windows event-log configuration on `ZACH-SURFACE`. It is
-**not in git, does not travel with the code, and is not restored by cloning
-or pulling.** A Windows reset, a rebuilt profile, a new machine, or some
-group-policy change loses it **silently** — the tasks keep running and the
-forensic trail simply stops existing, with nothing to announce that.
+**TWO settings live here, and BOTH are machine state:** the channel being
+*enabled*, and its 100 MB *cap*. Neither is in git, neither travels with the
+code, and neither is restored by cloning or pulling. A Windows reset, a
+rebuilt profile, a new machine, or a group-policy change reverts them
+**silently** — the tasks keep running, and the trail either stops existing
+or quietly shortens to ~4.9 days while this document still claims ~7 weeks.
 
-**Do not assume it is still on.** Check before relying on it:
+The second failure is the nastier one: an enabled channel with a reverted
+cap looks healthy and simply holds less than you think.
+
+**Do not assume either is still set.** Check both:
 
 ```powershell
-(Get-WinEvent -ListLog 'Microsoft-Windows-TaskScheduler/Operational').IsEnabled
+$l = Get-WinEvent -ListLog 'Microsoft-Windows-TaskScheduler/Operational'
+$l.IsEnabled                                    # expect True
+$l.MaximumSizeInBytes                           # expect 104857600
 ```
 
-Re-enable (needs elevation):
+Restore both (needs elevation):
 
 ```powershell
 wevtutil sl "Microsoft-Windows-TaskScheduler/Operational" /e:true
+wevtutil sl "Microsoft-Windows-TaskScheduler/Operational" /ms:104857600
 ```
 
 ## What it is for
@@ -42,27 +49,48 @@ autoBackup         : false         no .evtx archives accumulate
 fileMax            : 1             a single fixed-size file
 ```
 
-### ⚠️ THE FORENSIC WINDOW IS ABOUT 4 DAYS, NOT MONTHS
+### THE FORENSIC WINDOW IS ABOUT 7 WEEKS
 
-**Corrected 2026-09-02.** This section originally said the channel "will
-never approach the cap." That was measured after a handful of runs and was
-wrong by roughly an order of magnitude. A wrong number in a forensics guide
-is worse than no number, because it gets relied on in November precisely
-when it cannot be afforded.
+**History of this figure, because it has been wrong once already.** The
+guide originally said the channel "will never approach the cap" — measured
+after a handful of runs, and wrong by roughly an order of magnitude. On
+2026-09-02 it was corrected to ~4 days at the 10 MB default. Later the same
+day the cap was raised to 100 MB (see below), giving ~7 weeks.
+
+A wrong number in a forensics guide is worse than no number, because it gets
+relied on in November precisely when it cannot be afforded. Hence the
+measurement below rather than a bare figure.
 
 The channel logs **every scheduled task on the machine**, not only ours.
-Measured over the first 20.7 hours after enabling:
+Measured over the first 24.1 hours after enabling:
 
 ```
 oldest event    2026-09-01 11:25:08
-elapsed         20.7 h
-size            2,116 KB  of a 10,240 KB cap
-rate          ~ 2,451 KB/day
-=> retention  ~ 4.2 DAYS before circular overwrite begins
+elapsed         24.1 h
+size            2,116 KB
+rate          ~ 2,104 KB/day
+
+at the OLD  10,240 KB cap :  ~4.9 days
+at the NEW 102,400 KB cap : ~48.7 days  (~7.0 weeks)
 
 scheduled tasks on this machine : 270
-our events                      : 13 of 2,850
+our events                      : 19 of 3,231   (well under 1%)
 ```
+
+### ⚠️ THE WINDOW DOES NOT REACH BACKWARDS
+
+Raising the cap does **not** recover history that was never kept. The log
+fills forward from the moment the cap changed, so the full ~7 weeks is not
+real until the log has had ~7 weeks to accumulate. Before then the true
+window is however long the channel has been running — check the oldest
+event, not the cap:
+
+```powershell
+(Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -Oldest -MaxEvents 1).TimeCreated
+```
+
+As of 2026-09-02 that is 2026-09-01, so the real window was **one day**
+regardless of what the cap allows.
 
 Ours are **13 events out of 2,850** — well under 1%. The rate is set almost
 entirely by the other 268 tasks, so **it will drift as software is
@@ -87,21 +115,34 @@ logs in `var\sync_logs\` are retained 30 days and `var\watchdog_logs\` 60,
 so those remain the longer record; this channel is the shorter-lived but
 more trustworthy one, because the service writes it rather than our code.
 
-### The cap is at the Windows default, deliberately
+### The cap was RAISED on 2026-09-02
 
-`MaximumSizeInBytes` is untouched at 10 MB. Raising it to 100 MB would buy
-roughly **six weeks** of history at the measured rate, for 100 MB against
-~72 GB free:
+`MaximumSizeInBytes` was raised from the 10 MB Windows default to **100 MB**
+on 2026-09-02, authorised by Zach, to take the window from ~4.9 days to
+~48.7 days. Cost: 100 MB against ~71.6 GB free.
 
 ```powershell
 wevtutil sl "Microsoft-Windows-TaskScheduler/Operational" /ms:104857600   # needs elevation
 ```
 
-Not done as of 2026-09-02. Enabling the channel was authorised; changing
-its cap is an adjacent but separate decision about a system setting, and
-nothing was failing, so it was left for the operator rather than inferred.
-Recorded here so the option exists on paper instead of only in a
-conversation. If retention matters more later, this is the lever.
+Verified afterwards, two independent readers, rather than trusting the
+command's exit code:
+
+```
+Get-WinEvent -ListLog  ->  MaximumSizeInBytes : 104857600   IsEnabled : True   LogMode : Circular
+wevtutil gl            ->  maxSize: 104857600   enabled: true   retention: false
+                           autoBackup: false    fileMax: 1
+```
+
+**The resize did NOT clear the channel.** Checked, because some log
+configuration changes do: the oldest event was `2026-09-01 11:25:08` both
+before and after, and the record count went 3,225 → 3,231 (other tasks
+firing in between), not to zero. Existing history survived the change.
+
+Also confirmed pure observation: after the resize both tasks still read
+`State=Ready`, `LastResult=0`, `User=SYSTEM`, `RunLevel=Highest`,
+`StartWhenAvailable=True`, `MultipleInstances=IgnoreNew`, with the daily and
+boot triggers intact.
 
 ## What a HEALTHY run looks like
 
