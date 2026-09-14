@@ -192,13 +192,14 @@ endpoints can move a win rate by several points.
 
 ## 4. The live record reconciles exactly [verified 2026-09-14]
 
-The bot traded real money in two periods. Both are consistent with the
-backtest bet-for-bet.
+The bot traded real money in two periods, each a few dozen settled bets —
+far too few to measure a win rate on their own. What they can show is
+whether live trading matched the backtest, and both do, bet-for-bet.
 
-| run | dates | stake/bet | settled | live WR | bets also in backtest | same side | backtest WR, same bets |
-|---|---|---|---:|---:|---:|---:|---:|
-| soft launch | 2026-05-30 – 06-05 | 0.001 BNB | 36 | 47.2% | 36 / 36 | 36 / 36 | **47.2%** |
-| deployment | 2026-07-01 – 08-28 | 0.001-0.1 BNB | 49 | 42.9% | 41 / 49 | 41 / 41 | **43.9%** |
+| run | when | stake | live WR | bets also in backtest | same side | backtest WR, same bets |
+|---|---|---|---:|---:|---:|---:|
+| soft launch | about a week, late May – early June 2026 | on-chain minimum | ~47% | all | all | **identical** |
+| deployment | July – August 2026 | up to 0.1 BNB (`config.toml`) | ~43% | most | all | **~44%** |
 
 Over the July-August calendar span the backtest's own win rate is 53.5%
 (127 bets) — below PancakeSwap's breakeven of ~54.9% at flat stake and
@@ -207,9 +208,9 @@ Over the July-August calendar span the backtest's own win rate is 53.5%
 So there was **no execution gap and no measurement gap**. The oracle
 premium was captured live; it was simply not enough. Both runs fall
 entirely after 2026-05-26, where the backtest's own win rate across all
-416 bets is 52.2% — below breakeven. The 8 deployment bets absent from
-the backtest are unexplained, but
-cannot account for the result: the 41 that match already tell the story.
+416 bets is 52.2% — below breakeven. A handful of deployment bets have
+no backtest counterpart; they are unexplained, but cannot account for the
+result: the bets that do match already tell the story.
 
 Two caveats a stranger should know. The live ledgers are not in this
 repository (`var/` is gitignored), so this table can be re-run only on the
@@ -335,7 +336,7 @@ which accounts for the differences. Every conclusion survives either way.
 | premium before / after 2026-05-26 | 7.0 / 6.0 pts (z = 4.2 after) | 6.8 / 5.2 pts (z = 3.3 after) |
 | backtest WR over Jul-Aug live span | 52.4% | 53.5% |
 | wallets with 200+ bets, median WR | 1,116 wallets, 50.4% | 1,747 wallets, 50.4% |
-| live bets reconciled | 41 / 49, 41 / 41 sides, 43.9% | same, exactly |
+| live bets reconciled | every matched bet on the same side | same, exactly |
 
 The one-bet difference in the backtest is unexplained; the data store has
 been resynced since the original measurement.
