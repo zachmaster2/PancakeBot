@@ -17,16 +17,19 @@ SAFETY
   - --execute is required to send; --dry-run forces dry even if --execute is also passed.
   - In --execute, EACH TX is printed and requires typing 'yes' to send.
   - All TXs use 1 gwei gas (bot-consistent).
-  - Production address is hardcoded + re-verified against the expected <production wallet>;
-    the script NEVER reads the production private key, and refuses if the destination
-    equals any test wallet.
+  - The production (destination) address is supplied at run time in
+    PANCAKEBOT_SWEEP_DESTINATION and is never committed; it is printed for inspection
+    before anything is signed. The script NEVER reads the production private key, and
+    refuses if the destination is unset, malformed, or equals any test wallet.
 
+  export PANCAKEBOT_SWEEP_DESTINATION=0x...   # the production wallet address
   python sweep_and_claim.py              # DRY-RUN (default)
   python sweep_and_claim.py --dry-run    # explicit dry-run
   python sweep_and_claim.py --execute    # send (prompts 'yes' per TX)
 """
 import argparse
 import json
+import os
 import sys
 
 sys.path.insert(0, "/root/pancakebot")
@@ -39,10 +42,10 @@ from pancakebot.constants import (                                       # noqa:
 RPC = "https://bsc-dataseed1.binance.org"
 ABI_PATH = "/root/pancakebot/abi/prediction_v2_abi.json"
 WALLET_FILE = "/etc/pancakebot/experiment_wallets.env"
-# Production sweep destination (derived from /etc/pancakebot/pancakebot.env's
-# BSC_WALLET_PRIVATE_KEY on 2026-06-08; hardcoded so this script never reads the
-# production key). Re-verified at runtime against the <production wallet> abbreviation.
-PROD_WALLET = "<PRODUCTION_WALLET_ADDRESS>"
+# Production sweep destination. Supplied at run time, never committed: an
+# address in a public repo links the project to the wallet on any explorer.
+# The script still never reads the production private key.
+PROD_WALLET = os.environ.get("PANCAKEBOT_SWEEP_DESTINATION", "").strip()
 GAS_PRICE_WEI = 1_000_000_000          # 1 gwei
 SWEEP_GAS = 21_000                     # plain BNB transfer
 
@@ -82,10 +85,12 @@ def main():
     abi = json.load(open(ABI_PATH))
     c = w3.eth.contract(address=Web3.to_checksum_address(PREDICTION_V2_CONTRACT_ADDRESS), abi=abi)
 
+    if not PROD_WALLET:
+        raise SystemExit("ABORT: set PANCAKEBOT_SWEEP_DESTINATION to the production wallet address")
+    if not Web3.is_address(PROD_WALLET):
+        raise SystemExit("ABORT: PANCAKEBOT_SWEEP_DESTINATION is not a valid address")
     prod = Web3.to_checksum_address(PROD_WALLET)
-    if not (prod.lower().startswith("<expected-prefix>") and prod.lower().endswith("<expected-suffix>")):
-        raise SystemExit("ABORT: PROD_WALLET %s does not match expected <production wallet>" % prod)
-    out("sweep destination (production): %s" % prod)
+    out("sweep destination (production): %s  <- confirm this is the production wallet" % prod)
 
     wallets = load_test_wallets()
     test_addrs = {Web3.to_checksum_address(a) for _, a in wallets.values()}
