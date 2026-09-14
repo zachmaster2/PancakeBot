@@ -18,8 +18,11 @@ venv/
 # (team-shared settings live in .claude/settings.json)
 .claude/settings.local.json
 
-# Secrets/local env
-.env
+# Secrets/local env -- every .env variant (.env.local, .env.production, ...),
+# at any depth. A template meant to be committed must be named .env.example
+# and must hold placeholders only.
+.env*
+!.env.example
 
 # Runtime and experiment artifacts
 var/
