@@ -1,5 +1,23 @@
 # Edge-decay post-mortem — findings (2026-06-11)
 
+> **Superseded in part -- read [docs/FINDINGS.md](../docs/FINDINGS.md) first.**
+> *(added 2026-09-14)* Two conclusions below did not survive later work:
+>
+> 1. **"One statistically supported break at epoch ~484409" is not what the
+>    smoothed data shows.** On a 60-day trailing basis the decline has no
+>    single step: mild erosion from February, then a steep fall through
+>    June into a mid-July trough, then partial recovery. The date also
+>    falls inside a fire-rate drought with very few bets, so there is
+>    little data at the supposed break to pin it.
+> 2. **The edge was mostly not a BTC-to-BNB lead-lag.** Most of the measured
+>    win rate was Chainlink oracle lag at PancakeSwap settlement; the
+>    signal never predicted BTC, ETH or SOL themselves. The real-asset
+>    component was small, and it is what decayed -- the oracle premium
+>    persisted.
+>
+> The measurements below are kept as the historical record of what was
+> believed on 2026-06-11.
+
 Analysis: `research/post_mortem_2026_06_11.py` (reproducible end-to-end from
 the synced dataset; artifacts in `var/strategy_review/post_mortem_2026_06_11/`).
 Every headline claim below survived an adversarial replication panel

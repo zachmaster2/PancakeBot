@@ -2,6 +2,32 @@
 
 Automated trading bot for PancakeSwap Prediction V2 on BNB Smart Chain.
 
+> [!WARNING]
+> **Do not trade real money with this bot. Read [docs/FINDINGS.md](docs/FINDINGS.md) first.**
+>
+> - **It is stopped.** Live trading ended 2026-08-30 and the server it ran on
+>   was destroyed 2026-08-31. The only thing still running is a daily
+>   market-data sync on the operator's own machine.
+> - **Its edge was never a price forecast.** The signal predicts the next
+>   five minutes of BTC, ETH and SOL no better than a coin flip, in every
+>   period measured. What PancakeSwap actually paid for was *oracle
+>   lag*: rounds settle on a Chainlink push feed whose price can be stale
+>   at lock, and the signal was effectively betting on that stale price
+>   catching up to the market.
+> - **That edge no longer pays at PancakeSwap.** Scored against real BNB
+>   spot, the same bets win ~52% over their lifetime and ~44% over the last
+>   90 days of data. Scored the way PancakeSwap settles, the last 90 days
+>   were ~51.5% -- below the ~55-57% needed to clear its 3% fee. The most
+>   recent live deployment (July-August 2026) traded entirely inside that
+>   period and lost.
+> - **The 61% backtest is real, but it does not mean what it looks like.**
+>   It correctly measures what PancakeSwap used to pay out. It is not
+>   evidence that the bot can predict prices, and it does not describe
+>   current conditions.
+>
+> This genuinely made money for a stretch, so "it never worked" would be as
+> wrong as "it works". The claim is about *mechanism* and *current state*.
+
 ## Modes
 
 | Mode     | Command                    | Env vars                   | Description                                   |
