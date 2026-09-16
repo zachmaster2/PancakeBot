@@ -39,7 +39,7 @@ Automated trading bot for PancakeSwap Prediction V2 on BNB Smart Chain.
 | Sync     | `python run.py --sync`     | `THE_GRAPH_API_KEY`        | Fetch rounds + klines + contract constants (depth = `[backtest] backtest_round_count`) |
 | Backtest | `python run.py --backtest` | (none)                     | Replay historical data, compute PnL           |
 | Dry      | `python run.py --dry`      | (none)                     | Real-time paper trading                       |
-| Live     | `python run.py --live`     | `BSC_WALLET_PRIVATE_KEY`   | Real on-chain bets                            |
+| Live     | `python run.py --live`     | `BSC_WALLET_PRIVATE_KEY`   | Real on-chain bets — **retired, don't: see [docs/FINDINGS.md](docs/FINDINGS.md)** |
 
 Running with no flags prints help. Modes are mutually exclusive.
 
@@ -131,6 +131,11 @@ var/
 
 ## Setup
 
+> **If you arrived here directly:** this bot is retired and the edge it
+> traded on is gone — read [docs/FINDINGS.md](docs/FINDINGS.md) before
+> going further. These steps are kept so the *research* reproduces (sync,
+> backtest, dry), not as an invitation to trade real money.
+
 1. Create `.env` with required env vars (see mode table above)
 2. Review `config.toml`
 3. **Verify clock sync on the bot host** — see [clock-sync prerequisite](#clock-sync-prerequisite-dry--live-modes) below
@@ -169,6 +174,9 @@ VM (`.venv/bin/python -m pytest`) after checkout, before restarting the
 unit. The suite includes the canonical-hash bit-identity test.
 
 ### Deploying (git pull from GitHub, 2026-06-30)
+
+> **Historical.** The VM described here was destroyed 2026-08-31 and
+> nothing is deployed anywhere. Kept as a record of how it worked.
 
 Source of truth is **GitHub** (`github.com/zachmaster2/PancakeBot`). The VM
 is a plain clone at `/root/pancakebot`. Per deploy: push to GitHub from any
