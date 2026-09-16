@@ -133,6 +133,9 @@ change to `var/`. It does **not** protect against losing the drive. The kline hi
 2026-03-28 exists nowhere else, so if it matters, copy the zip to another device and check its
 SHA-256 there.
 
+This is a **known and accepted position**, not an oversight or a task left undone. At closure on
+2026-09-16 the operator weighed the single-disk exposure and decided against making further copies.
+
 Other copies that are **not** the archive:
 
 - **`pancakebot_stores_pre_normalization_20260829.zip`** (617 MB), under
