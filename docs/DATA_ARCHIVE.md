@@ -13,7 +13,7 @@ Data collection **stopped deliberately on 2026-09-16**, after a final clean sync
 Nothing collects any more.
 
 **The archive is not in this repository.** The stores live under `var/`, which is gitignored. They
-exist only on the operator's machine (plus the older backup in section 7). This file is the record of
+exist only on the operator's machine: in `var/`, and in a verified zip of the closed state (section 7). This file is the record of
 what they contain and the state they were closed in.
 
 ## 2. Why it stopped
@@ -111,16 +111,39 @@ the real engine, so it is the strongest single check that the archive is sound.
 To re-check later: `sha256sum var/*.jsonl` against the table above, and
 `python -m pytest tests/test_in_process_runner.py -k canonical`.
 
-## 7. Backups, and the single point of failure
+## 7. Copies, and the single point of failure
 
-- **`pancakebot_stores_pre_normalization_20260829.zip`** (617 MB) in the operator's Downloads folder
-  holds all five stores **as of 2026-08-29**, before a line-ending normalization, with its own README.
-  It does not contain the final ~2.5 weeks, and its files are pre-normalization originals, so its
-  checksums will not match section 6.
+**The checksums in section 6 describe files that exist in two places**, both verified on 2026-09-16:
+
+1. **`var/`**, the working copy.
+2. **`pancakebot_data_archive_CLOSED_epoch516226_20260916.zip`** (674,535,415 bytes) in the operator's
+   Downloads folder, under `pancakebot_archive_closed_20260916\`, with a README written for someone who
+   has never seen this project. SHA-256 of the zip:
+
+       c74d4ab20081c839106a4d04f2a3d553e5442fb1b5f07caf3348d3f012b9d8db
+
+   It holds the five stores, the collection logs and health records, and the records recovered from
+   the live bot's server before that server was destroyed. It is a zip64 container, confirmed in its
+   raw bytes. It was verified by **extracting every member and re-hashing it**, not only by testing
+   the container: all 174 files matched their checksums from before zipping, and the five extracted
+   stores match section 6 exactly. A checksum list for every file is inside the zip.
+
+**Both copies are on the same physical disk.** The zip protects against corruption or an accidental
+change to `var/`. It does **not** protect against losing the drive. The kline history before about
+2026-03-28 exists nowhere else, so if it matters, copy the zip to another device and check its
+SHA-256 there.
+
+Other copies that are **not** the archive:
+
+- **`pancakebot_stores_pre_normalization_20260829.zip`** (617 MB), under
+  `pancakebot_store_backup_20260829\` in the same Downloads folder. It is an **earlier, different
+  state**: all five stores as of 2026-08-29, before their line endings were normalized from CRLF to LF.
+  It lacks the final ~2.5 weeks, and its checksums will not match section 6. Its README originally
+  said it was written as zip64; it was not. It never needed zip64 (no member reaches 4 GiB), so its
+  data is not in question, and the README now carries that correction.
 - `var/` also holds older working snapshots (`pre_repair_20260824/`, `stale_20260823/` and others),
-  bringing it to about 15 GB in total. Only the five files above are the archive.
-- **There is no off-machine copy of the final archive.** The kline history before about 2026-03-28
-  exists nowhere else. If it matters, copy `var/*.jsonl` somewhere else and verify the checksums.
+  bringing it to about 15 GB in total. Every round in those snapshots is also in the final stores.
+  Only the five files in section 6 are the archive.
 
 ## 8. How it closed
 
