@@ -115,16 +115,30 @@ out-of-sample evidence, and it is why this was written down instead of mined fur
 Expect a null. The older data it came from is contaminated for this question and contributes
 nothing. Two other slices (epochs 466782-474086, and 475312-515944) were deliberately left unspent.
 
-## 7. What happens if nobody ever runs this
+## 7. Status: DECLINED, deliberately, on the day it was written
 
-**Probably nothing, and that is an acceptable outcome.** This project was winding down when the file
-was written: live trading had stopped, the server was gone, and only the daily data sync was still
-running. April 2027 was over half a year away, and nobody was waiting on the answer.
+**This test was not run, and that was a decision rather than an omission.** It was designed,
+committed, and then declined the same day, on these grounds:
 
-This document is an option, not a promise. If it is never executed, nothing was lost and no
-commitment was broken. If the sync stopped long ago and the confirmation set never accumulated, that
-is simply the option expiring. The one thing that would be a mistake is running it late, seeing an
-unwelcome number, and then deciding the window should have been longer.
+- **The wait is seven months** for a single look, and it cannot honestly be shortened. At roughly 37
+  bets a day, separating +0.026 from zero needs thousands of bets; an early look would need an
+  observed return around nine times the claimed effect to stop, which would signal a bug rather than
+  a windfall.
+- **The prize is small and shrinking.** At the pool sizes of September 2026 -- a median of about
+  0.95 BNB and still contracting -- a rule of this kind is worth on the order of $60 a day before
+  costs at our stake, and our own stake dilutes the payout materially at those sizes.
+- **The prior is low**, for the reasons in section 6: the feature failed its first registered test
+  and would have failed it under the corrected statistic too.
+
+Seven months of waiting for an expected null on a shrinking venue was not worth the option, so it
+was declined. **The design is left intact and executable** in case that judgement ever looks wrong:
+the rule, the cut-point, the date and the verdicts all still stand as written, and the runner still
+works. If anyone does revive it, the confirmation set is still defined as rounds after epoch 515944,
+and the date is still 2027-04-08 -- moving either afterwards would forfeit the only thing this
+document is for.
+
+What would be a mistake is running it late, seeing an unwelcome number, and then deciding the window
+should have been longer.
 
 ## 8. Scope notes
 

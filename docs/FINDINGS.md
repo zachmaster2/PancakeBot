@@ -18,34 +18,45 @@ before you spend real money on the backtest numbers in this repo.**
    frequently quoted **61.23%** (in
    [holdout_2026_04_24.md](holdout_2026_04_24.md)) is the same strategy
    over an earlier, shorter window; it was not re-run for this document.
-2. **It never predicted crypto prices.** Apply the same bets to the next
-   five minutes of BTC, ETH or SOL — the assets its signal is built from —
-   and they do no better than a coin flip in any period: about 50%
-   overall and in the strongest period, and lower since late May.
-3. **What PancakeSwap paid for was oracle lag.** Rounds settle on a
-   Chainlink *push* feed, which is stale between updates by design. Scored
-   against real BNB spot prices at the same instants, the same bets win
-   52.3%, not 59.6%. The ~6-point difference is the oracle.
-4. **That stopped being enough.** The real-price component eroded through
-   2026 until the total fell below PancakeSwap's ~55-57% breakeven. Both
-   live runs fall inside that late period, and both reconcile bet-for-bet
-   with the backtest: the bot did exactly what the backtest says, and the
+2. **It never predicted BTC, ETH or SOL.** Apply the same bets to the next
+   five minutes of the assets its signal is built from and they do no
+   better than a coin flip in any period: about 50% overall and in the
+   strongest period, and lower since late May. Against real **BNB** spot
+   it did beat chance for a while — 54.0% before late May, 52.3% over its
+   life — because BNB lagged BTC by seconds. That real-price part is what
+   later decayed.
+3. **Most of what PancakeSwap paid for was oracle lag.** Rounds settle on a
+   Chainlink *push* feed that updates about every 33 seconds, so the price
+   at lock is typically ~16 seconds stale. Scored against real BNB spot at
+   the same instants, the same bets win 52.3%, not 59.6%. The ~7-point
+   difference is the oracle, and [section 8](#8-the-lag-measured-directly-measured-2026-09-15)
+   measures the lag itself and shows staleness accounts for all of it.
+4. **But the lag alone was never a winning bet.** The crowd bets the
+   visible gap too, and prices it: a rule that mechanically bets the stale
+   price's gap loses money in every month measured, including the
+   biggest-pool ones. The edge was the lag **plus** knowing which moves
+   were real — see [section 9](#9-two-parts-not-one-measured-2026-09-15).
+5. **That stopped being enough.** The real-price part eroded through 2026
+   until the total fell below PancakeSwap's ~55-57% breakeven. Both live
+   runs fall inside that late period, and both reconcile bet-for-bet with
+   the backtest: the bot did exactly what the backtest says, and the
    backtest says those bets lose.
-5. **No other venue rescues it.** Venues on BTC/ETH/SOL fail by point 2.
-   The one venue with the same kind of stale anchor (Polymarket's 5-minute
-   BNB market) does show the edge — and prices it away before a slow
-   participant can reach it.
+6. **No other venue rescues it.** Venues on BTC/ETH/SOL fail by point 2 for
+   this signal. The one venue with the same kind of stale anchor
+   (Polymarket's 5-minute BNB market) does show the edge — and prices it
+   away before a slow participant can reach it.
 
 This genuinely made money for a stretch. "It never worked" would be as
 false as "it works". The claim is about **mechanism** and **current
-state**: it worked by harvesting an oracle's lag, not by forecasting, and
-that is no longer profitable where this bot trades.
+state**: it worked by harvesting an oracle's lag *and* by picking which
+short-horizon moves would hold, not by forecasting prices in general, and
+that combination is no longer profitable where this bot trades.
 
 ---
 
 ## How much of this is checked
 
-Every number below carries one of two labels.
+Every number below carries one of three labels.
 
 - **[verified 2026-09-14]** — re-derived from this repository's own
   backtest and price data by
@@ -55,6 +66,14 @@ Every number below carries one of two labels.
   scripts and cached data **no longer exist**. These were not re-derived
   here and cannot be from this repo. They are reported as measured, not
   as checked.
+- **[measured 2026-09-15]** — sections 8-10. Computed from public BNB Chain
+  reads (the Chainlink BNB/USD feed's own update records, and the
+  prediction contract's per-round oracle ids) combined with this repo's
+  price and round stores. The analysis scripts live in a working
+  scratchpad that is **not** part of this repository, so the method below
+  is reproducible but the exact numbers are not re-runnable from the repo
+  alone. The one committed artefact of that work is
+  [`research/prereg_A3_confirm_2026_09_15.py`](../research/prereg_A3_confirm_2026_09_15.py).
 
 Where a re-derivation disagreed with the earlier measurement, both are
 shown ([Appendix](#appendix-where-the-numbers-moved)). The disagreements
@@ -82,8 +101,11 @@ same signal, same asset, same venue, different amount of oracle lag.
 These are **actual settled outcomes**, not simulations. When the rule
 settles on a fresh price, the signal is a coin flip. The edge appears
 exactly when a lagged anchor appears, by roughly the amount the lag
-predicts. The first row doubles as five months of out-of-sample proof that
-the signal has no forecasting value against a real price.
+predicts. The first row doubles as five months of out-of-sample evidence
+that, **in that period**, the signal had no forecasting value against a
+real BNB price — consistent with the decay measured on the PancakeSwap
+side, where the real-price part was worth about +4 points before late May
+and nothing after.
 
 The PancakeSwap-side evidence below is independent of this table and was
 re-derived here. It points the same way.
@@ -107,19 +129,22 @@ also call the next five minutes of **BTC, ETH and SOL** themselves.
 strong-period ones. In the period when the PancakeSwap win rate was
 61.5%, the bets called BTC 50.6% of the time.
 
-It was never a crypto forecast in any era. It was a **BTC-to-BNB
-lead-lag**: BTC moves, BNB's settlement price catches up later. BTC does
-not lag itself, so nothing transfers to venues that settle on BTC, ETH or
-SOL.
+It was never a forecast of its own inputs. What it had was a **BTC-to-BNB
+lead-lag**: BTC moves, BNB follows seconds later, and BNB's settlement
+price catches up later still. That component was real but small — about
++4 points above chance against real BNB spot before late May, gone by
+summer ([section 9](#9-two-parts-not-one-measured-2026-09-15)) — and BTC does not lag itself,
+so nothing transfers to venues that settle on BTC, ETH or SOL.
 
 ## 2. What it harvested: oracle staleness [verified 2026-09-14]
 
 PancakeSwap Prediction V2 does not settle on a market price. The contract
 stores a `lockOracleId` and `closeOracleId` per round and reads its
 `lockPrice`/`closePrice` from an external oracle — Chainlink's BNB/USD
-push feed. (The ABI in this repo confirms an external oracle and the
-stored prices carry Chainlink's 8 decimals; that it is specifically
-Chainlink is PancakeSwap's documented design, not checked on-chain here.)
+push feed. (Confirmed on-chain on 2026-09-15: the contract's `oracle()`
+returns Chainlink's BNB/USD aggregator on BNB Chain, 8 decimals, and every
+sampled round's stored `lockPrice` equals that feed's answer for the
+round's `lockOracleId` exactly.)
 A push feed publishes only when price moves past a deviation
 threshold or a heartbeat expires, so **between updates the on-chain price
 is stale by construction**. A signal that sees BNB moving before the feed
@@ -286,6 +311,132 @@ Caveats that cut in both directions:
   Even a real edge here would be tiny.
 - The markets are flagged `restricted: true`; availability to US users was
   not verified.
+
+## 8. The lag, measured directly [measured 2026-09-15]
+
+Sections 2-5 measure what the lag was *worth*. This section measures the
+lag itself, as seconds and basis points, by reading the feed's own update
+records from the chain and lining them up against 1-second spot.
+
+**How the feed behaves.** Chainlink's BNB/USD feed on BNB Chain updates on
+a clock, not only on price moves: the median gap between updates is **33
+seconds** (5th-95th percentile 32-34s), every month from December to
+September. Between 0.5% and 6.6% of updates per month arrive early, after
+moves of about 12 bps, which is what a deviation trigger of roughly 10 bps
+on top of a 33-second heartbeat looks like.
+
+**How stale the price is at lock.** The print a round locks on is 0-33
+seconds old, **median 16 seconds**, and never close to the contract's own
+300-second staleness limit. Allowing for about 2 seconds between the
+market and the feed's timestamp, effective staleness is ~18 seconds.
+
+**How far it drifts.** The print sits 4.9 bps (standard deviation) away
+from spot at lock. Of that, 79% is explained by how far spot moved since
+the print was made; the rest (2.3 bps) is the feed and one exchange
+disagreeing at the same instant. Typical error grows with age, from 1.7
+bps at 5-9 seconds old to 2.4 bps at 30-34. For scale, a 5-minute BNB move
+has a standard deviation of 17.3 bps.
+
+**Does staleness explain the premium?** Scored on the same bets and the
+same seconds, four ways:
+
+| scoring | win rate |
+|---|---:|
+| A. settled (what PancakeSwap paid) | 61.3% |
+| B. real spot at the true lock and close | 52.5% |
+| C. **staleness only** — real spot, sampled when each print was made | **62.5%** |
+| D. disagreement only — the print with its staleness removed | 51.4% |
+
+A perfectly accurate feed that is merely *late* reproduces **114%** of the
+premium (95% CI 101-130%); the feed-versus-exchange disagreement
+contributes nothing and slightly dilutes it. Almost all of it comes from
+the lock side rather than the close side.
+
+**An independent check on the magnitude.** Between the print and the lock,
+spot moved an average of **+3.43 bps in the bet's favour**. Against the
+density of 5-minute moves near zero, that predicts a premium of **7.9
+points**; the measured premium on these bets is 8.7. The two agree without
+being fitted to each other.
+
+**Placebos.** Random bet directions give 50.0 / 49.7 / 49.9 on the three
+scorings. Mirroring the timing to the far side of the lock gives 50.2.
+Shifting lock and close by ±1-2 seconds moves the real-spot win rate by at
+most 0.5 points. Assuming 0, 3, 6 or 10 seconds of feed reporting lag
+gives 118%, 116%, 122%, 135% — the choice does not drive the result.
+
+**Caveats.** Spot here is one exchange used as a proxy for the composite
+the feed is built from; it sits about 6 bps away on a typical day and that
+offset is removed day by day. It cancels within a round in any case, since
+both ends use the same source. The 1-second store does not cover the ~7
+seconds immediately before each lock, which excludes the freshest 19% of
+prints from the comparison; the premium on those is smaller, as staleness
+predicts.
+
+## 9. Two parts, not one [measured 2026-09-15]
+
+The sections above credit the oracle with the whole edge. That is not
+right, and the correction matters more than the original claim.
+
+**The crowd bets the gap too.** The displacement between the stale print
+and spot is visible to anyone before the lock. A rule that mechanically
+bets it — same decision instant, scored at real pools after the fee —
+**loses money in every month measured**, including December to March when
+pools were at their largest. Its win rate rises with the gap (53.7% to
+63.8%) and the payout on that side falls in lockstep (1.87 to 1.61): the
+pool prices the visible part almost exactly.
+
+**What the strategy had that the crowd's version did not.** The two are
+not separate bets. The strategy fired on gap rounds 2-3 times more often
+than chance, agreed with the mechanical rule's side 85-88% of the time
+when both fired, got the same final price (its side held 0.532 of the pool
+against the rule's 0.530; payouts 1.79 against 1.77) — and still won far
+more often. Splitting each side's win rate into an oracle part and a
+real-price part:
+
+| | settled | real spot | oracle part | real-price part |
+|---|---:|---:|---:|---:|
+| strategy, before late May | 61.5% | **54.0%** | +7.6 | **+4.0** |
+| the mechanical gap rule, same period | 53.4% | **47.2%** | +6.3 | **−2.8** |
+| strategy, after late May | 52.2% | 46.1% | +6.0 | −3.9 |
+| the mechanical gap rule, after | 53.7% | 46.3% | +7.4 | −3.7 |
+
+Both harvest the same ~6-8 points of oracle. The difference is the last
+column: **visible gaps mean-revert on average, and the crowd's version
+gives back half its oracle premium by betting them; the strategy's picks
+kept moving.** Its BTC signal was telling it which short-horizon BNB moves
+would hold. After late May that ability disappeared — 46.1% against the
+crowd's 46.3% — and what remained was the crowded bet.
+
+So the accurate statement is: **the staleness created the opportunity, the
+crowd over-bet it, and the edge was knowing which instances were real.**
+Both parts were needed. Neither alone was profitable.
+
+## 10. What was tested afterwards, and found nothing [measured 2026-09-15]
+
+- **Would bigger pools fix it?** No. Within each era, realised return
+  against market size is flat (+0.034 per doubling, ±0.046). The informed
+  money scales with the pool rather than being fixed: 99 wallets bet the
+  gap's side persistently (73% of the time out of sample), they supply
+  about 18% of that side's money with the top three at 5%, and their stake
+  is a steady 10-11% of the pool at every size. Crowding was *tightest* in
+  March, the largest-pool month. Even assuming the most favourable case,
+  breakeven needs 1.5-3x the largest pools ever recorded here.
+- **Can the lag be predicted better?** A pre-registered test of 11
+  candidate features asked which visible gaps persist. **None passed**;
+  the best was 0.24 after correction. No feature predicted real-spot
+  persistence at all (all |ρ| ≤ 0.018). The features that did raise the
+  settled win rate lowered the return, which is the crowd pricing them.
+- **Fading the crowd?** The four features that came out backwards were
+  then faded on the very data that selected them — a circular test that
+  should flatter itself — and they still lost (−0.027 to −0.070 against a
+  −0.026 baseline). Simply betting the minority side did better than all
+  of them, and still lost.
+- **One design was written and deliberately declined**:
+  [`docs/prereg_A3_gap_persistence_2026_09_15.md`](prereg_A3_gap_persistence_2026_09_15.md)
+  registers a single rule to be judged on rounds that did not exist when
+  it was written. It was not run, for reasons stated in it: seven months
+  of waiting, an expected null, and a prize worth tens of dollars a day on
+  a venue whose pools are still shrinking.
 
 ## What would have to be true to make money with this again
 
