@@ -140,6 +140,10 @@ document is for.
 What would be a mistake is running it late, seeing an unwelcome number, and then deciding the window
 should have been longer.
 
+**Data collection was also stopped, on 2026-09-16** ([DATA_ARCHIVE.md](DATA_ARCHIVE.md)); the archive
+ends at epoch 516226. Reviving this test would therefore mean restarting collection first, and any
+confirmation round's 1-second klines must be captured within ~171.6 days or they are gone for good.
+
 ## 8. Scope notes
 
 - The runner implements the primary rule and its controls. The first registration also listed ten
